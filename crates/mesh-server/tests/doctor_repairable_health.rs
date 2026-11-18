@@ -12,15 +12,11 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The `mesh-mcp` binary Cargo built for this integration test. Deriving it from
+/// `current_exe()` assumed `target/<profile>/deps/` and broke when Cargo moved
+/// test executables to a separate build directory.
 fn mesh_mcp_bin() -> PathBuf {
-    let mut path = std::env::current_exe().expect("test exe");
-    path.pop(); // deps/
-    path.pop(); // release/ or debug/
-    path.join(if cfg!(windows) {
-        "mesh-mcp.exe"
-    } else {
-        "mesh-mcp"
-    })
+    PathBuf::from(env!("CARGO_BIN_EXE_mesh-mcp"))
 }
 
 fn write_config(dir: &Path) -> PathBuf {
