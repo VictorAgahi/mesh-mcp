@@ -139,8 +139,11 @@ pub struct TsAliasIndex {
 impl std::fmt::Debug for TsAliasIndex {
     /// A constant per state: this value is part of the extraction-config
     /// fingerprint, which must move with neither the memo's contents nor the
-    /// set of roots (a root is already part of every file's path, hence its key;
-    /// the aliases that govern a file are part of that file's key).
+    /// set of roots. The roots must stay out of it because the parse cache is
+    /// shared by every checkout of a repository (8.0.0) and its keys hold
+    /// root-relative paths only; which root a file belongs to enters its key as
+    /// the `RepoId`, and the aliases that govern a file enter that file's key
+    /// root-relative ([`TsAliasIndex::fingerprint_input`]).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.inner {
             None => f.write_str("TsAliasIndex(disabled)"),

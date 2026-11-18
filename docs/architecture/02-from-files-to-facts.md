@@ -106,7 +106,8 @@ skipped. This is why restarting, switching back to a branch seen before, or open
 worktree of the same commit, does not re-parse everything.
 
 - One database per Git repository, under `~/.cache/mesh-mcp/workspaces/<cache_family_id>/`,
-  shared by all its worktrees; outside Git, one per workspace under `workspaces/<id>/`.
+  shared by all its worktrees running the same mesh-mcp version (the version is part of every
+  key); outside Git, one per workspace under `workspaces/<id>/`.
 - Stored entries hold paths relative to the root and are re-anchored on the checkout reading
   them. Whatever extraction reads from the absolute path (a package named after a directory,
   path substring tests) is part of the key, so a checkout where it differs misses.

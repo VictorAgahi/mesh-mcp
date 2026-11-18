@@ -1277,6 +1277,10 @@ impl DoctorCommand {
     /// repository: since 8.0.0 every worktree of a repository uses the shared directory, so
     /// no live workspace maps to a per-worktree one any more. A shared directory carries no
     /// `workspace_path` marker, so it is never reported here, whichever worktree runs this.
+    ///
+    /// Only worktrees that still exist are recognised (`RepoFamily::resolve` of the marker):
+    /// a 7.x directory whose worktree was deleted cannot be tied to this repository any
+    /// more and is left alone, like any other project's directory.
     fn check_orphaned_workspace_dirs(
         workspace: &Option<(PathBuf, String)>,
         cache_dir: &Option<CacheDirId>,

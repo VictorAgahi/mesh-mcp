@@ -53,10 +53,34 @@ struct FileFragment {
     docs: Vec<DocSection>,
     props: Option<PropertyRegistry>,
     /// Set when `code` came from a fresh tree-sitter parse (a persistent-cache miss) rather
-    /// than a cache hit — the (key, serialized `FileIndex`) pair `run_scan_pass` should write
-    /// back once the whole parallel pass is done. `None` on a cache hit (nothing changed to
+    /// than a cache hit — the (key, serialized record) pairs `run_scan_pass` should write
+    /// back once the whole parallel pass is done (two when the record depends on the
+    /// inferred package, see `CachedRecord`). Empty on a cache hit (nothing changed to
     /// write) or when no cache is configured.
-    cache_write: Option<CacheEntry>,
+    cache_write: Vec<CacheEntry>,
+}
+
+/// What the shared parse cache stores under a key (8.0.0).
+///
+/// A file's first key leaves out the package inferred from its directories
+/// (`PathContext::package_of`): most records do not depend on it (every node declares its
+/// package, or the file has none), and in a manifest-less project that value is the
+/// checkout's own directory name, which would make every such key differ between
+/// worktrees. A record that does use it (a node whose package equals the inferred one,
+/// coincidences included) is stored under a second key that also folds the inferred
+/// package, and the first key holds `NeedsPackage` to send the lookup there.
+#[derive(serde::Deserialize)]
+enum CachedRecord {
+    Index(RootRelativeIndex),
+    NeedsPackage,
+}
+
+/// [`CachedRecord`]'s serialized form, written from a borrow (same variant names, same
+/// JSON).
+#[derive(serde::Serialize)]
+enum CachedRecordRef<'a> {
+    Index(&'a RootRelativeIndex),
+    NeedsPackage,
 }
 
 /// `[engines.contracts.spring]` settings resolved once per scan, mirroring how
@@ -546,7 +570,7 @@ impl WorkspaceIndexer {
         if let Some(cache) = scan_cfg.cache {
             let writes: Vec<CacheEntry> = fragments
                 .iter_mut()
-                .filter_map(|f| f.cache_write.take())
+                .flat_map(|f| std::mem::take(&mut f.cache_write))
                 .collect();
             // Also flushes this pass's batched `last_accessed_at` bumps, and enforces the
             // cache quota when more than `QUOTA_CHECK_MIN_WRITES` entries were written.
@@ -1341,7 +1365,7 @@ impl WorkspaceIndexer {
             code: FileIndex::default(),
             docs: Vec::new(),
             props: None,
-            cache_write: None,
+            cache_write: Vec::new(),
         };
 
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -1405,17 +1429,18 @@ impl WorkspaceIndexer {
     /// `content_hash` is the file's already-computed signature hash, so this costs nothing
     /// beyond the lookup itself on either path.
     ///
-    /// A cache hit deserializes and returns immediately, `cache_write: None` (nothing changed,
-    /// nothing to write back). A miss parses as before and, unless the parse itself failed
-    /// (`code.parse_failed`, retried by the caller — see `run_scan_pass`'s doc comment; caching
-    /// a failed parse would wrongly persist "no facts" past the retry), serializes the result
-    /// for `run_scan_pass` to batch-write once the whole parallel pass is done.
+    /// A cache hit deserializes and returns immediately with no write-back. A miss parses
+    /// as before and, unless the parse itself failed (`code.parse_failed`, retried by the
+    /// caller — see `run_scan_pass`'s doc comment; caching a failed parse would wrongly
+    /// persist "no facts" past the retry), serializes the result for `run_scan_pass` to
+    /// batch-write once the whole parallel pass is done.
     ///
     /// The cache is shared by every checkout of a repository (8.0.0), so nothing in a key or
     /// a record names the directory a checkout sits in: the key holds the path relative to
     /// `root`, the record holds node paths relative to `root` (re-anchored on the current
     /// `root` after a hit), and every decision extraction draws from the absolute path is
-    /// folded into the key (`PathContext::describe`). A file not under `root` is never
+    /// folded into the key (`PathContext::append_key_input`, plus the inferred package for
+    /// a record that uses it, see [`CachedRecord`]). A file not under `root` is never
     /// cached.
     fn extract_with_cache(
         path: &Path,
@@ -1424,68 +1449,88 @@ impl WorkspaceIndexer {
         repo_id: RepoId,
         content_hash: &[u8; 32],
         cfg: &ScanConfig,
-    ) -> (FileIndex, Option<CacheEntry>) {
+    ) -> (FileIndex, Vec<CacheEntry>) {
         let extract_cfg = cfg.extract_cfg;
         let extract = || PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg);
         let (Some(cache), Some(rel_path)) = (cfg.cache, root_relative(path, root)) else {
-            return (extract(), None);
+            return (extract(), Vec::new());
         };
-        let key = PersistentIndexCache::key_for(
-            &rel_path,
-            content_hash,
-            repo_id,
-            &Self::file_fingerprint(path, cfg),
-        );
-        if let Some(bytes) = cache.get(&key) {
-            if let Ok(cached) = serde_json::from_slice::<RootRelativeIndex>(&bytes) {
-                let mut code = cached.index;
-                code.reanchor(root, &cached.anchored);
-                return (code, None);
+        let fingerprint = Self::file_fingerprint(path, cfg);
+        let key = PersistentIndexCache::key_for(&rel_path, content_hash, repo_id, &fingerprint);
+        let package_key = |package: &str| {
+            let mut input = fingerprint.to_vec();
+            input.extend_from_slice(b"\0pkg=");
+            input.extend_from_slice(package.as_bytes());
+            PersistentIndexCache::key_for(&rel_path, content_hash, repo_id, &sha256(&input))
+        };
+        let decode = |bytes: Vec<u8>| match serde_json::from_slice::<CachedRecord>(&bytes) {
+            Ok(record) => Some(record),
+            Err(_) => {
+                tracing::warn!(
+                    target: "mesh::index_cache",
+                    "{}: cached FileIndex failed to deserialize, re-parsing",
+                    path.display()
+                );
+                None
             }
-            tracing::warn!(
-                target: "mesh::index_cache",
-                "{}: cached FileIndex failed to deserialize, re-parsing",
-                path.display()
-            );
+        };
+        let mut record = cache.get(&key).and_then(decode);
+        if let Some(CachedRecord::NeedsPackage) = record {
+            let package = cfg.path_context.package_of(path);
+            record = cache.get(&package_key(&package)).and_then(decode);
         }
+        if let Some(CachedRecord::Index(cached)) = record {
+            let mut code = cached.index;
+            code.reanchor(root, &cached.anchored);
+            return (code, Vec::new());
+        }
+
         let mut code = extract();
         if code.parse_failed {
-            return (code, None);
+            return (code, Vec::new());
         }
+        let package = cfg.path_context.package_of(path);
+        let uses_package = code.uses_package(&package);
         let Some(anchored) = code.relativize(root) else {
             // A node path outside `root`: no record another checkout could re-anchor.
-            return (code, None);
+            return (code, Vec::new());
         };
         let record = RootRelativeIndex {
             index: code,
             anchored,
         };
-        let bytes = serde_json::to_vec(&record);
+        let bytes = serde_json::to_vec(&CachedRecordRef::Index(&record));
+        let stub = serde_json::to_vec(&CachedRecordRef::NeedsPackage);
         let RootRelativeIndex {
             index: mut code,
             anchored,
         } = record;
         code.reanchor(root, &anchored);
-        match bytes {
-            Ok(bytes) => (code, Some((key, bytes))),
-            Err(e) => {
+        match (bytes, stub) {
+            (Ok(bytes), _) if !uses_package => (code, vec![(key, bytes)]),
+            (Ok(bytes), Ok(stub)) => (code, vec![(key, stub), (package_key(&package), bytes)]),
+            (Err(e), _) | (_, Err(e)) => {
                 tracing::warn!(
                     target: "mesh::index_cache",
                     "{}: failed to serialize FileIndex for caching: {e}",
                     path.display()
                 );
-                (code, None)
+                (code, Vec::new())
             }
         }
     }
 
-    /// The extraction-config fingerprint of one file's cache key: the per-scan config
+    /// The extraction-config fingerprint of one file's first cache key: the per-scan config
     /// fingerprint, the `tsconfig` / `package.json` aliases governing the file (so editing
     /// such a config re-extracts the files it governs; written root-relative), and what
-    /// extraction reads from the file's absolute path (`PathContext::describe`).
+    /// extraction reads from the file's absolute path except the inferred package
+    /// (`PathContext::append_key_input`; the package goes into the second key, see
+    /// [`CachedRecord`]).
     fn file_fingerprint(path: &Path, cfg: &ScanConfig) -> [u8; 32] {
-        let mut input = cfg.config_fingerprint.to_vec();
-        input.extend_from_slice(cfg.path_context.describe(cfg.extract_cfg, path).as_bytes());
+        let mut input = Vec::with_capacity(128);
+        input.extend_from_slice(&cfg.config_fingerprint);
+        cfg.path_context
+            .append_key_input(cfg.extract_cfg, path, &mut input);
         if let Some(aliases) = cfg.extract_cfg.ts_aliases.fingerprint_input(path) {
             input.push(0);
             input.extend_from_slice(aliases.as_bytes());

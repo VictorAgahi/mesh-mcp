@@ -333,12 +333,16 @@ the session stays up and answers every `tools/call` with an error naming the dir
 The persistent parse cache (`PersistentIndexCache`, `crates/mesh-core/src/index_cache.rs`) is
 one database per Git repository: `~/.cache/mesh-mcp/workspaces/<cache_family_id>/index-cache.db`
 (`mesh_core::identity::cache_family_id`, a hash of the canonical common Git directory), shared by
-every worktree, config file, process and mesh-mcp version of that repository. Outside Git it is
+every worktree, config file and process of that repository. Outside Git it is
 `workspaces/<workspace_id>/` as before. SQLite, WAL, mode `0600`, `auto_vacuum = INCREMENTAL`.
-Keys hold the file's root-relative path, content hash, `RepoId` and the extraction-config
-fingerprint, which also folds in everything extraction reads from the absolute path
-(`mesh_parsers::PathContext`: package inferred from directories, parent directory name, path
-substring tests) and the governing `tsconfig` / `package.json` aliases written root-relative.
+Keys hold the binary version (records are shared within one version; an older version's rows
+age out through LRU eviction), the file's root-relative path, content hash, `RepoId` and the
+extraction-config fingerprint, which also folds in everything extraction reads from the absolute
+path (`mesh_parsers::PathContext`: parent directory name of an `index.*` file, path substring
+tests) and the governing `tsconfig` / `package.json` aliases written root-relative. A record that
+uses the package inferred from directories (a manifest-less checkout gets its directory name) is
+stored under a second key that also folds that package, and the first key holds a pointer to it,
+so files that declare their package still share across differently named worktrees.
 Records store root-relative node paths and are re-anchored on the reading checkout's root, so
 two checkouts of one commit read the same entries and fingerprint the same. The shared
 directory carries a `family_common_dir` marker, never a `workspace_path` one, so `doctor` never

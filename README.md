@@ -334,8 +334,9 @@ What this shows, and what it does not:
   (for example a committed `.agents/mesh-mcp.toml`) are two workspaces: two `meshd` processes, two
   in-memory indexes, memory adds up.
 - The on-disk parse cache is one per Git repository (`~/.cache/mesh-mcp/workspaces/<id>/`, quota
-  `[cache] max_size_mb`, default 2048 MB), shared by all its worktrees: a second worktree of the
-  same commit boots on cache hits. A workspace outside Git has its own.
+  `[cache] max_size_mb`, default 2048 MB), shared by all its worktrees running the same mesh-mcp
+  version: a second worktree of the same commit boots on cache hits. A workspace outside Git has
+  its own.
 - `meshd` exits after 30 idle minutes (`--idle-timeout-minutes`), so a worktree nobody queries does
   not keep its index in RAM indefinitely. A session in each worktree you actively use does.
 - The other layout is one config listing several worktrees as `roots`: one process, but every

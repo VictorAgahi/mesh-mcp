@@ -2,16 +2,19 @@
 //! step 3.2), backed by SQLite in WAL mode (Commandment 7's audit db convention, mode
 //! `0600`). Since 8.0.0 there is one database per Git repository, at
 //! `~/.cache/mesh-mcp/workspaces/<cache_family_id>/index-cache.db`
-//! ([`crate::identity::cache_family_id`]), shared by every worktree, config file and
-//! mesh-mcp version of that repository; a workspace outside Git keeps its own directory
-//! named by [`crate::socket::workspace_id`] (plan 4 step 4.4).
+//! ([`crate::identity::cache_family_id`]), shared by every worktree and config file of that
+//! repository; a workspace outside Git keeps its own directory named by
+//! [`crate::socket::workspace_id`] (plan 4 step 4.4). The file outlives an upgrade, but a
+//! record is only ever read back by the binary version that wrote it (the version is part
+//! of every key); rows of a version no longer running age out through LRU eviction.
 //!
 //! The cache stores whatever a caller serializes for one file (`mesh-server`'s
 //! `WorkspaceIndexer` uses it for `mesh_parsers::FileIndex`, the AST-decapitated,
 //! tree-sitter-derived per-file fragment, with root-relative node paths) under a key folding
-//! together every input that fragment depends on: the file's root-relative path, content
-//! hash, `RepoId` and a caller-supplied extraction config fingerprint. An unchanged file rescanned under an unchanged config on a later cold
-//! start is then a single indexed SQLite lookup instead of a full tree-sitter re-parse.
+//! together every input that fragment depends on: binary version, the file's root-relative
+//! path, content hash, `RepoId` and a caller-supplied extraction config fingerprint. An
+//! unchanged file rescanned under an unchanged config on a later cold start is then a single
+//! indexed SQLite lookup instead of a full tree-sitter re-parse.
 //!
 //! Deliberately does *not* know about `NodeId`: `NodeId`s are assigned sequentially while
 //! folding files into the `ContractGraph` in sorted crawl order (idempotence invariant I1),
@@ -238,8 +241,9 @@ impl PersistentIndexCache {
 
     /// Which directory under `workspaces/` holds the cache of the workspace at `base_dir`:
     /// inside a Git repository, [`crate::identity::cache_family_id`] of its repository, one
-    /// database for every worktree, every config file and every mesh-mcp version (record
-    /// compatibility is [`SCHEMA_VERSION`]'s job); outside Git, the workspace's own
+    /// database for every worktree and every config file (the binary version and
+    /// [`SCHEMA_VERSION`] are in every key, so a record is only read back by the version
+    /// that wrote it); outside Git, the workspace's own
     /// [`crate::socket::workspace_id`] as before 8.0.0.
     pub fn cache_dir_id(base_dir: &Path, config_file: Option<&Path>) -> CacheDirId {
         let identity = crate::identity::WorkspaceIdentity::resolve(base_dir, config_file);
@@ -277,11 +281,14 @@ impl PersistentIndexCache {
                     std::fs::set_permissions(workspaces, std::fs::Permissions::from_mode(0o700));
             }
         }
+        // After `open`, which creates the directory: written before it, a marker was lost
+        // on the very first open of a directory.
+        let cache = Self::open(db_path, Self::quota_bytes_from_mb(max_size_mb))?;
         match &dir_id {
             CacheDirId::Family { id, common_dir } => Self::write_family_marker(id, common_dir),
             CacheDirId::Workspace { id } => Self::write_workspace_path_marker(id, base_dir),
         }
-        Self::open(db_path, Self::quota_bytes_from_mb(max_size_mb))
+        Ok(cache)
     }
 
     /// Marker file naming the canonical `base_dir` a workspace id's cache
@@ -328,7 +335,16 @@ impl PersistentIndexCache {
         if std::fs::read_to_string(&marker).is_ok_and(|t| t == text) {
             return;
         }
-        let _ = std::fs::write(marker, text.as_bytes());
+        // Every worktree's process may write it at the same time: a temp file per process
+        // renamed into place, so a reader never sees a half-written marker.
+        let tmp = dir.join(format!(".{FAMILY_MARKER}.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, text.as_bytes()).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        if std::fs::rename(&tmp, &marker).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     /// Reads back a shared directory's [`Self::write_family_marker`], if present.
@@ -490,7 +506,30 @@ impl PersistentIndexCache {
     /// every checkout of a repository (8.0.0), and two checkouts of one commit must produce
     /// the same keys. Anything else the extraction reads from the absolute path belongs in
     /// `config_fingerprint`.
+    ///
+    /// The binary version is part of the key too: the database is shared by every
+    /// worktree of a repository whatever mesh-mcp version opens it, so without it an
+    /// extraction fix in a patch release would keep serving the previous release's records
+    /// for every unchanged file until someone remembered to bump [`SCHEMA_VERSION`]. Rows
+    /// of a version no longer running age out through LRU eviction.
     pub fn key_for(
+        rel_path: &str,
+        content_hash: &[u8; 32],
+        repo_id: RepoId,
+        config_fingerprint: &[u8; 32],
+    ) -> [u8; 32] {
+        Self::key_for_version(
+            env!("CARGO_PKG_VERSION"),
+            rel_path,
+            content_hash,
+            repo_id,
+            config_fingerprint,
+        )
+    }
+
+    /// [`Self::key_for`] with the binary version given explicitly (tests).
+    pub fn key_for_version(
+        version: &str,
         rel_path: &str,
         content_hash: &[u8; 32],
         repo_id: RepoId,
@@ -498,6 +537,9 @@ impl PersistentIndexCache {
     ) -> [u8; 32] {
         let mut ctx = Context::new(&SHA256);
         ctx.update(&[SCHEMA_VERSION]);
+        ctx.update(&(version.len() as u64).to_le_bytes());
+        ctx.update(version.as_bytes());
+        ctx.update(&(rel_path.len() as u64).to_le_bytes());
         ctx.update(rel_path.as_bytes());
         ctx.update(content_hash);
         ctx.update(&repo_id.to_le_bytes());
@@ -863,6 +905,27 @@ mod tests {
         let key_a = PersistentIndexCache::key_for("a.rs", &hash, 0, &fp);
         let key_b = PersistentIndexCache::key_for("a.rs", &hash, 1, &fp);
         assert_ne!(key_a, key_b);
+    }
+
+    /// The shared database outlives a binary upgrade: the same file with the same bytes
+    /// under two versions must be two entries, so a patch release's extraction fix is
+    /// never hidden behind the previous release's records.
+    #[test]
+    fn different_binary_version_misses() {
+        let hash = [1u8; 32];
+        let fp = [2u8; 32];
+        let v800 = PersistentIndexCache::key_for_version("8.0.0", "a.rs", &hash, 0, &fp);
+        let v801 = PersistentIndexCache::key_for_version("8.0.1", "a.rs", &hash, 0, &fp);
+        assert_ne!(v800, v801);
+        assert_eq!(
+            PersistentIndexCache::key_for("a.rs", &hash, 0, &fp),
+            PersistentIndexCache::key_for_version(env!("CARGO_PKG_VERSION"), "a.rs", &hash, 0, &fp)
+        );
+        // Length-prefixed: moving bytes between the version and the path changes the key.
+        assert_ne!(
+            PersistentIndexCache::key_for_version("8.0.0a", "b.rs", &hash, 0, &fp),
+            PersistentIndexCache::key_for_version("8.0.0", "ab.rs", &hash, 0, &fp)
+        );
     }
 
     #[test]

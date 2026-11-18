@@ -23,6 +23,16 @@ use std::process::Command;
 
 const CHILD_ENV: &str = "MESH_TEST_SHARED_CACHE_CHILD";
 
+/// A git operation the test needs failed: fatal under CI (a silent pass would hide a broken
+/// environment), a skip on a developer machine without git.
+fn unavailable(what: &str) {
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "CI: required git operation failed: {what}"
+    );
+    eprintln!("{what} unavailable; skipping");
+}
+
 fn git(dir: &Path, args: &[&str]) -> bool {
     Command::new("git")
         .args([
@@ -193,7 +203,7 @@ fn second_worktree_cold_boot_hits_every_entry_and_reports_its_own_paths() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = dunce::canonicalize(tmp.path()).expect("canon");
     let Some((main, wt)) = two_worktrees(&base) else {
-        eprintln!("git worktree unavailable; skipping");
+        unavailable("git worktree");
         return;
     };
     let db = base.join("cache/index-cache.db");
@@ -218,7 +228,9 @@ fn second_worktree_cold_boot_hits_every_entry_and_reports_its_own_paths() {
         "second worktree must not re-parse: {stats_b:?}"
     );
     assert_eq!(stats_b.errors, 0, "{stats_b:?}");
-    assert_eq!(stats_b.hits, stats_a.misses, "{stats_a:?} vs {stats_b:?}");
+    // Every file A missed is a hit for B (twice for a record keyed by the inferred
+    // package: the first key, then the package-keyed one).
+    assert!(stats_b.hits >= stats_a.misses, "{stats_a:?} vs {stats_b:?}");
 
     // Same commit, same snapshot; and the records served to B are what B parses itself.
     assert_eq!(snap_a.fingerprint(), snap_b.fingerprint());
@@ -270,7 +282,7 @@ fn an_edit_in_one_worktree_never_reaches_the_other() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = dunce::canonicalize(tmp.path()).expect("canon");
     let Some((main, wt)) = two_worktrees(&base) else {
-        eprintln!("git worktree unavailable; skipping");
+        unavailable("git worktree");
         return;
     };
     let cache = open_cache(&base.join("cache/index-cache.db"));
@@ -302,10 +314,13 @@ fn an_edit_in_one_worktree_never_reaches_the_other() {
     assert_eq!(again_b.fingerprint(), after_b.fingerprint());
 }
 
-/// A file whose package can only come from the checkout's own directory name (no manifest
-/// declares one) must miss in the other worktree rather than be served the first one's.
+/// A manifest-less repository checked out as `alpha` and `beta`:
+/// - `tool.py` declares no package, so its package is the checkout directory's name. B must
+///   re-parse it and get `beta`, never be served A's `alpha`;
+/// - `billing.go` declares `package billing`. Its record does not depend on the directory
+///   name, so B reads A's record (the inferred package only keys the records that use it).
 #[test]
-fn a_package_named_after_the_checkout_directory_is_never_shared() {
+fn only_records_using_the_checkout_named_package_miss_in_another_worktree() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = dunce::canonicalize(tmp.path()).expect("canon");
     let main = base.join("alpha");
@@ -314,32 +329,53 @@ fn a_package_named_after_the_checkout_directory_is_never_shared() {
         "tool.py",
         "class Tool:\n    def run(self):\n        return 1\n",
     );
+    write(
+        &main,
+        "billing.go",
+        "package billing\n\ntype Ledger struct{}\n\nfunc (l *Ledger) Post() error { return nil }\n",
+    );
     if !(git(&main, &["init", "-q"])
         && git(&main, &["add", "."])
         && git(&main, &["commit", "-qm", "init"])
         && git(&main, &["worktree", "add", "-q", "../beta", "-b", "topic"]))
     {
-        eprintln!("git worktree unavailable; skipping");
+        unavailable("git worktree");
         return;
     }
     let main = dunce::canonicalize(&main).expect("canon");
     let wt = dunce::canonicalize(base.join("beta")).expect("canon");
-    let cache = open_cache(&base.join("cache/index-cache.db"));
-    let a = snapshot(&main, Some(&cache));
-    let b = snapshot(&wt, Some(&cache));
-    let package = |s: &MeshSnapshot| {
+    let db = base.join("cache/index-cache.db");
+    let cache_a = open_cache(&db);
+    let a = snapshot(&main, Some(&cache_a));
+    drop(cache_a);
+    let cache_b = open_cache(&db);
+    let b = snapshot(&wt, Some(&cache_b));
+    let package = |s: &MeshSnapshot, name: &str| {
         s.contract_graph
             .all_nodes()
-            .find(|n| n.name == "Tool")
+            .find(|n| n.name == name)
             .map(|n| n.package.to_string())
     };
-    assert_eq!(package(&a).as_deref(), Some("alpha"));
+    assert_eq!(package(&a, "Tool").as_deref(), Some("alpha"));
     assert_eq!(
-        package(&b).as_deref(),
+        package(&b, "Tool").as_deref(),
         Some("beta"),
         "B must not get A's package"
     );
-    assert_eq!(cache.stats().hits, 0, "{:?}", cache.stats());
+    assert_eq!(package(&a, "Ledger").as_deref(), Some("billing"));
+    assert_eq!(package(&b, "Ledger").as_deref(), Some("billing"));
+    // `tool.py` is the only miss: its first key points to the package-keyed record, which
+    // B does not have. `billing.go` is a plain hit.
+    let stats = cache_b.stats();
+    assert_eq!(stats.misses, 1, "{stats:?}");
+    assert_eq!(stats.hits, 2, "{stats:?}");
+    assert_eq!(b.fingerprint(), snapshot(&wt, None).fingerprint());
+
+    // B's own records now exist too: a second B boot parses nothing.
+    let again = open_cache(&db);
+    let b2 = snapshot(&wt, Some(&again));
+    assert_eq!(again.stats().misses, 0, "{:?}", again.stats());
+    assert_eq!(b2.fingerprint(), b.fingerprint());
 }
 
 fn run_child(test: &str, home: &Path, extra: &[(&str, &Path)]) {
@@ -378,6 +414,11 @@ fn child_open_both_worktrees() {
         let cache = PersistentIndexCache::open_for_workspace(ws, config.as_deref(), 64)
             .expect("open cache");
         drop(cache);
+        // Present from the very first open on (not only once the directory existed).
+        assert_eq!(
+            PersistentIndexCache::read_family_marker(&cache_family_id(&family)).as_deref(),
+            Some(family.common_dir.as_path())
+        );
         assert_eq!(
             PersistentIndexCache::cache_dir_id(ws, config.as_deref()).id(),
             cache_family_id(&family)
@@ -393,6 +434,15 @@ fn child_open_both_worktrees() {
         !dir.join("workspace_path").exists(),
         "a shared directory must not name one worktree"
     );
+    let leftovers: Vec<_> = std::fs::read_dir(dir)
+        .expect("read dir")
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "marker temp files left: {leftovers:?}"
+    );
     let entries: Vec<_> = std::fs::read_dir(dir.parent().expect("workspaces"))
         .expect("read workspaces")
         .flatten()
@@ -405,7 +455,7 @@ fn both_worktrees_open_the_repository_directory() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = dunce::canonicalize(tmp.path()).expect("canon");
     let Some((main, wt)) = two_worktrees(&base) else {
-        eprintln!("git worktree unavailable; skipping");
+        unavailable("git worktree");
         return;
     };
     write(
@@ -447,7 +497,7 @@ fn doctor_keeps_the_shared_directory_and_removes_per_worktree_leftovers() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = dunce::canonicalize(tmp.path()).expect("canon");
     let Some((main, wt)) = two_worktrees(&base) else {
-        eprintln!("git worktree unavailable; skipping");
+        unavailable("git worktree");
         return;
     };
     let config_body = "[workspace]\nname = \"d\"\nversion = \"0\"\nroots = [\".\"]\n";
