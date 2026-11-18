@@ -42,11 +42,17 @@ impl ContractGraph {
                 .push(id);
         }
 
+        self.grpc_index.insert(&node);
+        self.journal.node_added(id);
         self.nodes.insert(id, node);
         id
     }
 
     pub fn add_edge(&mut self, edge: ContractEdge) {
+        // An edge added by hand is not one `reconcile_edges` derives: a delta
+        // would keep it while a full rebuild drops it, so the next reconcile
+        // must be a full one.
+        self.journal.invalidate();
         match edge.kind {
             EdgeKind::Produces => {
                 if let Some(to_node) = self.nodes.get(&edge.to) {
@@ -74,6 +80,7 @@ impl ContractGraph {
     /// invariants I2/I3 — see the note on `reconcile_edges`).
     pub fn add_dependency(&mut self, consumer_node_id: NodeId, imported_target: &str) {
         let key = CompactStr::new(imported_target);
+        self.journal.dep_target(&key);
         self.reverse_deps
             .entry(key)
             .or_default()
@@ -82,6 +89,7 @@ impl ContractGraph {
 
     pub fn add_producer(&mut self, producer_node_id: NodeId, topic: &str) {
         let key = CompactStr::new(normalize_topic_key(topic));
+        self.journal.topic(&key);
         self.topic_producers
             .entry(key)
             .or_default()
@@ -90,6 +98,7 @@ impl ContractGraph {
 
     pub fn add_consumer(&mut self, consumer_node_id: NodeId, topic: &str) {
         let key = CompactStr::new(normalize_topic_key(topic));
+        self.journal.topic(&key);
         self.topic_consumers
             .entry(key)
             .or_default()
@@ -98,6 +107,7 @@ impl ContractGraph {
 
     /// Marks a producer / consumer node whose topic link is heuristic.
     pub fn mark_heuristic_topic_node(&mut self, node_id: NodeId) {
+        self.journal.heuristic_mark(node_id);
         self.heuristic_topic_nodes.insert(node_id);
     }
 
@@ -111,8 +121,9 @@ impl ContractGraph {
     }
 
     pub fn add_rpc_call(&mut self, caller_node_id: NodeId, target_rpc: &str) {
-        self.rpc_calls
-            .push((caller_node_id, CompactStr::new(target_rpc)));
+        let record = CompactStr::new(target_rpc);
+        self.journal.rpc_record(caller_node_id, &record);
+        self.rpc_calls.push((caller_node_id, record));
     }
 
     pub fn patch_file(&mut self, file_path: &Path) {
@@ -135,17 +146,33 @@ impl ContractGraph {
         self.remove_nodes(&stale_set);
 
         // Indices keyed by *target* (not node) need one sweep — done once for the whole batch.
-        for map in [
-            &mut self.reverse_deps,
-            &mut self.topic_producers,
-            &mut self.topic_consumers,
+        // Every key whose fact list shrank is journaled, so a delta revisits it.
+        let journal = &mut self.journal;
+        for (map, is_dep) in [
+            (&mut self.reverse_deps, true),
+            (&mut self.topic_producers, false),
+            (&mut self.topic_consumers, false),
         ] {
-            map.retain(|_, ids| {
+            map.retain(|key, ids| {
+                let before = ids.len();
                 ids.retain(|id| !stale_set.contains(id));
+                if ids.len() != before {
+                    if is_dep {
+                        journal.dep_target(key);
+                    } else {
+                        journal.topic(key);
+                    }
+                }
                 !ids.is_empty()
             });
         }
-        self.rpc_calls.retain(|(id, _)| !stale_set.contains(id));
+        self.rpc_calls.retain(|(id, record)| {
+            let stale = stale_set.contains(id);
+            if stale {
+                journal.rpc_record(*id, record);
+            }
+            !stale
+        });
         self.heuristic_topic_nodes
             .retain(|id| !stale_set.contains(id));
         self.edges
@@ -182,8 +209,10 @@ impl ContractGraph {
             {
                 by_fqcn.insert(CompactStr::new(format!("{}/{}", node.package, node.name)));
             }
-            by_name.insert(node.name);
-            by_file.insert(node.file_path);
+            by_name.insert(node.name.clone());
+            by_file.insert(node.file_path.clone());
+            self.grpc_index.remove(&node);
+            self.journal.node_removed(node);
         }
         for (index, keys) in [
             (&mut self.name_to_nodes, by_name),

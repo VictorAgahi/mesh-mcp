@@ -7,12 +7,17 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+mod delta;
 mod index;
 mod query;
 mod reconcile;
 mod render;
 mod resolve;
 
+pub use delta::ReconcileMode;
+
+#[cfg(test)]
+mod delta_tests;
 #[cfg(test)]
 mod handler_ref_tests;
 #[cfg(test)]
@@ -373,6 +378,15 @@ pub struct ContractGraph {
     /// of a declared proto service (`Service.Method`). Derived by
     /// `reconcile_edges`, never stored incrementally.
     handler_rpc_names: HashMap<NodeId, CompactStr>,
+
+    /// What changed since the last reconcile (nodes added and removed, fact
+    /// keys touched), read by `reconcile_delta` to recompute only the edges
+    /// those changes can reach. Not part of the graph's content.
+    journal: delta::ReconcileJournal,
+    /// gRPC declarations by the names the `Implements` / `CallsRpc` passes
+    /// look them up by, kept current by `add_node` / `remove_nodes`, so a
+    /// delta finds a changed handler's or call's candidates without a scan.
+    grpc_index: delta::GrpcIndex,
 
     next_node_id: u32,
 }
