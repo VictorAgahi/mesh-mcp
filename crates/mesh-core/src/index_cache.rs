@@ -807,7 +807,6 @@ impl PersistentIndexCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     fn key(i: u32) -> [u8; 32] {
         sha256(&i.to_le_bytes())
