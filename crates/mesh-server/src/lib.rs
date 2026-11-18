@@ -4,6 +4,7 @@ pub mod cli;
 pub mod framing;
 pub mod indexer;
 pub mod protocol;
+pub mod spawn_lock;
 pub mod tools;
 pub mod watcher;
 

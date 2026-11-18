@@ -12,8 +12,10 @@
 //! to; anything else re-indexes the workspace, reusing the per-file parse cache.
 //! The rebuild runs on a blocking thread while the old state keeps serving, and
 //! the swap happens once the new state is ready. The check runs when a request
-//! arrives (there is no timer), so an edit made while no client is talking to the
-//! daemon is applied by the next request. A config that does not parse, or whose
+//! arrives, and also on a periodic task ([`WorkspaceHost::spawn_idle_poller`],
+//! every [`IDLE_POLL_INTERVAL`]), so an edit made while no client is talking to
+//! the daemon is already applied when the next request comes. A config that does
+//! not parse, or whose
 //! roots do not resolve, is refused: the old state keeps serving, the reason is
 //! logged to stderr and recorded for `mesh-mcp doctor`.
 
@@ -34,6 +36,10 @@ use tokio_util::sync::CancellationToken;
 
 /// Minimum time between two `stat`s of the config file.
 pub const CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often the daemon checks its config file with no request in flight (see
+/// [`WorkspaceHost::spawn_idle_poller`]).
+pub const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// What one [`WorkspaceHost::reload_if_changed`] pass did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,12 +126,12 @@ fn now_ms() -> u128 {
 
 /// Indexes `state`'s workspace into its first snapshot, under `reload_lock` like
 /// every later reload (idempotence invariant I2). Blocking.
-pub fn ingest_blocking(state: &Arc<AppState>, base_dir: &Path) {
+pub fn ingest_blocking(state: &Arc<AppState>, base_dir: &Path, config_file: Option<&Path>) {
     let _guard = state.reload_lock.lock().unwrap_or_else(|p| p.into_inner());
     tracing::info!(target: "meshd", "Starting initial workspace ingestion...");
     // Per-workspace cache under its quota (plan 4 step 4.4); a failure to open it
     // degrades to "parse everything" (see `AppState::open_index_cache`).
-    let index_cache = state.open_index_cache(base_dir);
+    let index_cache = state.open_index_cache(base_dir, config_file);
     let snapshot = {
         let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
         WorkspaceIndexer::build_snapshot(
@@ -344,6 +350,26 @@ impl WorkspaceHost {
         self.current.load_full()
     }
 
+    /// Checks the config file every `interval` until the daemon shuts down, so an
+    /// edit made while the daemon is idle is applied before the next request
+    /// instead of being answered with the old state first. Each tick is the same
+    /// cheap check a request does (read and hash a few hundred bytes, reload only
+    /// on a different hash); nothing is held across an await.
+    pub fn spawn_idle_poller(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let host = Arc::clone(self);
+        let cancel = self.shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = ticker.tick() => host.check_for_change(),
+                }
+            }
+        })
+    }
+
     fn check_for_change(self: &Arc<Self>) {
         let Some(path) = self.config_path.as_deref() else {
             return;
@@ -550,13 +576,13 @@ impl WorkspaceHost {
         let watcher_cancel = self.shutdown.child_token();
         match kind {
             ReloadKind::Full => {
-                ingest_blocking(&state, &base_dir);
+                ingest_blocking(&state, &base_dir, self.config_path.as_deref());
             }
             ReloadKind::DisplayOnly | ReloadKind::Partial => {
                 // The index stays valid: carry it over instead of reading the
                 // workspace again. Only the query-time docs settings follow the
                 // new config.
-                state.open_index_cache(&base_dir);
+                state.open_index_cache(&base_dir, self.config_path.as_deref());
                 let settings = WorkspaceIndexer::doc_index_for(&state.config);
                 state.adopt_index_of(&old, |snapshot| {
                     snapshot.doc_index.adopt_query_settings(&settings);
@@ -682,7 +708,7 @@ mod tests {
         // in this test's own tempdir.
         let cache = root.join(".test-cache");
         seed_index_cache(&state, &cache, 0);
-        ingest_blocking(&state, &base);
+        ingest_blocking(&state, &base, Some(&config));
         let shutdown = CancellationToken::new();
         let host = WorkspaceHost::new_in(
             state,
@@ -818,6 +844,29 @@ mod tests {
         }
         assert!(served_new, "the rebuilt state never started serving");
         fx.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn an_idle_edit_is_picked_up_by_the_timer_without_any_request() {
+        let fx = fixture(&["a"]);
+        let poller = fx.host.spawn_idle_poller(Duration::from_millis(50));
+        write_config(&fx.config, &["a", "b"]);
+        // No `current()` call: only `peek()`, which never checks the file.
+        let mut served_new = false;
+        for _ in 0..200 {
+            if knows(&fx.host.peek(), "OnlyB") {
+                served_new = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(served_new, "the timer never applied the idle edit");
+        fx.shutdown.cancel();
+        // Cancelled by the daemon's token: the task ends.
+        tokio::time::timeout(Duration::from_secs(5), poller)
+            .await
+            .expect("poller stops on shutdown")
+            .expect("poller join");
     }
 
     fn set_mtime(path: &Path, secs: u64) {

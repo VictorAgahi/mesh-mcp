@@ -211,8 +211,12 @@ impl PersistentIndexCache {
 
     /// Opens the database of the workspace rooted at `base_dir` (see
     /// [`Self::workspace_db_path`]) with a quota of `max_size_mb`.
-    pub fn open_for_workspace(base_dir: &Path, max_size_mb: u64) -> Result<Self, IndexCacheError> {
-        let id = crate::socket::workspace_id(base_dir);
+    pub fn open_for_workspace(
+        base_dir: &Path,
+        config_file: Option<&Path>,
+        max_size_mb: u64,
+    ) -> Result<Self, IndexCacheError> {
+        let id = crate::socket::workspace_id(base_dir, config_file);
         let db_path = Self::workspace_db_path(&id);
         // `workspaces/` itself lists every indexed workspace's id: owner-only, like the
         // per-workspace directory `open` creates under it.

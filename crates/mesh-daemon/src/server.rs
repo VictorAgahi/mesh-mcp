@@ -606,8 +606,8 @@ mod unix_tests {
     async fn test_two_workspace_scoped_daemons_never_cross_talk() {
         let dir_a = tempdir().unwrap();
         let dir_b = tempdir().unwrap();
-        let sock_a = mesh_core::socket_path_for(&mesh_core::workspace_id(dir_a.path()));
-        let sock_b = mesh_core::socket_path_for(&mesh_core::workspace_id(dir_b.path()));
+        let sock_a = mesh_core::socket_path_for(&mesh_core::workspace_id(dir_a.path(), None));
+        let sock_b = mesh_core::socket_path_for(&mesh_core::workspace_id(dir_b.path(), None));
         assert_ne!(
             sock_a, sock_b,
             "two different workspaces must resolve to different sockets"
@@ -663,6 +663,75 @@ mod unix_tests {
             "workspace B's socket must only ever answer with workspace B's data, got: {resp_b}"
         );
 
+        token.cancel();
+    }
+
+    /// Two config files in ONE directory (`--config a.toml` / `--config b.toml`)
+    /// are two workspaces: distinct ids, distinct sockets, and each daemon
+    /// answers with its own config's graph only (idempotence invariant I7).
+    #[tokio::test]
+    async fn test_two_configs_in_one_directory_get_two_daemons_and_two_graphs() {
+        let dir = tempdir().unwrap();
+        let config_for = |name: &str| {
+            let path = dir.path().join(format!("{name}.toml"));
+            std::fs::write(
+                &path,
+                format!("[workspace]\nname = \"{name}\"\nversion = \"2.9.0\"\nroots = [\".\"]\n"),
+            )
+            .unwrap();
+            path
+        };
+        let cfg_a = config_for("k8s-wt1");
+        let cfg_b = config_for("k8s-wt2");
+
+        let id_a = mesh_core::workspace_id(dir.path(), Some(&cfg_a));
+        let id_b = mesh_core::workspace_id(dir.path(), Some(&cfg_b));
+        assert_ne!(id_a, id_b, "two configs in one directory share no identity");
+        assert_ne!(id_a, mesh_core::workspace_id(dir.path(), None));
+        assert_ne!(
+            mesh_core::socket_path_for(&id_a),
+            mesh_core::socket_path_for(&id_b)
+        );
+
+        // Bound in the test's own directory: a short name, never the user's cache.
+        let sock_a = dir.path().join(format!("m-{id_a}.sock"));
+        let sock_b = dir.path().join(format!("m-{id_b}.sock"));
+
+        let token = CancellationToken::new();
+        let counter = ClientCounter::new();
+        for (sock, cfg) in [(&sock_a, &cfg_a), (&sock_b, &cfg_b)] {
+            let config = Config::load_from_str(&std::fs::read_to_string(cfg).unwrap()).unwrap();
+            let audit = Arc::new(AuditLogger::new_in_memory().unwrap());
+            let rescan = Arc::new(BackgroundRescanEngine::new().unwrap());
+            let state = Arc::new(AppState::new(config, vec![], audit, rescan));
+            state.install_snapshot(mesh_core::MeshSnapshot::default());
+            let (sock, token, counter) = (sock.clone(), token.clone(), counter.clone());
+            tokio::spawn(async move {
+                run_uds_server(&sock, state, token, counter, "test-two-cfg", "0.0.0")
+                    .await
+                    .unwrap();
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let query = |sock_path: PathBuf| async move {
+            let mut stream = UnixStream::connect(&sock_path).await.unwrap();
+            let req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"visualize_mesh\",\"arguments\":{\"format\":\"json\"}}}\n";
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        };
+        let resp_a = query(sock_a).await;
+        let resp_b = query(sock_b).await;
+        assert!(
+            resp_a.contains("k8s-wt1") && !resp_a.contains("k8s-wt2"),
+            "config a's daemon must answer with config a's graph, got: {resp_a}"
+        );
+        assert!(
+            resp_b.contains("k8s-wt2") && !resp_b.contains("k8s-wt1"),
+            "config b's daemon must answer with config b's graph, got: {resp_b}"
+        );
         token.cancel();
     }
 

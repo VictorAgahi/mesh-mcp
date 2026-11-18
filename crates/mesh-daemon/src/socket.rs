@@ -2,6 +2,7 @@
 //!
 //! Re-exports canonical implementation from `mesh_core::socket`.
 
+#[cfg(test)]
 pub use mesh_core::socket::workspace_id;
 
 // Only `meshd`'s Unix path uses these (its Windows build speaks named pipes);
@@ -28,13 +29,32 @@ mod tests {
     }
 
     #[test]
+    fn test_workspace_id_folds_in_the_config_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a.toml");
+        let b = dir.path().join("b.toml");
+        std::fs::write(&a, "").expect("write a");
+        std::fs::write(&b, "").expect("write b");
+
+        let none = workspace_id(dir.path(), None);
+        let id_a = workspace_id(dir.path(), Some(&a));
+        let id_b = workspace_id(dir.path(), Some(&b));
+        assert_ne!(id_a, id_b, "two configs in one directory must differ");
+        assert_ne!(id_a, none, "a config file must change the identity");
+        assert_eq!(id_a, workspace_id(dir.path(), Some(&a)), "stable");
+        // A non-canonical spelling of the same file is the same identity.
+        let dotted = dir.path().join(".").join("a.toml");
+        assert_eq!(id_a, workspace_id(dir.path(), Some(&dotted)));
+    }
+
+    #[test]
     fn test_workspace_id_differs_by_base_dir_and_is_stable() {
         let dir_a = tempfile::tempdir().expect("tempdir a");
         let dir_b = tempfile::tempdir().expect("tempdir b");
 
-        let id_a1 = workspace_id(dir_a.path());
-        let id_a2 = workspace_id(dir_a.path());
-        let id_b = workspace_id(dir_b.path());
+        let id_a1 = workspace_id(dir_a.path(), None);
+        let id_a2 = workspace_id(dir_a.path(), None);
+        let id_b = workspace_id(dir_b.path(), None);
 
         assert_eq!(id_a1, id_a2, "same workspace must always yield the same id");
         assert_ne!(
