@@ -47,7 +47,7 @@ pub use docs::{DocIndex, DocSection};
 pub use governance::{GovernanceEngine, RsahResponse};
 pub use health::{IndexHealth, RejectReason, RejectedFile};
 pub use identity::{cache_family_id, family_id, RepoFamily, ViewKey, WorkspaceIdentity};
-pub use index_cache::{sha256, CacheEntry, IndexCacheError, PersistentIndexCache};
+pub use index_cache::{sha256, CacheDirId, CacheEntry, IndexCacheError, PersistentIndexCache};
 pub use paths::mesh_cache_dir;
 pub use properties::{PropertyRegistry, PropertySourceMatcher};
 pub use rescan::BackgroundRescanEngine;

@@ -13,8 +13,8 @@ use mesh_core::{
     RepoId, ValidatedScope,
 };
 use mesh_parsers::{
-    AstGuard, CompiledPattern, ExtractConfig, FileIndex, GuardRejection, LanguageKind,
-    PolyglotIndexer, TsAliasIndex,
+    root_relative, AstGuard, CompiledPattern, ExtractConfig, FileIndex, GuardRejection,
+    LanguageKind, PathContext, PolyglotIndexer, RootRelativeIndex, TsAliasIndex,
 };
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -135,6 +135,9 @@ struct ScanConfig<'a> {
     /// change (e.g. `proto_dirs`, `infer_string_topics`) invalidates stale entries instead of
     /// serving extraction results computed under different rules.
     config_fingerprint: [u8; 32],
+    /// Per-scan memo of what extraction reads from a file's absolute path beyond its
+    /// root-relative one (`PathContext::describe`), folded into every cache key.
+    path_context: &'a PathContext,
 }
 
 pub struct WorkspaceIndexer;
@@ -367,6 +370,7 @@ impl WorkspaceIndexer {
         let extract_cfg = Self::extract_config(config, roots);
         let toggles = Self::engine_toggles(config);
         let config_fingerprint = Self::config_fingerprint(&extract_cfg);
+        let path_context = PathContext::default();
         let scan_cfg = ScanConfig {
             patterns: &patterns,
             doc_template: &doc_template,
@@ -375,6 +379,7 @@ impl WorkspaceIndexer {
             toggles: &toggles,
             cache,
             config_fingerprint,
+            path_context: &path_context,
         };
 
         let (fragments, health, stable_rejects) =
@@ -935,6 +940,7 @@ impl WorkspaceIndexer {
             if pool.is_some() { "background" } else { "global" }
         );
         let doc_template = state.snapshot().doc_index.clone_settings();
+        let path_context = PathContext::default();
         // The workspace's persistent cache, when attached (plan 4 step 4.4): a branch
         // switch back to already-seen content is a lookup instead of a re-parse, and
         // `put_batch` re-checks the cache quota after any reload writing > 100 entries.
@@ -946,6 +952,7 @@ impl WorkspaceIndexer {
             toggles: &toggles,
             cache: state.index_cache.get(),
             config_fingerprint: Self::config_fingerprint(&extract_cfg),
+            path_context: &path_context,
         };
         let (fragments, pass_health, stable_rejects) =
             Self::run_scan_pass(&candidates, roots, &scan_cfg, pool);
@@ -1360,6 +1367,7 @@ impl WorkspaceIndexer {
                 if toggles.contracts_enabled {
                     let (code, cache_write) = Self::extract_with_cache(
                         path,
+                        root,
                         content,
                         repo_id,
                         &frag.signature.content_hash,
@@ -1373,6 +1381,7 @@ impl WorkspaceIndexer {
                 if toggles.contracts_enabled {
                     let (code, cache_write) = Self::extract_with_cache(
                         path,
+                        root,
                         content,
                         repo_id,
                         &frag.signature.content_hash,
@@ -1401,34 +1410,37 @@ impl WorkspaceIndexer {
     /// (`code.parse_failed`, retried by the caller — see `run_scan_pass`'s doc comment; caching
     /// a failed parse would wrongly persist "no facts" past the retry), serializes the result
     /// for `run_scan_pass` to batch-write once the whole parallel pass is done.
+    ///
+    /// The cache is shared by every checkout of a repository (8.0.0), so nothing in a key or
+    /// a record names the directory a checkout sits in: the key holds the path relative to
+    /// `root`, the record holds node paths relative to `root` (re-anchored on the current
+    /// `root` after a hit), and every decision extraction draws from the absolute path is
+    /// folded into the key (`PathContext::describe`). A file not under `root` is never
+    /// cached.
     fn extract_with_cache(
         path: &Path,
+        root: &Path,
         content: &str,
         repo_id: RepoId,
         content_hash: &[u8; 32],
         cfg: &ScanConfig,
     ) -> (FileIndex, Option<CacheEntry>) {
         let extract_cfg = cfg.extract_cfg;
-        let Some(cache) = cfg.cache else {
-            return (
-                PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg),
-                None,
-            );
+        let extract = || PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg);
+        let (Some(cache), Some(rel_path)) = (cfg.cache, root_relative(path, root)) else {
+            return (extract(), None);
         };
-        // A script governed by `tsconfig` / `package.json` aliases is keyed by
-        // them too: editing such a config re-extracts the files it governs.
-        let file_fingerprint = match extract_cfg.ts_aliases.fingerprint_input(path) {
-            Some(aliases) => {
-                let mut input = cfg.config_fingerprint.to_vec();
-                input.extend_from_slice(aliases.as_bytes());
-                sha256(&input)
-            }
-            None => cfg.config_fingerprint,
-        };
-        let key = PersistentIndexCache::key_for(path, content_hash, repo_id, &file_fingerprint);
+        let key = PersistentIndexCache::key_for(
+            &rel_path,
+            content_hash,
+            repo_id,
+            &Self::file_fingerprint(path, cfg),
+        );
         if let Some(bytes) = cache.get(&key) {
-            if let Ok(cached) = serde_json::from_slice::<FileIndex>(&bytes) {
-                return (cached, None);
+            if let Ok(cached) = serde_json::from_slice::<RootRelativeIndex>(&bytes) {
+                let mut code = cached.index;
+                code.reanchor(root, &cached.anchored);
+                return (code, None);
             }
             tracing::warn!(
                 target: "mesh::index_cache",
@@ -1436,11 +1448,25 @@ impl WorkspaceIndexer {
                 path.display()
             );
         }
-        let code = PolyglotIndexer::extract_with_config(path, content, repo_id, extract_cfg);
+        let mut code = extract();
         if code.parse_failed {
             return (code, None);
         }
-        match serde_json::to_vec(&code) {
+        let Some(anchored) = code.relativize(root) else {
+            // A node path outside `root`: no record another checkout could re-anchor.
+            return (code, None);
+        };
+        let record = RootRelativeIndex {
+            index: code,
+            anchored,
+        };
+        let bytes = serde_json::to_vec(&record);
+        let RootRelativeIndex {
+            index: mut code,
+            anchored,
+        } = record;
+        code.reanchor(root, &anchored);
+        match bytes {
             Ok(bytes) => (code, Some((key, bytes))),
             Err(e) => {
                 tracing::warn!(
@@ -1451,6 +1477,20 @@ impl WorkspaceIndexer {
                 (code, None)
             }
         }
+    }
+
+    /// The extraction-config fingerprint of one file's cache key: the per-scan config
+    /// fingerprint, the `tsconfig` / `package.json` aliases governing the file (so editing
+    /// such a config re-extracts the files it governs; written root-relative), and what
+    /// extraction reads from the file's absolute path (`PathContext::describe`).
+    fn file_fingerprint(path: &Path, cfg: &ScanConfig) -> [u8; 32] {
+        let mut input = cfg.config_fingerprint.to_vec();
+        input.extend_from_slice(cfg.path_context.describe(cfg.extract_cfg, path).as_bytes());
+        if let Some(aliases) = cfg.extract_cfg.ts_aliases.fingerprint_input(path) {
+            input.push(0);
+            input.extend_from_slice(aliases.as_bytes());
+        }
+        sha256(&input)
     }
 
     /// `paths` is empty (default) → no restriction. Otherwise the file's path,

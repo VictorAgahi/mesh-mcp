@@ -73,9 +73,6 @@ impl AliasRule {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RuleSet {
     rules: Vec<AliasRule>,
-    /// Canonical text of `rules`, built once (it keys the cache of every file
-    /// the rules govern).
-    canonical: String,
 }
 
 impl RuleSet {
@@ -88,18 +85,31 @@ impl RuleSet {
                 .then_with(|| a.suffix.cmp(&b.suffix))
         });
         rules.dedup();
-        let mut canonical = String::new();
-        for r in &rules {
-            canonical.push_str(&format!(
-                "{}|{}|{}|{}\n",
-                r.prefix, r.suffix, r.wildcard, r.target
-            ));
-        }
-        Self { rules, canonical }
+        Self { rules }
     }
 
     fn is_empty(&self) -> bool {
         self.rules.is_empty()
+    }
+
+    /// Canonical text of the rules with every target written relative to `root` (the
+    /// workspace root of the file they govern), so two checkouts of one project at
+    /// different places produce the same text: it keys the shared parse cache of every
+    /// file the rules govern. [`TsAliasIndex::rewrite`] turns a target into a specifier
+    /// relative to the importing file, so the same root-relative file and the same
+    /// root-relative target always give the same rewrite. A target with no relative
+    /// form (another drive on Windows) keeps its absolute text.
+    fn canonical_relative_to(&self, root: &Path) -> String {
+        let mut out = String::new();
+        for r in &self.rules {
+            let target =
+                relative_specifier(root, Path::new(&r.target)).unwrap_or_else(|| r.target.clone());
+            out.push_str(&format!(
+                "{}|{}|{}|{}\n",
+                r.prefix, r.suffix, r.wildcard, target
+            ));
+        }
+        out
     }
 }
 
@@ -182,27 +192,37 @@ impl TsAliasIndex {
     /// file-system router is read from, free of whatever directories hold the checkout
     /// (`/app/...` in a container, `~/api/...`).
     pub fn relative_to_root(&self, file: &Path) -> Option<PathBuf> {
-        let inner = self.inner.as_ref()?;
-        let root = inner
-            .roots
-            .iter()
-            .filter(|r| file.starts_with(r))
-            .max_by_key(|r| r.components().count())?;
+        let root = self.root_of(file)?;
         file.strip_prefix(root).ok().map(Path::to_path_buf)
     }
 
+    /// The most specific workspace root `file` sits under.
+    fn root_of(&self, file: &Path) -> Option<&Path> {
+        self.inner
+            .as_ref()?
+            .roots
+            .iter()
+            .filter(|r| file.starts_with(r))
+            .max_by_key(|r| r.components().count())
+            .map(PathBuf::as_path)
+    }
+
     /// What the aliases governing `file` add to its `FileIndex` cache key; `None`
-    /// when none do, so files outside any aliased project keep their key.
+    /// when none do, so files outside any aliased project keep their key. Targets are
+    /// written relative to `file`'s workspace root ([`RuleSet::canonical_relative_to`]):
+    /// the parse cache is shared by every checkout of a repository (8.0.0), so this text
+    /// must not name the directory a checkout sits in.
     pub fn fingerprint_input(&self, file: &Path) -> Option<String> {
         let (ts, pkg) = self.rule_sets(file)?;
+        let root = self.root_of(file)?;
         let mut out = String::new();
         if let Some(ts) = ts {
             out.push_str("ts\n");
-            out.push_str(&ts.canonical);
+            out.push_str(&ts.canonical_relative_to(root));
         }
         if let Some(pkg) = pkg {
             out.push_str("pkg\n");
-            out.push_str(&pkg.canonical);
+            out.push_str(&pkg.canonical_relative_to(root));
         }
         Some(out)
     }
@@ -773,6 +793,30 @@ mod tests {
         );
         let changed = TsAliasIndex::new(std::slice::from_ref(&root));
         assert_ne!(changed.fingerprint_input(&root.join("src/a.ts")), Some(ts));
+    }
+
+    /// Two checkouts of one project share the parse cache (8.0.0): the alias text in a
+    /// file's key names no directory above the workspace root, inside or outside it.
+    #[test]
+    fn fingerprint_input_is_the_same_in_two_checkouts() {
+        let (_t, base) = setup();
+        let config = r#"{ "compilerOptions": { "paths": { "@/*": ["src/*"], "@shared/*": ["../shared/*"] } } }"#;
+        let (a, b) = (base.join("one/main"), base.join("two/deeper/wt"));
+        for root in [&a, &b] {
+            write(root, "tsconfig.json", config);
+            write(root, "src/x.ts", "");
+        }
+        let fa = TsAliasIndex::new(std::slice::from_ref(&a))
+            .fingerprint_input(&a.join("src/x.ts"))
+            .expect("aliased");
+        let fb = TsAliasIndex::new(std::slice::from_ref(&b))
+            .fingerprint_input(&b.join("src/x.ts"))
+            .expect("aliased");
+        assert_eq!(fa, fb);
+        let a_text = a.to_string_lossy().replace('\\', "/");
+        assert!(!fa.contains(a_text.as_str()), "{fa}");
+        assert!(fa.contains("./src/*"), "{fa}");
+        assert!(fa.contains("../shared/*"), "{fa}");
     }
 
     #[test]

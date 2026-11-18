@@ -333,9 +333,9 @@ What this shows, and what it does not:
   (`workspace_id`, `crates/mesh-core/src/socket.rs`). Two worktrees with their own config copy
   (for example a committed `.agents/mesh-mcp.toml`) are two workspaces: two `meshd` processes, two
   in-memory indexes, memory adds up.
-- Each workspace has its own on-disk parse cache (`~/.cache/mesh-mcp/workspaces/<id>/`, quota
-  `[cache] max_size_mb`, default 2048 MB each). The cache key contains the file path, so two
-  worktrees of the same repository do not share entries even for identical files.
+- The on-disk parse cache is one per Git repository (`~/.cache/mesh-mcp/workspaces/<id>/`, quota
+  `[cache] max_size_mb`, default 2048 MB), shared by all its worktrees: a second worktree of the
+  same commit boots on cache hits. A workspace outside Git has its own.
 - `meshd` exits after 30 idle minutes (`--idle-timeout-minutes`), so a worktree nobody queries does
   not keep its index in RAM indefinitely. A session in each worktree you actively use does.
 - The other layout is one config listing several worktrees as `roots`: one process, but every

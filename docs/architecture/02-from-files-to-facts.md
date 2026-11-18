@@ -100,14 +100,20 @@ At this stage the two files know nothing about each other. Chapter 3 connects th
 ### Step 4: the parse cache
 
 Parsing is the expensive part. `crates/mesh-core/src/index_cache.rs` stores each file's `FileIndex`
-in a SQLite database, keyed by file path, content hash, root number and a fingerprint of the
-extraction settings. If all four match a stored entry, tree-sitter is skipped. This is why
-restarting, or switching back to a branch seen before, does not re-parse everything.
+in a SQLite database, keyed by the file's path relative to its root, content hash, root number and
+a fingerprint of the extraction settings. If all four match a stored entry, tree-sitter is
+skipped. This is why restarting, switching back to a branch seen before, or opening a second
+worktree of the same commit, does not re-parse everything.
 
-- One database per workspace, under `~/.cache/mesh-mcp/workspaces/<id>/`.
+- One database per Git repository, under `~/.cache/mesh-mcp/workspaces/<cache_family_id>/`,
+  shared by all its worktrees; outside Git, one per workspace under `workspaces/<id>/`.
+- Stored entries hold paths relative to the root and are re-anchored on the checkout reading
+  them. Whatever extraction reads from the absolute path (a package named after a directory,
+  path substring tests) is part of the key, so a checkout where it differs misses.
 - A disk quota (`[cache] max_size_mb`, default 2048); least recently used entries are evicted first.
 - It is a pure performance cache. Deleting it is always safe.
-- The key includes the file path, so identical files at two different paths are two entries.
+- The key includes the relative path, so identical files at two different places in one
+  checkout are two entries.
 
 ### Step 5: fold
 

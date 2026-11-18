@@ -1,5 +1,8 @@
 use crate::indexer::{WorkspaceIndexer, SCAN_DEPTH};
-use mesh_core::{expand_roots, AuditLogger, Config, PersistentIndexCache, PropertyRegistry};
+use mesh_core::{
+    expand_roots, AuditLogger, CacheDirId, Config, PersistentIndexCache, PropertyRegistry,
+    RepoFamily,
+};
 use mesh_parsers::AstGuard;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use notify::Watcher;
@@ -784,10 +787,18 @@ impl DoctorCommand {
         Self::check_daemon_version(&workspace, fix, &mut checks);
         Self::check_daemon_config(config_path, &workspace, fix, &mut checks);
         Self::check_daemon_sandbox(&workspace, &mut checks);
+        // The directory this workspace's parse cache lives in: its repository's shared one
+        // inside Git (8.0.0), else its own.
+        let cache_dir = workspace.as_ref().map(|(base_dir, _)| {
+            PersistentIndexCache::cache_dir_id(
+                base_dir,
+                WorkspaceIndexer::locate_config(config_path).as_deref(),
+            )
+        });
         Self::check_legacy_global_cache(fix, &mut checks);
-        Self::check_workspace_cache(&workspace, fix, &mut checks);
+        Self::check_workspace_cache(&cache_dir, fix, &mut checks);
         Self::check_audit_db(&mut checks);
-        Self::check_orphaned_workspace_dirs(&workspace, fix, &mut checks);
+        Self::check_orphaned_workspace_dirs(&workspace, &cache_dir, fix, &mut checks);
 
         checks
     }
@@ -1185,14 +1196,14 @@ impl DoctorCommand {
     }
 
     fn check_workspace_cache(
-        workspace: &Option<(PathBuf, String)>,
+        cache_dir: &Option<CacheDirId>,
         fix: bool,
         checks: &mut Vec<DoctorCheck>,
     ) {
-        let Some((_, workspace_id)) = workspace else {
+        let Some(cache_dir) = cache_dir else {
             return;
         };
-        let path = PersistentIndexCache::workspace_db_path(workspace_id);
+        let path = PersistentIndexCache::workspace_db_path(cache_dir.id());
         if !path.exists() {
             return;
         }
@@ -1260,13 +1271,31 @@ impl DoctorCommand {
         }
     }
 
+    /// A directory under `workspaces/` is a leftover of this project when it is not the one
+    /// this workspace's cache lives in and its `workspace_path` marker (written by 7.x, and
+    /// outside Git by 8.x) names this workspace or, inside Git, any worktree of the same
+    /// repository: since 8.0.0 every worktree of a repository uses the shared directory, so
+    /// no live workspace maps to a per-worktree one any more. A shared directory carries no
+    /// `workspace_path` marker, so it is never reported here, whichever worktree runs this.
     fn check_orphaned_workspace_dirs(
         workspace: &Option<(PathBuf, String)>,
+        cache_dir: &Option<CacheDirId>,
         fix: bool,
         checks: &mut Vec<DoctorCheck>,
     ) {
-        let Some((base_dir, current_id)) = workspace else {
+        let (Some((base_dir, _)), Some(cache_dir)) = (workspace, cache_dir) else {
             return;
+        };
+        let current_id = cache_dir.id();
+        let family_common_dir = match cache_dir {
+            CacheDirId::Family { common_dir, .. } => Some(common_dir.as_path()),
+            CacheDirId::Workspace { .. } => None,
+        };
+        let is_this_project = |marker: &Path| {
+            marker == base_dir.as_path()
+                || family_common_dir.is_some_and(|common| {
+                    RepoFamily::resolve(marker).is_some_and(|f| f.common_dir == common)
+                })
         };
         let workspaces_dir = mesh_core::mesh_cache_dir().join("workspaces");
         let Ok(entries) = std::fs::read_dir(&workspaces_dir) else {
@@ -1280,19 +1309,20 @@ impl DoctorCommand {
                 continue;
             }
             let id = entry.file_name().to_string_lossy().into_owned();
-            if id == *current_id {
+            if id == current_id {
                 continue;
             }
             let Some(marker_path) = PersistentIndexCache::read_workspace_path_marker(&id) else {
                 continue;
             };
-            if marker_path != *base_dir {
+            if !is_this_project(&marker_path) {
                 continue;
             }
             let mut check = DoctorCheck::warn(
                 "Orphaned workspace cache",
                 format!(
-                    "{} is a leftover from a previous mesh-mcp version of this project",
+                    "{} is a leftover from a previous mesh-mcp version of this project \
+                     (or of another worktree of its repository, which now share one cache)",
                     entry.path().display()
                 ),
             );
