@@ -1,3 +1,4 @@
+use crate::git::{self, BaseChoice, GitError, GitRunner};
 use crate::protocol::RequestMeta;
 use crate::tools::{McpTool, ToolError, ToolOutput};
 use mesh_core::{AppState, CompactStr, ValidatedScope};
@@ -7,11 +8,8 @@ use mesh_parsers::languages::proto::{
 use mesh_parsers::{AstGuard, MarkdownFormatter};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::ffi::{OsStr, OsString};
-use std::io::Read;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -72,7 +70,7 @@ fn run_with_git(
 ) -> Result<ToolOutput, ToolError> {
     let explicit_base = args.base.as_deref();
     if let Some(base) = explicit_base {
-        validate_base(base).map_err(|e| (-32602, e.to_string()))?;
+        git::validate_base(base).map_err(|e| (-32602, e.to_string()))?;
     }
 
     let snapshot = state.snapshot();
@@ -500,56 +498,13 @@ fn list_paths(paths: &[PathBuf], roots: &[PathBuf]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Git plumbing
+// Wire-format check
 // ---------------------------------------------------------------------------
-
-/// Per-command budget: every call runs on an agent's synchronous request path.
-const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Default base chain, in order (plan 4.6b). Never `HEAD~1`.
-const DEFAULT_BASE_CHAIN: [&str; 3] = ["origin/HEAD", "origin/main", "main"];
-
-/// Longest `base` accepted: a ref name or an expression like `main~3`, never a blob.
-const MAX_BASE_LEN: usize = 256;
-
-/// Git variables that would redirect every command to another repository or
-/// object store, inject configuration, or change which objects are read (they
-/// are set, for instance, when the server is spawned from a Git hook, where
-/// `GIT_QUARANTINE_PATH`/`GIT_ALTERNATE_OBJECT_DIRECTORIES` point at a
-/// push's quarantine). The user's own discovery settings
-/// (`GIT_CEILING_DIRECTORIES`) are kept.
-const REPO_REDIRECT_VARS: [&str; 13] = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_QUARANTINE_PATH",
-    "GIT_COMMON_DIR",
-    "GIT_NAMESPACE",
-    "GIT_PREFIX",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT",
-    "GIT_REPLACE_REF_BASE",
-    "GIT_NO_REPLACE_OBJECTS",
-];
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum WireCheckError {
-    #[error("`base` {0:?} is invalid: {1}")]
-    InvalidBase(String, &'static str),
-    #[error(
-        "`git` was not found on the PATH; install Git or add it to the PATH of the MeshMCP process"
-    )]
-    GitNotFound,
-    #[error("`{0}` is not inside a usable Git repository{1}")]
-    NotARepository(PathBuf, String),
-    #[error("Git base `{0}` was not found in the repository of this file")]
-    BaseNotFound(String),
-    #[error("`git {0}` did not finish within {1:?}")]
-    Timeout(String, Duration),
-    #[error("`git {0}` failed: {1}")]
-    GitFailed(String, String),
+    #[error(transparent)]
+    Git(#[from] GitError),
     #[error("cannot read `{0}`: {1}")]
     Io(PathBuf, String),
 }
@@ -567,173 +522,8 @@ impl WireCheckError {
     }
 
     fn is_invalid_request(&self) -> bool {
-        matches!(self, Self::InvalidBase(..))
+        matches!(self, Self::Git(e) if e.is_invalid_request())
     }
-}
-
-/// Rejects anything `git` could read as an option or a path expression:
-/// a `base` is passed as its own argv entry (no shell), and additionally must
-/// not start with `-` (option injection), nor contain `:` (`rev:path` would
-/// point at another file), whitespace or control characters.
-fn validate_base(base: &str) -> Result<(), WireCheckError> {
-    let fail = |why| Err(WireCheckError::InvalidBase(base.to_string(), why));
-    if base.is_empty() {
-        return fail("empty");
-    }
-    if base.len() > MAX_BASE_LEN {
-        return fail("longer than 256 bytes");
-    }
-    if base.starts_with('-') {
-        return fail("must not start with '-'");
-    }
-    if base.contains(':') {
-        return fail("must not contain ':'");
-    }
-    if base.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return fail("must not contain whitespace or control characters");
-    }
-    Ok(())
-}
-
-struct GitOutput {
-    success: bool,
-    stdout: Vec<u8>,
-    stderr: String,
-}
-
-impl GitOutput {
-    fn stdout_line(&self) -> String {
-        String::from_utf8_lossy(&self.stdout).trim().to_string()
-    }
-}
-
-/// Runs `git` without a shell, one argv entry per argument, with a timeout and
-/// bounded output. `path` is where `git` is looked up (`None`: the process
-/// `PATH`); `env` is added to the child's environment (tests use it to isolate
-/// `HOME` and the global Git config).
-pub(crate) struct GitRunner {
-    path: Option<OsString>,
-    env: Vec<(OsString, OsString)>,
-    timeout: Duration,
-}
-
-impl GitRunner {
-    pub(crate) fn system() -> Self {
-        Self {
-            path: std::env::var_os("PATH"),
-            env: Vec::new(),
-            timeout: GIT_COMMAND_TIMEOUT,
-        }
-    }
-
-    fn locate(&self) -> Result<PathBuf, WireCheckError> {
-        let path = self.path.as_ref().ok_or(WireCheckError::GitNotFound)?;
-        let names: &[&str] = if cfg!(windows) {
-            &["git.exe", "git.cmd", "git"]
-        } else {
-            &["git"]
-        };
-        std::env::split_paths(path)
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
-            .find(|candidate| candidate.is_file())
-            .ok_or(WireCheckError::GitNotFound)
-    }
-
-    fn run(
-        &self,
-        program: &Path,
-        cwd: &Path,
-        args: &[&OsStr],
-        stdout_limit: u64,
-    ) -> Result<GitOutput, WireCheckError> {
-        let display = args
-            .iter()
-            .map(|a| a.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let mut cmd = Command::new(program);
-        // No fsmonitor hook, no pager, no credential prompt, stable messages.
-        cmd.args(["-c", "core.fsmonitor=false", "--no-pager"])
-            .args(args)
-            .current_dir(cwd)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("LC_ALL", "C")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for var in REPO_REDIRECT_VARS {
-            cmd.env_remove(var);
-        }
-        for (k, v) in &self.env {
-            cmd.env(k, v);
-        }
-        let mut child = cmd.spawn().map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => WireCheckError::GitNotFound,
-            _ => WireCheckError::GitFailed(display.clone(), e.to_string()),
-        })?;
-
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let out_reader = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(s) = stdout {
-                // `+ 1` so an over-limit blob is detectable; dropping the pipe
-                // afterwards makes `git` exit on EPIPE instead of blocking.
-                let _ = s.take(stdout_limit + 1).read_to_end(&mut buf);
-            }
-            buf
-        });
-        let err_reader = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(s) = stderr {
-                let _ = s.take(8 * 1024).read_to_end(&mut buf);
-            }
-            buf
-        });
-
-        let deadline = Instant::now() + self.timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(WireCheckError::Timeout(display, self.timeout));
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(2)),
-                Err(e) => return Err(WireCheckError::GitFailed(display, e.to_string())),
-            }
-        };
-        let stdout = out_reader.join().unwrap_or_default();
-        let stderr = err_reader.join().unwrap_or_default();
-        if stdout.len() as u64 > stdout_limit {
-            return Err(WireCheckError::GitFailed(
-                display,
-                format!("output exceeds {stdout_limit} bytes"),
-            ));
-        }
-        Ok(GitOutput {
-            success: status.success(),
-            stdout,
-            stderr: String::from_utf8_lossy(&stderr).trim().to_string(),
-        })
-    }
-}
-
-/// Small outputs (a SHA, a path prefix).
-const SMALL_OUTPUT: u64 = 64 * 1024;
-
-/// How the base revision was chosen, for the report.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BaseChoice {
-    /// The caller's `base`.
-    Explicit(String),
-    /// `git merge-base HEAD <ref>`.
-    MergeBase(&'static str),
-    /// No ref of the default chain exists, or the merge-base failed.
-    HeadFallback,
 }
 
 #[derive(Debug)]
@@ -764,94 +554,24 @@ pub(crate) fn check_wire_format(
     git: &GitRunner,
 ) -> Result<WireReport, WireCheckError> {
     if let Some(b) = base {
-        validate_base(b)?;
+        git::validate_base(b)?;
     }
     let program = git.locate()?;
     let dir = file
         .parent()
-        .ok_or_else(|| WireCheckError::NotARepository(file.to_path_buf(), String::new()))?;
+        .ok_or_else(|| GitError::NotARepository(file.to_path_buf(), String::new()))?;
     let file_name = file
         .file_name()
-        .ok_or_else(|| WireCheckError::NotARepository(file.to_path_buf(), String::new()))?;
+        .ok_or_else(|| GitError::NotARepository(file.to_path_buf(), String::new()))?;
+    let rel_path = git::repo_relative_path(git, &program, dir, file_name)?;
+    let (choice, base_sha) = git::resolve_base(git, &program, dir, base)?;
     let run = |args: &[&OsStr], limit: u64| git.run(&program, dir, args, limit);
     let os = |s: &'static str| OsStr::new(s);
-
-    // `git` runs in the file's own directory: each configured root may be its
-    // own repository (or none). `--show-prefix` gives the directory relative to
-    // the repository top level, so no canonical-path comparison is needed.
-    let prefix = run(&[os("rev-parse"), os("--show-prefix")], SMALL_OUTPUT)?;
-    if !prefix.success {
-        // Keep git's own reason: "not a git repository" and a `safe.directory`
-        // ownership refusal need different fixes.
-        let reason = if prefix.stderr.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " (git: {})",
-                prefix.stderr.lines().next().unwrap_or_default()
-            )
-        };
-        return Err(WireCheckError::NotARepository(dir.to_path_buf(), reason));
-    }
-    let rel_path = format!(
-        "{}{}",
-        String::from_utf8_lossy(&prefix.stdout).trim_end_matches(['\n', '\r']),
-        file_name.to_string_lossy()
-    );
-
-    let verify = |rev: &str| -> Result<Option<String>, WireCheckError> {
-        let spec = format!("{rev}^{{commit}}");
-        let out = run(
-            &[
-                os("rev-parse"),
-                os("--verify"),
-                os("--quiet"),
-                os("--end-of-options"),
-                OsStr::new(&spec),
-            ],
-            SMALL_OUTPUT,
-        )?;
-        Ok(out.success.then(|| out.stdout_line()))
-    };
-
-    let (choice, base_sha) = match base {
-        Some(b) => {
-            let sha = verify(b)?.ok_or_else(|| WireCheckError::BaseNotFound(b.to_string()))?;
-            (BaseChoice::Explicit(b.to_string()), sha)
-        }
-        None => {
-            let mut chosen = None;
-            for candidate in DEFAULT_BASE_CHAIN {
-                if verify(candidate)?.is_none() {
-                    continue;
-                }
-                // The first existing ref decides; a failed merge-base (unrelated
-                // histories) falls back to HEAD rather than trying the next ref.
-                let mb = run(
-                    &[os("merge-base"), os("HEAD"), OsStr::new(candidate)],
-                    SMALL_OUTPUT,
-                )?;
-                if mb.success {
-                    chosen = Some((BaseChoice::MergeBase(candidate), mb.stdout_line()));
-                }
-                break;
-            }
-            match chosen {
-                Some(c) => c,
-                None => {
-                    let head = verify("HEAD")?.ok_or_else(|| {
-                        WireCheckError::BaseNotFound("HEAD (the repository has no commit)".into())
-                    })?;
-                    (BaseChoice::HeadFallback, head)
-                }
-            }
-        }
-    };
 
     let object = format!("{base_sha}:{rel_path}");
     let exists = run(
         &[os("cat-file"), os("-e"), OsStr::new(&object)],
-        SMALL_OUTPUT,
+        git::SMALL_OUTPUT,
     )?;
     if !exists.success {
         return Ok(WireReport {
@@ -866,10 +586,10 @@ pub(crate) fn check_wire_format(
         AstGuard::MAX_SCHEMA_FILE_SIZE_BYTES,
     )?;
     if !shown.success {
-        return Err(WireCheckError::GitFailed(
+        return Err(WireCheckError::Git(GitError::GitFailed(
             format!("show {object}"),
             shown.stderr,
-        ));
+        )));
     }
     let before = String::from_utf8_lossy(&shown.stdout);
     let after = read_bounded(file)?;
@@ -1029,91 +749,10 @@ fn render_report(report: &WireReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::test_support::TempRepo;
+    use crate::git::{GitError, GIT_COMMAND_TIMEOUT};
     use mesh_parsers::languages::proto::WireRule;
-
-    /// A throwaway repository with its own `HOME` and no global/system Git
-    /// config, so nothing from the developer's `~/.gitconfig` leaks in.
-    struct TempRepo {
-        _dir: tempfile::TempDir,
-        root: PathBuf,
-        home: PathBuf,
-    }
-
-    impl TempRepo {
-        fn new() -> Self {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let base = dunce::canonicalize(dir.path()).expect("canon");
-            let root = base.join("repo");
-            let home = base.join("home");
-            std::fs::create_dir_all(&root).expect("mkdir repo");
-            std::fs::create_dir_all(&home).expect("mkdir home");
-            let repo = Self {
-                _dir: dir,
-                root,
-                home,
-            };
-            repo.git(&["init", "-q"]);
-            repo.git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
-            repo.git(&["config", "user.email", "test@example.invalid"]);
-            repo.git(&["config", "user.name", "Test"]);
-            repo.git(&["config", "commit.gpgsign", "false"]);
-            repo.git(&["config", "core.autocrlf", "false"]);
-            repo
-        }
-
-        fn isolated_env(home: &Path) -> Vec<(OsString, OsString)> {
-            vec![
-                ("HOME".into(), home.as_os_str().to_owned()),
-                ("USERPROFILE".into(), home.as_os_str().to_owned()),
-                (
-                    "XDG_CONFIG_HOME".into(),
-                    home.join(".config").into_os_string(),
-                ),
-                ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
-                (
-                    "GIT_CONFIG_GLOBAL".into(),
-                    home.join(".gitconfig").into_os_string(),
-                ),
-            ]
-        }
-
-        fn runner(&self) -> GitRunner {
-            GitRunner {
-                path: std::env::var_os("PATH"),
-                env: Self::isolated_env(&self.home),
-                timeout: GIT_COMMAND_TIMEOUT,
-            }
-        }
-
-        fn git(&self, args: &[&str]) -> String {
-            let out = Command::new("git")
-                .args(args)
-                .current_dir(&self.root)
-                .envs(Self::isolated_env(&self.home))
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .output()
-                .expect("run git");
-            assert!(
-                out.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
-
-        fn write(&self, rel: &str, content: &str) -> PathBuf {
-            let path = self.root.join(rel);
-            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-            std::fs::write(&path, content).expect("write");
-            path
-        }
-
-        fn commit(&self, msg: &str) {
-            self.git(&["add", "-A"]);
-            self.git(&["commit", "-q", "-m", msg]);
-        }
-    }
+    use std::ffi::OsString;
 
     const BASE_PROTO: &str = r#"syntax = "proto3";
 package demo.v1;
@@ -1311,7 +950,10 @@ message User {
             timeout: GIT_COMMAND_TIMEOUT,
         };
         let err = check_wire_format(&file, Some("main"), &runner).expect_err("not a repo");
-        assert!(matches!(err, WireCheckError::NotARepository(..)), "{err}");
+        assert!(
+            matches!(err, WireCheckError::Git(GitError::NotARepository(..))),
+            "{err}"
+        );
         // git's own reason is kept (vs. a `safe.directory` ownership refusal).
         assert!(err.to_string().contains("not a git repository"), "{err}");
     }
@@ -1321,7 +963,10 @@ message User {
         let (repo, file) = committed_repo();
         let err = check_wire_format(&file, Some("no-such-branch"), &repo.runner())
             .expect_err("unknown base");
-        assert!(matches!(err, WireCheckError::BaseNotFound(_)), "{err}");
+        assert!(
+            matches!(err, WireCheckError::Git(GitError::BaseNotFound(_))),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1334,21 +979,15 @@ message User {
             timeout: GIT_COMMAND_TIMEOUT,
         };
         let err = check_wire_format(&file, Some("main"), &runner).expect_err("no git");
-        assert!(matches!(err, WireCheckError::GitNotFound), "{err}");
+        assert!(
+            matches!(err, WireCheckError::Git(GitError::GitNotFound)),
+            "{err}"
+        );
         drop(repo);
     }
 
     #[test]
     fn option_like_or_path_like_base_is_refused_before_git_runs() {
-        for bad in ["--output=/tmp/x", "-p", "main:other.proto", "", "a b"] {
-            assert!(
-                matches!(validate_base(bad), Err(WireCheckError::InvalidBase(..))),
-                "{bad:?} must be refused"
-            );
-        }
-        for good in ["main", "origin/main", "v1.2.0", "HEAD~3", "abc123"] {
-            assert!(validate_base(good).is_ok(), "{good:?} must be accepted");
-        }
         // Refused even with `git` unavailable: validation comes first.
         let runner = GitRunner {
             path: None,
@@ -1357,7 +996,10 @@ message User {
         };
         let err =
             check_wire_format(Path::new("x.proto"), Some("--help"), &runner).expect_err("invalid");
-        assert!(matches!(err, WireCheckError::InvalidBase(..)), "{err}");
+        assert!(
+            matches!(err, WireCheckError::Git(GitError::InvalidBase(..))),
+            "{err}"
+        );
     }
 
     // --- Through the tool ------------------------------------------------------
