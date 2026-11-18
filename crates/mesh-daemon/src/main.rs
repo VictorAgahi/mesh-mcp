@@ -91,7 +91,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // workspaces can never end up sharing (or racing to bind) the same
     // socket and silently serving each other's data (idempotence invariant
     // I7).
-    let workspace_id = socket::workspace_id(&base_dir);
+    let workspace_id = socket::workspace_id(&base_dir, config_path.as_deref());
+    let config_path_for_ingest = config_path.clone();
 
     #[cfg(unix)]
     let sock_path = match args.socket.clone() {
@@ -141,6 +142,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         watcher_cancel.clone(),
     );
 
+    // Follows the config file while no client is talking to the daemon.
+    host.spawn_idle_poller(host::IDLE_POLL_INTERVAL);
+
     // ── Initial ingestion: runs in the background, not before the IPC server
     // starts. A large workspace's first scan can take long enough that a
     // client polling for the socket to appear (`mesh-mcp`'s `ensure_daemon_running`)
@@ -157,8 +161,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     let ingest_state = state.clone();
     let ingest_base_dir = base_dir.clone();
+    let ingest_config = config_path_for_ingest;
     tokio::task::spawn_blocking(move || {
-        host::ingest_blocking(&ingest_state, &ingest_base_dir);
+        host::ingest_blocking(&ingest_state, &ingest_base_dir, ingest_config.as_deref());
     });
 
     // ── File watcher (single instance, shared across all clients) ─────────────

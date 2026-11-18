@@ -16,14 +16,34 @@
 use std::path::{Path, PathBuf};
 
 /// Derives a short, stable identifier for one workspace: the first 16 hex
-/// characters of SHA-256(canonical `base_dir` + this binary's version).
+/// characters of SHA-256(canonical `base_dir` + canonical `config_file` when
+/// one is used + this binary's version). This is the single source of truth
+/// for the daemon identity (socket, lock, log, parse cache, doctor checks).
+///
+/// The config file is part of the identity because a directory can hold
+/// several config files (`a.toml`, `b.toml` passed with `--config`), each
+/// describing a different graph: sharing one daemon between them would answer
+/// a session with the other config's graph (idempotence invariant I7).
+/// `None` (no config file, built-in default) hashes the directory alone.
+///
 /// Two different workspaces get distinct sockets, and so does the same
 /// workspace indexed by two different `mesh-mcp` versions — an old, stale
 /// daemon from before an upgrade is simply never found again rather than
 /// silently serving newer clients from an outdated snapshot format.
-pub fn workspace_id(base_dir: &Path) -> String {
+pub fn workspace_id(base_dir: &Path, config_file: Option<&Path>) -> String {
     let canonical = dunce::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
-    let key = format!("{}\u{0}{}", canonical.display(), env!("CARGO_PKG_VERSION"));
+    let key = match config_file {
+        Some(file) => {
+            let file = dunce::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+            format!(
+                "{}\u{0}{}\u{0}{}",
+                canonical.display(),
+                file.display(),
+                env!("CARGO_PKG_VERSION")
+            )
+        }
+        None => format!("{}\u{0}{}", canonical.display(), env!("CARGO_PKG_VERSION")),
+    };
     let digest = crate::audit::AuditLogger::compute_sha256(key.as_bytes());
     digest[..16].to_string()
 }

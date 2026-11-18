@@ -305,11 +305,19 @@ impl AppState {
     /// (permissions, disk full) degrades to "parse everything" with a warning instead of
     /// failing the boot: it is a performance optimization, never a correctness dependency.
     /// Idempotent: a second call returns the cache already attached.
-    pub fn open_index_cache(&self, base_dir: &Path) -> Option<&PersistentIndexCache> {
+    pub fn open_index_cache(
+        &self,
+        base_dir: &Path,
+        config_file: Option<&Path>,
+    ) -> Option<&PersistentIndexCache> {
         if let Some(cache) = self.index_cache.get() {
             return Some(cache);
         }
-        match PersistentIndexCache::open_for_workspace(base_dir, self.config.cache.max_size_mb) {
+        match PersistentIndexCache::open_for_workspace(
+            base_dir,
+            config_file,
+            self.config.cache.max_size_mb,
+        ) {
             Ok(cache) => Some(self.index_cache.get_or_init(|| cache)),
             Err(e) => {
                 tracing::warn!(
