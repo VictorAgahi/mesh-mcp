@@ -14,7 +14,7 @@ impl ContractGraph {
     /// (`detect_service_package`, proto `package` statements, Java FQCNs).
     /// Without this normalization a `crate::billing::Invoice` import could
     /// never match a node whose package is recorded as `crate.billing`.
-    fn split_fully_qualified(target_str: &str) -> Option<(Cow<'_, str>, &str)> {
+    pub(super) fn split_fully_qualified(target_str: &str) -> Option<(Cow<'_, str>, &str)> {
         if let Some(idx) = target_str.rfind("::") {
             let (pkg, name) = (&target_str[..idx], &target_str[idx + 2..]);
             if !pkg.is_empty() && !name.is_empty() {
@@ -364,6 +364,14 @@ impl ContractGraph {
     /// `None` when it is not a literal (the delegation drop then keeps the
     /// call); the method is folded (see [`fold_rpc_name`]).
     pub(super) fn handler_served_methods(&self) -> HashMap<NodeId, (Option<String>, String)> {
+        self.handler_served_methods_where(|_| true)
+    }
+
+    /// [`Self::handler_served_methods`] restricted to the handlers `keep` accepts.
+    pub(super) fn handler_served_methods_where(
+        &self,
+        keep: impl Fn(NodeId) -> bool,
+    ) -> HashMap<NodeId, (Option<String>, String)> {
         let unquote = |part: &str| {
             part.trim_matches(|c| matches!(c, '\'' | '"' | '`' | '?'))
                 .to_string()
@@ -373,6 +381,9 @@ impl ContractGraph {
             let Some(reference) = recorded.strip_prefix(HANDLER_REF_PREFIX) else {
                 continue;
             };
+            if !keep(*id) {
+                continue;
+            }
             let served = match self.handler_rpc_names.get(id) {
                 Some(rpc) => rpc
                     .rsplit_once('.')
@@ -470,50 +481,59 @@ impl ContractGraph {
             by_name.entry(n.as_str()).or_default().push(*pid);
         }
         for (id, recorded) in refs {
-            let (Some(node), Some(parsed)) =
-                (self.nodes.get(&id), Self::parse_handler_ref(recorded))
-            else {
-                continue;
-            };
-            let (service_expr, method_expr) = (parsed.service, parsed.method);
-            let (Some(service), Some(method)) = (
-                Self::resolve_literal_expr(service_expr, node.repo_id, &consts),
-                Self::resolve_literal_expr(method_expr, node.repo_id, &consts),
-            ) else {
-                continue;
-            };
-            // A package-qualified service (`demo.user.UserService`) must be
-            // declared in that package.
-            let (qualifier, service) = match service.rsplit_once('.') {
-                Some((q, s)) => (Some(q), s),
-                None => (None, service),
-            };
-            let name = format!("{service}.{method}");
-            // The package qualifier narrows the candidates first; only then must
-            // the name be unique. Counting before filtering left a fully-qualified
-            // handler unresolved whenever two packages declare the same
-            // `Service.Method`.
-            let declared_here = by_name.get(name.as_str()).map_or(0, |ids| {
-                ids.iter()
-                    .filter(|pid| {
-                        qualifier.is_none_or(|q| {
-                            self.nodes.get(pid).is_some_and(|p| p.package.as_str() == q)
-                        })
-                    })
-                    .count()
-            });
-            if declared_here != 1 {
-                continue;
+            let declared = |name: &str| by_name.get(name).into_iter().flatten().copied();
+            if let Some(name) = self.resolve_handler_ref(id, recorded, &consts, declared) {
+                out.insert(id, name);
             }
-            out.insert(id, CompactStr::new(name));
         }
         out
+    }
+
+    /// One [`HANDLER_REF_PREFIX`] record of handler `id` resolved to
+    /// `Service.Method` (see [`Self::resolve_handler_rpc_names`]); `declared`
+    /// lists the proto RPCs named exactly `Service.Method`.
+    pub(super) fn resolve_handler_ref<I: Iterator<Item = NodeId>>(
+        &self,
+        id: NodeId,
+        recorded: &str,
+        consts: &HashMap<&str, Vec<(RepoId, &str)>>,
+        declared: impl Fn(&str) -> I,
+    ) -> Option<CompactStr> {
+        let (Some(node), Some(parsed)) = (self.nodes.get(&id), Self::parse_handler_ref(recorded))
+        else {
+            return None;
+        };
+        let (service_expr, method_expr) = (parsed.service, parsed.method);
+        let (Some(service), Some(method)) = (
+            Self::resolve_literal_expr(service_expr, node.repo_id, consts),
+            Self::resolve_literal_expr(method_expr, node.repo_id, consts),
+        ) else {
+            return None;
+        };
+        // A package-qualified service (`demo.user.UserService`) must be
+        // declared in that package.
+        let (qualifier, service) = match service.rsplit_once('.') {
+            Some((q, s)) => (Some(q), s),
+            None => (None, service),
+        };
+        let name = format!("{service}.{method}");
+        // The package qualifier narrows the candidates first; only then must
+        // the name be unique. Counting before filtering left a fully-qualified
+        // handler unresolved whenever two packages declare the same
+        // `Service.Method`.
+        let declared_here = declared(name.as_str())
+            .filter(|pid| {
+                qualifier
+                    .is_none_or(|q| self.nodes.get(pid).is_some_and(|p| p.package.as_str() == q))
+            })
+            .count();
+        (declared_here == 1).then(|| CompactStr::new(name))
     }
 
     /// A quoted literal as-is, else the one string constant `expr` names:
     /// `Enum.MEMBER`, `OBJ.KEY` or `CONST`, spelled exactly as declared. Candidates from the caller's repository win; more
     /// than one distinct value left is ambiguous (`None`).
-    fn resolve_literal_expr<'a>(
+    pub(super) fn resolve_literal_expr<'a>(
         expr: &'a str,
         repo: RepoId,
         consts: &HashMap<&str, Vec<(RepoId, &'a str)>>,

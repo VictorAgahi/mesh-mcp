@@ -9,8 +9,8 @@
 use mesh_core::{
     expand_roots, sha256, AppState, BackgroundRescanEngine, CacheEntry, Config, ContractGraph,
     DifferentialVfs, DocIndex, DocSection, ExcludeMatcher, FilesystemCrawler, IndexHealth,
-    MeshSnapshot, PersistentIndexCache, PropertyRegistry, PropertySourceMatcher, RejectReason,
-    RepoId, ValidatedScope,
+    MeshSnapshot, PersistentIndexCache, PropertyRegistry, PropertySourceMatcher, ReconcileMode,
+    RejectReason, RepoId, ValidatedScope,
 };
 use mesh_parsers::{
     root_relative, AstGuard, CompiledPattern, ExtractConfig, FileIndex, GuardRejection,
@@ -895,6 +895,7 @@ impl WorkspaceIndexer {
         let spring = SpringSettings::from_config(config);
         let extract_cfg = Self::extract_config(config, roots);
         let toggles = Self::engine_toggles(config);
+        let t_start = std::time::Instant::now();
 
         let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -1041,7 +1042,9 @@ impl WorkspaceIndexer {
             );
         }
 
+        let t_scanned = std::time::Instant::now();
         let mut snapshot = state.snapshot_clone();
+        let t_cloned = std::time::Instant::now();
         snapshot.health.merge(&pass_health);
         snapshot.health.rejected = rejections.rejected;
         snapshot.health.rejected_overflow = rejections.rejected_overflow;
@@ -1067,9 +1070,34 @@ impl WorkspaceIndexer {
         if spring.resolve_placeholders {
             snapshot.property_registry.resolve_all_placeholders();
         }
-        snapshot.contract_graph.reconcile_edges();
+        let t_folded = std::time::Instant::now();
+        // Only the edges this batch can reach are recomputed (`reconcile_delta`
+        // falls back to the full rebuild for a large batch). An alias config edit
+        // changes how the scripts it governs resolve without those scripts' own
+        // nodes saying so, so it takes the full rebuild.
+        let mode = if forced_paths.is_empty() {
+            snapshot.contract_graph.reconcile_delta()
+        } else {
+            snapshot.contract_graph.reconcile_edges();
+            ReconcileMode::Full("alias config change")
+        };
+        let t_reconciled = std::time::Instant::now();
         let node_count = snapshot.contract_graph.node_count();
+        let edge_count = snapshot.contract_graph.edge_count();
         let generation = state.install_snapshot(snapshot);
+        let t_installed = std::time::Instant::now();
+        let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1000.0;
+        tracing::debug!(
+            target: "mesh::watcher",
+            "{label} reload timings: total_ms={:.1} scan_ms={:.1} clone_ms={:.1} patch_fold_ms={:.1} \
+             reconcile_ms={:.1} ({mode:?}) install_ms={:.1} nodes={node_count} edges={edge_count}",
+            ms(t_start, t_installed),
+            ms(t_start, t_scanned),
+            ms(t_scanned, t_cloned),
+            ms(t_cloned, t_folded),
+            ms(t_folded, t_reconciled),
+            ms(t_reconciled, t_installed),
+        );
 
         tracing::info!(
             target: "mesh::watcher",
