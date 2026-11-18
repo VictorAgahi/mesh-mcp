@@ -21,12 +21,13 @@ pub use ts_config::TsAliasIndex;
 use crate::decapitate::LanguageKind;
 use crate::guard::{AstGuard, ParseOutcome};
 use mesh_core::{
-    CompactStr, ContractGraph, ContractNode, ContractsConfig, CustomPatternConfig, NodeKind,
-    PatternKind, RepoId,
+    CompactStr, ContractGraph, ContractNode, ContractsConfig, CustomPatternConfig, FilePath,
+    NodeKind, PatternKind, RepoId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Default TS decorator that marks a method as a gRPC handler when
 /// `[engines.contracts.grpc] controller_annotations` is not configured.
@@ -236,6 +237,188 @@ impl FileIndex {
             graph.mark_heuristic_topic_node(ids[i]);
         }
     }
+
+    /// Whether any node carries `package`, the package [`PathContext::package_of`] infers
+    /// from the file's directories. A node whose declared package merely equals it counts
+    /// too: the record is then keyed by the inferred package, which can only cost a miss.
+    pub fn uses_package(&self, package: &str) -> bool {
+        self.nodes.iter().any(|n| n.package == package)
+    }
+
+    /// Rewrites every node's `file_path` under `root` to its root-relative form (components
+    /// joined with `/`), the shape the shared parse cache stores (8.0.0): two checkouts of
+    /// one repository, or one checkout moved, then read the same record. Returns the indices
+    /// of the rewritten nodes, which [`Self::reanchor`] needs to tell them from a node whose
+    /// path was relative to begin with (the empty placeholder path some extractors use).
+    ///
+    /// `None`, with `self` left as it was, when a node carries an absolute path outside
+    /// `root` (or one that is not valid UTF-8): such a record cannot be re-anchored on
+    /// another checkout, so it must not be cached at all.
+    ///
+    /// `file_path` is the only path-typed field of a `FileIndex`. Every other string
+    /// (names, packages, signatures, docstrings, dependency / topic / RPC targets) is
+    /// either read from the file's bytes or derived from the absolute path through a
+    /// decision [`PathContext`] folds into the cache key instead.
+    pub fn relativize(&mut self, root: &Path) -> Option<Vec<usize>> {
+        let mut rewritten: Vec<(usize, FilePath)> = Vec::new();
+        let mut last: Option<(FilePath, FilePath)> = None;
+        for (i, node) in self.nodes.iter().enumerate() {
+            if !node.file_path.is_absolute() {
+                continue;
+            }
+            if let Some((abs, rel)) = &last {
+                if Arc::ptr_eq(abs, &node.file_path) || **abs == *node.file_path {
+                    rewritten.push((i, Arc::clone(rel)));
+                    continue;
+                }
+            }
+            let rel = root_relative(&node.file_path, root)?;
+            let rel: FilePath = Arc::from(Path::new(&rel));
+            rewritten.push((i, Arc::clone(&rel)));
+            last = Some((Arc::clone(&node.file_path), rel));
+        }
+        let indices = rewritten.iter().map(|(i, _)| *i).collect();
+        for (i, rel) in rewritten {
+            self.nodes[i].file_path = rel;
+        }
+        Some(indices)
+    }
+
+    /// Inverse of [`Self::relativize`] on `root`, which may be another checkout's: the
+    /// nodes at `anchored` get `root` joined with their `/`-separated relative path. One
+    /// `Arc` is shared by every node of the same path, as extraction itself produces.
+    pub fn reanchor(&mut self, root: &Path, anchored: &[usize]) {
+        let mut last: Option<(FilePath, FilePath)> = None;
+        for &i in anchored {
+            let Some(node) = self.nodes.get_mut(i) else {
+                continue;
+            };
+            if let Some((rel, abs)) = &last {
+                if **rel == *node.file_path {
+                    node.file_path = Arc::clone(abs);
+                    continue;
+                }
+            }
+            let mut abs = root.to_path_buf();
+            if let Some(text) = node.file_path.to_str() {
+                abs.extend(text.split('/').filter(|s| !s.is_empty()));
+            }
+            let abs: FilePath = Arc::from(abs.as_path());
+            last = Some((Arc::clone(&node.file_path), Arc::clone(&abs)));
+            node.file_path = abs;
+        }
+    }
+}
+
+/// `path` relative to `root`, components joined with `/` whatever the platform
+/// separator; `None` when `path` is not strictly under `root` or a component is not UTF-8.
+pub fn root_relative(path: &Path, root: &Path) -> Option<String> {
+    if path == root {
+        return None;
+    }
+    let rel = path.strip_prefix(root).ok()?;
+    let mut parts: Vec<&str> = Vec::new();
+    for c in rel.components() {
+        match c {
+            std::path::Component::Normal(s) => parts.push(s.to_str()?),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(parts.join("/"))
+}
+
+/// What extraction reads from a file's absolute path beyond its root-relative path. The
+/// shared parse cache (8.0.0) is keyed by the root-relative path, so each of these
+/// decisions is folded into the key: a checkout where one comes out differently misses
+/// instead of reading a record extracted under another answer.
+///
+/// Every extractor decision that looks at the absolute path must be covered here. Today:
+/// - the package inferred from the directories above the file ([`Self::package_of`],
+///   [`mesh_core::detect_service_package`] with no AST package: manifests and directory
+///   names, possibly above the root, so the checkout's own directory name when nothing else
+///   is found), used as `ContractNode.package` whenever a file declares none (or declares
+///   Go's `main`). Only a record that uses it is keyed by it
+///   ([`FileIndex::uses_package`]): a declared package must not make every key of a
+///   manifest-less project differ between worktrees;
+/// - for an `index.*` file, the name of its parent directory (its default export is named
+///   after it, and for a file at the root that directory is the checkout itself);
+/// - substring tests over the whole lowercased path: `proto_dirs`, `openapi_spec_files`,
+///   `asyncapi_spec_files`, and the `openapi` / `asyncapi` / `routes` filename sniffs.
+///
+/// The last two are always in the key ([`Self::append_key_input`]).
+///
+/// One instance per scan: the package walk is memoised per directory (it stats manifests and
+/// would otherwise cost a cache hit far more than the lookup itself).
+#[derive(Debug, Default)]
+pub struct PathContext {
+    packages: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, CompactStr>>,
+}
+
+impl PathContext {
+    /// The package [`mesh_core::detect_service_package`] infers for `file_path` from its
+    /// directories alone (a function of the parent directory, memoised per scan).
+    pub fn package_of(&self, file_path: &Path) -> CompactStr {
+        let dir = file_path.parent().unwrap_or(Path::new(""));
+        let cached = self
+            .packages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(dir)
+            .cloned();
+        if let Some(p) = cached {
+            return p;
+        }
+        let p = mesh_core::detect_service_package(file_path, None);
+        self.packages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(dir.to_path_buf(), p.clone());
+        p
+    }
+
+    /// Appends to `out` the path-derived inputs every key of `file_path` carries: the
+    /// parent directory name of an `index.*` file and the path substring tests. Lock-free,
+    /// one allocation (the lowercased path).
+    pub fn append_key_input(&self, cfg: &ExtractConfig, file_path: &Path, out: &mut Vec<u8>) {
+        // Only an `index.*` file is named after its directory (`file_symbol_name`).
+        out.extend_from_slice(b"\0dir=");
+        if file_path.file_stem().and_then(|s| s.to_str()) == Some("index") {
+            if let Some(name) = file_path
+                .parent()
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str())
+            {
+                out.extend_from_slice(name.as_bytes());
+            }
+        }
+        let path_str = file_path.to_string_lossy();
+        // Lowercased exactly as `extract_yaml_contracts` and the Ruby extractor do.
+        let lower = path_str.to_lowercase();
+        let flags = [
+            cfg.allows_proto_path(&path_str),
+            cfg.allows_openapi_spec(&path_str),
+            cfg.openapi_spec_files
+                .iter()
+                .any(|f| spec_file_matches(&lower, f)),
+            cfg.asyncapi_spec_files
+                .iter()
+                .any(|f| spec_file_matches(&lower, f)),
+            lower.contains("openapi"),
+            lower.contains("asyncapi"),
+            lower.contains("routes"),
+        ];
+        out.extend_from_slice(b"\0flags=");
+        out.extend(flags.iter().map(|&b| if b { b'1' } else { b'0' }));
+    }
+}
+
+/// A [`FileIndex`] as the shared parse cache stores it: node paths root-relative, with the
+/// indices of the nodes [`FileIndex::relativize`] rewrote.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RootRelativeIndex {
+    pub index: FileIndex,
+    pub anchored: Vec<usize>,
 }
 
 /// A `CustomPatternConfig` with its regex compiled once, instead of once per file.
@@ -1161,6 +1344,172 @@ impl Seeker<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn node(name: &str, path: &Path) -> ContractNode {
+        ContractNode {
+            id: 0,
+            name: CompactStr::new(name),
+            kind: NodeKind::ServiceClass,
+            file_path: Arc::from(path),
+            line_start: 1,
+            line_end: 2,
+            package: CompactStr::new("pkg"),
+            repo_id: 3,
+            signature: Some(CompactStr::new("sig")),
+            docstring: Some(CompactStr::new("doc")),
+        }
+    }
+
+    /// The shared parse cache's record shape (8.0.0): every node path under the root is
+    /// stored root-relative and `/`-separated, the record names no checkout directory, and
+    /// re-anchoring on another root gives that root's paths; a relative placeholder path is
+    /// left alone both ways, and every non-path field is carried through unchanged.
+    #[test]
+    fn relativize_then_reanchor_moves_a_record_between_checkouts() {
+        let root_a = std::env::temp_dir().join("ckout-a").join("repo");
+        let root_b = std::env::temp_dir().join("other").join("ckout-b");
+        let file_a = root_a.join("src").join("svc").join("a.ts");
+        let mut index = FileIndex {
+            nodes: vec![
+                node("A", &file_a),
+                node("B", &file_a),
+                node("placeholder", Path::new("")),
+            ],
+            dependencies: vec![(0, CompactStr::new("../lib/x"))],
+            producers: vec![(1, CompactStr::new("orders.created"))],
+            consumers: vec![(1, CompactStr::new("orders.paid"))],
+            rpc_calls: vec![(0, CompactStr::new("Billing.Charge"))],
+            heuristic_topic_nodes: vec![1],
+            parse_failed: false,
+        };
+        let before = format!("{index:?}");
+        let anchored = index.relativize(&root_a).expect("all under root");
+        assert_eq!(anchored, vec![0, 1]);
+        assert_eq!(index.nodes[0].file_path.to_str(), Some("src/svc/a.ts"));
+        assert_eq!(index.nodes[2].file_path.as_os_str(), "");
+
+        let json = serde_json::to_string(&RootRelativeIndex {
+            index: index.clone(),
+            anchored: anchored.clone(),
+        })
+        .expect("serialize");
+        assert!(!json.contains("ckout-a"), "{json}");
+        let back: RootRelativeIndex = serde_json::from_str(&json).expect("deserialize");
+
+        let mut on_a = back.index.clone();
+        on_a.reanchor(&root_a, &back.anchored);
+        assert_eq!(format!("{on_a:?}"), before, "round trip on the same root");
+
+        let mut on_b = back.index;
+        on_b.reanchor(&root_b, &back.anchored);
+        let file_b = root_b.join("src").join("svc").join("a.ts");
+        assert_eq!(&*on_b.nodes[0].file_path, file_b.as_path());
+        assert_eq!(&*on_b.nodes[1].file_path, file_b.as_path());
+        assert!(Arc::ptr_eq(
+            &on_b.nodes[0].file_path,
+            &on_b.nodes[1].file_path
+        ));
+        assert_eq!(on_b.nodes[2].file_path.as_os_str(), "");
+        assert_eq!(
+            format!("{on_b:?}"),
+            before.replace(
+                &format!("{:?}", file_a.as_path()),
+                &format!("{:?}", file_b.as_path())
+            )
+        );
+    }
+
+    /// A node outside the root has no form another checkout could re-anchor: the record is
+    /// refused (not cached) and left as it was.
+    #[test]
+    fn relativize_refuses_a_node_outside_the_root() {
+        let root = std::env::temp_dir().join("ckout").join("repo");
+        let mut index = FileIndex {
+            nodes: vec![
+                node("in", &root.join("a.rs")),
+                node("out", &std::env::temp_dir().join("elsewhere.rs")),
+            ],
+            ..FileIndex::default()
+        };
+        let before = format!("{index:?}");
+        assert!(index.relativize(&root).is_none());
+        assert_eq!(format!("{index:?}"), before);
+        assert_eq!(root_relative(&root, &root), None);
+        assert_eq!(
+            root_relative(&root.join("x").join("y.rs"), &root).as_deref(),
+            Some("x/y.rs")
+        );
+    }
+
+    /// The parent directory's name (for `index.*`) and the path substring tests are part of
+    /// every key: same answers, same bytes. The inferred package comes from the manifest in
+    /// both checkouts, and from the checkout's own directory name without one.
+    #[test]
+    fn path_context_folds_every_path_derived_decision() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = dunce::canonicalize(tmp.path()).expect("canon");
+        let (a, b) = (base.join("alpha"), base.join("beta"));
+        for root in [&a, &b] {
+            std::fs::create_dir_all(root.join("svc/routes")).expect("mkdir");
+            std::fs::write(root.join("svc/package.json"), r#"{ "name": "orders" }"#)
+                .expect("manifest");
+        }
+        let cfg = ExtractConfig {
+            proto_dirs: vec!["contracts".to_string()],
+            ..ExtractConfig::default()
+        };
+        let ctx = PathContext::default();
+        let key_input = |p: &Path| {
+            let mut out = Vec::new();
+            ctx.append_key_input(&cfg, p, &mut out);
+            String::from_utf8(out).expect("utf8")
+        };
+        let in_a = key_input(&a.join("svc/routes/index.ts"));
+        assert_eq!(in_a, key_input(&b.join("svc/routes/index.ts")));
+        assert!(in_a.contains("dir=routes"), "{in_a}");
+        // Only an `index.*` file depends on its directory name.
+        assert!(key_input(&a.join("svc/a.ts")).contains("dir=\0"));
+        // At the root, an `index.ts` is named after the checkout itself.
+        assert_ne!(
+            key_input(&a.join("index.ts")),
+            key_input(&b.join("index.ts"))
+        );
+        assert_eq!(key_input(&a.join("tool.ts")), key_input(&b.join("tool.ts")));
+        // A substring test over the absolute path is captured.
+        let c = base.join("contracts-ws");
+        assert_ne!(
+            key_input(&c.join("svc/a.proto")),
+            key_input(&a.join("svc/a.proto"))
+        );
+
+        // The inferred package: from the manifest in both checkouts; the checkout
+        // directory itself without one.
+        assert_eq!(ctx.package_of(&a.join("svc/routes/x.ts")), "orders");
+        assert_eq!(ctx.package_of(&b.join("svc/routes/x.ts")), "orders");
+        assert_eq!(ctx.package_of(&a.join("tool.py")), "alpha");
+        assert_eq!(ctx.package_of(&b.join("tool.py")), "beta");
+    }
+
+    /// A record uses the inferred package when one of its nodes carries it; a file whose
+    /// nodes all declare another package does not, so its first key can be shared.
+    #[test]
+    fn uses_package_spots_a_node_carrying_the_inferred_package() {
+        let mut declared = node("A", Path::new("/r/a.go"));
+        declared.package = CompactStr::new("billing");
+        let mut inferred = node("B", Path::new("/r/a.go"));
+        inferred.package = CompactStr::new("alpha");
+        let only_declared = FileIndex {
+            nodes: vec![declared.clone()],
+            ..FileIndex::default()
+        };
+        assert!(!only_declared.uses_package("alpha"));
+        let mixed = FileIndex {
+            nodes: vec![declared, inferred],
+            ..FileIndex::default()
+        };
+        assert!(mixed.uses_package("alpha"));
+        assert!(!FileIndex::default().uses_package("alpha"));
+    }
 
     /// 7.0.1 (Volontariapp report, point 2 and 5): a module import belongs to
     /// the file's outermost declarations, once, whatever the number of import

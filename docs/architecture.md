@@ -328,11 +328,25 @@ A workspace that resolves to `/`, a drive root or the user's home with no config
 before any daemon is spawned (`mesh_core::guard_workspace_root`, `crates/mesh-core/src/root_guard.rs`):
 the session stays up and answers every `tools/call` with an error naming the directory.
 
-### 8.2 One parse cache per workspace, under a quota (plan 4 step 4.4)
+### 8.2 One parse cache per repository, under a quota (plan 4 step 4.4, 8.0.0)
 
 The persistent parse cache (`PersistentIndexCache`, `crates/mesh-core/src/index_cache.rs`) is
-scoped the same way as the socket: `~/.cache/mesh-mcp/workspaces/<workspace_id>/index-cache.db`
-(SQLite, WAL, mode `0600`, `auto_vacuum = INCREMENTAL`). It is opened once per process by
+one database per Git repository: `~/.cache/mesh-mcp/workspaces/<cache_family_id>/index-cache.db`
+(`mesh_core::identity::cache_family_id`, a hash of the canonical common Git directory), shared by
+every worktree, config file and process of that repository. Outside Git it is
+`workspaces/<workspace_id>/` as before. SQLite, WAL, mode `0600`, `auto_vacuum = INCREMENTAL`.
+Keys hold the binary version (records are shared within one version; an older version's rows
+age out through LRU eviction), the file's root-relative path, content hash, `RepoId` and the
+extraction-config fingerprint, which also folds in everything extraction reads from the absolute
+path (`mesh_parsers::PathContext`: parent directory name of an `index.*` file, path substring
+tests) and the governing `tsconfig` / `package.json` aliases written root-relative. A record that
+uses the package inferred from directories (a manifest-less checkout gets its directory name) is
+stored under a second key that also folds that package, and the first key holds a pointer to it,
+so files that declare their package still share across differently named worktrees.
+Records store root-relative node paths and are re-anchored on the reading checkout's root, so
+two checkouts of one commit read the same entries and fingerprint the same. The shared
+directory carries a `family_common_dir` marker, never a `workspace_path` one, so `doctor` never
+takes it for an orphan. It is opened once per process by
 `AppState::open_index_cache` and shared by the boot scan and every incremental reload, so a
 branch switch back to already-seen content is a lookup instead of a re-parse.
 

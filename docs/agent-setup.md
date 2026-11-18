@@ -238,7 +238,7 @@ did not, and anything you left for them to decide (stop rules, git hook, global 
 | What | Where |
 |---|---|
 | Config | `<workspace>/.agents/mesh-mcp.toml` (commit it so the team shares it) |
-| Index cache | `~/.cache/mesh-mcp/workspaces/<id>/` (safe to delete; rebuilt on start) |
+| Index cache | `~/.cache/mesh-mcp/workspaces/<id>/`, one per Git repository shared by its worktrees (safe to delete; rebuilt on start) |
 | Audit log | `~/.cache/mesh-mcp/audit.db` (mode `0600`, append-only, local); `MESH_AUDIT_DB` moves it; `mesh-mcp stats` summarizes it |
 | Daemon socket | `~/.cache/mesh/` (Unix) or a named pipe (Windows) |
 
