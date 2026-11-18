@@ -13,11 +13,11 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// The `mesh-mcp` binary Cargo built for this integration test (see
+/// `doctor_repairable_health.rs`: `current_exe()`-relative paths broke when Cargo
+/// moved test executables to a separate build directory).
 fn mesh_mcp_bin() -> PathBuf {
-    let mut path = std::env::current_exe().expect("test exe");
-    path.pop(); // deps/
-    path.pop(); // release/ or debug/
-    path.join("mesh-mcp")
+    PathBuf::from(env!("CARGO_BIN_EXE_mesh-mcp"))
 }
 
 #[test]
