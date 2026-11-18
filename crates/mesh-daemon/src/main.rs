@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // workspaces can never end up sharing (or racing to bind) the same
     // socket and silently serving each other's data (idempotence invariant
     // I7).
-    let workspace_id = socket::workspace_id(&base_dir, config_path.as_deref());
+    let workspace_id = WorkspaceIndexer::workspace_id_for(&base_dir, args.config.as_deref());
     let config_path_for_ingest = config_path.clone();
 
     #[cfg(unix)]

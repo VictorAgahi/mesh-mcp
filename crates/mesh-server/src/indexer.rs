@@ -159,6 +159,16 @@ impl WorkspaceIndexer {
             .map(|p| std::path::absolute(&p).unwrap_or(p))
     }
 
+    /// The daemon identity of the workspace whose directory is `base_dir`
+    /// (from [`Self::discover_config`]) when launched with `explicit` as
+    /// `--config`: [`mesh_core::workspace_id`] over the canonical directory and
+    /// the config file [`Self::locate_config`] finds. The one function both
+    /// `mesh-mcp run` and `meshd` call, so the proxy and the daemon it spawns
+    /// can never disagree on the socket.
+    pub fn workspace_id_for(base_dir: &Path, explicit: Option<&Path>) -> String {
+        mesh_core::workspace_id(base_dir, Self::locate_config(explicit).as_deref())
+    }
+
     /// Loads the config file at `path` the way `discover_config` does (skill
     /// paths and workspace root resolved against its directory) and returns it
     /// with that directory.

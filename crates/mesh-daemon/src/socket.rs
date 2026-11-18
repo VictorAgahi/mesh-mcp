@@ -2,6 +2,7 @@
 //!
 //! Re-exports canonical implementation from `mesh_core::socket`.
 
+#[cfg(test)]
 pub use mesh_core::socket::workspace_id;
 
 // Only `meshd`'s Unix path uses these (its Windows build speaks named pipes);

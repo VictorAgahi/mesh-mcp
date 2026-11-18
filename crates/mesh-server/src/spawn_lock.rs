@@ -87,7 +87,15 @@ impl SpawnLock {
             .mode(0o600)
             .open(path)?;
         // `mode` only applies when the file is created; tighten a pre-existing one.
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        // A pre-existing lock file wider than 0600 is tightened; if that fails the
+        // lock still works (it is advisory) but the mode is reported.
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(
+                target: "mesh::proxy",
+                "cannot restrict spawn lock {} to 0600: {e}",
+                path.display()
+            );
+        }
         // SAFETY: `flock` on a file descriptor this function owns for the whole call.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {

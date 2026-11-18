@@ -197,10 +197,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let canonical_base = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
             // The config file is part of the daemon identity: two configs in one
             // directory are two workspaces (see `mesh_core::workspace_id`).
-            let workspace_id = mesh_core::workspace_id(
-                &canonical_base,
-                WorkspaceIndexer::locate_config(cli.config.as_deref()).as_deref(),
-            );
+            let workspace_id =
+                WorkspaceIndexer::workspace_id_for(&canonical_base, cli.config.as_deref());
+            // The config file this session resolved (absolute, whether given with
+            // `--config` or discovered). Passed to the daemon as `--config` so the
+            // daemon hashes exactly this file, never a second discovery of its own.
+            let located_config = WorkspaceIndexer::locate_config(cli.config.as_deref());
 
             #[cfg(unix)]
             if !standalone {
@@ -210,7 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &sock_path,
                     &workspace_id,
                     &canonical_base,
-                    cli.config.as_deref(),
+                    located_config.as_deref(),
                 )
                 .await;
                 if try_proxy_unix(ensured, &sock_path, &workspace_id).await? == ProxyAttempt::Served
@@ -227,7 +229,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &pipe_name,
                     &workspace_id,
                     &canonical_base,
-                    cli.config.as_deref(),
+                    located_config.as_deref(),
                 )
                 .await;
                 if try_proxy_windows(ensured, &pipe_name, &workspace_id).await?
@@ -421,10 +423,10 @@ async fn ensure_daemon_running(
     sock_path: &Path,
     workspace_id: &str,
     base_dir: &Path,
-    explicit_config: Option<&Path>,
+    located_config: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let probe = || async { tokio::net::UnixStream::connect(sock_path).await.is_ok() };
-    let spawn = || spawn_meshd(sock_path, workspace_id, base_dir, explicit_config);
+    let spawn = || spawn_meshd(sock_path, workspace_id, base_dir, located_config);
     let lock_path = mesh_server::spawn_lock::lock_path_for(sock_path);
     let ensured = mesh_server::spawn_lock::ensure_with_lock(
         &lock_path,
@@ -452,7 +454,7 @@ fn spawn_meshd(
     endpoint: impl AsRef<std::ffi::OsStr>,
     workspace_id: &str,
     base_dir: &Path,
-    explicit_config: Option<&Path>,
+    located_config: Option<&Path>,
 ) -> Result<(), String> {
     tracing::info!(target: "mesh::proxy", "meshd not found for this workspace. Attempting auto-spawn…");
 
@@ -479,7 +481,7 @@ fn spawn_meshd(
         .stdin(std::process::Stdio::null())
         .stdout(stdout_io)
         .stderr(stderr_io);
-    if let Some(config) = explicit_config {
+    if let Some(config) = located_config {
         let canonical_config = dunce::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
         cmd.arg("--config").arg(canonical_config);
     }
@@ -656,12 +658,12 @@ async fn ensure_daemon_running_windows(
     pipe_name: &str,
     workspace_id: &str,
     base_dir: &Path,
-    explicit_config: Option<&Path>,
+    located_config: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
     let probe = || async { ClientOptions::new().open(pipe_name).is_ok() };
-    let spawn = || spawn_meshd(pipe_name, workspace_id, base_dir, explicit_config);
+    let spawn = || spawn_meshd(pipe_name, workspace_id, base_dir, located_config);
     let lock_path =
         mesh_server::spawn_lock::lock_path_for(&mesh_core::socket_path_for(workspace_id));
     let ensured = mesh_server::spawn_lock::ensure_with_lock(

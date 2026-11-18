@@ -772,10 +772,7 @@ impl DoctorCommand {
                 .to_path_buf(),
         };
         let canonical = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
-        let id = mesh_core::workspace_id(
-            &canonical,
-            WorkspaceIndexer::locate_config(config_path).as_deref(),
-        );
+        let id = WorkspaceIndexer::workspace_id_for(&canonical, config_path);
         Some((canonical, id))
     }
 
