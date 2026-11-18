@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::audit::AuditLogger;
+use crate::socket::hash_id16;
 use crate::watcher::git::resolve_git_dir;
 
 /// The Git repository a directory belongs to. All linked worktrees of one repository share
@@ -26,7 +26,8 @@ impl RepoFamily {
     /// Resolves the family of `dir` by following `.git` (directory or `gitdir:` file) upward.
     /// `None` outside a Git work tree or when the pointer is unreadable.
     pub fn resolve(dir: &Path) -> Option<Self> {
-        let git = resolve_git_dir(dir)?;
+        let dir = absolutize(dir);
+        let git = resolve_git_dir(&dir)?;
         let top = git.head_marker.parent()?.parent()?;
         Some(Self {
             common_dir: dunce::canonicalize(&git.common_dir).unwrap_or(git.common_dir),
@@ -35,17 +36,33 @@ impl RepoFamily {
     }
 }
 
-fn hash16(key: &str) -> String {
-    let digest = AuditLogger::compute_sha256(key.as_bytes());
-    digest[..16].to_string()
+/// Absolute form of `dir`: canonical when it exists, else made absolute against the cwd.
+fn absolutize(dir: &Path) -> PathBuf {
+    dunce::canonicalize(dir)
+        .or_else(|_| std::path::absolute(dir))
+        .unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// The common dir as hashed: case-folded on macOS and Windows (case-insensitive file systems,
+/// like `ValidatedScope`), verbatim on Linux where folding would merge distinct directories.
+fn common_dir_key(family: &RepoFamily) -> String {
+    let s = family.common_dir.display().to_string();
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        s.to_lowercase()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        s
+    }
 }
 
 /// 16 hex chars over the canonical common dir and the binary version. Names the per-repository
 /// socket, so a daemon from another version is never found.
 pub fn family_id(family: &RepoFamily) -> String {
-    hash16(&format!(
+    hash_id16(&format!(
         "{}\u{0}{}",
-        family.common_dir.display(),
+        common_dir_key(family),
         env!("CARGO_PKG_VERSION")
     ))
 }
@@ -53,7 +70,7 @@ pub fn family_id(family: &RepoFamily) -> String {
 /// Same hash as [`family_id`] without the version. Names the shared parse-cache directory:
 /// record compatibility across versions is handled by `SCHEMA_VERSION` in `index_cache`.
 pub fn cache_family_id(family: &RepoFamily) -> String {
-    hash16(&family.common_dir.display().to_string())
+    hash_id16(&common_dir_key(family))
 }
 
 /// One view of a repository: a worktree plus the config file a session uses.
@@ -80,13 +97,14 @@ pub struct WorkspaceIdentity {
 
 impl WorkspaceIdentity {
     pub fn resolve(base_dir: &Path, located_config: Option<&Path>) -> Self {
-        let family = RepoFamily::resolve(base_dir);
+        let base = absolutize(base_dir);
+        let family = RepoFamily::resolve(&base);
         let worktree_top = match &family {
             Some(f) => f.worktree_top.clone(),
-            None => dunce::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf()),
+            None => base,
         };
         let config_rel = located_config.map(|c| {
-            let canon = dunce::canonicalize(c).unwrap_or_else(|_| c.to_path_buf());
+            let canon = absolutize(c);
             match canon.strip_prefix(&worktree_top) {
                 Ok(rel) => rel.to_path_buf(),
                 Err(_) => canon,
@@ -106,6 +124,16 @@ impl WorkspaceIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A git operation the test needs failed: fatal under CI (a silent pass would hide a broken
+    /// environment), a skip on a developer machine without git.
+    fn unavailable(what: &str) {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI: required git operation failed: {what}"
+        );
+        eprintln!("{what} unavailable; skipping");
+    }
 
     fn git(dir: &Path, args: &[&str]) -> bool {
         std::process::Command::new("git")
@@ -149,12 +177,10 @@ mod tests {
         let base = dunce::canonicalize(tmp.path()).expect("canon");
         let main = base.join("main");
         if !init_repo(&main) {
-            eprintln!("git unavailable; skipping");
-            return;
+            return unavailable("git init");
         }
         if !git(&main, &["worktree", "add", "-q", "../wt", "-b", "topic"]) {
-            eprintln!("git worktree unavailable; skipping");
-            return;
+            return unavailable("git worktree add");
         }
         let wt = base.join("wt");
         for d in [&main, &wt] {
@@ -190,8 +216,7 @@ mod tests {
         let base = dunce::canonicalize(tmp.path()).expect("canon");
         let (r1, r2) = (base.join("r1"), base.join("r2"));
         if !init_repo(&r1) || !init_repo(&r2) {
-            eprintln!("git unavailable; skipping");
-            return;
+            return unavailable("git init");
         }
         let f1 = RepoFamily::resolve(&r1).expect("f1");
         let f2 = RepoFamily::resolve(&r2).expect("f2");
@@ -200,8 +225,7 @@ mod tests {
 
         let url = norm(&r2);
         if !git(&r1, &["submodule", "add", "-q", &url, "sub"]) {
-            eprintln!("git submodule add refused; skipping the submodule half");
-            return;
+            return unavailable("git submodule add");
         }
         let fs = RepoFamily::resolve(&r1.join("sub")).expect("sub");
         assert_ne!(family_id(&fs), family_id(&f1));
@@ -210,14 +234,13 @@ mod tests {
     }
 
     #[test]
-    fn plain_directory_has_no_family_and_legacy_id_matches() {
+    fn non_git_directory_has_no_family_and_legacy_id_matches() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let base = dunce::canonicalize(tmp.path()).expect("canon");
-        // A tempdir may itself sit inside a Git checkout on exotic setups; only assert when not.
-        if RepoFamily::resolve(&base).is_some() {
-            eprintln!("tempdir inside a git work tree; skipping");
-            return;
-        }
+        // A `.git` whose pointer is unreadable makes the directory non-Git regardless of what
+        // encloses the tempdir, so this branch is exercised deterministically.
+        std::fs::write(base.join(".git"), "gitdir: ./nowhere\n").expect("dot git");
+        assert!(RepoFamily::resolve(&base).is_none());
         let cfg = base.join("c.toml");
         std::fs::write(&cfg, "").expect("cfg");
         let id = WorkspaceIdentity::resolve(&base, Some(&cfg));
@@ -245,5 +268,75 @@ mod tests {
         std::fs::write(&cfg, "").expect("cfg");
         let id = WorkspaceIdentity::resolve(&work, Some(&cfg));
         assert_eq!(id.view.config_rel.as_deref(), Some(cfg.as_path()));
+    }
+
+    /// `target` expressed relative to the current directory (`..` up to the root, then down).
+    fn relative_to_cwd(target: &Path) -> Option<PathBuf> {
+        let cwd = dunce::canonicalize(std::env::current_dir().ok()?).ok()?;
+        // Same root or drive prefix, else there is no relative form.
+        if cwd.components().next() != target.components().next() {
+            return None;
+        }
+        let mut rel = PathBuf::new();
+        for comp in cwd.components().skip(1) {
+            if !matches!(comp, std::path::Component::RootDir) {
+                rel.push("..");
+            }
+        }
+        for comp in target.components().skip(1) {
+            if !matches!(comp, std::path::Component::RootDir) {
+                rel.push(comp);
+            }
+        }
+        Some(rel)
+    }
+
+    #[test]
+    fn relative_base_dir_gives_the_same_identity_as_absolute() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = dunce::canonicalize(tmp.path()).expect("canon");
+        let main = base.join("main");
+        if !init_repo(&main) {
+            return unavailable("git init");
+        }
+        std::fs::write(main.join("mesh-mcp.toml"), "").expect("cfg");
+        let abs = WorkspaceIdentity::resolve(&main, Some(&main.join("mesh-mcp.toml")));
+        let (Some(rel_dir), Some(rel_cfg)) = (
+            relative_to_cwd(&main),
+            relative_to_cwd(&main.join("mesh-mcp.toml")),
+        ) else {
+            eprintln!("no relative form on this platform layout; skipping");
+            return;
+        };
+        assert!(rel_dir.is_relative());
+        let rel = WorkspaceIdentity::resolve(&rel_dir, Some(&rel_cfg));
+        assert_eq!(rel.family, abs.family);
+        assert_eq!(rel.view, abs.view);
+        assert!(!rel.view.worktree_top.as_os_str().is_empty());
+        assert_eq!(
+            rel.view.config_rel.as_deref().map(norm).as_deref(),
+            Some("mesh-mcp.toml")
+        );
+        assert_eq!(rel.legacy_id, abs.legacy_id);
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn case_variants_of_one_repo_share_a_family_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = dunce::canonicalize(tmp.path()).expect("canon");
+        let main = base.join("repo");
+        if !init_repo(&main) {
+            return unavailable("git init");
+        }
+        let upper = base.join("REPO");
+        if !upper.exists() {
+            eprintln!("case-sensitive volume; skipping");
+            return;
+        }
+        let a = RepoFamily::resolve(&main).expect("a");
+        let b = RepoFamily::resolve(&upper).expect("b");
+        assert_eq!(family_id(&a), family_id(&b));
+        assert_eq!(cache_family_id(&a), cache_family_id(&b));
     }
 }
