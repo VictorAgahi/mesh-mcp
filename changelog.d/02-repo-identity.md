@@ -1,0 +1,2 @@
+### Added
+- `mesh_core::identity`: `RepoFamily` (canonical Git common dir plus worktree top, resolved through `.git` files so linked worktrees share a family and a submodule is its own), `family_id` (socket name: common dir plus version), `cache_family_id` (shared cache name: common dir only), `ViewKey` (worktree top plus config path relative to it) and `WorkspaceIdentity::resolve`, which also carries today's `workspace_id` as `legacy_id`. Computed only: the daemon socket and cache directory are unchanged.

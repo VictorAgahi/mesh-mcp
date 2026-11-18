@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 
-mod git;
+pub(crate) mod git;
 
 use git::{
     classify_git_event, DirObservation, GateAction, GitDir, GitEventKind, GitGate, LockTracker,

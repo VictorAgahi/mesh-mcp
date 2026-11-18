@@ -44,6 +44,11 @@ pub fn workspace_id(base_dir: &Path, config_file: Option<&Path>) -> String {
         }
         None => format!("{}\u{0}{}", canonical.display(), env!("CARGO_PKG_VERSION")),
     };
+    hash_id16(&key)
+}
+
+/// The one id scheme shared by every identity: SHA-256 of `key`, first 16 hex chars.
+pub(crate) fn hash_id16(key: &str) -> String {
     let digest = crate::audit::AuditLogger::compute_sha256(key.as_bytes());
     digest[..16].to_string()
 }
