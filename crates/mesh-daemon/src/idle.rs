@@ -51,12 +51,40 @@ impl ClientCounter {
 /// wrong so no client ever finds this daemon's socket), the pre-3.3 watchdog's "only activates
 /// after the first client" rule meant such a daemon lived forever, unkillable except by PID —
 /// exactly the kind of zombie this mechanism exists to prevent for the *other* case.
+#[cfg(test)]
 pub fn spawn_idle_watchdog(
     counter: ClientCounter,
     token: CancellationToken,
     idle_timeout: Duration,
     poll_interval: Duration,
     startup_grace: Duration,
+) {
+    spawn_idle_watchdog_with(
+        counter,
+        token,
+        idle_timeout,
+        poll_interval,
+        startup_grace,
+        None,
+    );
+}
+
+/// "Something still needs this daemon": the multi-view daemon passes whether any view exists.
+pub type ViewsAlive = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// [`spawn_idle_watchdog`] for a daemon whose views carry their own idle timeout (8.0.0).
+/// With `views_alive`, a daemon that has had a client exits as soon as it has neither a
+/// client nor a view: each view is dropped after `idle_timeout` with no session, so the last
+/// one going is the idle deadline (waiting `idle_timeout` again would double it). The
+/// startup-grace guard is unchanged. Without it, the single-workspace rule applies: exit after
+/// `idle_timeout` with no client.
+pub fn spawn_idle_watchdog_with(
+    counter: ClientCounter,
+    token: CancellationToken,
+    idle_timeout: Duration,
+    poll_interval: Duration,
+    startup_grace: Duration,
+    views_alive: Option<ViewsAlive>,
 ) {
     tokio::spawn(async move {
         let started_at = std::time::Instant::now();
@@ -75,6 +103,15 @@ pub fn spawn_idle_watchdog(
             if active > 0 {
                 ever_had_client = true;
                 idle_since = None;
+            } else if ever_had_client && views_alive.is_some() {
+                if !views_alive.as_ref().is_some_and(|alive| alive()) {
+                    tracing::info!(
+                        target: "meshd::idle",
+                        "No client and no view left. Initiating graceful idle shutdown."
+                    );
+                    token.cancel();
+                    break;
+                }
             } else if ever_had_client {
                 let since = idle_since.get_or_insert_with(std::time::Instant::now);
                 if since.elapsed() >= idle_timeout {
@@ -216,6 +253,36 @@ mod tests {
         assert!(
             !token.is_cancelled(),
             "A client connecting within the startup grace must disarm it, not just delay it"
+        );
+    }
+
+    /// 8.0.0: with views, the daemon outlives its last client while a view remains (the view
+    /// carries the idle timeout) and stops as soon as the last view is gone.
+    #[tokio::test]
+    async fn with_views_the_daemon_stops_with_its_last_view() {
+        let counter = ClientCounter::new();
+        let token = CancellationToken::new();
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let probe = Arc::clone(&alive);
+        spawn_idle_watchdog_with(
+            counter.clone(),
+            token.clone(),
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+            Duration::from_secs(3_600),
+            Some(Arc::new(move || probe.load(Ordering::SeqCst))),
+        );
+        counter.increment();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        counter.decrement();
+        // Far past `idle_timeout`, but a view is still alive.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!token.is_cancelled(), "a live view keeps the daemon");
+        alive.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            token.is_cancelled(),
+            "no client and no view: the daemon stops"
         );
     }
 }

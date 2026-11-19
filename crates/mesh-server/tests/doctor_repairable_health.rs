@@ -216,6 +216,8 @@ fn daemon_version_mismatch_is_reported_and_fix_stops_the_live_daemon() {
     let meta = mesh_core::socket::DaemonMeta {
         pid: child.id(),
         version: "0.0.1-old".to_string(),
+        views: Vec::new(),
+        view_builds: 0,
     };
     // `daemon_meta_path` reads `$HOME` at call time, which in this *test harness*
     // process is the real machine's home, not `home` (that override only takes
@@ -296,6 +298,8 @@ fn daemon_version_mismatch_with_a_dead_pid_is_fixed_by_removing_the_stale_record
     let meta = mesh_core::socket::DaemonMeta {
         pid: dead_pid,
         version: "0.0.1-old".to_string(),
+        views: Vec::new(),
+        view_builds: 0,
     };
     let meta_path = home
         .path()
@@ -331,6 +335,8 @@ fn daemon_version_match_is_ok_and_offers_no_fix() {
     let meta = mesh_core::socket::DaemonMeta {
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        views: Vec::new(),
+        view_builds: 0,
     };
     let meta_path = home
         .path()
@@ -494,6 +500,8 @@ fn corrupt_cache_and_stale_version_live_daemon_together_are_all_fixed_at_once() 
     let meta = mesh_core::socket::DaemonMeta {
         pid: child.id(),
         version: "0.0.1-old".to_string(),
+        views: Vec::new(),
+        view_builds: 0,
     };
     let meta_path = home
         .path()
@@ -555,6 +563,8 @@ fn invalid_config_reports_the_daemon_still_serving_its_previous_config() {
     let meta = mesh_core::socket::DaemonMeta {
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        views: Vec::new(),
+        view_builds: 0,
     };
     std::fs::write(
         cache.join(format!("{workspace_id}.meta")),
@@ -569,6 +579,7 @@ fn invalid_config_reports_the_daemon_still_serving_its_previous_config() {
         rejected_sha256: None,
         loaded_ms: Some(1_000),
         last_reload: None,
+        owner: None,
     };
     std::fs::write(
         cache.join(format!("{workspace_id}.config.json")),

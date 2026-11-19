@@ -196,6 +196,13 @@ impl WorkspaceIndexer {
         mesh_core::workspace_id(base_dir, Self::locate_config(explicit).as_deref())
     }
 
+    /// The full identity of the session or daemon whose directory is `base_dir`, launched with
+    /// `explicit` as `--config` (8.0.0). Its [`mesh_core::WorkspaceIdentity::daemon_id`] names
+    /// the daemon (one per Git repository); its `legacy_id` equals [`Self::workspace_id_for`].
+    pub fn identity_for(base_dir: &Path, explicit: Option<&Path>) -> mesh_core::WorkspaceIdentity {
+        mesh_core::WorkspaceIdentity::resolve(base_dir, Self::locate_config(explicit).as_deref())
+    }
+
     /// Loads the config file at `path` the way `discover_config` does (skill
     /// paths and workspace root resolved against its directory) and returns it
     /// with that directory.
@@ -211,7 +218,8 @@ impl WorkspaceIndexer {
     pub fn load_config_stamped(
         path: &Path,
     ) -> Result<(Config, PathBuf, String), Box<dyn std::error::Error>> {
-        let bytes = std::fs::read(path)
+        // Bounded (1 MiB): a config is a few KiB, and `meshd` loads whatever file a hello names.
+        let bytes = mesh_core::config_watch::read_config_bounded(path)
             .map_err(|e| mesh_core::ConfigError::IoError(path.to_path_buf(), e))?;
         let digest = mesh_core::config_watch::config_sha256(&bytes);
         let (cfg, base) = Self::parse_config_bytes(path, &bytes)?;
@@ -291,17 +299,26 @@ impl WorkspaceIndexer {
                 let (cfg, base, digest) = Self::load_config_stamped(&path)?;
                 Ok((cfg, base, Some(digest)))
             }
-            None => {
-                let default = concat!(
-                    "[workspace]\nname = \"default-mesh\"\nversion = \"",
-                    env!("CARGO_PKG_VERSION"),
-                    "\"\nroots = [\".\"]\n"
-                );
-                let mut cfg = Config::load_from_str(default)?;
-                cfg.resolve_workspace_root(Path::new("."));
-                Ok((cfg, PathBuf::from("."), None))
-            }
+            None => Ok((
+                Self::default_config_at(Path::new("."))?,
+                PathBuf::from("."),
+                None,
+            )),
         }
+    }
+
+    /// The built-in single-root config used when no config file is found, anchored at
+    /// `base_dir` (its one root is `base_dir` itself). `meshd` builds a view of a directory
+    /// without a config file with an absolute `base_dir`, never its own cwd.
+    pub fn default_config_at(base_dir: &Path) -> Result<Config, Box<dyn std::error::Error>> {
+        let default = concat!(
+            "[workspace]\nname = \"default-mesh\"\nversion = \"",
+            env!("CARGO_PKG_VERSION"),
+            "\"\nroots = [\".\"]\n"
+        );
+        let mut cfg = Config::load_from_str(default)?;
+        cfg.resolve_workspace_root(base_dir);
+        Ok(cfg)
     }
 
     /// Expands configured roots; on failure falls back to `base_dir` with a warning.

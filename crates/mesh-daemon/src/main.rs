@@ -1,9 +1,12 @@
 //! meshd — The MeshMCP Daemon
 //!
 //! A long-lived background process that:
-//!   - Holds a single ContractGraph in memory (shared across all IDE sessions)
-//!   - Runs exactly one FileWatcherService + one DifferentialVfs per machine
-//!   - Multiplexes N client connections via Unix Domain Socket (UDS)
+//!   - Serves one Git repository (8.0.0): one view per worktree and config file, each with
+//!     its own graph, watcher and config follower; outside Git, one directory and config
+//!   - Shares one watcher pool, one reload pool, one audit logger and the repository's parse
+//!     cache between its views
+//!   - Multiplexes N client connections via Unix Domain Socket (UDS) or named pipe; each
+//!     connection names its view in a hello line before any JSON-RPC frame
 //!
 //! IDE clients (`mesh-mcp run`) connect as lightweight proxies relaying stdio ↔ UDS.
 //! On the first connection, mesh-mcp auto-spawns meshd if it is not already running.
@@ -15,9 +18,11 @@ mod idle;
 mod sandbox;
 mod server;
 mod socket;
+mod views;
 
 use clap::Parser;
-use mesh_core::{AppState, AuditLogger, BackgroundRescanEngine};
+use mesh_core::{AuditLogger, BackgroundRescanEngine};
+use mesh_server::hello::Hello;
 use mesh_server::WorkspaceIndexer;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,9 +44,18 @@ struct Args {
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// Minutes of inactivity before automatic shutdown (0 = never)
+    /// Minutes a view may go without a session before it is dropped; the daemon stops with
+    /// its last view (0 = never)
     #[arg(long, default_value = "30")]
     idle_timeout_minutes: u64,
+
+    /// Tests: the idle timeout in seconds, overriding `--idle-timeout-minutes`
+    #[arg(long, hide = true)]
+    idle_timeout_secs: Option<u64>,
+
+    /// Tests: how often the idle watchdog and the view sweep run, in milliseconds
+    #[arg(long, hide = true, default_value = "10000")]
+    idle_poll_millis: u64,
 
     /// Seconds to wait for a first client to ever connect before shutting down as an orphaned
     /// daemon (0 = disabled). Always active by default (P2 step 3.3) since `ensure_daemon_running`
@@ -68,8 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Config loading ────────────────────────────────────────────────────────
     // Resolved before the socket path: the default (no `--socket`) is scoped
-    // to this workspace specifically (see below), which needs `base_dir` first.
-    let (config, base_dir, config_sha) =
+    // to this daemon's identity (see below), which needs `base_dir` first.
+    let (_config, base_dir, _config_sha) =
         WorkspaceIndexer::discover_config_stamped(args.config.as_deref())?;
     // Same guard as `mesh-mcp run`: a daemon started with cwd = `/` or HOME and
     // no config would index the whole filesystem or home. `mesh-mcp` never
@@ -78,26 +92,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::error!(target: "meshd", "{refusal}");
         return Err(refusal.into());
     }
-    // The config file this daemon follows (absolute), if one was found.
+    // The config file of the startup view (absolute), if one was found.
     let config_path = WorkspaceIndexer::locate_config(args.config.as_deref());
-    let allowed_roots = WorkspaceIndexer::resolve_roots(&config, &base_dir);
+    let canonical_base = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
+
+    // ── Identity (8.0.0) ──────────────────────────────────────────────────────
+    // Inside Git this daemon serves the whole repository (every worktree and
+    // config, one view each) and is named by the repository's family id; outside
+    // Git it serves exactly the directory and config it was started for, under
+    // the per-workspace id as before. `mesh-mcp run` computes the same id from
+    // the same inputs, so both sides name the same socket.
+    let identity = views::DaemonIdentity::of(&WorkspaceIndexer::identity_for(
+        &canonical_base,
+        args.config.as_deref(),
+    ));
+    let daemon_id = identity.daemon_id.clone();
 
     // ── Socket path (Unix) / named pipe address (Windows) ───────────────────────
-    // `meshd` has no UDS on Windows, so IDE clients share the daemon over a
-    // named pipe instead. `--socket` (always passed by `mesh-mcp`'s own
-    // auto-spawn) overrides either form; the default here — used only when
-    // meshd is started by hand — is scoped to this workspace + binary
-    // version, never the one-per-machine legacy path, so two unrelated
-    // workspaces can never end up sharing (or racing to bind) the same
-    // socket and silently serving each other's data (idempotence invariant
-    // I7).
-    let workspace_id = WorkspaceIndexer::workspace_id_for(&base_dir, args.config.as_deref());
-    let config_path_for_ingest = config_path.clone();
-
+    // `--socket` (always passed by `mesh-mcp`'s own auto-spawn) overrides either
+    // form; the default, used only when meshd is started by hand, is scoped to
+    // this daemon's identity and binary version, never one path per machine.
     #[cfg(unix)]
     let sock_path = match args.socket.clone() {
         Some(p) => p,
-        None => socket::socket_path_for(&workspace_id),
+        None => socket::socket_path_for(&daemon_id),
     };
 
     // Clean up any stale socket from a previous crashed daemon
@@ -107,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     let pipe_name = match args.socket.clone() {
         Some(p) => p.to_string_lossy().into_owned(),
-        None => socket::pipe_name_for(&workspace_id),
+        None => socket::pipe_name_for(&daemon_id),
     };
 
     // ── Cancellation token + signal handler ───────────────────────────────────
@@ -119,108 +137,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cancel_sig.cancel();
     });
 
-    // ── AppState (shared, single instance) ───────────────────────────────────
+    // ── Timeouts ──────────────────────────────────────────────────────────────
+    let idle_timeout = match (args.idle_timeout_secs, args.idle_timeout_minutes) {
+        (Some(secs), _) if secs > 0 => Duration::from_secs(secs),
+        (None, minutes) if minutes > 0 => Duration::from_secs(minutes * 60),
+        _ => Duration::MAX,
+    };
+    let idle_poll = Duration::from_millis(args.idle_poll_millis.max(10));
+
+    // ── Views: one shared audit logger, watcher pool and reload pool ─────────
     let audit = Arc::new(AuditLogger::new(None)?);
     let rescan = Arc::new(BackgroundRescanEngine::new()?);
-    let state = Arc::new(AppState::new(
-        config,
-        allowed_roots,
-        audit.clone(),
-        rescan.clone(),
-    ));
-    // The watcher token is a child of the daemon-wide one so a config reload can
-    // retire this state's watcher without touching the shutdown path.
-    let watcher_cancel = cancel_token.child_token();
-    let host = host::WorkspaceHost::new(
-        state.clone(),
-        config_path,
-        config_sha,
-        &workspace_id,
+    let registry = views::ViewRegistry::new(
+        identity,
         audit,
         rescan,
         cancel_token.clone(),
-        watcher_cancel.clone(),
+        idle_timeout,
+        None,
     );
 
-    // Follows the config file while no client is talking to the daemon.
-    host.spawn_idle_poller(host::IDLE_POLL_INTERVAL);
-
-    // ── Initial ingestion: runs in the background, not before the IPC server
-    // starts. A large workspace's first scan can take long enough that a
-    // client polling for the socket to appear (`mesh-mcp`'s `ensure_daemon_running`)
-    // used to time out and silently fall back to standalone mode — spinning
-    // up a second, redundant in-process index instead of just waiting a
-    // little longer for the one meshd already building. The socket now
-    // accepts connections immediately; `initialize`/`ping` succeed right
-    // away, and `tools/call` reports "still indexing" (via `generation == 0`,
-    // see `server::dispatch`) until this task's first `install_snapshot`.
-    // Held under `reload_lock`, the same as every later `WorkspaceIndexer::reload`
-    // call, so a filesystem event racing the initial scan can't install a
-    // snapshot computed from a stale base out from under it (idempotence
-    // invariant I2 — see `AppState::reload_lock`'s own doc).
-    //
-    let ingest_state = state.clone();
-    let ingest_base_dir = base_dir.clone();
-    let ingest_config = config_path_for_ingest;
-    tokio::task::spawn_blocking(move || {
-        host::ingest_blocking(&ingest_state, &ingest_base_dir, ingest_config.as_deref());
-    });
-
-    // ── File watcher (single instance, shared across all clients) ─────────────
-    // `FileWatcherService::spawn` does its (potentially slow, on a large workspace) setup —
-    // the per-root directory walk and initial OS watch registration — synchronously before
-    // returning, by design (a non-blocking setup silently raced real filesystem events against
-    // watch registration finishing). `spawn_blocking` keeps that work off the async workers,
-    // preserving the "socket accepts connections immediately" invariant. Its trailing
-    // differential reload closes the window in which a file changed with no watcher in place
-    // (`reload`/`reload_paths` are purely event-driven); it takes `reload_lock`, so it waits
-    // for the ingestion above if that is still running.
-    let watcher_state = state.clone();
-    tokio::task::spawn_blocking(move || {
-        host::start_watcher_blocking(&watcher_state, watcher_cancel);
-    });
+    // The startup view is built right away (validation, then its first scan and
+    // watcher in the background) so the session that spawned this daemon finds
+    // its scan already running. The socket accepts connections immediately:
+    // `initialize`/`ping` succeed at once and `tools/call` reports "still
+    // indexing" until the view's first snapshot.
+    registry
+        .prewarm(Hello::new(&canonical_base, config_path.as_deref()))
+        .await
+        .map_err(|e| {
+            tracing::error!(target: "meshd", "Cannot build the startup view: {e}");
+            e
+        })?;
+    registry.spawn_sweeper(idle_poll);
 
     // ── Idle watchdog ─────────────────────────────────────────────────────────
-    // Always spawned (P2 step 3.3), regardless of `idle_timeout_minutes`: the startup-grace
-    // deadline below is a separate, unconditional-by-default guarantee against an orphaned
-    // zombie daemon (`ensure_daemon_running` auto-spawns `meshd` ad-hoc, no launchd/systemd — if
-    // that spawn races or a client never finds this daemon's socket at all, this is what
-    // eventually cleans it up), not the opt-in "shut down once idle after real use" policy
-    // `idle_timeout_minutes` controls. `idle_timeout_minutes == 0` disables *that* policy (an
-    // effectively-infinite idle timeout below) without weakening the orphan guard.
-    // `--startup-grace-secs 0` disables the orphan guard itself too — meant for a manual,
-    // interactive `meshd` run where a developer intends to attach a client more than the default
-    // 60s later, not for the ad-hoc auto-spawn path this guard exists for.
+    // Always spawned (P2 step 3.3): the startup-grace deadline is an
+    // unconditional-by-default guard against an orphaned daemon (`mesh-mcp`
+    // auto-spawns `meshd` ad-hoc, no launchd/systemd). Each view is dropped after
+    // `idle_timeout` with no session; the daemon exits once it has no client and
+    // no view left. `idle_timeout_minutes == 0` keeps views (and so the daemon)
+    // forever; `--startup-grace-secs 0` disables the orphan guard too.
     let counter = idle::ClientCounter::new();
-    let idle_timeout = if args.idle_timeout_minutes > 0 {
-        Duration::from_secs(args.idle_timeout_minutes * 60)
-    } else {
-        Duration::from_secs(u64::MAX)
-    };
     let startup_grace = if args.startup_grace_secs > 0 {
         Duration::from_secs(args.startup_grace_secs)
     } else {
         Duration::from_secs(u64::MAX)
     };
-    idle::spawn_idle_watchdog(
+    let alive_registry = Arc::clone(&registry);
+    idle::spawn_idle_watchdog_with(
         counter.clone(),
         cancel_token.clone(),
         idle_timeout,
-        Duration::from_secs(10),
+        idle_poll,
         startup_grace,
+        Some(Arc::new(move || alive_registry.has_views())),
     );
-    match (args.idle_timeout_minutes > 0, args.startup_grace_secs > 0) {
+    match (idle_timeout != Duration::MAX, args.startup_grace_secs > 0) {
         (true, true) => tracing::info!(
             target: "meshd",
-            "Idle watchdog active: shutdown after {} min with no clients (startup grace: {}s).",
-            args.idle_timeout_minutes,
+            "Idle watchdog active: a view is dropped after {idle_timeout:?} with no session, the \
+             daemon stops with the last one (startup grace: {}s).",
             args.startup_grace_secs
         ),
         (true, false) => tracing::info!(
             target: "meshd",
-            "Idle watchdog active: shutdown after {} min with no clients (startup-grace orphan \
-             guard disabled).",
-            args.idle_timeout_minutes
+            "Idle watchdog active: a view is dropped after {idle_timeout:?} with no session, the \
+             daemon stops with the last one (startup-grace orphan guard disabled)."
         ),
         (false, true) => tracing::info!(
             target: "meshd",
@@ -235,12 +218,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── IPC server (blocking until cancelled) ─────────────────────────────────
-    // `write_daemon_meta`/`remove_daemon_meta` (plan 4 step 4.7) run inside
-    // `run_uds_server`/`run_named_pipe_server` themselves, only once bind/pipe
-    // creation actually succeeds — never here, before it's known this process
-    // is the one that will actually serve this workspace's socket (a losing
-    // side of a bind race must never overwrite the winner's record with its
-    // own, already-exiting PID).
+    // The meta file (pid, version, views) is written inside
+    // `run_uds_server_then`/`run_named_pipe_server`, only once bind/pipe creation
+    // succeeds: a losing side of a bind race must never overwrite the winner's
+    // record with its own, already-exiting PID.
     //
     // Plan 4 step 4.10: once the socket is bound, confine the whole process
     // (every thread, via TSYNC) so the kernel refuses any AF_INET/AF_INET6
@@ -248,10 +229,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     server::run_uds_server_then(
         &sock_path,
-        host,
+        Arc::clone(&registry),
         cancel_token,
         counter,
-        &workspace_id,
+        &daemon_id,
         env!("CARGO_PKG_VERSION"),
         sandbox::apply_after_bind,
     )
@@ -266,10 +247,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     server::run_named_pipe_server(
         &pipe_name,
-        host,
+        Arc::clone(&registry),
         cancel_token,
         counter,
-        &workspace_id,
+        &daemon_id,
         env!("CARGO_PKG_VERSION"),
     )
     .await

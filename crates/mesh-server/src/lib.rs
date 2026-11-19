@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod framing;
 mod git;
+pub mod hello;
 pub mod indexer;
 pub mod protocol;
 pub mod spawn_lock;

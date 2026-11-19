@@ -231,9 +231,12 @@ entirely on how much of it is function bodies; no general percentage is claimed.
   response is flushed before the process exits.
 - Notifications (no `id`) never receive a reply. Methods: `initialize`, `ping`, `tools/list`,
   `tools/call`; anything else is `-32601`.
-- In proxy mode, `mesh-mcp run` copies bytes between stdio and the daemon socket without adding
-  any. If the daemon dies mid-session the proxy exits with status 1 and logs the daemon log path;
-  if it cannot connect right after a successful liveness check it falls back to standalone mode.
+- In proxy mode, `mesh-mcp run` first sends one hello line naming its view (8.0.0, see 8.1) and
+  waits for the daemon's ack; no client byte is forwarded before it (the client's `initialize`
+  waits in the stdin buffer). After the ack it copies bytes between stdio and the daemon socket
+  without adding any. If the daemon dies mid-session the proxy exits with status 1 and logs the
+  daemon log path; if it cannot connect right after a successful liveness check, or the daemon
+  refuses the hello, it falls back to standalone mode.
 
 ---
 
@@ -280,7 +283,44 @@ against every crawl (7.1.9).
 
 The daemon transport is a Unix domain socket on macOS/Linux and a named pipe on Windows.
 
-### 8.1 One `meshd` per workspace (P0 step 1.8)
+### 8.1 One `meshd` per repository, one view per worktree (8.0.0)
+
+Inside a Git repository the daemon is named by the repository: `meshd-<family_id>.sock`
+(`\\.\pipe\mesh-mcp-<user>-<family_id>` on Windows), where `family_id`
+(`mesh_core::identity::family_id`) hashes the canonical common Git directory and the binary
+version. The spawn lock, the meta file and the auto-spawn log carry the same id
+(`WorkspaceIdentity::daemon_id`). Outside Git the id is the per-workspace one described below,
+so nothing changes there. `MESH_SOCKET_PATH` still overrides the path.
+
+One daemon serves every worktree and config file of its repository as separate **views**
+(`crates/mesh-daemon/src/views.rs`). Each view is a `WorkspaceHost` with its own state, file
+watcher and config follower; RAM holds one graph per active view. All views share the watcher
+pool, the config-reload pool, the audit logger and the repository's parse cache (8.2).
+
+- **Hello** (`crates/mesh-server/src/hello.rs`, shared by the socket and the pipe): the first
+  line of every connection is `{"meshd_hello":1,"worktree":"<canonical dir>","config":...}`.
+  The daemon reads it under 8 KiB and 5 s and answers `{"meshd_hello_ok":1}` or
+  `{"meshd_hello_error":"<reason>"}`. Anything else, a raw JSON-RPC frame included, gets the
+  error line and the connection is closed. The proxy reads the ack one byte at a time so it
+  consumes nothing after it.
+- **Validation**: the hello's directory and the directory of its config must both resolve
+  (`RepoFamily::resolve`) to the daemon's repository; outside Git they must give exactly the
+  daemon's own per-workspace id. The config must load and the workspace-root guard must accept
+  it. A refused session falls back to standalone mode.
+- **Routing**: views are keyed by `ViewKey` (worktree top, config) plus the directory the state
+  is built from, so without a config each session directory is its own view. The first hello
+  for a key builds it once (one `tokio::sync::OnceCell` per key; the map lock is never held
+  across the build); its scan runs in the background and `tools/call` answers "still indexing"
+  until its first snapshot. The connection then holds that one view for its whole life: no
+  request is ever routed after the hello, so a session can only receive its own view's data.
+- **Lifecycle**: each view counts its sessions. A view with none for `idle_timeout_minutes` is
+  dropped (watcher and config poller cancelled, state freed) and rebuilt on the next hello. The
+  daemon exits once it has no view and no client. The startup view (the one the daemon was
+  spawned for) is built at start so its scan begins before the spawning session connects.
+- **doctor** reads the views (worktree, config, sessions, builds since start) from the meta
+  file, which the daemon rewrites atomically whenever a view is built or dropped.
+
+### 8.1b One `meshd` per workspace outside Git (P0 step 1.8)
 
 Before P0 step 1.8, every `meshd` on a machine bound the same one-per-user socket
 (`~/.cache/mesh/meshd.sock`) regardless of which workspace it was indexing — two unrelated

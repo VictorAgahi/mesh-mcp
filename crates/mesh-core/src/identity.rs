@@ -1,10 +1,9 @@
 //! Repository-level identities (8.0.0): which Git repository a directory belongs to, and which
 //! view of it (worktree plus config file) a session asks for.
 //!
-//! This module only computes identities. Nothing here chooses a socket or a cache directory yet:
-//! the daemon still keys on [`crate::workspace_id`] (carried as [`WorkspaceIdentity::legacy_id`]).
-//! Later changes name the per-repository socket with [`family_id`], the shared parse cache with
-//! [`cache_family_id`], and route a connection to a view with [`ViewKey`].
+//! The per-repository daemon socket is named by [`WorkspaceIdentity::daemon_id`] ([`family_id`]
+//! inside Git, [`crate::workspace_id`] outside), the shared parse cache by [`cache_family_id`],
+//! and the daemon routes each connection to a view by [`ViewKey`].
 
 use std::path::{Path, PathBuf};
 
@@ -74,7 +73,7 @@ pub fn cache_family_id(family: &RepoFamily) -> String {
 }
 
 /// One view of a repository: a worktree plus the config file a session uses.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ViewKey {
     /// Canonical worktree top (the canonical base directory outside Git).
     pub worktree_top: PathBuf,
@@ -117,6 +116,16 @@ impl WorkspaceIdentity {
                 config_rel,
             },
             legacy_id: crate::workspace_id(base_dir, located_config),
+        }
+    }
+
+    /// The id that names this session's daemon (socket, named pipe, spawn lock, meta file, log):
+    /// [`family_id`] inside Git, so every worktree and config of one repository shares one
+    /// `meshd`; [`Self::legacy_id`] outside Git, one daemon per directory and config as before.
+    pub fn daemon_id(&self) -> String {
+        match &self.family {
+            Some(family) => family_id(family),
+            None => self.legacy_id.clone(),
         }
     }
 }
@@ -203,6 +212,9 @@ mod tests {
             Some("mesh-mcp.toml")
         );
         assert_ne!(a.legacy_id, b.legacy_id);
+        // One daemon for the repository, whatever the worktree.
+        assert_eq!(a.daemon_id(), b.daemon_id());
+        assert_eq!(a.daemon_id(), family_id(fa));
         // A subdirectory resolves to the same top.
         std::fs::create_dir_all(wt.join("sub/dir")).expect("mkdir");
         let c = WorkspaceIdentity::resolve(&wt.join("sub/dir"), None);
@@ -251,8 +263,11 @@ mod tests {
             id.view.config_rel.as_deref().map(norm).as_deref(),
             Some("c.toml")
         );
+        assert_eq!(id.daemon_id(), id.legacy_id);
         let none = WorkspaceIdentity::resolve(&base, None);
         assert_eq!(none.legacy_id, crate::workspace_id(&base, None));
+        // Outside Git two configs of one directory keep two daemons.
+        assert_ne!(none.daemon_id(), id.daemon_id());
         assert_eq!(none.view.config_rel, None);
     }
 

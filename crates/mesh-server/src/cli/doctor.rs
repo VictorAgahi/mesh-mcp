@@ -762,9 +762,11 @@ impl DoctorCommand {
         Ok(())
     }
 
-    /// The workspace's own daemon socket, if this run has a resolvable config
-    /// (skipped entirely otherwise — there is no workspace to look one up
-    /// for). Shared by the socket-permission and version checks below.
+    /// The workspace's canonical directory and the id of the daemon that serves
+    /// it (8.0.0: the repository's family id inside Git, the per-workspace id
+    /// outside), if this run has a resolvable config (skipped entirely otherwise —
+    /// there is no workspace to look one up for). Shared by the socket-permission
+    /// and version checks below.
     fn resolved_workspace(config_path: Option<&Path>) -> Option<(PathBuf, String)> {
         // A config that does not parse still pins the workspace (its directory):
         // the daemon serving it must stay visible to the daemon checks.
@@ -775,7 +777,7 @@ impl DoctorCommand {
                 .to_path_buf(),
         };
         let canonical = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
-        let id = WorkspaceIndexer::workspace_id_for(&canonical, config_path);
+        let id = WorkspaceIndexer::identity_for(&canonical, config_path).daemon_id();
         Some((canonical, id))
     }
 
@@ -785,6 +787,7 @@ impl DoctorCommand {
 
         Self::check_socket(&workspace, fix, &mut checks);
         Self::check_daemon_version(&workspace, fix, &mut checks);
+        Self::check_daemon_views(&workspace, &mut checks);
         Self::check_daemon_config(config_path, &workspace, fix, &mut checks);
         Self::check_daemon_sandbox(&workspace, &mut checks);
         // The directory this workspace's parse cache lives in: its repository's shared one
@@ -961,6 +964,51 @@ impl DoctorCommand {
         checks.push(check);
     }
 
+    /// Which views the running `meshd` serves (8.0.0: one daemon per repository,
+    /// one view per worktree and config), from the meta file it rewrites whenever
+    /// a view is built or dropped. Read-only.
+    fn check_daemon_views(workspace: &Option<(PathBuf, String)>, checks: &mut Vec<DoctorCheck>) {
+        const NAME: &str = "Daemon views";
+        let Some((_, daemon_id)) = workspace else {
+            return;
+        };
+        let Some(meta) = mesh_core::socket::read_daemon_meta(daemon_id) else {
+            return;
+        };
+        if !mesh_core::socket::daemon_is_reachable(daemon_id) {
+            return;
+        }
+        let list = meta
+            .views
+            .iter()
+            .map(|v| {
+                let config = v.config.as_deref().and_then(Path::file_name).map_or_else(
+                    || "default config".to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                format!(
+                    "{} ({config}, {} session{})",
+                    v.worktree.display(),
+                    v.clients,
+                    if v.clients == 1 { "" } else { "s" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        checks.push(DoctorCheck::info(
+            NAME,
+            format!(
+                "meshd (pid {}) serves {} view{}{}{} ({} built since start)",
+                meta.pid,
+                meta.views.len(),
+                if meta.views.len() == 1 { "" } else { "s" },
+                if list.is_empty() { "" } else { ": " },
+                list,
+                meta.view_builds
+            ),
+        ));
+    }
+
     /// Whether the running `meshd` serves the config file as it is on disk.
     /// `meshd` follows its config (7.1.7) and records which config hash it was
     /// built from; this warns when the file moved on and the daemon did not follow
@@ -974,10 +1022,13 @@ impl DoctorCommand {
     ) {
         use mesh_core::config_watch::{config_drift, read_daemon_config_status, ConfigDrift};
         const NAME: &str = "Daemon config";
-        let Some((_, workspace_id)) = workspace else {
+        let Some((base_dir, workspace_id)) = workspace else {
             return;
         };
-        let status = read_daemon_config_status(workspace_id);
+        // The config status is per view, keyed by this directory's own
+        // per-workspace id; the daemon (meta, socket) by `workspace_id`.
+        let view_id = WorkspaceIndexer::workspace_id_for(base_dir, config_path);
+        let status = read_daemon_config_status(&view_id);
         // Only a daemon confirmed to serve this workspace's socket right now
         // (a crash leaves the records behind).
         let reachable = mesh_core::socket::daemon_is_reachable(workspace_id);
