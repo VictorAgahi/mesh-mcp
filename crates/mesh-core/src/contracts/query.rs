@@ -366,7 +366,7 @@ impl ContractGraph {
             }
             Some(match (pkg, package) {
                 (None, _) => recorded,
-                (Some(p), Some(want)) if p.eq_ignore_ascii_case(want) => recorded,
+                (Some(p), Some(want)) if fold_rpc_name(p) == fold_rpc_name(want) => recorded,
                 (Some(_), Some(_)) => EdgeConfidence::Ambiguous,
                 (Some(_), None) => EdgeConfidence::Heuristic,
             })

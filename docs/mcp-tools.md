@@ -761,19 +761,32 @@ repositories), the working tree is compared with a base revision at the **contra
   `analyze_grpc` (see [Wire-format check](#wire-format-check)). It reuses the base sha and the two
   versions already read: no further `git` run.
 
-**Output**: dense Markdown, budgeted inside the tool so the registry's 48 KB cut never has to
-fire. In order: the roots and their base, the summary of counts and the notes (files left out by
-the cap or the time budget, roots not compared); the wire-format results, never dropped (a report
-that does not fit in full keeps its result line, with the count of `WIRE_FORMAT_BREAKING_CHANGE`);
-the impact rows; the per-file sections. Each section that is cut ends with an "N more ... narrow
-`scope`" line.
+**Output**: dense Markdown, budgeted inside the tool within 44 KB (under the 48 KB cap, with room
+for the notes the registry prepends); a final clamp enforces the bound. In order:
+1. The roots and their base (at most 10 listed), the summary of counts and the notes (files left
+   out by the cap or the time budget, at most 20 names each; roots not compared). The summary
+   always carries the count of `WIRE_FORMAT_BREAKING_CHANGE` and of `.proto` files not checked
+   (time budget, file cap, a version not read or not parsed).
+2. `### Wire-format checks (N changed .proto)`, within 16 KB: breaking results first (the full
+   report, else its result line), then not checked or not compared, removed, clean. Past the
+   budget, results collapse into counts: "N more breaking `.proto` not listed", "N `.proto` with
+   no wire-format breaking change".
+3. The impact rows; the "impact not computed" notes always fit.
+4. The per-file sections.
+
+Each section that is cut ends with an "N more ... narrow `scope`" line. Paths are clipped to 160
+characters, prose lines to 320.
 
 **Bounds**: at most 2,000 changed files analysed per call (the rest counted in a note naming
-`scope`); a 20 s budget for the whole call, after which the files not yet extracted are named as
-"not analysed: time budget" and the `.proto` files not yet checked as "not checked"; 4 MB per path
-listing; 32 MB of base contents in total across repositories; 60 looked-up elements and 10 impact
-rows each; 40 changes listed per file; signatures cut at 160 characters; 5 s per `git` command, no
-shell, the same hardened environment as `analyze_grpc`.
+`scope`); a time budget of about 20 s for the whole call, checked between files and between
+impact queries: the files not yet extracted are named as "not analysed: time budget", the
+`.proto` files not yet checked are counted as not checked, and the elements whose impact was not
+looked up are counted ("impact not computed for N element(s): cap" or ": time budget"). Impact
+queries run in order of importance (removed RPCs, removed declarations, signature changes,
+topics), and the 60-element cap is applied before a query runs; 10 impact rows each. 4 MB per path
+listing; 32 MB of base contents in total across repositories; 40 changes listed per file;
+signatures cut at 160 characters; 5 s per `git` command, no shell, the same hardened environment
+as `analyze_grpc`.
 
 **Errors**: a malformed `base` (starts with `-`, contains `:`, whitespace) is refused before any
 `git` runs (`-32602`); an explicit `base` that names no commit is `-32602` and, in a shallow clone,
@@ -782,7 +795,7 @@ other roots could be compared it is listed as "Root not compared" and the call s
 `base`, a repository with no `origin/HEAD`, `origin/main` or `main` (or no merge-base with it)
 falls back to `HEAD`, which the root line says. A detached `HEAD` works like a branch.
 
-**Negative Constraints**: This is the tool for 'what does my branch change in the mesh / what will this change break'. Body-only edits are counted, never listed. DO NOT USE to trace one known symbol, RPC or topic (use find_dependents, analyze_grpc or analyze_impact). DO NOT pass a file path or a `--option` as `base`.
+**Negative Constraints**: This is the tool for 'what does my branch change in the mesh / what will this change break'. Body-only edits are counted, never listed. The time budget is about 20 s, checked between files: files, .proto and elements it does not reach are counted and named, never dropped. DO NOT USE to trace one known symbol, RPC or topic (use find_dependents, analyze_grpc or analyze_impact). DO NOT pass a file path or a `--option` as `base`.
 
 #### JSON Schema
 ```json
@@ -811,7 +824,9 @@ shortened:
 
 - **Root** `/work/demo`: base merge-base of `HEAD` and `main` (`f12cc14677f9`)
 
-**Summary**: 5 changed source file(s) — 3 with contract changes, 1 body-only, 1 skipped. Declarations +3 -0 ~1; RPCs/services +0 -1 ~0; routes +0 -0 ~0; producers +1 -0; consumers +0 -0; imports +2 -0; RPC calls +0 -0. Wire-format breaking changes: 1. Impacted call sites / dependents: 2.
+**Summary**: 5 changed source file(s) — 3 with contract changes, 1 body-only, 1 skipped. Declarations +3 -0 ~1; RPCs/services +0 -1 ~0; routes +0 -0 ~0; producers +1 -0; consumers +0 -0; imports +2 -0; RPC calls +0 -0. Wire-format breaking changes: 1 in 1 `.proto`. Impacted call sites / dependents: 2.
+
+### Wire-format checks (1 changed `.proto`)
 
 ### Wire-format check: `proto/user.proto`
 - **Base**: merge-base of `HEAD` and `main` (`f12cc14677f9`), compared with the working tree

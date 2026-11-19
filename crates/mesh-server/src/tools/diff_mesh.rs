@@ -5,7 +5,7 @@
 use crate::git::{self, BaseChoice, GitError, GitRunner};
 use crate::indexer::{ContentExtractor, WorkspaceIndexer};
 use crate::protocol::RequestMeta;
-use crate::tools::analyze_grpc::{compare_wire, render_report};
+use crate::tools::analyze_grpc::{compare_wire, render_report, WireClass};
 use crate::tools::find_dependents::is_indexable_source;
 use crate::tools::smart_search::SearchScope;
 use crate::tools::{McpTool, ToolError, ToolOutput};
@@ -48,7 +48,7 @@ pub struct DiffMeshTool;
 
 impl McpTool for DiffMeshTool {
     const NAME: &'static str = "diff_mesh";
-    const DESCRIPTION: &'static str = "Contract-level diff of the working tree (uncommitted edits and untracked files included) against a Git base, per configured root: declarations added, removed or with a changed signature, gRPC services and RPCs, HTTP routes, event producers and consumers per topic, imports and RPC calls; then, from the live graph, the callers and dependents of every removed or changed symbol and RPC (path:line, heuristic or ambiguous rows marked) and the .proto wire-format check of every changed .proto. This is the tool for 'what does my branch change in the mesh / what will this change break'. Body-only edits are counted, never listed. DO NOT USE to trace one known symbol, RPC or topic (use find_dependents, analyze_grpc or analyze_impact). DO NOT pass a file path or a `--option` as `base`.";
+    const DESCRIPTION: &'static str = "Contract-level diff of the working tree (uncommitted edits and untracked files included) against a Git base, per configured root: declarations added, removed or with a changed signature, gRPC services and RPCs, HTTP routes, event producers and consumers per topic, imports and RPC calls; then, from the live graph, the callers and dependents of every removed or changed symbol and RPC (path:line, heuristic or ambiguous rows marked) and the .proto wire-format check of every changed .proto. This is the tool for 'what does my branch change in the mesh / what will this change break'. Body-only edits are counted, never listed. The time budget is about 20 s, checked between files: files, .proto and elements it does not reach are counted and named, never dropped. DO NOT USE to trace one known symbol, RPC or topic (use find_dependents, analyze_grpc or analyze_impact). DO NOT pass a file path or a `--option` as `base`.";
     type Args = DiffMeshArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {
@@ -163,6 +163,8 @@ struct Counters {
     cap: usize,
     /// Files not extracted because the call's time budget was spent.
     timed_out: Vec<String>,
+    /// Changed `.proto` files left out by the file cap: never wire-checked.
+    protos_capped: usize,
 }
 
 /// The configured roots and their display names (`WorkspaceIndexer::repo_names`:
@@ -893,7 +895,7 @@ fn run_with(
             changed.push(Changed {
                 repo_id,
                 root_diff,
-                display: view.path(&abs),
+                display: clip_path(&view.path(&abs)),
                 abs,
                 rel_top,
             });
@@ -920,6 +922,10 @@ fn run_with(
     changed.sort_by(|a, b| a.display.cmp(&b.display));
     if changed.len() > limits.max_files {
         counters.truncated = changed.len() - limits.max_files;
+        counters.protos_capped = changed[limits.max_files..]
+            .iter()
+            .filter(|c| is_proto(&c.abs))
+            .count();
         changed.truncate(limits.max_files);
     }
 
@@ -970,9 +976,17 @@ fn run_with(
     let mut reports: Vec<FileReport> = Vec::new();
     let mut files_accessed: Vec<String> = Vec::new();
     let mut protos: Vec<ProtoInput> = Vec::new();
+    // Changed `.proto` files the extraction loop never reached (time budget).
+    let mut pending_protos: Vec<String> = Vec::new();
     for (i, c) in changed.iter().enumerate() {
         if Instant::now() >= deadline {
             counters.timed_out = changed[i..].iter().map(|c| c.display.clone()).collect();
+            pending_protos.extend(
+                changed[i..]
+                    .iter()
+                    .filter(|c| is_proto(&c.abs))
+                    .map(|c| c.display.clone()),
+            );
             break;
         }
         let base_side = base_sides.remove(&i).unwrap_or(Side::Absent);
@@ -1040,34 +1054,46 @@ fn run_with(
 
     // 5. Impact from the live graph, and the wire check of every changed .proto.
     let snapshot = state.snapshot();
-    let impact = render_impact(&reports, &snapshot.contract_graph, &view);
+    let impact = render_impact(&reports, &snapshot.contract_graph, &view, deadline);
     let mut wire: Vec<WireEntry> = reports
         .iter()
         .filter(|r| is_proto(&r.abs) && r.status == FileStatus::Removed)
         .map(|r| {
-            WireEntry::note(
+            WireEntry::new(
                 &r.display,
-                "file removed: every message and RPC it declared is gone (its RPC removals are listed with the file)",
+                WireRank::Removed,
+                "file removed: every message and RPC it declared is gone (its RPC removals are listed with the file)".into(),
             )
         })
         .collect();
+    const TIME_BUDGET_SPENT: &str = "not checked: the time budget of this call is spent; run `analyze_grpc` with this `.proto` as `target`";
+    for display in &pending_protos {
+        wire.push(WireEntry::new(
+            display,
+            WireRank::NotChecked,
+            TIME_BUDGET_SPENT.into(),
+        ));
+    }
     for p in protos {
         if Instant::now() >= deadline {
-            wire.push(WireEntry::unchecked(
+            wire.push(WireEntry::new(
                 &p.display,
-                "not checked: the time budget of this call is spent; run `analyze_grpc` with this `.proto` as `target`",
+                WireRank::NotChecked,
+                TIME_BUDGET_SPENT.into(),
             ));
             continue;
         }
         let d = &diffs[p.root_diff];
         match (p.before, p.after) {
-            (Err(why), _) => wire.push(WireEntry::unchecked(
+            (Err(why), _) => wire.push(WireEntry::new(
                 &p.display,
-                &format!("not checked: the base version was not read ({why})"),
+                WireRank::NotChecked,
+                format!("not checked: the base version was not read ({why})"),
             )),
-            (_, Err(why)) => wire.push(WireEntry::unchecked(
+            (_, Err(why)) => wire.push(WireEntry::new(
                 &p.display,
-                &format!("not checked: the working-tree version was not read ({why})"),
+                WireRank::NotChecked,
+                format!("not checked: the working-tree version was not read ({why})"),
             )),
             (Ok(before), Ok(after)) => {
                 let report = compare_wire(
@@ -1108,48 +1134,55 @@ struct ProtoInput {
     after: Result<Option<String>, String>,
 }
 
-/// One `.proto`'s wire-format result: the full report, and the one-line form
-/// kept when the full one does not fit the output budget.
+/// The order wire results are listed in, most important first: a breaking
+/// result is never collapsed before a clean one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum WireRank {
+    Breaking,
+    /// Not checked (time budget, a version not read) or not compared (a
+    /// version that does not parse): nothing is claimed about it.
+    NotChecked,
+    Removed,
+    Clean,
+}
+
+/// One changed `.proto`'s wire-format result: its one-line form, and the full
+/// report for a breaking result (listed in full while the section has room).
 struct WireEntry {
-    full: String,
-    compact: String,
+    display: String,
+    rank: WireRank,
+    result: String,
+    full: Option<String>,
     breaks: usize,
-    unchecked: bool,
 }
 
 impl WireEntry {
-    fn note(display: &str, result: &str) -> Self {
-        let full = format!("\n### Wire-format check: `{display}`\n- **Result**: {result}\n");
+    fn new(display: &str, rank: WireRank, result: String) -> Self {
         Self {
-            compact: full.clone(),
-            full,
+            display: clip_path(display),
+            rank,
+            result: clip_line(&result),
+            full: None,
             breaks: 0,
-            unchecked: false,
-        }
-    }
-
-    fn unchecked(display: &str, result: &str) -> Self {
-        Self {
-            unchecked: true,
-            ..Self::note(display, result)
         }
     }
 
     fn report(display: &str, report: &crate::tools::analyze_grpc::WireReport) -> Self {
-        let breaks = report.breaking_count();
-        let result = if breaks > 0 {
-            format!("{breaks} `WIRE_FORMAT_BREAKING_CHANGE`")
-        } else {
-            "no wire-format breaking change".to_string()
+        let (class, result) = report.summary();
+        let rank = match class {
+            WireClass::Breaking => WireRank::Breaking,
+            WireClass::NotCompared => WireRank::NotChecked,
+            WireClass::Clean => WireRank::Clean,
         };
         Self {
-            full: render_report(report),
-            compact: format!(
-                "\n### Wire-format check: `{display}`\n- **Result**: {result} (details cut to stay under the 48 KB cap: run `analyze_grpc` with this `.proto` as `target`, or narrow `scope`)\n"
-            ),
-            breaks,
-            unchecked: false,
+            full: (rank == WireRank::Breaking).then(|| render_report(report)),
+            breaks: report.breaking_count(),
+            ..Self::new(display, rank, result)
         }
+    }
+
+    fn line(&self) -> String {
+        format!("- `{}`: {}\n", self.display, self.result)
     }
 }
 
@@ -1176,7 +1209,7 @@ fn push_rows(
             out,
             "- `{}` in `{}:{}` _({how})_",
             node.name,
-            view.path(&node.file_path),
+            clip_path(&view.path(&node.file_path)),
             node.line_start
         );
     }
@@ -1186,71 +1219,107 @@ fn push_rows(
     *sites += rows.len();
 }
 
-fn render_impact(reports: &[FileReport], graph: &ContractGraph, view: &RootView<'_>) -> Impact {
-    let mut items: Vec<String> = Vec::new();
-    let mut sites = 0usize;
-    let mut skipped_items = 0usize;
+/// Which graph query an element's impact needs.
+enum Lookup<'a> {
+    Rpc(&'a str, Option<&'a str>),
+    Symbol(&'a str),
+    Topic(&'a str, bool),
+}
+
+/// Looks up the impact of removed and changed elements, most important first:
+/// removed RPCs, removed declarations, signature changes, then topics. The item
+/// cap and the call's deadline are checked BEFORE each query, so no query runs
+/// for an element that would be dropped; the elements they stop are counted.
+fn render_impact(
+    reports: &[FileReport],
+    graph: &ContractGraph,
+    view: &RootView<'_>,
+    deadline: Instant,
+) -> Impact {
     let (mut routes, mut services) = (0usize, 0usize);
+    // (priority, file, change, query)
+    let mut wanted: Vec<(u8, &FileReport, &Change, Lookup<'_>)> = Vec::new();
     for r in reports {
         for ch in &r.changes {
             if ch.kind == ChangeKind::Added {
                 continue;
             }
-            let what = if ch.kind == ChangeKind::Removed {
-                "removed"
-            } else {
-                "signature changed"
-            };
-            let package = || {
-                ch.base
-                    .as_ref()
-                    .or(ch.current.as_ref())
-                    .and_then(|v| v.package.as_deref())
-            };
-            let looked_up = match &ch.fact {
-                Fact::Rpc("RPC", name) => Some(rpc_impact(graph, name, package(), &r.abs)),
+            let removed = ch.kind == ChangeKind::Removed;
+            let package = ch
+                .base
+                .as_ref()
+                .or(ch.current.as_ref())
+                .and_then(|v| v.package.as_deref());
+            let (priority, lookup) = match &ch.fact {
+                Fact::Rpc("RPC", name) => (if removed { 0 } else { 2 }, Lookup::Rpc(name, package)),
                 Fact::Rpc(..) => {
                     services += 1;
-                    None
+                    continue;
                 }
                 Fact::Route(_) => {
                     routes += 1;
-                    None
+                    continue;
                 }
                 Fact::Decl(_, name)
                     if name.chars().count() >= 3
                         && !GENERIC_NAMES.contains(&name.to_ascii_lowercase().as_str()) =>
                 {
-                    Some(symbol_impact(graph, name, &r.abs))
+                    (if removed { 1 } else { 2 }, Lookup::Symbol(name))
                 }
-                Fact::Produces(topic) if ch.kind == ChangeKind::Removed => {
-                    Some(topic_impact(graph, topic, true, &r.abs))
-                }
-                Fact::Consumes(topic) if ch.kind == ChangeKind::Removed => {
-                    Some(topic_impact(graph, topic, false, &r.abs))
-                }
-                _ => None,
+                Fact::Produces(topic) if removed => (3, Lookup::Topic(topic, true)),
+                Fact::Consumes(topic) if removed => (3, Lookup::Topic(topic, false)),
+                _ => continue,
             };
-            let Some((rows, empty_note)) = looked_up else {
-                continue;
-            };
-            if items.len() >= MAX_IMPACT_ITEMS {
-                skipped_items += 1;
-                continue;
-            }
-            let mut item = format!("\n#### {} {what} — `{}`\n", ch.fact.describe(), r.display);
-            if rows.is_empty() {
-                let _ = writeln!(item, "- {empty_note}");
-            } else {
-                push_rows(&mut item, &rows, view, &mut sites);
-            }
-            items.push(item);
+            wanted.push((priority, r, ch, lookup));
         }
     }
+    // Stable: within one priority, the file order of the report.
+    wanted.sort_by_key(|(p, _, _, _)| *p);
+
+    let mut items: Vec<String> = Vec::new();
+    let mut sites = 0usize;
+    let (mut capped, mut timed_out) = (0usize, 0usize);
+    for (_, r, ch, lookup) in &wanted {
+        if items.len() >= MAX_IMPACT_ITEMS {
+            capped += 1;
+            continue;
+        }
+        if Instant::now() >= deadline {
+            timed_out += 1;
+            continue;
+        }
+        let (rows, empty_note) = match lookup {
+            Lookup::Rpc(name, package) => rpc_impact(graph, name, *package, &r.abs),
+            Lookup::Symbol(name) => symbol_impact(graph, name, &r.abs),
+            Lookup::Topic(topic, producer) => topic_impact(graph, topic, *producer, &r.abs),
+        };
+        let what = if ch.kind == ChangeKind::Removed {
+            "removed"
+        } else {
+            "signature changed"
+        };
+        let mut item = format!(
+            "\n#### {} {what} — `{}`\n",
+            clip_line(&ch.fact.describe()),
+            r.display
+        );
+        if rows.is_empty() {
+            let _ = writeln!(item, "- {empty_note}");
+        } else {
+            push_rows(&mut item, &rows, view, &mut sites);
+        }
+        items.push(item);
+    }
     let mut notes = Vec::new();
-    if skipped_items > 0 {
+    if capped > 0 {
         notes.push(format!(
-            "\n*{skipped_items} more removed or changed element(s) not looked up (limit {MAX_IMPACT_ITEMS}); narrow `scope`.*\n"
+            "\n*Impact not computed for {capped} element(s): cap ({MAX_IMPACT_ITEMS} per call); narrow `scope`.*\n"
+        ));
+    }
+    if timed_out > 0 {
+        notes.push(format!(
+            "\n*Impact not computed for {timed_out} element(s): time budget ({} s) of this call spent; narrow `scope`.*\n",
+            CALL_TIME_BUDGET.as_secs()
         ));
     }
     if routes + services > 0 {
@@ -1389,6 +1458,33 @@ fn clip(sig: &str) -> String {
     format!("{cut}…")
 }
 
+/// Longest prose line (a result, a heading's description) kept as written.
+const MAX_LINE_CHARS: usize = 320;
+/// Longest path shown; a longer one keeps its end (the file name).
+const MAX_PATH_CHARS: usize = 160;
+
+/// `text` on one line, at most [`MAX_LINE_CHARS`]. Its Markdown is kept when it
+/// fits; a cut line loses its backticks, so no code span is left open.
+fn clip_line(text: &str) -> String {
+    let flat = text.replace(['\n', '\r'], " ");
+    if flat.chars().count() <= MAX_LINE_CHARS {
+        return flat;
+    }
+    let cut: String = flat.chars().take(MAX_LINE_CHARS).collect();
+    format!("{}…", cut.replace('`', "'"))
+}
+
+/// A path for display, at most [`MAX_PATH_CHARS`], with no backtick.
+fn clip_path(path: &str) -> String {
+    let flat = path.replace(['\n', '\r'], " ").replace('`', "'");
+    let n = flat.chars().count();
+    if n <= MAX_PATH_CHARS {
+        return flat;
+    }
+    let tail: String = flat.chars().skip(n - (MAX_PATH_CHARS - 1)).collect();
+    format!("…{tail}")
+}
+
 fn signature_of(val: &FactVal) -> String {
     val.signatures
         .iter()
@@ -1487,11 +1583,59 @@ fn describe_base(d: &RootDiff) -> String {
     }
 }
 
-/// The answer, budgeted section by section so the registry's 48 KB cut never
-/// has to fire: the summary first, then the wire-format results (never dropped:
-/// a result that does not fit in full keeps its one-line form), then the impact
-/// rows, then the per-file sections. Every section that is cut ends with an
-/// "N more, narrow `scope`" line.
+/// Bytes the wire-format section may take: room for every breaking report a
+/// branch usually has, the one-line results after them, and the closing
+/// counts. Its result lines are collapsed into counts past it.
+const WIRE_BUDGET: usize = 16 * 1024;
+/// Roots and failed roots listed in the header; the rest are counted.
+const MAX_LISTED_ROOTS: usize = 10;
+/// File names listed in one note (time budget, body-only); the rest are counted.
+const MAX_LISTED_NAMES: usize = 20;
+
+/// Appends `piece` when `out` stays within `limit` bytes plus `reserve`.
+fn push_within(out: &mut String, piece: &str, limit: usize, reserve: usize) -> bool {
+    if out.len() + piece.len() + reserve <= limit {
+        out.push_str(piece);
+        true
+    } else {
+        false
+    }
+}
+
+/// `names` as a backticked list of at most [`MAX_LISTED_NAMES`], then a count.
+fn listed_names<'a>(names: impl Iterator<Item = &'a String>, total: usize) -> String {
+    let listed: Vec<String> = names
+        .take(MAX_LISTED_NAMES)
+        .map(|n| format!("`{}`", clip_path(n)))
+        .collect();
+    let more = total.saturating_sub(listed.len());
+    format!(
+        "{}{}",
+        listed.join(", "),
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
+    )
+}
+
+/// The answer, budgeted section by section within [`OUTPUT_BUDGET`] (44 KB,
+/// under the registry's 48 KB cap with room for the notes it prepends):
+///
+/// 1. the header and summary: bounded by construction (at most
+///    [`MAX_LISTED_ROOTS`] roots, [`MAX_LISTED_NAMES`] names per note, clipped
+///    paths and messages, counts otherwise); the wire-format breaking COUNT is
+///    in the summary, so it is always shown;
+/// 2. the wire-format results, within [`WIRE_BUDGET`]: breaking first (full
+///    report, else its result line), then not checked / not compared, removed,
+///    clean; what does not fit is collapsed into counts;
+/// 3. the impact rows, with their closing notes reserved;
+/// 4. the per-file sections.
+///
+/// Each cut section ends with an "N more ... narrow `scope`" line. A final
+/// clamp cuts at [`OUTPUT_BUDGET`] should the sections ever overrun it; the
+/// sizes above keep it from firing.
 fn render(
     diffs: &[RootDiff],
     failures: &[RootFailure],
@@ -1506,19 +1650,35 @@ fn render(
     let skipped = reports.iter().filter(|r| r.skipped.is_some()).count();
     let body_only = reports.len() - with_changes - skipped;
     let wire_breaks: usize = wire.iter().map(|w| w.breaks).sum();
-    let wire_unchecked = wire.iter().filter(|w| w.unchecked).count();
+    let breaking_protos = wire.iter().filter(|w| w.rank == WireRank::Breaking).count();
+    // Every changed `.proto` that was not compared: not reached, not read, not
+    // parsed, or left out by the file cap.
+    let wire_unchecked = wire
+        .iter()
+        .filter(|w| w.rank == WireRank::NotChecked)
+        .count()
+        + counters.protos_capped;
+
+    // 1. Header and summary.
     let mut out = String::from("## Mesh diff: working tree against the Git base\n\n");
-    for d in diffs {
+    for d in diffs.iter().take(MAX_LISTED_ROOTS) {
         let _ = writeln!(
             out,
             "- **Root** `{}`: base {}",
-            view.root(&d.root),
+            clip_path(&view.root(&d.root)),
             describe_base(d)
+        );
+    }
+    if diffs.len() > MAX_LISTED_ROOTS {
+        let _ = writeln!(
+            out,
+            "- … and {} more root(s)",
+            diffs.len() - MAX_LISTED_ROOTS
         );
     }
     let _ = writeln!(
         out,
-        "\n**Summary**: {} changed source file(s) — {with_changes} with contract changes, {body_only} body-only, {skipped} skipped. Declarations +{} -{} ~{}; RPCs/services +{} -{} ~{}; routes +{} -{} ~{}; producers +{} -{}; consumers +{} -{}; imports +{} -{}; RPC calls +{} -{}. Wire-format breaking changes: {wire_breaks}{}. Impacted call sites / dependents: {}.",
+        "\n**Summary**: {} changed source file(s) — {with_changes} with contract changes, {body_only} body-only, {skipped} skipped. Declarations +{} -{} ~{}; RPCs/services +{} -{} ~{}; routes +{} -{} ~{}; producers +{} -{}; consumers +{} -{}; imports +{} -{}; RPC calls +{} -{}. Wire-format breaking changes: {wire_breaks} in {breaking_protos} `.proto`{}. Impacted call sites / dependents: {}.",
         reports.len(),
         t.decl[0], t.decl[1], t.decl[2],
         t.rpc[0], t.rpc[1], t.rpc[2],
@@ -1528,7 +1688,7 @@ fn render(
         t.imports[0], t.imports[1],
         t.calls[0], t.calls[1],
         if wire_unchecked > 0 {
-            format!(" ({wire_unchecked} `.proto` not checked, see below)")
+            format!(" ({wire_unchecked} `.proto` not checked)")
         } else {
             String::new()
         },
@@ -1551,71 +1711,91 @@ fn render(
             );
         }
         if !counters.timed_out.is_empty() {
-            let listed: Vec<String> = counters
-                .timed_out
-                .iter()
-                .take(20)
-                .map(|p| format!("`{p}`"))
-                .collect();
-            let more = counters.timed_out.len().saturating_sub(20);
             let _ = writeln!(
                 out,
-                "> {} changed file(s) not analysed: time budget ({} s) of this call spent: {}{}.",
+                "> {} changed file(s) not analysed: time budget (about {} s, checked between files) of this call spent: {}.",
                 counters.timed_out.len(),
                 CALL_TIME_BUDGET.as_secs(),
-                listed.join(", "),
-                if more > 0 {
-                    format!(" and {more} more")
-                } else {
-                    String::new()
-                }
+                listed_names(counters.timed_out.iter(), counters.timed_out.len())
             );
         }
         out.push_str("> Narrow `scope` to one root or one sub-directory to cover them.\n");
     }
-    for f in failures {
+    for f in failures.iter().take(MAX_LISTED_ROOTS) {
         let _ = writeln!(
             out,
             "\n**Root not compared** `{}`: {}",
-            view.root(&f.root),
+            clip_path(&view.root(&f.root)),
             clip(&f.message)
         );
     }
-
-    // Wire-format results: the full report while it fits, its one-line form
-    // otherwise. The one-line forms are always written (one per changed
-    // `.proto`, which `MAX_CHANGED_FILES` bounds).
-    let compact_total: usize = wire.iter().map(|w| w.compact.len()).sum();
-    let mut compact_left = compact_total;
-    let mut shortened = 0usize;
-    for w in wire {
-        compact_left -= w.compact.len();
-        let room = OUTPUT_BUDGET.saturating_sub(out.len() + compact_left + NOTE_RESERVE);
-        if w.full.len() <= room {
-            out.push_str(&w.full);
-        } else {
-            out.push_str(&w.compact);
-            shortened += 1;
-        }
-    }
-    if shortened > 0 {
+    if failures.len() > MAX_LISTED_ROOTS {
         let _ = writeln!(
             out,
-            "\n*{shortened} wire-format report(s) shortened to their result line to stay under the 48 KB cap; narrow `scope`, or run `analyze_grpc` on the `.proto`, for the findings.*"
+            "\n*… and {} more root(s) not compared.*",
+            failures.len() - MAX_LISTED_ROOTS
         );
     }
 
-    // Impact rows, then per-file sections, each while it fits.
+    // 2. Wire-format results, most important first.
+    if !wire.is_empty() {
+        let mut ordered: Vec<&WireEntry> = wire.iter().collect();
+        ordered.sort_by_key(|w| w.rank);
+        let limit = (out.len() + WIRE_BUDGET).min(OUTPUT_BUDGET);
+        let _ = writeln!(
+            out,
+            "\n### Wire-format checks ({} changed `.proto`)",
+            wire.len()
+        );
+        // The four closing count lines below are at most this long each.
+        let reserve = 4 * 200;
+        // Left out, per rank: breaking, not checked, removed, clean.
+        let mut left = [0usize; 4];
+        for w in ordered {
+            let shown = match (&w.full, w.rank) {
+                (Some(full), WireRank::Breaking) if push_within(&mut out, full, limit, reserve) => {
+                    true
+                }
+                _ => push_within(&mut out, &w.line(), limit, reserve),
+            };
+            if !shown {
+                left[w.rank as usize] += 1;
+            }
+        }
+        let [breaking, unchecked, removed, clean] = left;
+        if breaking > 0 {
+            let _ = writeln!(
+                out,
+                "\n*{breaking} more breaking `.proto` not listed (counted in the summary); narrow `scope`.*"
+            );
+        }
+        if unchecked > 0 {
+            let _ = writeln!(
+                out,
+                "\n*{unchecked} more `.proto` not checked or not compared, not listed; narrow `scope`.*"
+            );
+        }
+        if removed > 0 {
+            let _ = writeln!(out, "\n*{removed} more removed `.proto` not listed.*");
+        }
+        if clean > 0 {
+            let _ = writeln!(
+                out,
+                "\n*{clean} `.proto` with no wire-format breaking change.*"
+            );
+        }
+    }
+
+    // 3. Impact rows; the closing notes have their room reserved.
+    let notes_len: usize = impact.notes.iter().map(String::len).sum();
     if !impact.items.is_empty() || !impact.notes.is_empty() {
         out.push_str("\n### Impact (live graph)\n");
     }
     let mut left_out = 0usize;
     for item in &impact.items {
-        if out.len() + item.len() + NOTE_RESERVE > OUTPUT_BUDGET {
+        if !push_within(&mut out, item, OUTPUT_BUDGET, notes_len + NOTE_RESERVE) {
             left_out += 1;
-            continue;
         }
-        out.push_str(item);
     }
     if left_out > 0 {
         let _ = writeln!(
@@ -1624,23 +1804,27 @@ fn render(
         );
     }
     for note in &impact.notes {
-        if out.len() + note.len() + NOTE_RESERVE <= OUTPUT_BUDGET {
-            out.push_str(note);
-        }
+        out.push_str(note);
     }
 
+    // 4. Per-file sections.
     let listed: Vec<&FileReport> = reports
         .iter()
         .filter(|r| !r.changes.is_empty() || r.skipped.is_some())
         .collect();
     if !listed.is_empty() {
-        out.push_str("\n### Contract changes per file\n");
+        push_within(
+            &mut out,
+            "\n### Contract changes per file\n",
+            OUTPUT_BUDGET,
+            NOTE_RESERVE,
+        );
     }
     let mut unlisted = 0usize;
     for r in &listed {
         let mut section = format!("\n#### `{}` ({})\n", r.display, r.status.label());
         if let Some(why) = &r.skipped {
-            let _ = writeln!(section, "- skipped: {why}");
+            let _ = writeln!(section, "- skipped: {}", clip_line(why));
         }
         for ch in r.changes.iter().take(MAX_CHANGES_PER_FILE) {
             section.push_str(&render_change(ch));
@@ -1653,11 +1837,9 @@ fn render(
                 r.changes.len() - MAX_CHANGES_PER_FILE
             );
         }
-        if out.len() + section.len() + NOTE_RESERVE > OUTPUT_BUDGET {
+        if !push_within(&mut out, &section, OUTPUT_BUDGET, NOTE_RESERVE) {
             unlisted += 1;
-            continue;
         }
-        out.push_str(&section);
     }
     if unlisted > 0 {
         let _ = writeln!(
@@ -1666,26 +1848,32 @@ fn render(
         );
     }
     if body_only > 0 {
-        let names: Vec<String> = reports
+        let names = reports
             .iter()
             .filter(|r| r.changes.is_empty() && r.skipped.is_none())
-            .take(20)
-            .map(|r| format!("`{}`", r.display))
-            .collect();
+            .map(|r| &r.display);
         let line = format!(
-            "\n*No contract-level change (body edits only): {}{}*\n",
-            names.join(", "),
-            if body_only > 20 {
-                format!(" and {} more", body_only - 20)
-            } else {
-                String::new()
-            }
+            "\n*No contract-level change (body edits only): {}*\n",
+            listed_names(names, body_only)
         );
-        if out.len() + line.len() <= OUTPUT_BUDGET {
-            out.push_str(&line);
-        } else {
+        if !push_within(&mut out, &line, OUTPUT_BUDGET, 0) {
             let _ = writeln!(out, "\n*{body_only} file(s) with body edits only.*");
         }
+    }
+
+    // Final clamp: never fires with the sizes above; it makes the bound hold
+    // whatever a future section adds.
+    if out.len() > OUTPUT_BUDGET {
+        let note = "\n\n*Answer cut at the output budget; narrow `scope`.*\n";
+        let mut cut = OUTPUT_BUDGET - note.len();
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if let Some(nl) = out[..cut].rfind('\n') {
+            cut = nl;
+        }
+        out.truncate(cut);
+        out.push_str(note);
     }
     out
 }
@@ -2197,7 +2385,7 @@ func Connect(conn any) {
     #[test]
     fn impact_overflow_keeps_the_wire_result_and_says_what_was_cut() {
         let repo = TempRepo::new();
-        let names: Vec<String> = (0..60)
+        let names: Vec<String> = (0..65)
             .map(|i| format!("computeTheQuarterlyRevenueForRegionNumber{i:02}"))
             .collect();
         let lib = |extra: &str| {
@@ -2253,6 +2441,12 @@ func Connect(conn any) {
             ),
             "{text}"
         );
+        // 65 changed symbols, 60 looked up: the 5 past the cap are never queried,
+        // and the answer says so.
+        assert!(
+            text.contains("Impact not computed for 5 element(s): cap (60 per call)"),
+            "{text}"
+        );
         // The wire section comes before the impact rows that were cut.
         let wire_at = text.find("### Wire-format check").expect("wire");
         let impact_at = text.find("### Impact (live graph)").expect("impact");
@@ -2278,6 +2472,104 @@ func Connect(conn any) {
         );
         assert!(out.text.contains("`proto/user.proto`"), "{}", out.text);
         assert!(out.files_accessed.is_empty(), "{:?}", out.files_accessed);
+        // The pending `.proto` is counted: no "0 breaking changes" that reads
+        // as checked and safe.
+        assert!(
+            out.text
+                .contains("Wire-format breaking changes: 0 in 0 `.proto` (1 `.proto` not checked)"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("- `proto/user.proto`: not checked: the time budget"),
+            "{}",
+            out.text
+        );
+    }
+
+    /// Several hundred changed `.proto` files: the answer stays under 48 KB, the
+    /// breaking count is in the summary, the clean results collapse to a count.
+    #[test]
+    fn hundreds_of_changed_protos_stay_under_the_cap() {
+        let proto = |i: usize, email: u32, extra: &str| {
+            format!(
+                "syntax = \"proto3\";\npackage demo.p{i:03};\n\nmessage User{i:03} {{\n  string id = 1;\n  string email = {email};\n{extra}}}\n"
+            )
+        };
+        let repo = TempRepo::new();
+        for i in 0..300 {
+            repo.write(
+                &format!("protos/a_rather_long_directory_name/user_{i:03}.proto"),
+                &proto(i, 2, ""),
+            );
+        }
+        repo.commit("base");
+        for i in 0..300 {
+            // 40 renumber a field (breaking), the rest add one (compatible).
+            let changed = if i < 40 {
+                proto(i, 3, "")
+            } else {
+                proto(i, 2, "  string phone = 4;\n")
+            };
+            repo.write(
+                &format!("protos/a_rather_long_directory_name/user_{i:03}.proto"),
+                &changed,
+            );
+        }
+        let state = state_for(&repo.root);
+        let out = run_with(
+            &args(Some("main"), None),
+            &state,
+            &repo.runner(),
+            Limits::DEFAULT,
+        )
+        .expect("diff");
+        let text = &out.text;
+        assert!(text.len() <= 48 * 1024, "{} bytes", text.len());
+        assert!(
+            text.contains("Wire-format breaking changes: 40 in 40 `.proto`."),
+            "{text}"
+        );
+        assert!(
+            text.contains("`.proto` with no wire-format breaking change.*"),
+            "{text}"
+        );
+        assert!(
+            text.contains("### Wire-format checks (300 changed `.proto`)"),
+            "{text}"
+        );
+        // Breaking results come before every clean one.
+        let first_clean = text
+            .find(": no wire-format breaking change")
+            .unwrap_or(text.len());
+        let last_break = text.rfind("WIRE_FORMAT_BREAKING_CHANGE").unwrap_or(0);
+        assert!(last_break < first_clean, "{text}");
+    }
+
+    /// A client naming another package's `UserService` is listed, ambiguous.
+    #[test]
+    fn a_caller_in_another_package_is_ambiguous() {
+        let repo = TempRepo::new();
+        repo.write("proto/user.proto", PROTO);
+        repo.write(
+            "client/other.ts",
+            &TS_QUALIFIED_CLIENT.replace("'demo.v1.UserService'", "'other.v2.UserService'"),
+        );
+        repo.commit("base");
+        repo.write(
+            "proto/user.proto",
+            &PROTO.replace("  rpc DeleteUser(DeleteUserRequest) returns (Empty);\n", ""),
+        );
+        let state = indexed_state(&repo.root);
+        let out =
+            run_with(&args(Some("main"), None), &state, &repo.runner(), files(10)).expect("diff");
+        assert!(
+            out.text
+                .contains("- `wipe` in `client/other.ts:10` _(caller, match: ambiguous)_"),
+            "{}",
+            out.text
+        );
     }
 
     /// An excluded file is never read nor reported, even when it is a source

@@ -534,6 +534,17 @@ pub(crate) struct WireReport {
     outcome: WireOutcome,
 }
 
+/// What a wire-format check concluded, for a one-line summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WireClass {
+    /// At least one `WIRE_FORMAT_BREAKING_CHANGE`.
+    Breaking,
+    /// No comparison happened (a version did not parse): nothing is claimed.
+    NotCompared,
+    /// Compared without a breaking change, or new at the base (nothing to break).
+    Clean,
+}
+
 impl WireReport {
     /// Number of `WIRE_FORMAT_BREAKING_CHANGE` findings (0 for a new or
     /// unparseable file, which claim none).
@@ -541,6 +552,28 @@ impl WireReport {
         match &self.outcome {
             WireOutcome::Compared(diff) => diff.breaking.len(),
             _ => 0,
+        }
+    }
+
+    /// The outcome's class and its one-line wording, each outcome its own.
+    pub(crate) fn summary(&self) -> (WireClass, String) {
+        match &self.outcome {
+            WireOutcome::NewFile => (
+                WireClass::Clean,
+                "new file (absent from the base): no breaking change possible".to_string(),
+            ),
+            WireOutcome::Unparseable { side, reason } => (
+                WireClass::NotCompared,
+                format!("not compared: the {side} version could not be parsed ({reason})"),
+            ),
+            WireOutcome::Compared(diff) if diff.breaking.is_empty() => (
+                WireClass::Clean,
+                "no wire-format breaking change".to_string(),
+            ),
+            WireOutcome::Compared(diff) => (
+                WireClass::Breaking,
+                format!("{} `WIRE_FORMAT_BREAKING_CHANGE`", diff.breaking.len()),
+            ),
         }
     }
 }
