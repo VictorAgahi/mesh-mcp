@@ -1311,3 +1311,29 @@ The golden corpus precision/recall ratchet is enforced in CI via `.github/workfl
 (`online-boutique`, `bank-of-anthos`, and `otel-demo` all held at 1.0 / 1.0).
 Raising thresholds or adding new golden repositories is a tracked quality milestone.
 
+
+## 8.0.0 end-to-end (2026-11-19)
+
+Measured on `~/bench-repos/kubernetes` at `16b319ff` (30,526 files), two git worktrees of it, an
+isolated `HOME`. 8.0 is `p8/base` at `45a4e00`; 7.1.11 is the `v7.1.11` tag. The machine ran other
+jobs during the measurement (load average 20 to 190), so cold times carry about +-5 s of noise.
+
+| Measurement | 8.0 | 7.1.11 |
+|---|---|---|
+| wt1 cold time to ready | 17.1 s (load 95), 8.1 s (load 35) | 12.3 s (load 38), 8.1 s (load 26) |
+| meshd count / RSS after wt1 | 1 / 350-380 MB | 1 / 390-410 MB |
+| wt2 time to ready, wt1 open | 2.5 s | 8.1 s |
+| meshd count / RSS both open | 1 / 452-458 MB | 2 / 288+382 MB |
+| wt2 index scan | 2.1 s (shared cache) | 7.2 s (full rescan) |
+| 4 simultaneous sessions, all ready | 8.1 s | 26.2 s, 24.2 s |
+| meshd spawned / peak total RSS | 1 / 402-410 MB | 4 / 1,027-1,183 MB |
+| edit in wt2 visible in wt2 (never in wt1) | 0.6-1.1 s | 1.07 s |
+
+Reading: the gains are the second worktree, concurrent starts and total memory. A single cold
+session is not faster than 7.1.11 (the first cold row is within the noise, or slower under load),
+and RAM is still one graph per active view (452-458 MB for two views against 350-380 MB for one).
+
+Incremental reload (PR7), 30,000-file synthetic workspace, one file edited per reload, release
+build: median reload 289 ms -> 106 ms and median reconcile 181.4 ms -> 2.4 ms. The delta path was
+checked against the full rebuild on 520,000 seeded random-edit stress steps (delta == full each
+time).

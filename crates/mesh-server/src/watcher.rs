@@ -123,7 +123,10 @@ roots = ["."]
 
         // Wait for debounce (150ms) + background Rayon execution (max 2500ms)
         let mut reloaded = false;
-        for _ in 0..25 {
+        // Poll to a generous deadline (30 s): a busy runner can delay the OS event, the
+        // debounce and the background pool by far more than the idle 2.5 s.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
             if state.snapshot().contract_graph.node_count() > 2 {
                 reloaded = true;

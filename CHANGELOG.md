@@ -5,6 +5,108 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
+## [8.0.0] - 2026-11-19
+
+One `meshd` per Git repository, one view per worktree. Open a session in each worktree of a
+repository and they find the same daemon; each session only ever sees its own worktree. The parse
+cache is shared by every worktree of the repository (one binary version), so a second worktree of
+the same commit boots on cache hits. Reloads are faster, and there is a new `diff_mesh` tool.
+
+Measured on kubernetes (30,526 files, two worktrees): the second worktree is ready in 2.5 s
+instead of 8.1 s, four simultaneous sessions are all ready in 8.1 s instead of 26 s, and one
+daemon replaces four (peak 402-410 MB total instead of 1,027-1,183 MB). On a 30,000-file
+synthetic workspace a one-file reload goes from a median 289 ms to 106 ms. Figures and caveats:
+`docs/quality.md`.
+
+### Breaking
+- Daemon socket naming. Inside a Git repository `meshd` is named by the repository: the socket is
+  `meshd-<family_id>.sock` (named pipe `mesh-mcp-<user>-<family_id>` on Windows), where
+  `family_id` hashes the canonical common Git directory and the binary version, so every worktree
+  and every config file of one repository share one daemon. The spawn lock, the daemon meta file
+  (`~/.cache/mesh-mcp/meshd/<family_id>.meta`) and the auto-spawn log are keyed the same way.
+  Outside Git the daemon is still named by the config file's directory and the config file, so two
+  config files in one plain directory still get two daemons. `MESH_SOCKET_PATH` still overrides
+  the socket path.
+- Mandatory hello. Every connection to `meshd` must start with one line,
+  `{"meshd_hello":1,"worktree":"<canonical dir>","config":"<canonical config>"|null}`, read under
+  8 KiB and a 5 s timeout. The daemon answers `{"meshd_hello_ok":1}` or
+  `{"meshd_hello_error":"<reason>"}`; any other first line (a raw JSON-RPC frame included) gets
+  the error line and the connection is closed. `mesh-mcp run` sends the hello before forwarding
+  any client byte and falls back to standalone mode, with a warning on stderr, when the daemon
+  refuses it. A 7.x `mesh-mcp` cannot talk to an 8.0 `meshd` and vice versa; the two are always
+  the same binary pair, and the version in the socket name keeps them from meeting.
+- Parse cache location and schema. Inside Git the cache is
+  `~/.cache/mesh-mcp/workspaces/<cache_family_id>/index-cache.db`, one database shared by every
+  worktree and config file of the repository. Cache schema 12 (was 11): keys hold the binary
+  version and the file's root-relative path instead of its absolute path, and records store
+  root-relative paths. Older databases are dropped and recreated on open, so the first boot after
+  upgrading parses everything once and the 7.x cache directories are orphaned. `mesh-mcp doctor
+  --fix` removes the 7.x directories of worktrees that still exist; the directories of deleted
+  worktrees are not recognised and can be removed by hand. Outside Git the per-workspace
+  directory is unchanged.
+- Daemon and cache identity now include the config file. The canonical path of the config the
+  session resolves (`--config` or discovered) is part of the identity, and `mesh-mcp run` always
+  hands that file to the `meshd` it spawns. Two config files in one directory used to share a
+  daemon, so a session could receive the other config's graph. Only with no config file at all is
+  the identity unchanged.
+
+### Added
+- `diff_mesh` tool (see `docs/mcp-tools.md`).
+- `mesh-mcp doctor` lists the views the running daemon serves (count, worktree, config file,
+  sessions, views built since start).
+- `mesh_core::identity`: `RepoFamily`, `family_id`, `cache_family_id`, `ViewKey` and
+  `WorkspaceIdentity::resolve`.
+
+### Changed
+- One `meshd` per repository serves one view per worktree and config file. Each view has its own
+  graph, file watcher and config follower; all views share one watcher pool, one config-reload
+  pool, one audit logger and the repository's parse cache. A view is built on its first hello
+  (once, however many sessions ask at the same instant); until its first snapshot `tools/call`
+  answers "still indexing" while `initialize` and `ping` work. A hello is refused when its
+  directory is not in the daemon's repository, when its config cannot be loaded, or when the
+  workspace-root guard refuses it. A view with no session for `--idle-timeout-minutes` (default
+  30) is dropped and rebuilt on the next hello; the daemon exits once it has no view and no client.
+- Shared cache behaviour. A second worktree of the same commit, or a checkout moved elsewhere,
+  boots on cache hits and produces the same snapshot fingerprint. A file whose facts depend on the
+  checkout's own directory (a package named after it when no manifest declares one) is parsed,
+  never served another checkout's answer. `tsconfig` / `package.json` alias targets enter a
+  file's key relative to the workspace root, and the inferred package is part of the key of the
+  records that use it, so renaming a manifest's `name` re-extracts the files it governs.
+- Incremental reload. The contract graph's edges are reconciled incrementally
+  (`ContractGraph::reconcile_delta`): only the edges the changed files can reach are recomputed.
+  A change to more than 20% of the nodes, a `.proto` method change, interleaved call records, an
+  alias config or custom pattern edit and a graph without a change journal still take the full
+  rebuild, which is unchanged and remains the oracle (same fingerprint and same JSON graph as
+  before; tests check that the delta ends in the same graph after every step of seeded random
+  edit sequences). Reload phase timings are logged at debug level on `mesh::watcher`.
+- The wait for a freshly spawned daemon to bind its socket is 5 seconds (was 500 ms).
+- `mesh_core::workspace_id` and the index-cache entry points take the config file as an extra
+  argument; `PersistentIndexCache::key_for` takes the relative path as `&str`.
+- Internal: the Git command runner and the contracts module moved into their own modules, no
+  behaviour change.
+
+### Fixed
+- N `mesh-mcp run` starting at once on one workspace no longer each spawn and index their own
+  `meshd`: the spawn is serialized by an exclusive lock file next to the socket (mode 0600) and
+  the other sessions wait for the winner's daemon. On timeout the session falls back to
+  standalone mode with a warning.
+- A config edit made while the daemon is idle is applied before the next request: the daemon
+  checks its config file every 2 seconds instead of only when a request arrives.
+- Tests locate the `mesh-mcp` binary through `CARGO_BIN_EXE_mesh-mcp`, which broke on the current
+  stable Cargo; several timing-sensitive tests now poll to a generous deadline instead of using
+  fixed sleeps.
+
+### Known limitations
+- RAM is still one graph per active view; sharing memory across views is planned for 8.1.
+- A single cold session is not faster than 7.1.11. The gains are the second worktree, concurrent
+  starts and memory.
+- `mesh-mcp doctor --fix` on a stale pre-7.1.7 daemon stops the whole daemon, ending every
+  worktree's sessions.
+- No end-to-end test of the one-view-per-session guarantee (I7) runs on Windows yet; it is Unix
+  only.
+- `diff_mesh`'s time budget is about 20 s, checked between files.
+- The cache hit ratio is not exposed by `doctor` or `stats` yet.
+
 ## [7.1.11] — 2026-10-13
 
 Performance fix found by the nightly 50k contract-mix bench (`reload_ms` over budget). Bisecting
