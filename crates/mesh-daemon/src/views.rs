@@ -81,6 +81,15 @@ fn same_family(dir: &Path, expected: &str) -> bool {
     RepoFamily::resolve(dir).is_some_and(|f| family_id(&f) == expected)
 }
 
+/// Whether canonical `dir` lies inside a Git directory: a `.git` component anywhere (`.git/`,
+/// `.git/worktrees/*`, `.git/modules/*`), or under the common directory of the repository it
+/// resolves to (a bare-style common dir that is not named `.git`). Git's own files are never a
+/// workspace.
+fn inside_git_dir(dir: &Path) -> bool {
+    dir.components().any(|c| c.as_os_str() == ".git")
+        || RepoFamily::resolve(dir).is_some_and(|f| dir.starts_with(&f.common_dir))
+}
+
 /// Checks `hello` against the daemon's identity (blocking: canonicalizes and reads `.git`).
 ///
 /// Inside Git the session's directory and the directory its state would be built from must
@@ -109,6 +118,14 @@ pub fn validate(daemon: &DaemonIdentity, hello: &Hello) -> Result<ViewSpec, Stri
         Some(parent) => canonical(parent, "config directory")?,
         None => worktree.clone(),
     };
+    for (what, dir) in [("worktree", &worktree), ("config directory", &base_dir)] {
+        if inside_git_dir(dir) {
+            return Err(format!(
+                "{what} {} is inside a Git directory, not a work tree",
+                dir.display()
+            ));
+        }
+    }
     match &daemon.family_id {
         Some(expected) => {
             if !same_family(&worktree, expected) || !same_family(&base_dir, expected) {
@@ -135,6 +152,19 @@ pub fn validate(daemon: &DaemonIdentity, hello: &Hello) -> Result<ViewSpec, Stri
                 ));
             }
         }
+    }
+    // The view is picked by the config's directory; the worktree the session names must be
+    // that very directory, so a hello can never claim one worktree and be bound to another's
+    // view. `Hello::new` (the shipped proxy) always derives it so.
+    if worktree != base_dir {
+        return Err(format!(
+            "worktree {} does not match the directory of config {} ({})",
+            worktree.display(),
+            config
+                .as_deref()
+                .map_or_else(|| "none".to_string(), |c| c.display().to_string()),
+            base_dir.display()
+        ));
     }
     let identity = WorkspaceIdentity::resolve(&base_dir, config.as_deref());
     Ok(ViewSpec {
@@ -230,7 +260,7 @@ impl View {
     /// Stops this view's background work. Idempotent.
     fn retire(&self) {
         self.cancel.cancel();
-        self.host.remove_status();
+        self.host.retire_status();
     }
 }
 
@@ -668,7 +698,47 @@ mod tests {
         .expect_err("foreign config");
         assert!(err.contains("not in the Git repository"), "{err}");
         assert!(validate(&daemon, &Hello::new(&r.main.join("nope"), None)).is_err());
+        // A worktree of this repository paired with the config of another worktree of it:
+        // refused, never bound to the config's view.
+        let crafted = Hello {
+            meshd_hello: 1,
+            worktree: r.main.clone(),
+            config: Some(r.wt.join("mesh-mcp.toml")),
+        };
+        let err = validate(&daemon, &crafted).expect_err("mismatched worktree and config");
+        assert!(
+            err.contains("does not match the directory of config"),
+            "{err}"
+        );
         assert!(validate(&daemon, &Hello::new(&r.main, Some(&r.main.join("no.toml")))).is_err());
+    }
+
+    #[test]
+    fn a_directory_inside_the_git_dir_is_refused() {
+        let Some(r) = repo() else { return };
+        let daemon = daemon_for(&r.main);
+        let git_dir = r.main.join(".git");
+        let wt_admin = std::fs::read_dir(git_dir.join("worktrees"))
+            .expect("worktrees admin dir")
+            .flatten()
+            .next()
+            .expect("one linked worktree")
+            .path();
+        let modules = git_dir.join("modules").join("m");
+        std::fs::create_dir_all(&modules).expect("mkdir");
+        for dir in [&git_dir, &wt_admin, &modules] {
+            let err = validate(&daemon, &Hello::new(dir, None)).expect_err("git dir");
+            assert!(err.contains("inside a Git directory"), "{err}");
+        }
+        // A config file placed inside `.git/` is refused too.
+        std::fs::write(git_dir.join("mesh-mcp.toml"), "[workspace]\nname = \"g\"\n").expect("cfg");
+        let hello = Hello {
+            meshd_hello: 1,
+            worktree: git_dir.clone(),
+            config: Some(git_dir.join("mesh-mcp.toml")),
+        };
+        let err = validate(&daemon, &hello).expect_err("config in .git");
+        assert!(err.contains("inside a Git directory"), "{err}");
     }
 
     #[test]

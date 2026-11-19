@@ -579,6 +579,7 @@ fn invalid_config_reports_the_daemon_still_serving_its_previous_config() {
         rejected_sha256: None,
         loaded_ms: Some(1_000),
         last_reload: None,
+        owner: None,
     };
     std::fs::write(
         cache.join(format!("{workspace_id}.config.json")),

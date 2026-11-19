@@ -46,10 +46,40 @@ pub fn config_sha256(bytes: &[u8]) -> String {
     hex(&sha256(bytes))
 }
 
+/// Largest config file any process reads (1 MiB). A real config is a few KiB; the bound keeps a
+/// session (or a hello naming any file of the repository) from making `meshd` read an
+/// arbitrarily large file into memory.
+pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Reads the config file at `path`, refusing one larger than [`MAX_CONFIG_BYTES`] with
+/// `InvalidData`. The read goes through `take(limit + 1)`, so nothing past the limit is ever
+/// allocated, whatever the file's size.
+pub fn read_config_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_bounded(path, MAX_CONFIG_BYTES)
+}
+
+fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "config {} is larger than {} KiB; refusing to read it",
+                path.display(),
+                limit / 1024
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Reads and hashes `path`.
 pub fn stamp_config(path: &Path) -> std::io::Result<ConfigStamp> {
     let (mtime_ms, _) = config_fingerprint_cheap(path).unwrap_or((0, 0));
-    let bytes = std::fs::read(path)?;
+    let bytes = read_config_bounded(path)?;
     Ok(ConfigStamp {
         mtime_ms,
         len: bytes.len() as u64,
@@ -93,6 +123,11 @@ pub struct DaemonConfigStatus {
     /// The last reload applied since the daemon started; `None` before the first.
     #[serde(default)]
     pub last_reload: Option<ReloadRecord>,
+    /// The view instance that wrote this record (8.0.0): one daemon serves several views, and
+    /// a view that idled out removes the record only while it is still its own, never the one
+    /// a newer view of the same directory published since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<u64>,
 }
 
 /// Where [`DaemonConfigStatus`] of `workspace_id` lives.
@@ -207,6 +242,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_config_over_the_limit_is_refused_without_reading_it_whole() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path().join("big.toml");
+        std::fs::write(&p, vec![b'#'; 4097]).expect("write");
+        let err = read_bounded(&p, 4096).expect_err("over the limit");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("larger than 4 KiB"), "{err}");
+        std::fs::write(&p, vec![b'#'; 4096]).expect("write");
+        assert_eq!(read_bounded(&p, 4096).expect("at the limit").len(), 4096);
+        assert_eq!(MAX_CONFIG_BYTES, 1024 * 1024);
+    }
+
+    #[test]
     fn stamp_changes_with_content_not_with_a_touch() {
         let dir = tempfile::tempdir().expect("dir");
         let p = dir.path().join("c.toml");
@@ -232,6 +280,7 @@ mod tests {
             rejected_sha256: None,
             loaded_ms: None,
             last_reload: None,
+            owner: None,
         };
         assert_eq!(config_drift(&status, &p), ConfigDrift::InSync);
         std::fs::write(&p, "a = 2\n").expect("rewrite");
@@ -264,6 +313,7 @@ mod tests {
             rejected_sha256: Some(stamp_config(&p).expect("stamp").sha256),
             loaded_ms: None,
             last_reload: None,
+            owner: None,
         };
         assert!(matches!(
             config_drift(&status, &p),

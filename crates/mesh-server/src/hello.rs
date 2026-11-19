@@ -49,13 +49,21 @@ pub struct Hello {
 
 impl Hello {
     /// The hello of a session whose base directory is `base_dir` and whose located config is
-    /// `config`, both canonicalized when they exist.
+    /// `config`, both canonicalized when they exist. With a config the worktree sent is the
+    /// canonical directory of the canonical config (what the daemon builds the view from, and
+    /// what it requires the worktree to be), so a config reached through a symlink still
+    /// names a consistent pair.
     pub fn new(base_dir: &Path, config: Option<&Path>) -> Self {
         let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let config = config.map(canon);
+        let worktree = config
+            .as_deref()
+            .and_then(Path::parent)
+            .map_or_else(|| canon(base_dir), canon);
         Self {
             meshd_hello: HELLO_VERSION,
-            worktree: canon(base_dir),
-            config: config.map(canon),
+            worktree,
+            config,
         }
     }
 

@@ -88,6 +88,12 @@ pub struct WorkspaceHost {
     /// Where the status record and the index caches of rebuilt states go;
     /// `None` is the user's real cache directory. Tests point it at a tempdir.
     cache_dir: Option<PathBuf>,
+    /// This host instance, written into every status record it publishes: a view
+    /// that idles out removes the record only while it is still its own (8.0.0).
+    owner: u64,
+    /// Set once the view is dropped: a retired host never publishes again, even
+    /// from a reload that was still running.
+    retired: AtomicBool,
     /// Test hook: make the next reload panic.
     #[cfg(test)]
     panic_next: AtomicBool,
@@ -116,6 +122,18 @@ pub fn seed_index_cache(state: &AppState, cache_dir: &Path, tag: u64) {
         }
         Err(e) => tracing::warn!(target: "meshd", "cannot open the seeded index cache: {e}"),
     }
+}
+
+/// Serializes every status publish and removal of this process: views of one daemon share
+/// the record directory, and two views of one directory (one retiring, one new) share a
+/// record path.
+static STATUS_LOCK: Mutex<()> = Mutex::new(());
+
+/// A process-unique host instance id (pid in the high bits, so a record left by an earlier
+/// daemon never carries the id of a live host).
+fn next_owner() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    (u64::from(std::process::id()) << 32) | (NEXT.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff)
 }
 
 fn now_ms() -> u128 {
@@ -298,6 +316,8 @@ impl WorkspaceHost {
                 last_reload: None,
             }),
             cache_dir,
+            owner: next_owner(),
+            retired: AtomicBool::new(false),
             #[cfg(test)]
             panic_next: AtomicBool::new(false),
             #[cfg(test)]
@@ -338,6 +358,8 @@ impl WorkspaceHost {
                 last_reload: None,
             }),
             cache_dir: None,
+            owner: next_owner(),
+            retired: AtomicBool::new(false),
             #[cfg(test)]
             panic_next: AtomicBool::new(false),
             #[cfg(test)]
@@ -392,7 +414,7 @@ impl WorkspaceHost {
         self.last_check_ms.store(elapsed.max(1), Ordering::Relaxed);
         // Read and hash every time the throttle window passes: the file is tiny
         // and `(mtime, len)` cannot see a same-length edit within one mtime tick.
-        let moved = match std::fs::read(path) {
+        let moved = match mesh_core::config_watch::read_config_bounded(path) {
             Ok(bytes) => self.observe(&config_sha256(&bytes)),
             Err(_) => false,
         };
@@ -447,7 +469,7 @@ impl WorkspaceHost {
                 let sha = self
                     .config_path
                     .as_deref()
-                    .and_then(|p| std::fs::read(p).ok())
+                    .and_then(|p| mesh_core::config_watch::read_config_bounded(p).ok())
                     .map(|b| config_sha256(&b));
                 self.reject(
                     sha,
@@ -459,19 +481,32 @@ impl WorkspaceHost {
         }
     }
 
-    /// Removes the status record [`Self::publish_status`] wrote (a view that idled out).
-    pub fn remove_status(&self) {
+    /// Retires this host (its view was dropped): it never publishes again, and the status
+    /// record goes only if it is still this host's own. A newer view of the same directory
+    /// may already have published its record at that path; that one stays.
+    pub fn retire_status(&self) {
+        self.retired.store(true, Ordering::SeqCst);
         if self.config_path.is_none() || self.workspace_id.is_empty() {
             return;
         }
-        let dir = self
-            .cache_dir
-            .clone()
-            .unwrap_or_else(mesh_core::paths::mesh_cache_dir);
-        let _ = std::fs::remove_file(mesh_core::config_watch::daemon_config_status_path_in(
-            &dir,
+        let _serial = STATUS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let path = mesh_core::config_watch::daemon_config_status_path_in(
+            &self.status_dir(),
             &self.workspace_id,
-        ));
+        );
+        let ours = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<DaemonConfigStatus>(&text).ok())
+            .is_some_and(|status| status.owner == Some(self.owner));
+        if ours {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    fn status_dir(&self) -> PathBuf {
+        self.cache_dir
+            .clone()
+            .unwrap_or_else(mesh_core::paths::mesh_cache_dir)
     }
 
     /// Records which config this daemon serves, for `mesh-mcp doctor`.
@@ -479,11 +514,14 @@ impl WorkspaceHost {
         let Some(path) = self.config_path.clone() else {
             return;
         };
+        let _serial = STATUS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Checked under the lock `retire_status` takes after setting the flag: once a host
+        // is retired, no publish of it can land after its removal.
+        if self.retired.load(Ordering::SeqCst) {
+            return;
+        }
         let book = self.book.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = self
-            .cache_dir
-            .clone()
-            .unwrap_or_else(mesh_core::paths::mesh_cache_dir);
+        let dir = self.status_dir();
         write_daemon_config_status_in(
             &dir,
             &self.workspace_id,
@@ -495,6 +533,7 @@ impl WorkspaceHost {
                 rejected_sha256: book.rejected_sha.clone(),
                 loaded_ms: Some(book.loaded_ms),
                 last_reload: book.last_reload.clone(),
+                owner: Some(self.owner),
             },
         );
     }
@@ -527,7 +566,7 @@ impl WorkspaceHost {
         };
         // One read: these bytes are hashed, parsed and, if they win, recorded as
         // the served content, so the recorded hash always describes the state.
-        let bytes = match std::fs::read(path) {
+        let bytes = match mesh_core::config_watch::read_config_bounded(path) {
             Ok(b) => b,
             // Vanished (an editor's atomic save, or deleted): keep serving.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReloadOutcome::Unchanged,
@@ -1189,6 +1228,55 @@ mod tests {
             mesh_core::config_watch::daemon_config_status_path_in(&fx.cache, "test-ws-host");
         assert!(status.exists(), "{}", status.display());
         assert!(fx.cache.join("index").exists());
+        fx.shutdown.cancel();
+    }
+
+    /// 8.0.0 review M3: a view that idles out while a newer view of the same
+    /// directory has already published must not delete the newer record, and a
+    /// retired host (a reload still finishing) never publishes again.
+    #[test]
+    fn a_retired_host_removes_only_its_own_status_and_never_publishes_again() {
+        let fx = fixture(&["a"]);
+        let status =
+            mesh_core::config_watch::daemon_config_status_path_in(&fx.cache, "test-ws-host");
+        let owner_of = || -> Option<u64> {
+            let text = std::fs::read_to_string(&status).ok()?;
+            serde_json::from_str::<DaemonConfigStatus>(&text)
+                .ok()?
+                .owner
+        };
+        fx.host.publish_status();
+        assert_eq!(owner_of(), Some(fx.host.owner));
+
+        // A newer host for the same directory and config publishes over it.
+        let newer = WorkspaceHost::new_in(
+            fx.host.peek(),
+            Some(fx.config.clone()),
+            None,
+            "test-ws-host",
+            Arc::new(AuditLogger::new_in_memory().expect("audit")),
+            Arc::new(BackgroundRescanEngine::new().expect("rescan")),
+            fx.shutdown.clone(),
+            fx.shutdown.child_token(),
+            Some(fx.cache.clone()),
+        );
+        newer.publish_status();
+        assert_eq!(owner_of(), Some(newer.owner));
+
+        // The old one retires: the newer record stays, and the old one cannot
+        // write over it any more.
+        fx.host.retire_status();
+        assert_eq!(owner_of(), Some(newer.owner), "the newer record survives");
+        fx.host.publish_status();
+        assert_eq!(
+            owner_of(),
+            Some(newer.owner),
+            "a retired host never publishes"
+        );
+
+        // The newer one retiring removes its own record.
+        newer.retire_status();
+        assert!(!status.exists());
         fx.shutdown.cancel();
     }
 }

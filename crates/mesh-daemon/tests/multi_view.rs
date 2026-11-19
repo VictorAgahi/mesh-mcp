@@ -697,6 +697,33 @@ fn malformed_oversized_slow_and_raw_frame_hellos_are_rejected() {
     );
     assert_eq!(rest_until_eof(&mut c.reader, Duration::from_secs(5)), "");
 
+    // A worktree of the repository paired with another worktree's config (review M1).
+    let crafted = format!(
+        "{{\"meshd_hello\":1,\"worktree\":{},\"config\":{}}}\n",
+        serde_json::to_string(&env.main).unwrap(),
+        serde_json::to_string(&env.config(&env.wt)).unwrap()
+    );
+    let (_c, reply) = Client::raw(&daemon.sock, &crafted);
+    assert!(
+        reply.contains("does not match the directory of config"),
+        "{reply}"
+    );
+
+    // A directory inside the Git directory (review M2).
+    let (_c, reply) = Client::raw(
+        &daemon.sock,
+        &Hello::new(&env.main.join(".git"), None).to_line().unwrap(),
+    );
+    assert!(reply.contains("inside a Git directory"), "{reply}");
+
+    // A config file over the 1 MiB bound (review M6): refused, not read whole.
+    let big = env.main.join("big.toml");
+    std::fs::write(&big, vec![b'#'; 2 * 1024 * 1024]).unwrap();
+    let refused = Client::view(&daemon.sock, &env.main, Some(&big))
+        .err()
+        .expect("refused");
+    assert!(refused.contains("larger than 1024 KiB"), "{refused}");
+
     // A hello of an unknown version.
     let wt_json = serde_json::to_string(&env.main).unwrap();
     let (_c, reply) = Client::raw(

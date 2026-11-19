@@ -218,7 +218,8 @@ impl WorkspaceIndexer {
     pub fn load_config_stamped(
         path: &Path,
     ) -> Result<(Config, PathBuf, String), Box<dyn std::error::Error>> {
-        let bytes = std::fs::read(path)
+        // Bounded (1 MiB): a config is a few KiB, and `meshd` loads whatever file a hello names.
+        let bytes = mesh_core::config_watch::read_config_bounded(path)
             .map_err(|e| mesh_core::ConfigError::IoError(path.to_path_buf(), e))?;
         let digest = mesh_core::config_watch::config_sha256(&bytes);
         let (cfg, base) = Self::parse_config_bytes(path, &bytes)?;
