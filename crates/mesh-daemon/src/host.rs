@@ -214,7 +214,7 @@ fn close_reload_gap(
 impl WorkspaceHost {
     /// The intermediate-priority pool of the config-driven reload; should it not
     /// build, the watcher's own (lower priority) pool serves instead.
-    fn reload_pool_for(fallback: &Arc<BackgroundRescanEngine>) -> Arc<BackgroundRescanEngine> {
+    pub fn reload_pool_for(fallback: &Arc<BackgroundRescanEngine>) -> Arc<BackgroundRescanEngine> {
         match BackgroundRescanEngine::with_priority(mesh_core::rescan::RescanPriority::Utility) {
             Ok(pool) => Arc::new(pool),
             Err(e) => {
@@ -230,32 +230,10 @@ impl WorkspaceHost {
     /// `WorkspaceIndexer::discover_config_stamped`), never a later re-read of the
     /// file, which could describe newer content than the state serves.
     /// `watcher_cancel` stops the watcher already running on `state`; it must be
-    /// a child of `shutdown`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        state: Arc<AppState>,
-        config_path: Option<PathBuf>,
-        serving_sha: Option<String>,
-        workspace_id: &str,
-        audit: Arc<AuditLogger>,
-        rescan: Arc<BackgroundRescanEngine>,
-        shutdown: CancellationToken,
-        watcher_cancel: CancellationToken,
-    ) -> Arc<Self> {
-        Self::new_in(
-            state,
-            config_path,
-            serving_sha,
-            workspace_id,
-            audit,
-            rescan,
-            shutdown,
-            watcher_cancel,
-            None,
-        )
-    }
-
-    /// [`Self::new`] with the cache directory given (`None`: the real one).
+    /// a child of `shutdown`. `cache_dir` is where status records and the index
+    /// caches of rebuilt states go (`None`: the real cache). Tests only; `meshd`
+    /// builds its hosts with [`Self::new_view`].
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn new_in(
         state: Arc<AppState>,
@@ -268,12 +246,42 @@ impl WorkspaceHost {
         watcher_cancel: CancellationToken,
         cache_dir: Option<PathBuf>,
     ) -> Arc<Self> {
+        let reload_pool = Self::reload_pool_for(&rescan);
+        Self::new_view(
+            state,
+            config_path,
+            serving_sha,
+            workspace_id,
+            audit,
+            rescan,
+            reload_pool,
+            shutdown,
+            watcher_cancel,
+            cache_dir,
+        )
+    }
+
+    /// [`Self::new_in`] with the config-reload pool given: every view of a multi-view daemon
+    /// shares one, as it shares the watcher pool `rescan` and the audit logger.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_view(
+        state: Arc<AppState>,
+        config_path: Option<PathBuf>,
+        serving_sha: Option<String>,
+        workspace_id: &str,
+        audit: Arc<AuditLogger>,
+        rescan: Arc<BackgroundRescanEngine>,
+        reload_pool: Arc<BackgroundRescanEngine>,
+        shutdown: CancellationToken,
+        watcher_cancel: CancellationToken,
+        cache_dir: Option<PathBuf>,
+    ) -> Arc<Self> {
         let host = Arc::new(Self {
             current: ArcSwap::from(state),
             config_path,
             workspace_id: workspace_id.to_string(),
             audit,
-            reload_pool: Self::reload_pool_for(&rescan),
+            reload_pool,
             rescan,
             shutdown,
             started_ms: now_ms(),
@@ -301,7 +309,8 @@ impl WorkspaceHost {
         host
     }
 
-    /// A host that never reloads: tests and embedders with a fixed state.
+    /// A host that never reloads: tests with a fixed state.
+    #[cfg(test)]
     pub fn fixed(state: Arc<AppState>) -> Arc<Self> {
         let audit = Arc::clone(&state.audit);
         let rescan = Arc::clone(&state.rescan);
@@ -448,6 +457,21 @@ impl WorkspaceHost {
                 )
             }
         }
+    }
+
+    /// Removes the status record [`Self::publish_status`] wrote (a view that idled out).
+    pub fn remove_status(&self) {
+        if self.config_path.is_none() || self.workspace_id.is_empty() {
+            return;
+        }
+        let dir = self
+            .cache_dir
+            .clone()
+            .unwrap_or_else(mesh_core::paths::mesh_cache_dir);
+        let _ = std::fs::remove_file(mesh_core::config_watch::daemon_config_status_path_in(
+            &dir,
+            &self.workspace_id,
+        ));
     }
 
     /// Records which config this daemon serves, for `mesh-mcp doctor`.
@@ -628,11 +652,12 @@ impl WorkspaceHost {
     }
 }
 
-/// What the IPC server hands each connection: a [`WorkspaceHost`], or a fixed
-/// `AppState` (tests) wrapped in one that never reloads.
+/// A fixed `AppState` wrapped in a host that never reloads (the server's test router).
+#[cfg(test)]
 #[derive(Clone)]
 pub struct StateHandle(pub Arc<WorkspaceHost>);
 
+#[cfg(test)]
 impl StateHandle {
     pub fn current(&self) -> Arc<AppState> {
         self.0.current()
@@ -643,12 +668,14 @@ impl StateHandle {
     }
 }
 
+#[cfg(test)]
 impl From<Arc<AppState>> for StateHandle {
     fn from(state: Arc<AppState>) -> Self {
         Self(WorkspaceHost::fixed(state))
     }
 }
 
+#[cfg(test)]
 impl From<Arc<WorkspaceHost>> for StateHandle {
     fn from(host: Arc<WorkspaceHost>) -> Self {
         Self(host)

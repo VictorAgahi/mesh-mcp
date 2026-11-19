@@ -195,14 +195,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return mesh_server::run_refusing_server(message, CancellationToken::new()).await;
             }
             let canonical_base = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
-            // The config file is part of the daemon identity: two configs in one
-            // directory are two workspaces (see `mesh_core::workspace_id`).
+            // The daemon this session talks to (8.0.0): inside Git one `meshd` per
+            // repository, named by its family id, serves every worktree and config
+            // as a separate view; outside Git the config file stays part of the
+            // identity, so two configs in one directory are two daemons (see
+            // `mesh_core::WorkspaceIdentity::daemon_id`).
             let workspace_id =
-                WorkspaceIndexer::workspace_id_for(&canonical_base, cli.config.as_deref());
+                WorkspaceIndexer::identity_for(&canonical_base, cli.config.as_deref()).daemon_id();
             // The config file this session resolved (absolute, whether given with
             // `--config` or discovered). Passed to the daemon as `--config` so the
             // daemon hashes exactly this file, never a second discovery of its own.
             let located_config = WorkspaceIndexer::locate_config(cli.config.as_deref());
+            // The view this session asks for, sent before any client byte.
+            #[cfg(any(unix, windows))]
+            let hello = mesh_server::hello::Hello::new(&canonical_base, located_config.as_deref());
 
             #[cfg(unix)]
             if !standalone {
@@ -215,7 +221,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     located_config.as_deref(),
                 )
                 .await;
-                if try_proxy_unix(ensured, &sock_path, &workspace_id).await? == ProxyAttempt::Served
+                if try_proxy_unix(ensured, &sock_path, &workspace_id, &hello).await?
+                    == ProxyAttempt::Served
                 {
                     return Ok(());
                 }
@@ -232,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     located_config.as_deref(),
                 )
                 .await;
-                if try_proxy_windows(ensured, &pipe_name, &workspace_id).await?
+                if try_proxy_windows(ensured, &pipe_name, &workspace_id, &hello).await?
                     == ProxyAttempt::Served
                 {
                     return Ok(());
@@ -553,6 +560,7 @@ async fn try_proxy_unix(
     ensured: Result<(), Box<dyn std::error::Error + Send + Sync>>,
     sock_path: &Path,
     workspace_id: &str,
+    hello: &mesh_server::hello::Hello,
 ) -> Result<ProxyAttempt, Box<dyn std::error::Error>> {
     if let Err(e) = ensured {
         tracing::warn!(
@@ -579,7 +587,17 @@ async fn try_proxy_unix(
         sock_path.display(),
         workspace_id
     );
-    let (daemon_reader, daemon_writer) = stream.into_split();
+    let (mut daemon_reader, mut daemon_writer) = stream.into_split();
+    if !handshake(
+        &mut daemon_reader,
+        &mut daemon_writer,
+        hello,
+        &sock_path.display().to_string(),
+    )
+    .await
+    {
+        return Ok(ProxyAttempt::Fallback);
+    }
     let end = bridge(
         daemon_reader,
         daemon_writer,
@@ -589,6 +607,41 @@ async fn try_proxy_unix(
     .await;
     finish_proxy_session(&end, &sock_path.display().to_string(), workspace_id);
     Ok(ProxyAttempt::Served)
+}
+
+/// Sends this session's hello and waits for the daemon's ack (8.0.0), before any
+/// client byte is forwarded: the client's `initialize` waits in the stdin buffer
+/// meanwhile. A refusal (another repository's daemon, a config the daemon cannot
+/// load, a version that does not speak the hello) is logged and the session falls
+/// back to standalone mode, as when the daemon cannot be reached at all.
+#[cfg(any(unix, windows))]
+async fn handshake<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    hello: &mesh_server::hello::Hello,
+    endpoint: &str,
+) -> bool
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match mesh_server::hello::client_handshake(
+        reader,
+        writer,
+        hello,
+        mesh_server::hello::ACK_TIMEOUT,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                target: "mesh::proxy",
+                "meshd at {endpoint} did not accept this session ({e}). Falling back to standalone mode."
+            );
+            false
+        }
+    }
 }
 
 /// Ultra-lightweight proxy: bridges the client's stdin/stdout and the daemon's
@@ -691,6 +744,7 @@ async fn try_proxy_windows(
     ensured: Result<(), Box<dyn std::error::Error + Send + Sync>>,
     pipe_name: &str,
     workspace_id: &str,
+    hello: &mesh_server::hello::Hello,
 ) -> Result<ProxyAttempt, Box<dyn std::error::Error>> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
@@ -718,7 +772,10 @@ async fn try_proxy_windows(
         pipe_name,
         workspace_id
     );
-    let (daemon_reader, daemon_writer) = tokio::io::split(client);
+    let (mut daemon_reader, mut daemon_writer) = tokio::io::split(client);
+    if !handshake(&mut daemon_reader, &mut daemon_writer, hello, pipe_name).await {
+        return Ok(ProxyAttempt::Fallback);
+    }
     let end = bridge(
         daemon_reader,
         daemon_writer,
@@ -897,8 +954,46 @@ mod proxy_tests {
         drop(listener);
         std::fs::remove_file(&sock).expect("rm socket");
 
-        let attempt = try_proxy_unix(Ok(()), &sock, "ws").await.expect("no error");
+        let hello = mesh_server::hello::Hello::new(dir.path(), None);
+        let attempt = try_proxy_unix(Ok(()), &sock, "ws", &hello)
+            .await
+            .expect("no error");
         assert_eq!(attempt, ProxyAttempt::Fallback);
+    }
+
+    /// 8.0.0: a daemon that refuses the hello (here: another repository's)
+    /// sends the session to standalone mode, and no client byte reached it.
+    #[tokio::test]
+    async fn a_refused_hello_falls_back_to_standalone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("r.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (r, mut w) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(r);
+            let hello = mesh_server::hello::read_hello(
+                &mut reader,
+                mesh_server::hello::MAX_HELLO_BYTES,
+                mesh_server::hello::HELLO_TIMEOUT,
+            )
+            .await
+            .expect("hello");
+            w.write_all(mesh_server::hello::error_line("other repository").as_bytes())
+                .await
+                .expect("refuse");
+            let mut rest = Vec::new();
+            let _ = reader.read_to_end(&mut rest).await;
+            (hello, rest)
+        });
+        let hello = mesh_server::hello::Hello::new(dir.path(), None);
+        let attempt = try_proxy_unix(Ok(()), &sock, "ws", &hello)
+            .await
+            .expect("no error");
+        assert_eq!(attempt, ProxyAttempt::Fallback);
+        let (seen, rest) = daemon.await.expect("daemon");
+        assert_eq!(seen, hello);
+        assert!(rest.is_empty(), "no client byte after a refused hello");
     }
 
     /// A daemon closing its end first is reported as such (the caller logs it).
