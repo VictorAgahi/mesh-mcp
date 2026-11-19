@@ -144,6 +144,21 @@ impl GitRunner {
         args: &[&OsStr],
         stdout_limit: u64,
     ) -> Result<GitOutput, GitError> {
+        self.run_with_input(program, cwd, args, None, stdout_limit)
+    }
+
+    /// [`Self::run`] with `input` written to the child's stdin (then closed),
+    /// for `git cat-file --batch`. The same timeout and output bound apply; the
+    /// input is written from its own thread, so a child that fills its stdout
+    /// pipe before reading all of its stdin cannot deadlock the call.
+    pub(crate) fn run_with_input(
+        &self,
+        program: &Path,
+        cwd: &Path,
+        args: &[&OsStr],
+        input: Option<Vec<u8>>,
+        stdout_limit: u64,
+    ) -> Result<GitOutput, GitError> {
         let display = args
             .iter()
             .map(|a| a.to_string_lossy())
@@ -157,7 +172,11 @@ impl GitRunner {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("LC_ALL", "C")
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for var in REPO_REDIRECT_VARS {
@@ -171,6 +190,16 @@ impl GitRunner {
             _ => GitError::GitFailed(display.clone(), e.to_string()),
         })?;
 
+        let stdin = child.stdin.take();
+        let in_writer = input.map(|bytes| {
+            std::thread::spawn(move || {
+                if let Some(mut s) = stdin {
+                    // A child that exits early closes the pipe: EPIPE is its
+                    // answer, read from its status and output, not an error here.
+                    let _ = std::io::Write::write_all(&mut s, &bytes);
+                }
+            })
+        });
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let out_reader = std::thread::spawn(move || {
@@ -203,6 +232,9 @@ impl GitRunner {
                 Err(e) => return Err(GitError::GitFailed(display, e.to_string())),
             }
         };
+        if let Some(writer) = in_writer {
+            let _ = writer.join();
+        }
         let stdout = out_reader.join().unwrap_or_default();
         let stderr = err_reader.join().unwrap_or_default();
         if stdout.len() as u64 > stdout_limit {

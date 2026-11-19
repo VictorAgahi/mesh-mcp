@@ -22,7 +22,7 @@ consumer in another service, and a context window filled with function bodies th
 read to find a signature.
 
 MeshMCP builds that cross-service map once, keeps it in memory, updates it as files change, and
-exposes it through six MCP tools.
+exposes it through seven MCP tools.
 
 ---
 
@@ -47,7 +47,7 @@ exposes it through six MCP tools.
 
 ---
 
-## The six tools
+## The seven tools
 
 | Tool | Answers |
 | :--- | :--- |
@@ -57,6 +57,7 @@ exposes it through six MCP tools.
 | `analyze_impact` | What is affected if this RPC, service, topic, event or HTTP route handler changes? One table row per impacted element, marked `INTERNAL`/`EXTERNAL` with edge confidence; `depth` follows re-emissions across hops. |
 | `search_docs` | What do our Markdown docs, ADRs and RFCs say about this term? |
 | `visualize_mesh` | Per-service topology as Mermaid, JSON or HTML, bounded in size, with zoom (a zoom also lists the service's HTTP routes in Mermaid). |
+| `diff_mesh` | What does my branch change in the mesh, and what will it break? Contract-level diff of the working tree against a Git base (declarations, RPCs, routes, topics, imports), the callers and dependents of what was removed or changed, and the wire-format check of every changed `.proto`. |
 
 Arguments, output formats and error handling: [docs/mcp-tools.md](docs/mcp-tools.md).
 

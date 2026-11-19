@@ -534,6 +534,17 @@ pub(crate) struct WireReport {
     outcome: WireOutcome,
 }
 
+impl WireReport {
+    /// Number of `WIRE_FORMAT_BREAKING_CHANGE` findings (0 for a new or
+    /// unparseable file, which claim none).
+    pub(crate) fn breaking_count(&self) -> usize {
+        match &self.outcome {
+            WireOutcome::Compared(diff) => diff.breaking.len(),
+            _ => 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum WireOutcome {
     /// The file does not exist in the base: new file, nothing to break.
@@ -638,7 +649,7 @@ fn read_bounded(file: &Path) -> Result<String, WireCheckError> {
 /// At most this many findings are listed; the rest are counted.
 const MAX_LISTED_FINDINGS: usize = 100;
 
-fn render_report(report: &WireReport) -> String {
+pub(crate) fn render_report(report: &WireReport) -> String {
     let short_sha = report.base_sha.get(..12).unwrap_or(&report.base_sha);
     let base = match &report.base {
         BaseChoice::Explicit(b) => format!("`{b}` (`{short_sha}`)"),

@@ -104,7 +104,7 @@ Claude Code must strictly enforce these invariants on every edit:
 
 ## 4. Key References & Documentation
 - High-level architecture: [`docs/architecture.md`](docs/architecture.md)
-- 6 MCP Tools & Schemas: [`docs/mcp-tools.md`](docs/mcp-tools.md)
+- 7 MCP Tools & Schemas: [`docs/mcp-tools.md`](docs/mcp-tools.md)
 - Developer & Tree-sitter guide: [`docs/development.md`](docs/development.md)
 - Governance & RSAH: [`docs/governance-rsah.md`](docs/governance-rsah.md)
 - Measurement harnesses: [`docs/benchmarks.md`](docs/benchmarks.md); dated results: [`docs/quality.md`](docs/quality.md)

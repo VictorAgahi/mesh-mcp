@@ -330,6 +330,49 @@ impl ContractGraph {
         }
     }
 
+    /// Call sites recorded for `service.method` (`=Service.Method`, or
+    /// `~Service.Method` when the service was inferred from a field name),
+    /// whether or not they resolved to a declared RPC. A caller of an RPC that
+    /// no longer exists has no `CallsRpc` edge (there is no node left to link it
+    /// to), so `analyze_grpc` cannot list it: `diff_mesh` asks here instead.
+    /// Names compare with [`fold_rpc_name`]; an inferred service is heuristic.
+    /// Sorted by location, each node once.
+    pub fn recorded_rpc_callers(
+        &self,
+        service: &str,
+        method: &str,
+    ) -> Vec<(&ContractNode, EdgeConfidence)> {
+        let (want_service, want_method) = (fold_rpc_name(service), fold_rpc_name(method));
+        let mut out: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
+        for (caller_id, recorded) in &self.rpc_calls {
+            let (target, confidence) =
+                if let Some(t) = recorded.strip_prefix(RPC_EXACT_METHOD_PREFIX) {
+                    (t, EdgeConfidence::Exact)
+                } else if let Some(t) = recorded.strip_prefix(RPC_INFERRED_METHOD_PREFIX) {
+                    (t, EdgeConfidence::Heuristic)
+                } else {
+                    continue;
+                };
+            let Some((s, m)) = target.rsplit_once('.') else {
+                continue;
+            };
+            if fold_rpc_name(s) != want_service || fold_rpc_name(m) != want_method {
+                continue;
+            }
+            if let Some(node) = self.nodes.get(caller_id) {
+                match out.iter_mut().find(|(n, _)| n.id == node.id) {
+                    Some(seen) if confidence == EdgeConfidence::Exact => seen.1 = confidence,
+                    Some(_) => {}
+                    None => out.push((node, confidence)),
+                }
+            }
+        }
+        out.sort_by(|(a, _), (b, _)| {
+            (&a.file_path, a.line_start, a.id).cmp(&(&b.file_path, b.line_start, b.id))
+        });
+        out
+    }
+
     /// Asynchronous causal impact flow resolution
     pub fn analyze_impact(&self, target: &str) -> ImpactFlow<'_> {
         let mut norm_target = normalize_topic_key(target);

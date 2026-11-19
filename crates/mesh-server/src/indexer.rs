@@ -45,6 +45,61 @@ enum RejectKind {
     ReadError,
 }
 
+/// Guards and extracts in-memory contents the way `process_file` does a file it
+/// read from disk: the full lexical guard for tree-sitter inputs, the size budget
+/// and binary sniff for everything else, UTF-8, then `extract_with_config` plus
+/// the custom patterns. No persistent cache, no docs or properties: contract
+/// facts only.
+pub(crate) struct ContentExtractor {
+    extract_cfg: ExtractConfig,
+    patterns: Vec<CompiledPattern>,
+}
+
+impl ContentExtractor {
+    /// The extracted facts, or why the guards refused the contents.
+    pub(crate) fn extract(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        repo_id: RepoId,
+    ) -> Result<FileIndex, String> {
+        let lang = LanguageKind::from_path(&path.to_string_lossy());
+        let budget = AstGuard::size_budget(path);
+        let verdict = if lang.language().is_some() {
+            AstGuard::check_content(path, bytes)
+        } else if bytes.len() as u64 > budget {
+            Err(GuardRejection::Oversized {
+                size: bytes.len() as u64,
+                budget,
+            })
+        } else if AstGuard::looks_binary(bytes) {
+            Err(GuardRejection::Binary)
+        } else {
+            Ok(())
+        };
+        verdict.map_err(|r| match r {
+            GuardRejection::Oversized { size, budget } => {
+                format!("oversized ({size} bytes, budget {budget})")
+            }
+            GuardRejection::Binary => "binary (a null byte in the first 4 KB)".to_string(),
+            GuardRejection::LongLine { len } => format!("a {len}-byte line (limit 1024)"),
+            GuardRejection::DeepNesting { depth } => format!("nesting depth {depth} (limit 64)"),
+        })?;
+        let content = std::str::from_utf8(bytes).map_err(|_| "not valid UTF-8".to_string())?;
+        let mut code =
+            PolyglotIndexer::extract_with_config(path, content, repo_id, &self.extract_cfg);
+        if !self.patterns.is_empty() {
+            code.merge(PolyglotIndexer::extract_custom_patterns(
+                path,
+                content,
+                repo_id,
+                &self.patterns,
+            ));
+        }
+        Ok(code)
+    }
+}
+
 /// Output of processing one file on the pool.
 struct FileFragment {
     path: PathBuf,
@@ -867,7 +922,10 @@ impl WorkspaceIndexer {
     /// matching prefix) — the same attribution `crawl_all` gives an overlapping
     /// file via `exclude_patterns_for_root`'s nested-root exclusion, reproduced
     /// here for a single path without crawling anything.
-    fn most_specific_root<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<(RepoId, &'a Path)> {
+    pub(crate) fn most_specific_root<'a>(
+        path: &Path,
+        roots: &'a [PathBuf],
+    ) -> Option<(RepoId, &'a Path)> {
         roots
             .iter()
             .enumerate()
@@ -1330,7 +1388,7 @@ impl WorkspaceIndexer {
     /// canonicalized, deduplicated list `expand_roots` produces (equal paths never
     /// occur twice, so "strict descendant" is the only overlap `PathBuf` prefixing can
     /// mean here).
-    fn exclude_patterns_for_root(
+    pub(crate) fn exclude_patterns_for_root(
         exclude_patterns: &[String],
         roots: &[PathBuf],
         root: &Path,
@@ -1349,6 +1407,15 @@ impl WorkspaceIndexer {
             patterns.push(format!("{}/**", rel.to_string_lossy().replace('\\', "/")));
         }
         patterns
+    }
+
+    /// The extraction knobs of a full scan, for callers that extract contents the
+    /// scan never reads (a file's version at a Git base, in `diff_mesh`).
+    pub(crate) fn content_extractor(config: &Config, roots: &[PathBuf]) -> ContentExtractor {
+        ContentExtractor {
+            extract_cfg: Self::extract_config(config, roots),
+            patterns: Self::compiled_patterns(config),
+        }
     }
 
     /// Reads, guards and extracts one file. Runs on the pool; touches no shared state.
