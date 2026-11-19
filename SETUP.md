@@ -250,7 +250,7 @@ mesh-mcp doctor
 Abridged output (the exact lines depend on the platform and configuration):
 
 ```
-🔍 Running MeshMCP Diagnostic Healthcheck (v7.1.11, commit: ...)...
+🔍 Running MeshMCP Diagnostic Healthcheck (v8.0.0, commit: ...)...
 
 ✔ Config syntax: valid (.agents/mesh-mcp.toml)
 ℹ Project skills: none configured ([engines.policy.skills])
@@ -345,13 +345,14 @@ printf '%s\n' \
 ### Daemon vs standalone
 
 `mesh-mcp run` (default) connects to a `meshd` daemon over a Unix socket scoped to *this
-workspace* (a hash of its canonical path + the binary version), auto-spawning it if needed.
-Several IDE windows open on the *same* repo then share one index; a different repo always gets
-its own daemon and socket — they never mix, even if both happen to be running at once. The
-daemon exits on its own once idle.
+repository* (a hash of its canonical Git directory + the binary version; outside Git, of the
+workspace directory and config file), auto-spawning it if needed. Several IDE windows open on the
+*same* repo, worktrees included, then share one daemon; a different repo always gets its own
+daemon and socket — they never mix, even if both happen to be running at once. The daemon exits
+on its own once idle.
 
 The daemon follows its config file: edit `mesh-mcp.toml` and the next requests (within about a
-second, checked at most every 250 ms) rebuild the workspace state in the background while the old
+second, checked at most every 250 ms, and every 2 seconds when idle) rebuild the workspace state in the background while the old
 one keeps serving; no restart is needed. A file that does not parse, or whose roots do not
 resolve, is refused: the old state keeps serving, a warning goes to the daemon log
 (`~/.cache/mesh-mcp/logs/meshd-<id>.log`) and `mesh-mcp doctor` shows it under "Daemon config".
@@ -367,8 +368,8 @@ What a reload costs depends on what changed (the daemon log says `display-only`,
 | `[[engines.contracts.patterns]]` added, removed or edited | partial | only the files a changed pattern's `file_pattern` applies to are extracted again (the parse cache answers the tree-sitter part) |
 | anything else (`roots`, `exclude_patterns`, `[engines.contracts.*]` other than patterns, docs `enabled` / `paths` / `sanitize_prompt_injections`, `[cache]`, ...) | full | the workspace is indexed again, reusing the per-file parse cache for every file whose parse inputs did not change |
 
-The check runs when a request arrives, not on a timer: an edit made while no client is talking to
-the daemon is applied by the next request. A reload never serves a half-built index; the old
+The check runs when a request arrives and every 2 seconds in the background, so an edit made while
+no client is talking to the daemon is already applied by the next request. A reload never serves a half-built index; the old
 state keeps serving until the new one is ready, and a reload that fails keeps the old state.
 
 **Root guard.** With no config file found, the workspace is the current directory. If that is
@@ -382,11 +383,35 @@ checked). Home is read from `HOME`/`USERPROFILE`, else from the operating system
 `mesh-mcp run --standalone` keeps everything in one process — use it in containers, in CI, or
 anywhere a Unix socket isn't available.
 
+### Worktrees
+
+Inside a Git repository, one `meshd` serves every worktree of the repository (and every config
+file in it). Each worktree is a separate *view* of that daemon with its own graph and file
+watcher, so a session in one worktree only ever sees that worktree's files, and an edit in one
+never shows up in another. There is nothing to configure: open a session in each worktree and
+they find the same daemon.
+
+- **See the views.** `mesh-mcp doctor` lists the views the running daemon serves (worktree,
+  config file, sessions, views built since start). A view with no session for 30 minutes
+  (`--idle-timeout-minutes`) is dropped and rebuilt on the next session; the daemon exits once it
+  has no view and no client.
+- **Cache sharing.** The parse cache is one database per repository
+  (`~/.cache/mesh-mcp/workspaces/<id>/`), so a second worktree of the same commit boots on cache
+  hits instead of re-parsing. Records are shared between worktrees running the same mesh-mcp
+  version. RAM still holds one graph per active view.
+- **Outside Git** nothing changes: one daemon per directory and config file.
+- **After upgrading from 7.x.** An 8.0 `mesh-mcp` and `meshd` always come as a pair and never talk
+  to a 7.x daemon (the socket name differs), so stale 7.x daemons simply idle out. The first start
+  re-parses everything once because the cache schema changed. Run `mesh-mcp doctor --fix` in each
+  worktree you still use to remove its old 7.x cache directory; the directory of a worktree you
+  already deleted is not recognised and can be removed by hand from
+  `~/.cache/mesh-mcp/workspaces/`.
+
 To manage a workspace's daemon explicitly:
 
 ```bash
 meshd --idle-timeout-minutes 30    # foreground, indexes the cwd's workspace
-pkill meshd                        # stop all daemons; the next `mesh-mcp run` respawns per-workspace
+pkill meshd                        # stop all daemons; the next `mesh-mcp run` respawns one per repository
 ```
 
 If you're upgrading from a version before P0 step 1.8 and see more than one `meshd` process, or
@@ -697,7 +722,7 @@ The requested path is outside every configured root. That's the security jail wo
 directory to `roots` if it should be readable.
 
 **I edited `mesh-mcp.toml` and nothing changed**
-The daemon applies a config edit on the next request, at most every 250 ms, and keeps serving the
+The daemon applies a config edit within about 2 seconds (on the next request at the latest), and keeps serving the
 old state until the new one is ready (seconds on a large workspace). If the file does not parse or
 its roots do not resolve, the old config stays active: run `mesh-mcp doctor`, which shows the
 refusal under "Daemon config". Only the main toml is followed, not files it refers to.

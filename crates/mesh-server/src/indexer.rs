@@ -1156,12 +1156,14 @@ impl WorkspaceIndexer {
         // Only the edges this batch can reach are recomputed (`reconcile_delta`
         // falls back to the full rebuild for a large batch). An alias config edit
         // changes how the scripts it governs resolve without those scripts' own
-        // nodes saying so, so it takes the full rebuild.
+        // nodes saying so, and a changed custom pattern forces the files it applies
+        // to; either way `forced_paths` is non-empty and the reload takes the full
+        // rebuild.
         let mode = if forced_paths.is_empty() {
             snapshot.contract_graph.reconcile_delta()
         } else {
             snapshot.contract_graph.reconcile_edges();
-            ReconcileMode::Full("alias config change")
+            ReconcileMode::Full("forced re-extraction (alias config or custom pattern change)")
         };
         let t_reconciled = std::time::Instant::now();
         let node_count = snapshot.contract_graph.node_count();

@@ -127,7 +127,7 @@ flowchart TD
         Guard{"AstGuard Limits<br/>(size, binary, line-length, nesting)"}
         Rejected["Rejected Files List<br/>(surfaced in doctor & tools, never dropped silently)"]
         Parse["Tree-sitter Parse & Extractors<br/>(parallel Rayon workers)"]
-        Cache[("SQLite Parse Cache<br/>(persistent per-workspace cache)")]
+        Cache[("SQLite Parse Cache<br/>(persistent per-repository cache)")]
         Reconcile["Fold & Reconcile Edges<br/>(Imports, Implements, CallsRpc, Produces, Consumes)"]
     end
 
@@ -154,15 +154,15 @@ flowchart TD
     Server --> Answers
 ```
 
-- **Daemon mode (default).** `mesh-mcp run` is a thin stdio proxy to a per-workspace `meshd`
-  process (Unix socket on macOS/Linux, named pipe on Windows), so several editor windows on the
-  same repository share one index. `meshd` is started on demand and exits after 30 idle minutes.
+- **Daemon mode (default).** `mesh-mcp run` is a thin stdio proxy to a `meshd`
+  process per Git repository (per workspace outside Git; Unix socket on macOS/Linux, named pipe on
+  Windows), so several editor windows and worktrees of the same repository share one daemon. `meshd` is started on demand and exits after 30 idle minutes.
   `mesh-mcp run --standalone` keeps everything in one process (containers, CI).
 - **The daemon follows its config.** Edit `mesh-mcp.toml` and `meshd` applies it without a restart,
   at the cost of what changed: display-only keys swap over the running index, a changed custom
   pattern re-extracts only the files it applies to, anything else rebuilds the index from the
   parse cache. The old state keeps serving until the new one is ready ([SETUP.md](SETUP.md#daemon-vs-standalone)).
-- **Persistent parse cache.** One SQLite file per workspace under `~/.cache/mesh-mcp/workspaces/`,
+- **Persistent parse cache.** One SQLite file per Git repository (per workspace outside Git) under `~/.cache/mesh-mcp/workspaces/`,
   with a size quota and LRU eviction, so a restart or a branch switch back to known content does
   not re-parse it.
 - Details: [docs/architecture.md](docs/architecture.md).
@@ -330,10 +330,11 @@ What this shows, and what it does not:
   `scripts/bench/tier_bench.py --repo <path> --workdir /tmp/mesh-real` ([docs/benchmarks.md](docs/benchmarks.md)).
 
 **How worktrees behave** (from the code, not from a benchmark):
-- A daemon is identified by the **config file's base directory** plus the binary version
-  (`workspace_id`, `crates/mesh-core/src/socket.rs`). Two worktrees with their own config copy
-  (for example a committed `.agents/mesh-mcp.toml`) are two workspaces: two `meshd` processes, two
-  in-memory indexes, memory adds up.
+- Inside a Git repository one `meshd` serves every worktree and config file of the repository
+  (socket `meshd-<family_id>`, from the canonical common Git directory plus the binary version,
+  `crates/mesh-core/src/identity.rs`). Each worktree is its own **view** with its own in-memory
+  graph, so a second worktree adds one graph, not one process; RAM is still one graph per active
+  view. Outside Git the daemon is still named by the config file's base directory.
 - The on-disk parse cache is one per Git repository (`~/.cache/mesh-mcp/workspaces/<id>/`, quota
   `[cache] max_size_mb`, default 2048 MB), shared by all its worktrees running the same mesh-mcp
   version: a second worktree of the same commit boots on cache hits. A workspace outside Git has
@@ -345,8 +346,8 @@ What this shows, and what it does not:
   ([docs/agent-setup.md](docs/agent-setup.md) says to exclude mirrored copies).
 - The watcher follows `.git` files (linked worktrees and submodules) and pauses reloads during
   checkouts and rebases ([architecture §8](docs/architecture.md)).
-- Disk adds up too: with the default quota (2048 MB per workspace), twenty workspaces can occupy up to
-  about 40 GB of cache. Lower `[cache] max_size_mb` when you run many.
+- Disk adds up too: with the default quota (2048 MB per repository, or per workspace outside Git), twenty
+  repositories can occupy up to about 40 GB of cache. Lower `[cache] max_size_mb` when you run many.
 - Startup is the peak: several daemons starting at once (after a reboot, say) all run their first
   parallel parse together.
 - There is no memory cap or eviction setting; only the disk cache has a quota.
@@ -391,7 +392,7 @@ Details: [docs/architecture.md](docs/architecture.md) (jail, sandbox, audit) and
 
 ## Status and known limitations
 
-- **Version 7.1.11** on `main`. Single Rust workspace (`mesh-core`, `mesh-parsers`,
+- **Version 8.0.0** on `main`. Single Rust workspace (`mesh-core`, `mesh-parsers`,
   `mesh-server`, `mesh-daemon`); CI runs formatting, strict Clippy, and the test suite on Linux,
   macOS and Windows, plus the determinism and golden-corpus gates.
 - **Ready for a pilot, not yet validated in production use.** The A/B pilot is the next

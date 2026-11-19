@@ -351,13 +351,14 @@ how long that indexing takes.
 ### 8.1a The daemon follows its config (7.1.7, 7.1.9)
 
 `meshd` does not hold a fixed `AppState`: it serves a `WorkspaceHost`
-(`crates/mesh-daemon/src/host.rs`). On a request, at most every 250 ms, it reads and hashes the
+(`crates/mesh-daemon/src/host.rs`). On a request (at most every 250 ms) and on an idle poll every 2 s, it reads and hashes the
 config file it was started from (`mesh_core::config_watch`; mtime and length are not trusted). A
 different hash builds a new state on a blocking thread while the previous one keeps serving; an
 `ArcSwap` store swaps it in once the new state has its first snapshot, and the old watcher is
 cancelled. A config that fails to parse or whose roots do not resolve is refused and recorded for
-`doctor`; refused bytes are not retried until the file changes. There is no timer: an edit made
-while no client talks to the daemon is applied by the next request.
+`doctor`; refused bytes are not retried until the file changes. The 2 s idle poll
+(`WorkspaceHost::spawn_idle_poller`) means an edit made while no client talks to the daemon is
+already applied when the next request comes.
 
 How much work the swap does depends on the edit (`mesh_core::reload_kind`): display-only keys swap
 the config over the running index, a changed `[[engines.contracts.patterns]]` re-extracts only the
@@ -408,8 +409,8 @@ The cache key of a file folds in its content hash, its `RepoId`, the extraction-
 and, for a JavaScript / TypeScript file, the `tsconfig` / `jsconfig` `paths` and `package.json`
 `imports` aliases that govern it, so editing an alias config re-extracts exactly the files under it.
 The fingerprint does not depend on the workspace roots (adding a root does not invalidate the
-cache). The record schema is versioned (`SCHEMA_VERSION` in `index_cache.rs`, 11 at 7.1.11) and the
-workspace id folds in the binary version.
+cache). The record schema is versioned (`SCHEMA_VERSION` in `index_cache.rs`, 12 at 8.0.0) and the
+daemon id folds in the binary version.
 
 ### 8.3 Kernel network sandbox of `meshd` (Linux, plan 4 step 4.10)
 
