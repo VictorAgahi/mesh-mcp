@@ -534,7 +534,13 @@ impl ViewRegistry {
     }
 
     /// Daemon shutdown: every view's status record goes (the server removes the meta file).
-    pub fn on_shutdown(&self) {
+    pub fn on_shutdown(&self, daemon_id: &str) {
+        // Unbound first, under the lock `publish_meta` holds while writing: a sweep or a
+        // session that finishes after this point can no longer recreate the meta file.
+        let mut bound = self.bound.lock().unwrap_or_else(|p| p.into_inner());
+        *bound = None;
+        mesh_core::socket::remove_daemon_meta(daemon_id);
+        drop(bound);
         for view in self.ready_views() {
             view.retire();
         }

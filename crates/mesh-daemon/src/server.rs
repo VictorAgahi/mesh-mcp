@@ -92,11 +92,10 @@ impl Router {
 
     fn on_shutdown(&self, daemon_id: &str) {
         match self {
-            Self::Views(registry) => registry.on_shutdown(),
+            Self::Views(registry) => registry.on_shutdown(daemon_id),
             #[cfg(test)]
-            Self::Fixed(_) => {}
+            Self::Fixed(_) => mesh_core::socket::remove_daemon_meta(daemon_id),
         }
-        mesh_core::socket::remove_daemon_meta(daemon_id);
     }
 }
 
