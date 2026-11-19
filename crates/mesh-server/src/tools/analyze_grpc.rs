@@ -585,12 +585,8 @@ pub(crate) fn check_wire_format(
         git::SMALL_OUTPUT,
     )?;
     if !exists.success {
-        return Ok(WireReport {
-            rel_path,
-            base: choice,
-            base_sha,
-            outcome: WireOutcome::NewFile,
-        });
+        // Absent from the base: nothing to compare, the working tree is not read.
+        return Ok(compare_wire(rel_path, choice, base_sha, None, ""));
     }
     let shown = run(
         &[os("show"), os("--no-textconv"), OsStr::new(&object)],
@@ -604,10 +600,36 @@ pub(crate) fn check_wire_format(
     }
     let before = String::from_utf8_lossy(&shown.stdout);
     let after = read_bounded(file)?;
+    Ok(compare_wire(
+        rel_path,
+        choice,
+        base_sha,
+        Some(&before),
+        &after,
+    ))
+}
 
+/// The wire-format comparison of `before` (the `.proto` at the base, `None`
+/// when absent there) with `after` (the working tree), for callers that already
+/// hold both versions (`diff_mesh` reads them in one `git cat-file --batch`).
+pub(crate) fn compare_wire(
+    rel_path: String,
+    base: BaseChoice,
+    base_sha: String,
+    before: Option<&str>,
+    after: &str,
+) -> WireReport {
+    let Some(before) = before else {
+        return WireReport {
+            rel_path,
+            base,
+            base_sha,
+            outcome: WireOutcome::NewFile,
+        };
+    };
     let outcome = match (
-        ProtoExtractor::wire_schema(&before),
-        ProtoExtractor::wire_schema(&after),
+        ProtoExtractor::wire_schema(before),
+        ProtoExtractor::wire_schema(after),
     ) {
         (Err(reason), _) => WireOutcome::Unparseable {
             side: "base",
@@ -619,12 +641,12 @@ pub(crate) fn check_wire_format(
         },
         (Ok(old), Ok(new)) => WireOutcome::Compared(diff_wire_schemas(&old, &new)),
     };
-    Ok(WireReport {
+    WireReport {
         rel_path,
-        base: choice,
+        base,
         base_sha,
         outcome,
-    })
+    }
 }
 
 /// Reads the working-tree file, refusing it before the read when it exceeds the

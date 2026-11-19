@@ -86,8 +86,15 @@ impl ContentExtractor {
             GuardRejection::DeepNesting { depth } => format!("nesting depth {depth} (limit 64)"),
         })?;
         let content = std::str::from_utf8(bytes).map_err(|_| "not valid UTF-8".to_string())?;
-        let mut code =
-            PolyglotIndexer::extract_with_config(path, content, repo_id, &self.extract_cfg);
+        // On an agent's synchronous request path: the query parse budget, never
+        // the indexing one (CLAUDE.md commandment 2).
+        let mut code = PolyglotIndexer::extract_with_budget(
+            path,
+            content,
+            repo_id,
+            &self.extract_cfg,
+            AstGuard::QUERY_PARSE_TIMEOUT_MICROS,
+        );
         if !self.patterns.is_empty() {
             code.merge(PolyglotIndexer::extract_custom_patterns(
                 path,

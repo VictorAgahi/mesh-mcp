@@ -5,13 +5,13 @@
 use crate::git::{self, BaseChoice, GitError, GitRunner};
 use crate::indexer::{ContentExtractor, WorkspaceIndexer};
 use crate::protocol::RequestMeta;
-use crate::tools::analyze_grpc::{check_wire_format, render_report};
+use crate::tools::analyze_grpc::{compare_wire, render_report};
 use crate::tools::find_dependents::is_indexable_source;
 use crate::tools::smart_search::SearchScope;
 use crate::tools::{McpTool, ToolError, ToolOutput};
 use mesh_core::{
     AppState, CompactStr, ContractGraph, ContractNode, DependentsMatch, EdgeConfidence,
-    ExcludeMatcher, FilesystemCrawler, NodeKind, RepoId, ValidatedScope,
+    ExcludeMatcher, FilesystemCrawler, NodeKind, RecordedCaller, RepoId, ValidatedScope,
 };
 use mesh_parsers::{AstGuard, FileIndex};
 use schemars::JsonSchema;
@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -74,7 +75,7 @@ impl McpTool for DiffMeshTool {
     }
 
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError> {
-        run_with(args, state, &GitRunner::system(), MAX_CHANGED_FILES)
+        run_with(args, state, &GitRunner::system(), Limits::DEFAULT)
     }
 }
 
@@ -101,6 +102,26 @@ const MAX_CHANGES_PER_FILE: usize = 40;
 const MAX_SIGNATURE_CHARS: usize = 160;
 /// Names too generic for a dependents lookup to mean anything.
 const GENERIC_NAMES: [&str; 6] = ["constructor", "main", "init", "new", "default", "index"];
+/// Wall-clock budget of one call (it runs on an agent's synchronous request
+/// path). Once it is spent, the files not yet extracted and the `.proto` files
+/// not yet checked are reported as not analysed, never silently dropped.
+const CALL_TIME_BUDGET: Duration = Duration::from_secs(20);
+/// Room kept, while a section is filled, for the "N more" line that ends it.
+const NOTE_RESERVE: usize = 512;
+
+/// The bounds of one call; tests shrink them.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    max_files: usize,
+    time_budget: Duration,
+}
+
+impl Limits {
+    const DEFAULT: Self = Self {
+        max_files: MAX_CHANGED_FILES,
+        time_budget: CALL_TIME_BUDGET,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Changed files
@@ -140,6 +161,58 @@ struct Counters {
     truncated: usize,
     /// The file cap of this call.
     cap: usize,
+    /// Files not extracted because the call's time budget was spent.
+    timed_out: Vec<String>,
+}
+
+/// The configured roots and their display names (`WorkspaceIndexer::repo_names`:
+/// two roots named `api` under different parents stay apart).
+struct RootView<'a> {
+    roots: &'a [PathBuf],
+    names: Vec<String>,
+}
+
+impl<'a> RootView<'a> {
+    fn new(roots: &'a [PathBuf]) -> Self {
+        Self {
+            roots,
+            names: WorkspaceIndexer::repo_names(roots),
+        }
+    }
+
+    fn name_of(&self, id: RepoId) -> Option<&str> {
+        self.names.get(id as usize).map(String::as_str)
+    }
+
+    /// `abs` relative to its most specific root, `/`-separated; prefixed with
+    /// the root's display name when several roots are configured.
+    fn path(&self, abs: &Path) -> String {
+        let Some((id, root)) = WorkspaceIndexer::most_specific_root(abs, self.roots) else {
+            return abs.display().to_string();
+        };
+        let rel = abs
+            .strip_prefix(root)
+            .map(|r| {
+                r.components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .unwrap_or_else(|_| abs.display().to_string());
+        match (self.roots.len() > 1, self.name_of(id)) {
+            (true, Some(name)) => format!("{name}/{rel}"),
+            _ => rel,
+        }
+    }
+
+    /// A root: its display name when several roots are configured, else its path.
+    fn root(&self, root: &Path) -> String {
+        let id = self.roots.iter().position(|r| r == root);
+        match (self.roots.len() > 1, id.and_then(|i| self.names.get(i))) {
+            (true, Some(name)) => name.clone(),
+            _ => root.display().to_string(),
+        }
+    }
 }
 
 /// Selects the roots `scope` covers: every root when global, else the root that
@@ -338,32 +411,6 @@ fn list_changes(
         shallow,
         paths: paths.into_iter().collect(),
     })
-}
-
-/// `abs` relative to its most specific root, `/`-separated; prefixed with the
-/// root's directory name when several roots are configured.
-fn display_path(abs: &Path, roots: &[PathBuf]) -> String {
-    let Some((_, root)) = WorkspaceIndexer::most_specific_root(abs, roots) else {
-        return abs.display().to_string();
-    };
-    let rel = abs
-        .strip_prefix(root)
-        .map(|r| {
-            r.components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/")
-        })
-        .unwrap_or_else(|_| abs.display().to_string());
-    if roots.len() > 1 {
-        let name = root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        format!("{name}/{rel}")
-    } else {
-        rel
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +618,8 @@ struct FactVal {
     line: usize,
     /// The declaration a relation is attached to (a producer's method).
     owner: Option<String>,
+    /// The declared package of an RPC (`demo.v1`), which a client may prefix.
+    package: Option<String>,
 }
 
 fn decl_label(kind: NodeKind) -> Option<&'static str> {
@@ -586,13 +635,13 @@ fn decl_label(kind: NodeKind) -> Option<&'static str> {
 
 /// Records `fact` at `line` (the earliest wins), with the signature of a
 /// declaration or the owner of a relation.
-fn add_fact(
-    facts: &mut BTreeMap<Fact, FactVal>,
+fn add_fact<'f>(
+    facts: &'f mut BTreeMap<Fact, FactVal>,
     fact: Fact,
     line: Option<usize>,
     signature: Option<&str>,
     owner: Option<&str>,
-) {
+) -> &'f mut FactVal {
     let entry = facts.entry(fact).or_insert_with(|| FactVal {
         line: usize::MAX,
         ..FactVal::default()
@@ -606,12 +655,14 @@ fn add_fact(
     if entry.owner.is_none() {
         entry.owner = owner.map(str::to_string);
     }
+    entry
 }
 
 fn facts_of(index: &FileIndex) -> BTreeMap<Fact, FactVal> {
     let mut facts: BTreeMap<Fact, FactVal> = BTreeMap::new();
     for node in &index.nodes {
         let name = node.name.to_string();
+        let is_rpc = matches!(node.kind, NodeKind::GrpcService | NodeKind::GrpcMethod);
         let fact = match node.kind {
             NodeKind::GrpcService => Fact::Rpc("gRPC service", name),
             NodeKind::GrpcMethod => Fact::Rpc("RPC", name),
@@ -621,13 +672,16 @@ fn facts_of(index: &FileIndex) -> BTreeMap<Fact, FactVal> {
                 None => continue,
             },
         };
-        add_fact(
+        let entry = add_fact(
             &mut facts,
             fact,
             Some(node.line_start),
             node.signature.as_deref(),
             None,
         );
+        if is_rpc && !node.package.is_empty() && entry.package.is_none() {
+            entry.package = Some(node.package.to_string());
+        }
     }
     let node = |i: usize| index.nodes.get(i);
     let relations = index
@@ -756,8 +810,9 @@ fn run_with(
     args: &DiffMeshArgs,
     state: &AppState,
     git: &GitRunner,
-    max_files: usize,
+    limits: Limits,
 ) -> Result<ToolOutput, ToolError> {
+    let deadline = Instant::now() + limits.time_budget;
     let base = args.base.as_deref();
     if let Some(b) = base {
         git::validate_base(b).map_err(|e| (-32602, e.to_string()))?;
@@ -768,6 +823,7 @@ fn run_with(
     }
     let program = git.locate().map_err(|e| (-32603, e.to_string()))?;
     let roots = &state.allowed_roots;
+    let view = RootView::new(roots);
 
     // 1. Changed paths, per target.
     let mut diffs: Vec<RootDiff> = Vec::new();
@@ -775,7 +831,7 @@ fn run_with(
     let mut changed: Vec<Changed> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut counters = Counters {
-        cap: max_files,
+        cap: limits.max_files,
         ..Counters::default()
     };
     let mut matchers: HashMap<RepoId, ExcludeMatcher> = HashMap::new();
@@ -837,7 +893,7 @@ fn run_with(
             changed.push(Changed {
                 repo_id,
                 root_diff,
-                display: display_path(&abs, roots),
+                display: view.path(&abs),
                 abs,
                 rel_top,
             });
@@ -862,9 +918,9 @@ fn run_with(
         ));
     }
     changed.sort_by(|a, b| a.display.cmp(&b.display));
-    if changed.len() > max_files {
-        counters.truncated = changed.len() - max_files;
-        changed.truncate(max_files);
+    if changed.len() > limits.max_files {
+        counters.truncated = changed.len() - limits.max_files;
+        changed.truncate(limits.max_files);
     }
 
     // 2. Base contents: one batch per repository and base.
@@ -879,6 +935,11 @@ fn run_with(
             .push((i, c));
     }
     for ((_, sha), files) in &groups {
+        // Past the deadline nothing more is read; the extraction loop below
+        // names every file left as not analysed.
+        if Instant::now() >= deadline {
+            break;
+        }
         let Some(&(_, first)) = files.first() else {
             continue;
         };
@@ -908,7 +969,12 @@ fn run_with(
         WorkspaceIndexer::content_extractor(&state.config, &state.allowed_roots);
     let mut reports: Vec<FileReport> = Vec::new();
     let mut files_accessed: Vec<String> = Vec::new();
+    let mut protos: Vec<ProtoInput> = Vec::new();
     for (i, c) in changed.iter().enumerate() {
+        if Instant::now() >= deadline {
+            counters.timed_out = changed[i..].iter().map(|c| c.display.clone()).collect();
+            break;
+        }
         let base_side = base_sides.remove(&i).unwrap_or(Side::Absent);
         let current_side = read_current(&c.abs, state);
         let status = match (&base_side, &current_side) {
@@ -919,6 +985,21 @@ fn run_with(
         };
         if matches!(current_side, Side::Content(_)) {
             files_accessed.push(c.abs.to_string_lossy().into_owned());
+        }
+        // The wire check reuses the contents read here: no second `git` run.
+        if is_proto(&c.abs) && status != FileStatus::Removed {
+            let text = |side: &Side| match side {
+                Side::Absent => Ok(None),
+                Side::Skipped(why) => Err(why.clone()),
+                Side::Content(bytes) => Ok(Some(String::from_utf8_lossy(bytes).into_owned())),
+            };
+            protos.push(ProtoInput {
+                display: c.display.clone(),
+                rel_top: c.rel_top.clone(),
+                root_diff: c.root_diff,
+                before: text(&base_side),
+                after: text(&current_side),
+            });
         }
         let mut skipped = None;
         let mut extract = |side: Side, label: &str| -> BTreeMap<Fact, FactVal> {
@@ -959,43 +1040,51 @@ fn run_with(
 
     // 5. Impact from the live graph, and the wire check of every changed .proto.
     let snapshot = state.snapshot();
-    let impact = render_impact(&reports, &snapshot.contract_graph, roots);
-    let mut wire = String::new();
-    let mut wire_breaks = 0usize;
-    for r in reports.iter().filter(|r| is_proto(&r.abs)) {
-        if r.status == FileStatus::Removed {
-            let _ = writeln!(
-                wire,
-                "\n### Wire-format check: `{}`\n- **Result**: file removed — every message and RPC it declared is gone (see the RPC removals above)",
-                r.display
-            );
+    let impact = render_impact(&reports, &snapshot.contract_graph, &view);
+    let mut wire: Vec<WireEntry> = reports
+        .iter()
+        .filter(|r| is_proto(&r.abs) && r.status == FileStatus::Removed)
+        .map(|r| {
+            WireEntry::note(
+                &r.display,
+                "file removed: every message and RPC it declared is gone (its RPC removals are listed with the file)",
+            )
+        })
+        .collect();
+    for p in protos {
+        if Instant::now() >= deadline {
+            wire.push(WireEntry::unchecked(
+                &p.display,
+                "not checked: the time budget of this call is spent; run `analyze_grpc` with this `.proto` as `target`",
+            ));
             continue;
         }
-        match check_wire_format(&r.abs, base, git) {
-            Ok(report) => {
-                wire_breaks += report.breaking_count();
-                wire.push_str(&render_report(&report));
-            }
-            Err(e) => {
-                let _ = writeln!(
-                    wire,
-                    "\n### Wire-format check: `{}`\n*Skipped: {e}*",
-                    r.display
+        let d = &diffs[p.root_diff];
+        match (p.before, p.after) {
+            (Err(why), _) => wire.push(WireEntry::unchecked(
+                &p.display,
+                &format!("not checked: the base version was not read ({why})"),
+            )),
+            (_, Err(why)) => wire.push(WireEntry::unchecked(
+                &p.display,
+                &format!("not checked: the working-tree version was not read ({why})"),
+            )),
+            (Ok(before), Ok(after)) => {
+                let report = compare_wire(
+                    p.rel_top,
+                    d.base.clone(),
+                    d.base_sha.clone(),
+                    before.as_deref(),
+                    after.as_deref().unwrap_or_default(),
                 );
+                wire.push(WireEntry::report(&p.display, &report));
             }
         }
     }
 
     // 6. Render.
     let text = render(
-        &diffs,
-        &failures,
-        &reports,
-        &counters,
-        &impact,
-        &wire,
-        wire_breaks,
-        roots,
+        &diffs, &failures, &reports, &counters, &impact, &wire, &view,
     );
     Ok(ToolOutput {
         text,
@@ -1009,35 +1098,86 @@ fn is_proto(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("proto"))
 }
 
+/// Both versions of a changed `.proto`, as read for extraction: `Ok(None)` is
+/// absent, `Err` the reason it was not read.
+struct ProtoInput {
+    display: String,
+    rel_top: String,
+    root_diff: usize,
+    before: Result<Option<String>, String>,
+    after: Result<Option<String>, String>,
+}
+
+/// One `.proto`'s wire-format result: the full report, and the one-line form
+/// kept when the full one does not fit the output budget.
+struct WireEntry {
+    full: String,
+    compact: String,
+    breaks: usize,
+    unchecked: bool,
+}
+
+impl WireEntry {
+    fn note(display: &str, result: &str) -> Self {
+        let full = format!("\n### Wire-format check: `{display}`\n- **Result**: {result}\n");
+        Self {
+            compact: full.clone(),
+            full,
+            breaks: 0,
+            unchecked: false,
+        }
+    }
+
+    fn unchecked(display: &str, result: &str) -> Self {
+        Self {
+            unchecked: true,
+            ..Self::note(display, result)
+        }
+    }
+
+    fn report(display: &str, report: &crate::tools::analyze_grpc::WireReport) -> Self {
+        let breaks = report.breaking_count();
+        let result = if breaks > 0 {
+            format!("{breaks} `WIRE_FORMAT_BREAKING_CHANGE`")
+        } else {
+            "no wire-format breaking change".to_string()
+        };
+        Self {
+            full: render_report(report),
+            compact: format!(
+                "\n### Wire-format check: `{display}`\n- **Result**: {result} (details cut to stay under the 48 KB cap: run `analyze_grpc` with this `.proto` as `target`, or narrow `scope`)\n"
+            ),
+            breaks,
+            unchecked: false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Impact
 // ---------------------------------------------------------------------------
 
+/// The impact section: one rendered block per looked-up element (the output
+/// budget decides how many are shown), and the notes that close it.
 struct Impact {
-    text: String,
+    items: Vec<String>,
+    notes: Vec<String>,
     sites: usize,
-}
-
-fn root_relative(node: &ContractNode, roots: &[PathBuf]) -> String {
-    format!(
-        "{}:{}",
-        display_path(&node.file_path, roots),
-        node.line_start
-    )
 }
 
 fn push_rows(
     out: &mut String,
     rows: &[(&ContractNode, String)],
-    roots: &[PathBuf],
+    view: &RootView<'_>,
     sites: &mut usize,
 ) {
     for (node, how) in rows.iter().take(MAX_IMPACT_ROWS) {
         let _ = writeln!(
             out,
-            "- `{}` in `{}` _({how})_",
+            "- `{}` in `{}:{}` _({how})_",
             node.name,
-            root_relative(node, roots)
+            view.path(&node.file_path),
+            node.line_start
         );
     }
     if rows.len() > MAX_IMPACT_ROWS {
@@ -1046,11 +1186,11 @@ fn push_rows(
     *sites += rows.len();
 }
 
-fn render_impact(reports: &[FileReport], graph: &ContractGraph, roots: &[PathBuf]) -> Impact {
-    let mut out = String::new();
+fn render_impact(reports: &[FileReport], graph: &ContractGraph, view: &RootView<'_>) -> Impact {
+    let mut items: Vec<String> = Vec::new();
     let mut sites = 0usize;
-    let mut items = 0usize;
     let mut skipped_items = 0usize;
+    let (mut routes, mut services) = (0usize, 0usize);
     for r in reports {
         for ch in &r.changes {
             if ch.kind == ChangeKind::Added {
@@ -1061,8 +1201,22 @@ fn render_impact(reports: &[FileReport], graph: &ContractGraph, roots: &[PathBuf
             } else {
                 "signature changed"
             };
+            let package = || {
+                ch.base
+                    .as_ref()
+                    .or(ch.current.as_ref())
+                    .and_then(|v| v.package.as_deref())
+            };
             let looked_up = match &ch.fact {
-                Fact::Rpc("RPC", name) => Some(rpc_impact(graph, name, &r.abs)),
+                Fact::Rpc("RPC", name) => Some(rpc_impact(graph, name, package(), &r.abs)),
+                Fact::Rpc(..) => {
+                    services += 1;
+                    None
+                }
+                Fact::Route(_) => {
+                    routes += 1;
+                    None
+                }
                 Fact::Decl(_, name)
                     if name.chars().count() >= 3
                         && !GENERIC_NAMES.contains(&name.to_ascii_lowercase().as_str()) =>
@@ -1080,36 +1234,45 @@ fn render_impact(reports: &[FileReport], graph: &ContractGraph, roots: &[PathBuf
             let Some((rows, empty_note)) = looked_up else {
                 continue;
             };
-            if items >= MAX_IMPACT_ITEMS {
+            if items.len() >= MAX_IMPACT_ITEMS {
                 skipped_items += 1;
                 continue;
             }
-            items += 1;
-            let _ = writeln!(
-                out,
-                "\n#### {} {what} — `{}`",
-                ch.fact.describe(),
-                r.display
-            );
+            let mut item = format!("\n#### {} {what} — `{}`\n", ch.fact.describe(), r.display);
             if rows.is_empty() {
-                let _ = writeln!(out, "- {empty_note}");
+                let _ = writeln!(item, "- {empty_note}");
             } else {
-                push_rows(&mut out, &rows, roots, &mut sites);
+                push_rows(&mut item, &rows, view, &mut sites);
             }
+            items.push(item);
         }
     }
+    let mut notes = Vec::new();
     if skipped_items > 0 {
-        let _ = writeln!(
-            out,
-            "\n*{skipped_items} more removed or changed element(s) not looked up (limit {MAX_IMPACT_ITEMS}); narrow `scope`.*"
-        );
+        notes.push(format!(
+            "\n*{skipped_items} more removed or changed element(s) not looked up (limit {MAX_IMPACT_ITEMS}); narrow `scope`.*\n"
+        ));
     }
-    Impact { text: out, sites }
+    if routes + services > 0 {
+        notes.push(format!(
+            "\n*Impact not computed for routes / services: {routes} removed or changed route(s) (HTTP callers are not linked in the graph), {services} removed or changed gRPC service(s) (their callers are listed under each RPC).*\n"
+        ));
+    }
+    Impact {
+        items,
+        notes,
+        sites,
+    }
 }
 
 type Rows<'g> = (Vec<(&'g ContractNode, String)>, &'static str);
 
-fn rpc_impact<'g>(graph: &'g ContractGraph, name: &str, file: &Path) -> Rows<'g> {
+fn rpc_impact<'g>(
+    graph: &'g ContractGraph,
+    name: &str,
+    package: Option<&str>,
+    file: &Path,
+) -> Rows<'g> {
     let Some((service, method)) = name.rsplit_once('.') else {
         return (
             Vec::new(),
@@ -1118,9 +1281,13 @@ fn rpc_impact<'g>(graph: &'g ContractGraph, name: &str, file: &Path) -> Rows<'g>
     };
     let mut rows: Vec<(&ContractNode, String)> = Vec::new();
     let mut seen: HashSet<mesh_core::NodeId> = HashSet::new();
-    for (node, confidence) in graph.recorded_rpc_callers(service, method) {
+    for (node, confidence, how) in graph.recorded_rpc_callers(service, method, package) {
         if seen.insert(node.id) {
-            rows.push((node, format!("caller, match: {}", confidence.label())));
+            let role = match how {
+                RecordedCaller::Method => "caller",
+                RecordedCaller::ServiceClient => "service-level client, may call",
+            };
+            rows.push((node, format!("{role}, match: {}", confidence.label())));
         }
     }
     // Still declared (a changed RPC): the trace adds callers linked by an edge
@@ -1272,15 +1439,18 @@ fn render_change(ch: &Change) -> String {
     line
 }
 
+/// Added / removed / changed counts per fact family. A relation (topic,
+/// import, call) has no signature, so `diff_facts` never reports it changed;
+/// its third slot stays 0 and is not printed.
 #[derive(Default)]
 struct Tally {
     decl: [usize; 3],
     rpc: [usize; 3],
     route: [usize; 3],
-    produces: [usize; 2],
-    consumes: [usize; 2],
-    imports: [usize; 2],
-    calls: [usize; 2],
+    produces: [usize; 3],
+    consumes: [usize; 3],
+    imports: [usize; 3],
+    calls: [usize; 3],
 }
 
 fn tally(reports: &[FileReport]) -> Tally {
@@ -1291,16 +1461,16 @@ fn tally(reports: &[FileReport]) -> Tally {
             ChangeKind::Removed => 1,
             ChangeKind::Changed => 2,
         };
-        let two = i.min(1);
-        match &ch.fact {
-            Fact::Decl(..) => t.decl[i] += 1,
-            Fact::Rpc(..) => t.rpc[i] += 1,
-            Fact::Route(_) => t.route[i] += 1,
-            Fact::Produces(_) => t.produces[two] += 1,
-            Fact::Consumes(_) => t.consumes[two] += 1,
-            Fact::Import(_) => t.imports[two] += 1,
-            Fact::Calls(_) => t.calls[two] += 1,
-        }
+        let slot = match &ch.fact {
+            Fact::Decl(..) => &mut t.decl,
+            Fact::Rpc(..) => &mut t.rpc,
+            Fact::Route(_) => &mut t.route,
+            Fact::Produces(_) => &mut t.produces,
+            Fact::Consumes(_) => &mut t.consumes,
+            Fact::Import(_) => &mut t.imports,
+            Fact::Calls(_) => &mut t.calls,
+        };
+        slot[i] += 1;
     }
     t
 }
@@ -1317,33 +1487,38 @@ fn describe_base(d: &RootDiff) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The answer, budgeted section by section so the registry's 48 KB cut never
+/// has to fire: the summary first, then the wire-format results (never dropped:
+/// a result that does not fit in full keeps its one-line form), then the impact
+/// rows, then the per-file sections. Every section that is cut ends with an
+/// "N more, narrow `scope`" line.
 fn render(
     diffs: &[RootDiff],
     failures: &[RootFailure],
     reports: &[FileReport],
     counters: &Counters,
     impact: &Impact,
-    wire: &str,
-    wire_breaks: usize,
-    roots: &[PathBuf],
+    wire: &[WireEntry],
+    view: &RootView<'_>,
 ) -> String {
     let t = tally(reports);
     let with_changes = reports.iter().filter(|r| !r.changes.is_empty()).count();
     let skipped = reports.iter().filter(|r| r.skipped.is_some()).count();
     let body_only = reports.len() - with_changes - skipped;
+    let wire_breaks: usize = wire.iter().map(|w| w.breaks).sum();
+    let wire_unchecked = wire.iter().filter(|w| w.unchecked).count();
     let mut out = String::from("## Mesh diff: working tree against the Git base\n\n");
     for d in diffs {
         let _ = writeln!(
             out,
             "- **Root** `{}`: base {}",
-            display_root(&d.root, roots),
+            view.root(&d.root),
             describe_base(d)
         );
     }
     let _ = writeln!(
         out,
-        "\n**Summary**: {} changed source file(s) — {with_changes} with contract changes, {body_only} body-only, {skipped} skipped. Declarations +{} -{} ~{}; RPCs/services +{} -{} ~{}; routes +{} -{} ~{}; producers +{} -{}; consumers +{} -{}; imports +{} -{}; RPC calls +{} -{}. Wire-format breaking changes: {wire_breaks}. Impacted call sites / dependents: {}.",
+        "\n**Summary**: {} changed source file(s) — {with_changes} with contract changes, {body_only} body-only, {skipped} skipped. Declarations +{} -{} ~{}; RPCs/services +{} -{} ~{}; routes +{} -{} ~{}; producers +{} -{}; consumers +{} -{}; imports +{} -{}; RPC calls +{} -{}. Wire-format breaking changes: {wire_breaks}{}. Impacted call sites / dependents: {}.",
         reports.len(),
         t.decl[0], t.decl[1], t.decl[2],
         t.rpc[0], t.rpc[1], t.rpc[2],
@@ -1352,6 +1527,11 @@ fn render(
         t.consumes[0], t.consumes[1],
         t.imports[0], t.imports[1],
         t.calls[0], t.calls[1],
+        if wire_unchecked > 0 {
+            format!(" ({wire_unchecked} `.proto` not checked, see below)")
+        } else {
+            String::new()
+        },
         impact.sites,
     );
     if counters.excluded + counters.non_source > 0 {
@@ -1361,41 +1541,102 @@ fn render(
             counters.excluded, counters.non_source
         );
     }
-    if counters.truncated > 0 {
-        let _ = writeln!(
-            out,
-            "\n> [!NOTE]\n> {} more changed file(s) were not analysed: at most {} files per call. Narrow `scope` to one root or one sub-directory to cover them.",
-            counters.truncated, counters.cap
-        );
+    if counters.truncated > 0 || !counters.timed_out.is_empty() {
+        out.push_str("\n> [!NOTE]\n");
+        if counters.truncated > 0 {
+            let _ = writeln!(
+                out,
+                "> {} more changed file(s) were not analysed: at most {} files per call.",
+                counters.truncated, counters.cap
+            );
+        }
+        if !counters.timed_out.is_empty() {
+            let listed: Vec<String> = counters
+                .timed_out
+                .iter()
+                .take(20)
+                .map(|p| format!("`{p}`"))
+                .collect();
+            let more = counters.timed_out.len().saturating_sub(20);
+            let _ = writeln!(
+                out,
+                "> {} changed file(s) not analysed: time budget ({} s) of this call spent: {}{}.",
+                counters.timed_out.len(),
+                CALL_TIME_BUDGET.as_secs(),
+                listed.join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
+            );
+        }
+        out.push_str("> Narrow `scope` to one root or one sub-directory to cover them.\n");
     }
     for f in failures {
         let _ = writeln!(
             out,
             "\n**Root not compared** `{}`: {}",
-            display_root(&f.root, roots),
-            f.message
+            view.root(&f.root),
+            clip(&f.message)
         );
     }
 
-    // Impact and wire sections are rendered whole (they are what the diff is
-    // for); per-file sections fill what is left of the budget.
-    let mut tail = String::new();
-    if !impact.text.is_empty() {
-        tail.push_str("\n### Impact (live graph)\n");
-        tail.push_str(&impact.text);
+    // Wire-format results: the full report while it fits, its one-line form
+    // otherwise. The one-line forms are always written (one per changed
+    // `.proto`, which `MAX_CHANGED_FILES` bounds).
+    let compact_total: usize = wire.iter().map(|w| w.compact.len()).sum();
+    let mut compact_left = compact_total;
+    let mut shortened = 0usize;
+    for w in wire {
+        compact_left -= w.compact.len();
+        let room = OUTPUT_BUDGET.saturating_sub(out.len() + compact_left + NOTE_RESERVE);
+        if w.full.len() <= room {
+            out.push_str(&w.full);
+        } else {
+            out.push_str(&w.compact);
+            shortened += 1;
+        }
     }
-    tail.push_str(wire);
-    let budget = OUTPUT_BUDGET.saturating_sub(out.len() + tail.len() + 512);
+    if shortened > 0 {
+        let _ = writeln!(
+            out,
+            "\n*{shortened} wire-format report(s) shortened to their result line to stay under the 48 KB cap; narrow `scope`, or run `analyze_grpc` on the `.proto`, for the findings.*"
+        );
+    }
 
-    let mut files = String::new();
-    let mut unlisted = 0usize;
+    // Impact rows, then per-file sections, each while it fits.
+    if !impact.items.is_empty() || !impact.notes.is_empty() {
+        out.push_str("\n### Impact (live graph)\n");
+    }
+    let mut left_out = 0usize;
+    for item in &impact.items {
+        if out.len() + item.len() + NOTE_RESERVE > OUTPUT_BUDGET {
+            left_out += 1;
+            continue;
+        }
+        out.push_str(item);
+    }
+    if left_out > 0 {
+        let _ = writeln!(
+            out,
+            "\n*{left_out} more impacted element(s) not shown to stay under the 48 KB cap; narrow `scope`.*"
+        );
+    }
+    for note in &impact.notes {
+        if out.len() + note.len() + NOTE_RESERVE <= OUTPUT_BUDGET {
+            out.push_str(note);
+        }
+    }
+
     let listed: Vec<&FileReport> = reports
         .iter()
         .filter(|r| !r.changes.is_empty() || r.skipped.is_some())
         .collect();
     if !listed.is_empty() {
-        files.push_str("\n### Contract changes per file\n");
+        out.push_str("\n### Contract changes per file\n");
     }
+    let mut unlisted = 0usize;
     for r in &listed {
         let mut section = format!("\n#### `{}` ({})\n", r.display, r.status.label());
         if let Some(why) = &r.skipped {
@@ -1412,16 +1653,16 @@ fn render(
                 r.changes.len() - MAX_CHANGES_PER_FILE
             );
         }
-        if files.len() + section.len() > budget {
+        if out.len() + section.len() + NOTE_RESERVE > OUTPUT_BUDGET {
             unlisted += 1;
             continue;
         }
-        files.push_str(&section);
+        out.push_str(&section);
     }
     if unlisted > 0 {
         let _ = writeln!(
-            files,
-            "\n*{unlisted} more file section(s) left out to stay under the 48 KB cap; narrow `scope` to list them.*"
+            out,
+            "\n*{unlisted} more file section(s) not shown to stay under the 48 KB cap; narrow `scope`.*"
         );
     }
     if body_only > 0 {
@@ -1431,9 +1672,8 @@ fn render(
             .take(20)
             .map(|r| format!("`{}`", r.display))
             .collect();
-        let _ = writeln!(
-            files,
-            "\n*No contract-level change (body edits only): {}{}*",
+        let line = format!(
+            "\n*No contract-level change (body edits only): {}{}*\n",
             names.join(", "),
             if body_only > 20 {
                 format!(" and {} more", body_only - 20)
@@ -1441,20 +1681,13 @@ fn render(
                 String::new()
             }
         );
+        if out.len() + line.len() <= OUTPUT_BUDGET {
+            out.push_str(&line);
+        } else {
+            let _ = writeln!(out, "\n*{body_only} file(s) with body edits only.*");
+        }
     }
-    out.push_str(&files);
-    out.push_str(&tail);
     out
-}
-
-fn display_root(root: &Path, roots: &[PathBuf]) -> String {
-    if roots.len() > 1 {
-        root.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| root.display().to_string())
-    } else {
-        root.display().to_string()
-    }
 }
 
 #[cfg(test)]
@@ -1579,9 +1812,14 @@ export class ArchiveEvents {
 "#;
 
     fn state_for(root: &Path) -> AppState {
-        let config = mesh_core::Config::load_from_str(
-            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n",
-        )
+        state_with(root, "")
+    }
+
+    /// `extra` is appended to the `[workspace]` table.
+    fn state_with(root: &Path, extra: &str) -> AppState {
+        let config = mesh_core::Config::load_from_str(&format!(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n{extra}"
+        ))
         .expect("config");
         let audit = std::sync::Arc::new(mesh_core::AuditLogger::new_in_memory().expect("audit"));
         let rescan = std::sync::Arc::new(mesh_core::BackgroundRescanEngine::new().expect("rescan"));
@@ -1590,11 +1828,21 @@ export class ArchiveEvents {
 
     /// Indexes the working tree into the live snapshot, as the server does.
     fn indexed_state(root: &Path) -> AppState {
-        let state = state_for(root);
+        index(state_for(root))
+    }
+
+    fn index(state: AppState) -> AppState {
         let snapshot =
             WorkspaceIndexer::build_snapshot(&state.config, &state.allowed_roots, None, None, None);
         state.install_snapshot(snapshot);
         state
+    }
+
+    fn files(max_files: usize) -> Limits {
+        Limits {
+            max_files,
+            ..Limits::DEFAULT
+        }
     }
 
     fn args(base: Option<&str>, scope: Option<&str>) -> DiffMeshArgs {
@@ -1664,7 +1912,7 @@ export class ArchiveEvents {
     fn reports_contract_changes_impact_and_the_wire_break() {
         let repo = changed_repo();
         let state = indexed_state(&repo.root);
-        let out = run_with(&args(None, None), &state, &repo.runner(), MAX_CHANGED_FILES)
+        let out = run_with(&args(None, None), &state, &repo.runner(), Limits::DEFAULT)
             .expect("diff_mesh ok");
         let text = &out.text;
 
@@ -1740,7 +1988,7 @@ export class ArchiveEvents {
             &args(Some("main"), Some(&events)),
             &state,
             &repo.runner(),
-            MAX_CHANGED_FILES,
+            Limits::DEFAULT,
         )
         .expect("scoped diff");
         assert!(out.text.contains("events/archive.ts"), "{}", out.text);
@@ -1752,7 +2000,7 @@ export class ArchiveEvents {
             &args(None, Some(&outside)),
             &state,
             &repo.runner(),
-            MAX_CHANGED_FILES,
+            Limits::DEFAULT,
         )
         .err()
         .expect("jail");
@@ -1763,8 +2011,8 @@ export class ArchiveEvents {
     fn file_cap_says_how_many_files_were_left_out() {
         let repo = changed_repo();
         let state = indexed_state(&repo.root);
-        let out =
-            run_with(&args(Some("main"), None), &state, &repo.runner(), 2).expect("capped diff");
+        let out = run_with(&args(Some("main"), None), &state, &repo.runner(), files(2))
+            .expect("capped diff");
         assert!(
             out.text
                 .contains("more changed file(s) were not analysed: at most 2 files per call"),
@@ -1779,7 +2027,7 @@ export class ArchiveEvents {
         let repo = changed_repo();
         let state = state_for(&repo.root);
         for bad in ["--output=/tmp/x", "main:proto/user.proto", "a b", ""] {
-            let err = run_with(&args(Some(bad), None), &state, &repo.runner(), 10)
+            let err = run_with(&args(Some(bad), None), &state, &repo.runner(), files(10))
                 .err()
                 .expect("refused");
             assert_eq!(err.0, -32602, "{bad:?}: {}", err.1);
@@ -1788,7 +2036,7 @@ export class ArchiveEvents {
             &args(Some("no-such-branch"), None),
             &state,
             &repo.runner(),
-            10,
+            files(10),
         )
         .err()
         .expect("unknown base");
@@ -1826,7 +2074,7 @@ export class ArchiveEvents {
             env,
             timeout: GIT_COMMAND_TIMEOUT,
         };
-        let err = run_with(&args(None, None), &state, &git, 10)
+        let err = run_with(&args(None, None), &state, &git, files(10))
             .err()
             .expect("not a repo");
         assert_eq!(err.0, -32603, "{}", err.1);
@@ -1845,8 +2093,8 @@ export class ArchiveEvents {
         repo.git(&["checkout", "-q", "--detach", &head]);
         repo.git(&["mv", "lib/format.ts", "lib/fmt.ts"]);
         let state = indexed_state(&repo.root);
-        let out =
-            run_with(&args(Some("main"), None), &state, &repo.runner(), 10).expect("detached diff");
+        let out = run_with(&args(Some("main"), None), &state, &repo.runner(), files(10))
+            .expect("detached diff");
         // A rename is a removal plus an addition.
         assert!(
             out.text.contains("#### `lib/format.ts` (removed)"),
@@ -1860,5 +2108,264 @@ export class ArchiveEvents {
         );
         assert!(out.text.contains("- - symbol `formatUser`"), "{}", out.text);
         assert!(out.text.contains("- + symbol `formatUser`"), "{}", out.text);
+    }
+
+    const TS_QUALIFIED_CLIENT: &str = r#"import { ClientGrpc } from '@nestjs/microservices';
+
+export class QualifiedCleaner {
+  private userClient: UserServiceClient;
+
+  constructor(private readonly grpcClient: ClientGrpc) {
+    this.userClient = this.grpcClient.getService<UserServiceClient>('demo.v1.UserService');
+  }
+
+  async wipe(id: string) {
+    await this.userClient.DeleteUser({ id });
+  }
+}
+"#;
+
+    const GO_CLIENT: &str = r#"package main
+
+import pb "github.com/demo/gen/go/demo/v1"
+
+func Connect(conn any) {
+	client := pb.NewUserServiceClient(conn)
+	_ = client
+}
+"#;
+
+    /// A client naming the service with its proto package records
+    /// `=demo.v1.UserService.DeleteUser`; Go records only a service-level client.
+    /// Removing the RPC lists both, never "no recorded call site".
+    #[test]
+    fn package_qualified_and_service_level_callers_of_a_removed_rpc_are_listed() {
+        let probe = mesh_parsers::PolyglotIndexer::extract(
+            Path::new("/probe/qualified.ts"),
+            TS_QUALIFIED_CLIENT,
+            0,
+        );
+        assert!(
+            probe
+                .rpc_calls
+                .iter()
+                .any(|(_, t)| t == "=demo.v1.UserService.DeleteUser"),
+            "{:?}",
+            probe.rpc_calls
+        );
+        let go = mesh_parsers::PolyglotIndexer::extract(Path::new("/probe/c.go"), GO_CLIENT, 0);
+        assert!(
+            go.rpc_calls.iter().any(|(_, t)| t == "UserService"),
+            "{:?}",
+            go.rpc_calls
+        );
+
+        let repo = TempRepo::new();
+        repo.write("proto/user.proto", PROTO);
+        repo.write("client/qualified.ts", TS_QUALIFIED_CLIENT);
+        repo.write("goclient/main.go", GO_CLIENT);
+        repo.commit("base");
+        repo.write(
+            "proto/user.proto",
+            &PROTO.replace("  rpc DeleteUser(DeleteUserRequest) returns (Empty);\n", ""),
+        );
+        let state = indexed_state(&repo.root);
+        let out =
+            run_with(&args(Some("main"), None), &state, &repo.runner(), files(10)).expect("diff");
+        let rpc = out
+            .text
+            .split("#### RPC `UserService.DeleteUser` removed")
+            .nth(1)
+            .expect("rpc impact");
+        assert!(
+            rpc.contains("- `wipe` in `client/qualified.ts:10` _(caller, match: exact)_"),
+            "{}",
+            out.text
+        );
+        assert!(
+            rpc.contains(
+                "in `goclient/main.go:5` _(service-level client, may call, match: heuristic)_"
+            ),
+            "{}",
+            out.text
+        );
+        assert!(!rpc.contains("no recorded call site"), "{}", out.text);
+    }
+
+    /// Impact rows past the 48 KB cap are cut by `render` itself: the wire
+    /// result survives, the cut says so, the whole answer fits.
+    #[test]
+    fn impact_overflow_keeps_the_wire_result_and_says_what_was_cut() {
+        let repo = TempRepo::new();
+        let names: Vec<String> = (0..60)
+            .map(|i| format!("computeTheQuarterlyRevenueForRegionNumber{i:02}"))
+            .collect();
+        let lib = |extra: &str| {
+            names
+                .iter()
+                .map(|n| {
+                    format!("export function {n}(id: string{extra}): string {{\n  return id;\n}}\n")
+                })
+                .collect::<String>()
+        };
+        repo.write("lib/many.ts", &lib(""));
+        let imports = names
+            .iter()
+            .map(|n| format!("  {n},\n"))
+            .collect::<String>();
+        let calls = names
+            .iter()
+            .map(|n| format!("  {n}(id);\n"))
+            .collect::<String>();
+        for i in 0..12 {
+            repo.write(
+                &format!("consumers/importer_with_a_long_name_{i:02}.ts"),
+                &format!(
+                    "import {{\n{imports}}} from '../lib/many';\n\nexport function useEverything{i:02}(id: string): string {{\n{calls}  return id;\n}}\n"
+                ),
+            );
+        }
+        repo.write("proto/user.proto", PROTO);
+        repo.commit("base");
+        repo.write("lib/many.ts", &lib(", region: number"));
+        repo.write(
+            "proto/user.proto",
+            &PROTO.replace("string email = 2;", "string email = 3;"),
+        );
+        let state = indexed_state(&repo.root);
+        let out = run_with(
+            &args(Some("main"), None),
+            &state,
+            &repo.runner(),
+            files(100),
+        )
+        .expect("diff");
+        let text = &out.text;
+        assert!(text.len() <= 48 * 1024, "{} bytes", text.len());
+        assert!(
+            text.contains("### Wire-format check: `proto/user.proto`"),
+            "{text}"
+        );
+        assert!(text.contains("`WIRE_FORMAT_BREAKING_CHANGE`"), "{text}");
+        assert!(
+            text.contains(
+                "more impacted element(s) not shown to stay under the 48 KB cap; narrow `scope`."
+            ),
+            "{text}"
+        );
+        // The wire section comes before the impact rows that were cut.
+        let wire_at = text.find("### Wire-format check").expect("wire");
+        let impact_at = text.find("### Impact (live graph)").expect("impact");
+        assert!(wire_at < impact_at, "{text}");
+    }
+
+    /// A spent time budget stops the call: the files not extracted are named.
+    #[test]
+    fn a_spent_time_budget_lists_the_files_not_analysed() {
+        let repo = changed_repo();
+        let state = indexed_state(&repo.root);
+        let limits = Limits {
+            max_files: 100,
+            time_budget: Duration::ZERO,
+        };
+        let out =
+            run_with(&args(Some("main"), None), &state, &repo.runner(), limits).expect("diff");
+        assert!(
+            out.text
+                .contains("changed file(s) not analysed: time budget"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("`proto/user.proto`"), "{}", out.text);
+        assert!(out.files_accessed.is_empty(), "{:?}", out.files_accessed);
+    }
+
+    /// An excluded file is never read nor reported, even when it is a source
+    /// file that changed: its content never reaches the answer.
+    #[test]
+    fn excluded_secrets_are_neither_read_nor_reported() {
+        const SECRET: &str = "sk_live_0123456789abcdefSECRET";
+        let repo = TempRepo::new();
+        repo.write(".env", "API_KEY=old\n");
+        repo.write("certs/server.pem", "-----BEGIN KEY-----\nold\n");
+        repo.write("secrets/keys.ts", "export const KEY = 'old';\n");
+        repo.write("lib/format.ts", TS_LIB);
+        repo.commit("base");
+        repo.write(".env", &format!("API_KEY={SECRET}\n"));
+        repo.write(
+            "certs/server.pem",
+            &format!("-----BEGIN KEY-----\n{SECRET}\n"),
+        );
+        repo.write(
+            "secrets/keys.ts",
+            &format!("export const KEY = '{SECRET}';\nexport function leak(): string {{ return KEY; }}\n"),
+        );
+        repo.write(
+            "lib/format.ts",
+            &TS_LIB.replace("(id: string)", "(id: string, n: number)"),
+        );
+        let state = index(state_with(
+            &repo.root,
+            "exclude_patterns = [\".env\", \"*.pem\", \"secrets/**\"]\n",
+        ));
+        let out =
+            run_with(&args(Some("main"), None), &state, &repo.runner(), files(10)).expect("diff");
+        assert!(!out.text.contains(SECRET), "{}", out.text);
+        for path in [".env", "server.pem", "secrets/keys.ts", "leak"] {
+            assert!(!out.text.contains(path), "{path}: {}", out.text);
+        }
+        assert!(
+            out.text
+                .contains("3 file(s) excluded by `exclude_patterns`/ignore files"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.files_accessed.iter().all(|f| f.ends_with("format.ts")),
+            "{:?}",
+            out.files_accessed
+        );
+        assert!(out.text.contains("~ symbol `formatUser`"), "{}", out.text);
+    }
+
+    /// Moving a function within its file changes lines, not the contract.
+    #[test]
+    fn a_function_moved_within_its_file_is_no_change() {
+        const FIRST: &str = "export function alpha(id: string): string {\n  return id;\n}\n";
+        const SECOND: &str = "export function beta(n: number): number {\n  return n;\n}\n";
+        let repo = TempRepo::new();
+        repo.write("lib/two.ts", &format!("{FIRST}\n{SECOND}"));
+        repo.commit("base");
+        repo.write("lib/two.ts", &format!("{SECOND}\n// moved\n{FIRST}"));
+        let state = indexed_state(&repo.root);
+        let out =
+            run_with(&args(Some("main"), None), &state, &repo.runner(), files(10)).expect("diff");
+        assert!(
+            out.text
+                .contains("1 changed source file(s) — 0 with contract changes, 1 body-only"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("No contract-level change (body edits only): `lib/two.ts`"),
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("#### `lib/two.ts`"), "{}", out.text);
+    }
+
+    /// Two roots with one directory name stay apart in every path shown.
+    #[test]
+    fn roots_sharing_a_directory_name_are_told_apart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dunce::canonicalize(dir.path()).expect("canon");
+        let roots = vec![base.join("a").join("api"), base.join("b").join("api")];
+        let view = RootView::new(&roots);
+        let shown_a = view.path(&roots[0].join("x.ts"));
+        let shown_b = view.path(&roots[1].join("x.ts"));
+        assert_ne!(shown_a, shown_b);
+        assert_eq!(shown_a, "a/api/x.ts");
+        assert_eq!(view.root(&roots[1]), "b/api");
     }
 }

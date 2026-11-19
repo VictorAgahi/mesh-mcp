@@ -735,33 +735,45 @@ repositories), the working tree is compared with a base revision at the **contra
   and base, read in memory. A file absent at the base is `added`, absent from the working tree
   `removed`.
 - **Extraction**: both versions go through the indexer's guards (size budget, binary sniff,
-  1,024-byte lines, nesting ≤ 64, UTF-8) and its extractor (`extract_with_config` plus custom
-  patterns), so the facts compared are the ones the index holds. A refused version is listed as
-  `skipped` with the guard's reason. The working-tree file is read through the path jail, never
-  through a symlink.
+  1,024-byte lines, nesting ≤ 64, UTF-8) and its extractor (`extract_with_budget` plus custom
+  patterns), so the facts compared are the ones the index holds. The tree-sitter parse budget is
+  the query one (`QUERY_PARSE_TIMEOUT_MICROS`, 500 ms), not indexing's 2 s: this runs on the
+  agent's request path. A refused version is listed as `skipped` with the guard's reason. The
+  working-tree file is read through the path jail, never through a symlink.
 - **Contract diff** per file: declarations (classes, functions, interfaces, messages) added,
   removed or with a changed signature; gRPC services and RPCs; HTTP routes; topics produced and
   consumed; imports; RPC calls. A body-only edit changes no signature: such files are counted
   and named in one line, never listed as changes.
 - **Impact** (live graph): for every removed or changed declaration, its dependents
-  (`find_dependents` matching); for every removed or changed RPC, its recorded call sites (a
-  caller of a removed RPC has no resolved edge left, so the recorded `Service.Method` call targets
-  are read directly) plus, for a changed one, the `analyze_grpc` callers and server handlers; for a
-  removed producer or consumer, the other side of the topic. Each row gives `path:line` and its
-  match (`exact`, `heuristic`, `ambiguous`). Generic names (`constructor`, `main`, ...) are not
-  looked up.
-- **Wire-format check** of every changed `.proto`, against the same `base`, exactly as
-  `analyze_grpc` runs it (see [Wire-format check](#wire-format-check)).
+  (`find_dependents` matching); for every removed or changed RPC, its recorded call sites, plus,
+  for a changed one, the `analyze_grpc` callers and server handlers; for a removed producer or
+  consumer, the other side of the topic. A caller of a removed RPC has no resolved edge left, so
+  the recorded call targets are read directly (`ContractGraph::recorded_rpc_callers`): a
+  method-level call may name the service with its proto package (`demo.v1.UserService.DeleteUser`,
+  matched against the `.proto`'s own `package`: same package keeps the record's confidence, no
+  package known is `heuristic`, another package `ambiguous`); a client built for the service with
+  no method-level call in its file (Go `NewUserServiceClient`, a Python stub, a Java
+  `newBlockingStub`) is listed as a "service-level client, may call", `heuristic`. Each row gives
+  `path:line` and its match (`exact`, `heuristic`, `ambiguous`). Generic names (`constructor`,
+  `main`, ...) are not looked up; routes and gRPC services are not looked up either, and one line
+  says so (HTTP callers are not linked in the graph; a service's callers are listed under its RPCs).
+- **Wire-format check** of every changed `.proto`, against the same base, with the rules of
+  `analyze_grpc` (see [Wire-format check](#wire-format-check)). It reuses the base sha and the two
+  versions already read: no further `git` run.
 
-**Output**: dense Markdown, the roots and their base first, then a one-paragraph summary of the
-counts, the per-file sections, the impact and the wire checks. The impact and wire sections are
-always kept whole; per-file sections fill what remains under the 48 KB cap, and those left out are
-counted with the advice to narrow `scope`.
+**Output**: dense Markdown, budgeted inside the tool so the registry's 48 KB cut never has to
+fire. In order: the roots and their base, the summary of counts and the notes (files left out by
+the cap or the time budget, roots not compared); the wire-format results, never dropped (a report
+that does not fit in full keeps its result line, with the count of `WIRE_FORMAT_BREAKING_CHANGE`);
+the impact rows; the per-file sections. Each section that is cut ends with an "N more ... narrow
+`scope`" line.
 
 **Bounds**: at most 2,000 changed files analysed per call (the rest counted in a note naming
-`scope`); 4 MB per path listing; 32 MB of base contents in total across repositories; 60 looked-up
-elements and 10 impact rows each; 40 changes listed per file; signatures cut at 160 characters;
-5 s per `git` command, no shell, the same hardened environment as `analyze_grpc`.
+`scope`); a 20 s budget for the whole call, after which the files not yet extracted are named as
+"not analysed: time budget" and the `.proto` files not yet checked as "not checked"; 4 MB per path
+listing; 32 MB of base contents in total across repositories; 60 looked-up elements and 10 impact
+rows each; 40 changes listed per file; signatures cut at 160 characters; 5 s per `git` command, no
+shell, the same hardened environment as `analyze_grpc`.
 
 **Errors**: a malformed `base` (starts with `-`, contains `:`, whitespace) is refused before any
 `git` runs (`-32602`); an explicit `base` that names no commit is `-32602` and, in a shallow clone,
@@ -801,6 +813,19 @@ shortened:
 
 **Summary**: 5 changed source file(s) — 3 with contract changes, 1 body-only, 1 skipped. Declarations +3 -0 ~1; RPCs/services +0 -1 ~0; routes +0 -0 ~0; producers +1 -0; consumers +0 -0; imports +2 -0; RPC calls +0 -0. Wire-format breaking changes: 1. Impacted call sites / dependents: 2.
 
+### Wire-format check: `proto/user.proto`
+- **Base**: merge-base of `HEAD` and `main` (`f12cc14677f9`), compared with the working tree
+- **Result**: 1 `WIRE_FORMAT_BREAKING_CHANGE`
+  - `WIRE_FORMAT_BREAKING_CHANGE` field deleted without `reserved` — `User` #2 (L19): `email` (`string`) was removed; add `reserved 2;` and `reserved "email";` so the number is never reused
+
+### Impact (live graph)
+
+#### symbol `formatUser` signature changed — `lib/format.ts`
+- `renderUser` in `client/view.ts:3` _(imports it, match: exact)_
+
+#### RPC `UserService.DeleteUser` removed — `proto/user.proto`
+- `purge` in `client/cleaner.ts:16` _(caller, match: exact)_
+
 ### Contract changes per file
 
 #### `client/blob.ts` (added)
@@ -818,19 +843,6 @@ shortened:
 - - RPC `UserService.DeleteUser` (base L6): `rpc DeleteUser(DeleteUserRequest) returns (Empty);`
 
 *No contract-level change (body edits only): `events/consumer.ts`*
-
-### Impact (live graph)
-
-#### symbol `formatUser` signature changed — `lib/format.ts`
-- `renderUser` in `client/view.ts:3` _(imports it, match: exact)_
-
-#### RPC `UserService.DeleteUser` removed — `proto/user.proto`
-- `purge` in `client/cleaner.ts:16` _(caller, match: exact)_
-
-### Wire-format check: `proto/user.proto`
-- **Base**: merge-base of `HEAD` and `main` (`f12cc14677f9`), compared with the working tree
-- **Result**: 1 `WIRE_FORMAT_BREAKING_CHANGE`
-  - `WIRE_FORMAT_BREAKING_CHANGE` field deleted without `reserved` — `User` #2 (L19): `email` (`string`) was removed; add `reserved 2;` and `reserved "email";` so the number is never reused
 ```
 
 ---

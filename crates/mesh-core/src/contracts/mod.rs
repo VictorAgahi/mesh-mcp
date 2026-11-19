@@ -173,6 +173,16 @@ pub fn fold_rpc_name(name: &str) -> String {
         .collect()
 }
 
+/// How a [`ContractGraph::recorded_rpc_callers`] row calls the RPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedCaller {
+    /// A recorded call of the method itself.
+    Method,
+    /// A client constructed for the method's service, with no method-level
+    /// call recorded in its file: it may call the method.
+    ServiceClient,
+}
+
 /// How [`ContractGraph::find_dependents_matched`] found its result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependentsMatch {
