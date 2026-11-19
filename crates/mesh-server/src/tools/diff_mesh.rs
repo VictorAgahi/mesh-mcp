@@ -206,6 +206,18 @@ fn is_shallow(git: &GitRunner, program: &Path, dir: &Path) -> bool {
     .unwrap_or(false)
 }
 
+/// What `list_changes` found for one target.
+struct Listing {
+    choice: BaseChoice,
+    sha: String,
+    toplevel: String,
+    /// The target directory relative to the top level (`--show-prefix`).
+    prefix: String,
+    shallow: bool,
+    /// Changed and untracked paths, relative to the top level.
+    paths: Vec<String>,
+}
+
 const SHALLOW_HINT: &str = " This is a shallow clone: the base may not have been fetched (`git fetch --unshallow`, or `git fetch origin <branch>`), or pass a `base` inside the fetched history.";
 
 /// Lists the changed paths of one target: `git diff --name-only` of the base
@@ -215,7 +227,7 @@ fn list_changes(
     program: &Path,
     target: &Target,
     base: Option<&str>,
-) -> Result<(BaseChoice, String, String, String, bool, Vec<String>), RootFailure> {
+) -> Result<Listing, RootFailure> {
     let dir = &target.dir;
     let fail = |message: String, invalid_request: bool| RootFailure {
         root: dir.clone(),
@@ -318,14 +330,14 @@ fn list_changes(
             paths.insert(String::from_utf8_lossy(raw).into_owned());
         }
     }
-    Ok((
+    Ok(Listing {
         choice,
         sha,
         toplevel,
         prefix,
         shallow,
-        paths.into_iter().collect(),
-    ))
+        paths: paths.into_iter().collect(),
+    })
 }
 
 /// `abs` relative to its most specific root, `/`-separated; prefixed with the
@@ -417,7 +429,10 @@ fn read_base_contents(
             continue;
         };
         if kind != "blob" {
-            sides.insert(i, Side::Skipped(format!("a {kind} at the base, not a file")));
+            sides.insert(
+                i,
+                Side::Skipped(format!("a {kind} at the base, not a file")),
+            );
             continue;
         }
         let size: u64 = size.parse().unwrap_or(u64::MAX);
@@ -425,7 +440,9 @@ fn read_base_contents(
         if size > limit {
             sides.insert(
                 i,
-                Side::Skipped(format!("oversized at the base ({size} bytes, budget {limit})")),
+                Side::Skipped(format!(
+                    "oversized at the base ({size} bytes, budget {limit})"
+                )),
             );
             continue;
         }
@@ -684,14 +701,12 @@ fn diff_facts(base: &BTreeMap<Fact, FactVal>, current: &BTreeMap<Fact, FactVal>)
                 base: Some(b.clone()),
                 current: None,
             }),
-            Some(c) if fact.has_signature() && c.signatures != b.signatures => {
-                out.push(Change {
-                    kind: ChangeKind::Changed,
-                    fact: fact.clone(),
-                    base: Some(b.clone()),
-                    current: Some(c.clone()),
-                })
-            }
+            Some(c) if fact.has_signature() && c.signatures != b.signatures => out.push(Change {
+                kind: ChangeKind::Changed,
+                fact: fact.clone(),
+                base: Some(b.clone()),
+                current: Some(c.clone()),
+            }),
             Some(_) => {}
         }
     }
@@ -749,10 +764,7 @@ fn run_with(
     }
     let targets = select_targets(args.scope.as_deref(), state)?;
     if targets.is_empty() {
-        return Err((
-            -32602,
-            "`scope` selects no configured root".to_string(),
-        ));
+        return Err((-32602, "`scope` selects no configured root".to_string()));
     }
     let program = git.locate().map_err(|e| (-32603, e.to_string()))?;
     let roots = &state.allowed_roots;
@@ -768,14 +780,20 @@ fn run_with(
     };
     let mut matchers: HashMap<RepoId, ExcludeMatcher> = HashMap::new();
     for target in &targets {
-        let (choice, sha, toplevel, prefix, shallow, paths) =
-            match list_changes(git, &program, target, base) {
-                Ok(found) => found,
-                Err(f) => {
-                    failures.push(f);
-                    continue;
-                }
-            };
+        let Listing {
+            choice,
+            sha,
+            toplevel,
+            prefix,
+            shallow,
+            paths,
+        } = match list_changes(git, &program, target, base) {
+            Ok(found) => found,
+            Err(f) => {
+                failures.push(f);
+                continue;
+            }
+        };
         let root_diff = diffs.len();
         diffs.push(RootDiff {
             root: roots
@@ -835,7 +853,13 @@ fn run_with(
             .iter()
             .map(|f| format!("root `{}`: {}", f.root.display(), f.message))
             .collect();
-        return Err((code, format!("diff_mesh: no root could be compared. {}", reasons.join(" "))));
+        return Err((
+            code,
+            format!(
+                "diff_mesh: no root could be compared. {}",
+                reasons.join(" ")
+            ),
+        ));
     }
     changed.sort_by(|a, b| a.display.cmp(&b.display));
     if changed.len() > max_files {
@@ -858,7 +882,11 @@ fn run_with(
         let Some(&(_, first)) = files.first() else {
             continue;
         };
-        let dir = first.abs.parent().map(Path::to_path_buf).unwrap_or_default();
+        let dir = first
+            .abs
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         // Run where the root is: the file's own directory may be gone.
         let dir = if dir.is_dir() {
             dir
@@ -991,7 +1019,11 @@ struct Impact {
 }
 
 fn root_relative(node: &ContractNode, roots: &[PathBuf]) -> String {
-    format!("{}:{}", display_path(&node.file_path, roots), node.line_start)
+    format!(
+        "{}:{}",
+        display_path(&node.file_path, roots),
+        node.line_start
+    )
 }
 
 fn push_rows(
@@ -1079,7 +1111,10 @@ type Rows<'g> = (Vec<(&'g ContractNode, String)>, &'static str);
 
 fn rpc_impact<'g>(graph: &'g ContractGraph, name: &str, file: &Path) -> Rows<'g> {
     let Some((service, method)) = name.rsplit_once('.') else {
-        return (Vec::new(), "not a `Service.Method` name: callers not looked up");
+        return (
+            Vec::new(),
+            "not a `Service.Method` name: callers not looked up",
+        );
     };
     let mut rows: Vec<(&ContractNode, String)> = Vec::new();
     let mut seen: HashSet<mesh_core::NodeId> = HashSet::new();
@@ -1102,7 +1137,10 @@ fn rpc_impact<'g>(graph: &'g ContractGraph, name: &str, file: &Path) -> Rows<'g>
         }
         for (node, confidence) in &trace.server_handlers {
             if &*node.file_path != file && seen.insert(node.id) {
-                rows.push((node, format!("server handler, match: {}", confidence.label())));
+                rows.push((
+                    node,
+                    format!("server handler, match: {}", confidence.label()),
+                ));
             }
         }
     }
@@ -1132,7 +1170,12 @@ fn symbol_impact<'g>(graph: &'g ContractGraph, name: &str, file: &Path) -> Rows<
     )
 }
 
-fn topic_impact<'g>(graph: &'g ContractGraph, topic: &str, producer: bool, file: &Path) -> Rows<'g> {
+fn topic_impact<'g>(
+    graph: &'g ContractGraph,
+    topic: &str,
+    producer: bool,
+    file: &Path,
+) -> Rows<'g> {
     let flow = graph.analyze_impact(topic);
     let (list, role) = if producer {
         (&flow.downstream_consumers, "consumer of the topic")
@@ -1524,7 +1567,6 @@ export function renderUser(id: string): string {
 }
 "#;
 
-
     const TS_ARCHIVE: &str = r#"import { Producer } from 'kafkajs';
 
 export class ArchiveEvents {
@@ -1549,13 +1591,8 @@ export class ArchiveEvents {
     /// Indexes the working tree into the live snapshot, as the server does.
     fn indexed_state(root: &Path) -> AppState {
         let state = state_for(root);
-        let snapshot = WorkspaceIndexer::build_snapshot(
-            &state.config,
-            &state.allowed_roots,
-            None,
-            None,
-            None,
-        );
+        let snapshot =
+            WorkspaceIndexer::build_snapshot(&state.config, &state.allowed_roots, None, None, None);
         state.install_snapshot(snapshot);
         state
     }
@@ -1592,10 +1629,7 @@ export class ArchiveEvents {
         repo.git(&["checkout", "-q", "-b", "feature"]);
         repo.write(
             "proto/user.proto",
-            &PROTO.replace(
-                "  rpc DeleteUser(DeleteUserRequest) returns (Empty);\n",
-                "",
-            ),
+            &PROTO.replace("  rpc DeleteUser(DeleteUserRequest) returns (Empty);\n", ""),
         );
         repo.write(
             "lib/format.ts",
@@ -1617,7 +1651,10 @@ export class ArchiveEvents {
         repo.write("client/blob.ts", "export const x = 1;\0\0\0\n");
         repo.write(
             "events/consumer.ts",
-            &TS_CONSUMER.replace("async start() {", "async start() {\n    const ready = true;"),
+            &TS_CONSUMER.replace(
+                "async start() {",
+                "async start() {\n    const ready = true;",
+            ),
         );
         repo.write("README.md", "# demo, edited\n");
         repo
@@ -1663,7 +1700,10 @@ export class ArchiveEvents {
         assert!(text.contains("1 non-source file(s)"), "{text}");
 
         // Impact: the caller of the removed RPC, the dependent of the function.
-        let impact = text.split("### Impact (live graph)").nth(1).expect("impact");
+        let impact = text
+            .split("### Impact (live graph)")
+            .nth(1)
+            .expect("impact");
         let rpc = impact
             .split("#### RPC `UserService.DeleteUser` removed")
             .nth(1)
@@ -1682,7 +1722,10 @@ export class ArchiveEvents {
         );
 
         // The wire check of the changed .proto, against the same base.
-        assert!(text.contains("### Wire-format check: `proto/user.proto`"), "{text}");
+        assert!(
+            text.contains("### Wire-format check: `proto/user.proto`"),
+            "{text}"
+        );
         assert!(text.contains("`WIRE_FORMAT_BREAKING_CHANGE`"), "{text}");
         assert!(!text.contains("Wire-format breaking changes: 0"), "{text}");
         assert!(text.len() < 48 * 1024);
@@ -1720,10 +1763,11 @@ export class ArchiveEvents {
     fn file_cap_says_how_many_files_were_left_out() {
         let repo = changed_repo();
         let state = indexed_state(&repo.root);
-        let out = run_with(&args(Some("main"), None), &state, &repo.runner(), 2)
-            .expect("capped diff");
+        let out =
+            run_with(&args(Some("main"), None), &state, &repo.runner(), 2).expect("capped diff");
         assert!(
-            out.text.contains("more changed file(s) were not analysed: at most 2 files per call"),
+            out.text
+                .contains("more changed file(s) were not analysed: at most 2 files per call"),
             "{}",
             out.text
         );
@@ -1740,12 +1784,25 @@ export class ArchiveEvents {
                 .expect("refused");
             assert_eq!(err.0, -32602, "{bad:?}: {}", err.1);
         }
-        let err = run_with(&args(Some("no-such-branch"), None), &state, &repo.runner(), 10)
-            .err()
-            .expect("unknown base");
+        let err = run_with(
+            &args(Some("no-such-branch"), None),
+            &state,
+            &repo.runner(),
+            10,
+        )
+        .err()
+        .expect("unknown base");
         assert_eq!(err.0, -32602, "{}", err.1);
-        assert!(err.1.contains("`no-such-branch` does not name a commit"), "{}", err.1);
-        assert!(err.1.contains(&repo.root.display().to_string()), "{}", err.1);
+        assert!(
+            err.1.contains("`no-such-branch` does not name a commit"),
+            "{}",
+            err.1
+        );
+        assert!(
+            err.1.contains(&repo.root.display().to_string()),
+            "{}",
+            err.1
+        );
     }
 
     #[test]
@@ -1760,7 +1817,10 @@ export class ArchiveEvents {
         let state = state_for(&root);
         let mut env = TempRepo::isolated_env(&home);
         // Never walk up into whatever repository holds the temp directory.
-        env.push(("GIT_CEILING_DIRECTORIES".into(), base.clone().into_os_string()));
+        env.push((
+            "GIT_CEILING_DIRECTORIES".into(),
+            base.clone().into_os_string(),
+        ));
         let git = GitRunner {
             path: std::env::var_os("PATH"),
             env,
@@ -1771,7 +1831,11 @@ export class ArchiveEvents {
             .expect("not a repo");
         assert_eq!(err.0, -32603, "{}", err.1);
         assert!(err.1.contains(&root.display().to_string()), "{}", err.1);
-        assert!(err.1.contains("not inside a usable Git repository"), "{}", err.1);
+        assert!(
+            err.1.contains("not inside a usable Git repository"),
+            "{}",
+            err.1
+        );
     }
 
     #[test]
@@ -1781,11 +1845,19 @@ export class ArchiveEvents {
         repo.git(&["checkout", "-q", "--detach", &head]);
         repo.git(&["mv", "lib/format.ts", "lib/fmt.ts"]);
         let state = indexed_state(&repo.root);
-        let out = run_with(&args(Some("main"), None), &state, &repo.runner(), 10)
-            .expect("detached diff");
+        let out =
+            run_with(&args(Some("main"), None), &state, &repo.runner(), 10).expect("detached diff");
         // A rename is a removal plus an addition.
-        assert!(out.text.contains("#### `lib/format.ts` (removed)"), "{}", out.text);
-        assert!(out.text.contains("#### `lib/fmt.ts` (added)"), "{}", out.text);
+        assert!(
+            out.text.contains("#### `lib/format.ts` (removed)"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("#### `lib/fmt.ts` (added)"),
+            "{}",
+            out.text
+        );
         assert!(out.text.contains("- - symbol `formatUser`"), "{}", out.text);
         assert!(out.text.contains("- + symbol `formatUser`"), "{}", out.text);
     }

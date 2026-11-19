@@ -198,9 +198,7 @@ impl ToolRegistry {
             VisualizeMeshTool::NAME => {
                 Self::invoke::<VisualizeMeshTool>(arguments, state, session).await?
             }
-            DiffMeshTool::NAME => {
-                Self::invoke::<DiffMeshTool>(arguments, state, session).await?
-            }
+            DiffMeshTool::NAME => Self::invoke::<DiffMeshTool>(arguments, state, session).await?,
             #[cfg(feature = "test-util")]
             TestSlowOpTool::NAME => {
                 Self::invoke::<TestSlowOpTool>(arguments, state, session).await?
