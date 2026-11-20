@@ -831,11 +831,27 @@ fn a_huge_function_of_new_expressions_and_sends_stays_fast() {
         ));
     }
     code.push_str("}\n");
-    let start = std::time::Instant::now();
-    let fi = index("svc/big.ts", &code);
+    // What this test guards is that extraction is linear, not that the machine is
+    // idle. The 2 s index parse timeout is a hang guard measured in wall-clock time,
+    // so on a starved CI runner the tree-sitter parse itself can trip it (a counted
+    // `parse_failed`, not an extraction bug) and indexing retries such a file. Do
+    // the same here: retry a parse that timed out, and time only the attempt that
+    // parsed. The quadratic regression this catches would exceed the bound on every
+    // attempt, so retrying does not hide it.
+    let mut last = None;
+    for _ in 0..8 {
+        let start = std::time::Instant::now();
+        let fi = PolyglotIndexer::extract(Path::new("svc/big.ts"), &code, 0);
+        let elapsed = start.elapsed();
+        if !fi.parse_failed {
+            last = Some((fi, elapsed));
+            break;
+        }
+    }
+    let (fi, elapsed) = last.expect("svc/big.ts must parse within 8 attempts");
     assert_eq!(events(&fi), vec![ev('P', "topic-a")]);
     // Linear: a block is scanned once however many names are looked up in it.
-    assert!(start.elapsed().as_secs() < 10, "took {:?}", start.elapsed());
+    assert!(elapsed.as_secs() < 10, "took {elapsed:?}");
 }
 
 #[test]

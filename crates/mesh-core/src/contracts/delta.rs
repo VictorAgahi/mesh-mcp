@@ -508,9 +508,11 @@ impl ContractGraph {
 
         let imports = self.imports_delta(old_imports, &journal, &dirty);
         let (topics, removed_hubs) = self.topics_delta(old_topics, &journal, &dirty);
-        // A hub the topic pass just removed keeps its `rpc_calls` records, which
-        // the gRPC passes skip once their owner is gone: to them it is a removed
-        // node whose records changed.
+        // A hub the topic pass just removed keeps its `rpc_calls` records. Only
+        // the delta gRPC passes skip a record whose owner is gone; the full pass
+        // (`rpc_call_edges`) has no owner check. Journaling the hub as a removed
+        // node whose records changed makes the delta treat those records as
+        // changed, so it ends in the same graph as the full pass.
         if !removed_hubs.is_empty() {
             journal.removed.extend(
                 self.journal

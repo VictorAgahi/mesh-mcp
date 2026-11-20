@@ -1160,7 +1160,10 @@ mod tests {
         FileWatcherService::schedule_reload(state, reload, &paths);
 
         let mut got = None;
-        for _ in 0..50 {
+        // Poll to a generous deadline: the job runs on the background-priority pool,
+        // which a loaded machine can starve for well over a second.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
             if let Some(v) = received.lock().unwrap().clone() {
                 got = Some(v);
                 break;

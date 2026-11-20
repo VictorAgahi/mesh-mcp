@@ -40,6 +40,11 @@ impl ContractGraph {
     /// and any incremental reload converge to the same graph (idempotence invariants
     /// I2 and I3: `derive(derive(g)) == derive(g)`).
     ///
+    /// Known one-reconcile lag (pre-existing, identical in the full and the delta
+    /// path, so they still agree): an `Imports` edge whose target is a synthetic
+    /// topic hub that is removed in this same reconcile survives until the next
+    /// one, because imports are resolved before the stale hubs are removed.
+    ///
     /// This is also the oracle of [`Self::reconcile_delta`], which recomputes only
     /// the edges a journaled change can reach and must end in the same graph.
     ///

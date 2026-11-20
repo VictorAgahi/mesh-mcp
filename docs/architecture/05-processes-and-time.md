@@ -7,21 +7,29 @@ several editors connect, and the configuration is edited. This chapter is about 
 
 | Mode | What happens |
 | :--- | :--- |
-| `mesh-mcp run` (default) | A thin proxy. It finds or starts the `meshd` for this workspace and copies bytes between its standard input/output and the daemon's local socket. |
+| `mesh-mcp run` (default) | A thin proxy. It finds or starts the `meshd` for this repository (or workspace outside Git) and copies bytes between its standard input/output and the daemon's local socket. |
 | `mesh-mcp run --standalone` | Everything in one process: no daemon. For containers and CI. |
 
 If the daemon dies mid-session, the proxy exits with status 1 and logs where the daemon log is. If
 it cannot connect right after a successful liveness check, it falls back to standalone.
 
-## One daemon per workspace
+## One daemon per repository
 
-The daemon is found through a **workspace id**: the first 16 hex characters of a SHA-256 of the
-configuration's canonical base directory plus the binary's version. The socket is
-`meshd-<id>.sock` (a Unix socket, mode `0600`, in a `0700` directory) or a named pipe on Windows.
+Inside a Git repository the daemon is found through a **family id**: the first 16 hex characters
+of a SHA-256 of the canonical common Git directory plus the binary's version. Every worktree and
+config file of the repository gives the same id. Outside Git the id is a **workspace id**: the
+configuration's canonical base directory plus the version. The socket is `meshd-<id>.sock` (a Unix
+socket, mode `0600`, in a `0700` directory) or a named pipe on Windows.
+
+A daemon serves one **view** per worktree and config file. The first line a session sends is a
+hello naming its worktree and config; the daemon routes the whole connection to that view, so a
+session only ever gets answers about its own checkout. Each view has its own graph and watcher;
+the parse cache, the thread pools and the audit log are shared.
 
 Consequences:
 
-- Two editor windows on the same repository share one index.
+- Two editor windows on the same repository, or on two worktrees of it, share one daemon process.
+  Each worktree still holds its own graph in RAM.
 - Two different repositories never share a daemon, even if both run at once.
 - Upgrading the binary changes the id, so a stale daemon from the old version is never found again.
   Before spawning, `mesh-mcp` checks the sibling `meshd`'s version and serves in-process on a
@@ -79,7 +87,7 @@ read, and reads it again only when its modification time or size changes.
 
 ## The daemon follows its configuration
 
-Editing `mesh-mcp.toml` needs no restart. On a request, at most every 250 ms, the daemon reads and
+Editing `mesh-mcp.toml` needs no restart. On a request (at most every 250 ms) and on an idle poll every 2 seconds, the daemon reads and
 hashes the config file. If the hash differs, it builds a whole new state on a blocking thread while the
 old one keeps serving, then swaps it in once the first snapshot is ready. A config that does not parse,
 or whose roots do not resolve, is refused: the old state keeps serving, a warning is logged, and
@@ -94,8 +102,8 @@ How much work the swap costs depends on what changed:
 | anything else (roots, excludes, engines) | `full` | rebuild the index, reusing the parse cache for unchanged files |
 
 The classifier is written so that adding a config key is a compile error until the key is classified,
-and tests check an incremental result equals a full rebuild. There is no timer: an edit made while
-nobody talks to the daemon is applied by the next request.
+and tests check an incremental result equals a full rebuild. The idle poll means an edit made while
+nobody talks to the daemon is already applied by the next request.
 
 A workspace that resolves to `/`, a drive root or the home directory, with no config file, is refused
 before any daemon starts; the session answers every call with an error naming the directory.
@@ -106,7 +114,7 @@ before any daemon starts; the session answers every call with an error naming th
 graph LR
     Agent1[Agent A] <-->|stdio JSON lines| P1[mesh-mcp proxy]
     Agent2[Agent B] <-->|stdio JSON lines| P2[mesh-mcp proxy]
-    P1 <-->|local socket| D[meshd for this workspace]
+    P1 <-->|local socket| D[meshd for this repository]
     P2 <-->|local socket| D
     D --> S[(current snapshot)]
     W[file watcher + config watcher] --> D
@@ -118,11 +126,11 @@ graph LR
 | Setting | Value |
 | :--- | :--- |
 | Watcher debounce | 150 ms |
-| Config file check | at most every 250 ms, on a request |
+| Config file check | at most every 250 ms on a request, every 2 s when idle |
 | Git operation hold | at most 60 s |
 | Watched directories (Linux, Windows) | 2,048 across all roots, then polling |
 | Daemon idle shutdown | 30 minutes |
-| Parse cache quota | 2048 MB per workspace (`[cache] max_size_mb`) |
+| Parse cache quota | 2048 MB per repository, per workspace outside Git (`[cache] max_size_mb`) |
 | Output cap | 48 KB; `smart_search` page about 8 KB |
 | Message channel | 64 frames |
 
