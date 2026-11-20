@@ -179,8 +179,43 @@ pub enum RecordedCaller {
     /// A recorded call of the method itself.
     Method,
     /// A client constructed for the method's service, with no method-level
-    /// call recorded in its file: it may call the method.
+    /// call recorded in its file and no client field bound in it (a Go
+    /// `NewXClient`, a Python stub): it may call the method.
     ServiceClient,
+    /// A class that binds a client field to the method's service
+    /// (`#field=Service`) while neither it nor a direct subclass calling
+    /// through the field has a resolved call of the method: it holds a client,
+    /// no call of the method was found (a subclass two levels down is not
+    /// seen: its record names only its own parent).
+    BoundClient,
+}
+
+/// One recorded RPC call resolved the way `reconcile_edges` resolves it
+/// (client binding, inherited field, field-name inference), without the RPC
+/// having to be declared: see [`RpcRecordResolver`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRpcRecord {
+    /// `[pkg.]Service.method` as the call names it for a method-level call,
+    /// `[pkg.]Service` for a service-level client.
+    pub target: String,
+    pub method_level: bool,
+    /// [`EdgeConfidence::Exact`] when the service was read from a client
+    /// binding, [`EdgeConfidence::Heuristic`] when inferred from a field name.
+    pub confidence: EdgeConfidence,
+    /// `Service.Method` as a `.proto` of the graph declares it, when exactly
+    /// one declared RPC folds to the same service and method.
+    pub declared: Option<CompactStr>,
+}
+
+/// Resolves recorded RPC call records (`=`, `~`, `^` and plain service
+/// records) against one graph's client field bindings: built once by
+/// [`ContractGraph::rpc_record_resolver`], then asked per record.
+pub struct RpcRecordResolver<'g> {
+    class_fields: reconcile::ClassFields<'g>,
+    /// (folded bare service, folded method) -> declared `Service.Method`s.
+    declared: HashMap<(String, String), Vec<CompactStr>>,
+    /// Every `$` string constant: path -> (repository, value).
+    consts: HashMap<&'g str, Vec<(RepoId, &'g str)>>,
 }
 
 /// How [`ContractGraph::find_dependents_matched`] found its result.

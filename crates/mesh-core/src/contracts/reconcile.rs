@@ -714,6 +714,18 @@ impl ContractGraph {
         recorded: &'r str,
         class_fields: &ClassFields<'_>,
     ) -> Option<(&'r str, bool, bool, Option<String>)> {
+        let caller_repo = self.nodes.get(&caller_id).map(|n| n.repo_id);
+        Self::rpc_record_target(caller_repo, recorded, class_fields)
+    }
+
+    /// [`Self::rpc_call_target`] for a caller known by its repository only:
+    /// what `diff_mesh` resolves a record of a file outside the graph with,
+    /// and a removed RPC's recorded callers with (no RPC node needed).
+    pub(super) fn rpc_record_target<'r>(
+        caller_repo: Option<RepoId>,
+        recorded: &'r str,
+        class_fields: &ClassFields<'_>,
+    ) -> Option<(&'r str, bool, bool, Option<String>)> {
         if !Self::is_rpc_call_record(recorded) {
             return None;
         }
@@ -722,7 +734,6 @@ impl ContractGraph {
         } else if let Some(t) = recorded.strip_prefix(RPC_INFERRED_METHOD_PREFIX) {
             Some((t, true, true, None))
         } else if let Some(t) = recorded.strip_prefix(RPC_INHERITED_METHOD_PREFIX) {
-            let caller_repo = self.nodes.get(&caller_id).map(|n| n.repo_id);
             let (resolved, inferred) = Self::resolve_inherited_call(t, caller_repo, class_fields)?;
             Some((t, true, inferred, Some(resolved)))
         } else {

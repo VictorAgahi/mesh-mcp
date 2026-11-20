@@ -908,17 +908,33 @@ pub fn diff_wire_schemas(old: &ProtoWireSchema, new: &ProtoWireSchema) -> WireDi
                 }
                 None => {
                     if !new_msg.is_number_reserved(number) && !new_msg.is_name_reserved(&of.name) {
-                        diff.breaking.push(WireBreakingChange {
-                            rule: WireRule::DeletedWithoutReserved,
-                            message: old_msg.path.clone(),
-                            number: i64::from(number),
-                            detail: format!(
+                        // Same name under another number: a renumbering, as
+                        // breaking as a deletion (a peer on the other version
+                        // drops the value), said as what it is.
+                        let moved_to = new_msg
+                            .fields
+                            .iter()
+                            .find(|f| f.name == of.name && f.number != number);
+                        let detail = match moved_to {
+                            Some(nf) => format!(
+                                "field `{}` (`{}`) renumbered {number} -> {}: a peer on the other version no longer reads it; keep {number}, or add `reserved {number};` if the move is intended",
+                                of.name,
+                                of.type_label(),
+                                nf.number
+                            ),
+                            None => format!(
                                 "`{}` (`{}`) was removed; add `reserved {number};` and `reserved \"{}\";` so the number is never reused",
                                 of.name,
                                 of.type_label(),
                                 of.name
                             ),
-                            line: of.line,
+                        };
+                        diff.breaking.push(WireBreakingChange {
+                            rule: WireRule::DeletedWithoutReserved,
+                            message: old_msg.path.clone(),
+                            number: i64::from(number),
+                            detail,
+                            line: moved_to.map_or(of.line, |nf| nf.line),
                         });
                     }
                 }
@@ -1871,5 +1887,30 @@ message Outer {
         assert_eq!(diff.breaking[0].rule, WireRule::DeletedWithoutReserved);
         assert_eq!(diff.breaking[0].number, 2);
         assert_eq!(diff.removed_messages, vec!["Gone".to_string()]);
+    }
+
+    /// A field kept under its name with a new number is classified exactly as
+    /// a deletion without `reserved` (breaking), and the detail names both
+    /// numbers.
+    #[test]
+    fn wire_diff_names_a_renumbered_field() {
+        let old =
+            schema("syntax = \"proto3\";\nmessage M { int32 a = 1; string pagination = 2; }\n");
+        let new = schema(
+            "syntax = \"proto3\";\nmessage M {\n  int32 a = 1;\n  string pagination = 5;\n}\n",
+        );
+        let diff = diff_wire_schemas(&old, &new);
+        assert_eq!(diff.breaking.len(), 1, "{:?}", diff.breaking);
+        let change = &diff.breaking[0];
+        assert_eq!(change.rule, WireRule::DeletedWithoutReserved);
+        assert_eq!(change.number, 2);
+        assert!(
+            change
+                .detail
+                .starts_with("field `pagination` (`string`) renumbered 2 -> 5"),
+            "{}",
+            change.detail
+        );
+        assert_eq!(change.line, 4);
     }
 }
