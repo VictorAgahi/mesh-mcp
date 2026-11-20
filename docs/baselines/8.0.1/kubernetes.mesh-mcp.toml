@@ -1,0 +1,11 @@
+[workspace]
+name = "kubernetes"
+workspace_root = "/Users/victoragahi/bench-repos/kubernetes"
+roots = ["/Users/victoragahi/bench-repos/kubernetes"]
+
+[engines.docs]
+enabled = true
+paths = ["/Users/victoragahi/bench-repos/kubernetes/*.md"]
+
+[engines.contracts]
+enabled = true
