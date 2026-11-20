@@ -1,0 +1,3 @@
+- Add `scripts/golden/score_events.py` (+ self-tests, wired into the golden workflow): precision/recall of producers, consumers, call hops and chains against `tests/golden/events/*.expected.yaml`.
+- Add `scripts/bench/agent-ab/run.py`: headless agent A/B runner, dry-run by default, real runs gated by `MESH_AB_APPROVED_RUNS`.
+- Add `scripts/bench/eda_unresolved_share.py`: share of topics answered with "No producer / consumer statically resolved".
