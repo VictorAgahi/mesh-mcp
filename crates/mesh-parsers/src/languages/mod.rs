@@ -1,11 +1,15 @@
+mod call_support;
 pub mod cpp;
 pub mod csharp;
 pub mod go;
+mod go_calls;
 pub mod java;
+mod java_calls;
 mod js_frameworks;
 pub mod kotlin;
 pub mod php;
 pub mod proto;
+mod py_calls;
 pub mod python;
 pub mod ruby;
 pub mod rust_lang;
@@ -717,6 +721,27 @@ impl PolyglotIndexer {
         out
     }
 
+    /// Whether a Java, Go or Python file carries call facts: not test code (a chain
+    /// entered from a test is not an architecture flow, and tests only cost memory;
+    /// judged below the workspace root, as for TypeScript) and not generated code
+    /// (stubs, `zz_generated` files: thousands of callables nothing hand-written calls
+    /// through).
+    fn wants_call_facts(cfg: &ExtractConfig, file_path: &Path) -> bool {
+        let rel = Self::routing_path(cfg, file_path);
+        let judged = rel.as_deref().unwrap_or(file_path);
+        let name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let in_test = match rel.as_deref() {
+            Some(rel) => mesh_core::is_test_path(rel),
+            None => file_path
+                .file_name()
+                .is_some_and(|n| mesh_core::is_test_path(Path::new(n))),
+        };
+        !in_test && !mesh_core::is_generated_path(judged) && !name.starts_with("zz_generated")
+    }
+
     fn extract_as(
         file_path: &Path,
         content: &str,
@@ -766,9 +791,22 @@ impl PolyglotIndexer {
             }
 
             LanguageKind::Java => {
-                if let Some((nodes, dependencies, producers, rpc_calls)) = parsed!(|tree| {
-                    java::JavaExtractor::extract_relations(file_path, content, repo_id, tree)
-                }) {
+                let with_calls = Self::wants_call_facts(cfg, file_path);
+                if let Some(((nodes, dependencies, producers, rpc_calls), calls)) =
+                    parsed!(|tree| {
+                        (
+                            java::JavaExtractor::extract_relations(
+                                file_path, content, repo_id, tree,
+                            ),
+                            if with_calls {
+                                java_calls::extract(tree, content.as_bytes())
+                            } else {
+                                CallFacts::default()
+                            },
+                        )
+                    })
+                {
+                    out.calls = calls;
                     for (i, node) in nodes.iter().enumerate() {
                         if node.kind == NodeKind::KafkaTopic {
                             out.consumers.push((i, node.name.clone()));
@@ -781,9 +819,18 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::Go => {
-                if let Some((nodes, relations)) = parsed!(|tree| {
-                    go::GoExtractor::extract_with_relations(file_path, content, repo_id, tree)
+                let with_calls = Self::wants_call_facts(cfg, file_path);
+                if let Some(((nodes, relations), calls)) = parsed!(|tree| {
+                    (
+                        go::GoExtractor::extract_with_relations(file_path, content, repo_id, tree),
+                        if with_calls {
+                            go_calls::extract(tree, content.as_bytes())
+                        } else {
+                            CallFacts::default()
+                        },
+                    )
                 }) {
+                    out.calls = calls;
                     out.nodes = nodes;
                     out.dependencies = relations.dependencies;
                     out.producers = relations.producers;
@@ -792,11 +839,20 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::Python => {
-                if let Some((nodes, relations)) = parsed!(|tree| {
-                    python::PythonExtractor::extract_with_relations(
-                        file_path, content, repo_id, tree,
+                let with_calls = Self::wants_call_facts(cfg, file_path);
+                if let Some(((nodes, relations), calls)) = parsed!(|tree| {
+                    (
+                        python::PythonExtractor::extract_with_relations(
+                            file_path, content, repo_id, tree,
+                        ),
+                        if with_calls {
+                            py_calls::extract(tree, content.as_bytes())
+                        } else {
+                            CallFacts::default()
+                        },
                     )
                 }) {
+                    out.calls = calls;
                     out.nodes = nodes;
                     out.dependencies = relations.dependencies;
                     out.producers = relations.producers;
