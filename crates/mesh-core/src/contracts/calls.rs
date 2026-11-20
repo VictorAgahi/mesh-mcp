@@ -69,8 +69,14 @@ pub const MAX_STRUCTURAL_IMPLS: usize = 64;
 /// Extensions a relative module specifier may omit.
 const SCRIPT_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
+// The facts of every file are serialized into the parse cache, and a full build holds
+// every file's serialized record at once before writing them: the four list element
+// types below serialize as arrays (`[3,"Handle",1,"svc",25]`), not as maps with field
+// names, which is about a quarter of the bytes.
+
 /// A method or function declared in a file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "CallableRepr", into = "CallableRepr")]
 pub struct CallableFact {
     /// Bare name (`place`, `handleOrder`).
     pub name: CompactStr,
@@ -80,6 +86,26 @@ pub struct CallableFact {
     /// 1-based, inclusive.
     pub line_start: u32,
     pub line_end: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CallableRepr(CompactStr, Option<CompactStr>, u32, u32);
+
+impl From<CallableFact> for CallableRepr {
+    fn from(c: CallableFact) -> Self {
+        Self(c.name, c.owner, c.line_start, c.line_end)
+    }
+}
+
+impl From<CallableRepr> for CallableFact {
+    fn from(r: CallableRepr) -> Self {
+        Self {
+            name: r.0,
+            owner: r.1,
+            line_start: r.2,
+            line_end: r.3,
+        }
+    }
 }
 
 /// How a call site names its callee.
@@ -101,6 +127,7 @@ pub enum CallReceiver {
 
 /// One call site, inside a callable of the same file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "CallFactRepr", into = "CallFactRepr")]
 pub struct CallFact {
     /// Index into [`CallFacts::callables`].
     pub caller: u32,
@@ -109,9 +136,48 @@ pub struct CallFact {
     pub line: u32,
 }
 
+/// (caller, callee, receiver kind, receiver field or namespace, line).
+#[derive(Serialize, Deserialize)]
+struct CallFactRepr(u32, CompactStr, u8, CompactStr, u32);
+
+impl From<CallFact> for CallFactRepr {
+    fn from(c: CallFact) -> Self {
+        let (kind, name) = match c.receiver {
+            CallReceiver::This => (0, CompactStr::default()),
+            CallReceiver::InjectedField(f) => (1, f),
+            CallReceiver::ImportedSymbol => (2, CompactStr::default()),
+            CallReceiver::SameModule => (3, CompactStr::default()),
+            CallReceiver::Namespace(n) => (4, n),
+        };
+        Self(c.caller, c.callee, kind, name, c.line)
+    }
+}
+
+impl TryFrom<CallFactRepr> for CallFact {
+    type Error = String;
+
+    fn try_from(r: CallFactRepr) -> Result<Self, String> {
+        let receiver = match r.2 {
+            0 => CallReceiver::This,
+            1 => CallReceiver::InjectedField(r.3),
+            2 => CallReceiver::ImportedSymbol,
+            3 => CallReceiver::SameModule,
+            4 => CallReceiver::Namespace(r.3),
+            other => return Err(format!("unknown call receiver kind {other}")),
+        };
+        Ok(Self {
+            caller: r.0,
+            callee: r.1,
+            receiver,
+            line: r.4,
+        })
+    }
+}
+
 /// A field of `class` holding a dependency of type `declared_type` (a constructor
 /// parameter property, an `inject(T)` field, a Spring constructor parameter, ...).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "TripleRepr", into = "TripleRepr")]
 pub struct InjectionFact {
     pub class: CompactStr,
     pub field: CompactStr,
@@ -123,12 +189,49 @@ pub struct InjectionFact {
 /// (`export { X } from './x'`) is recorded as an import of `X` too, and
 /// `export * from './x'` as `local == exported == "*"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "TripleRepr", into = "TripleRepr")]
 pub struct ImportFact {
     pub local: CompactStr,
     pub exported: CompactStr,
     /// The module as written once aliases are applied. Only a relative specifier
     /// (`./x`, `../y/z`) is resolved to a file; a package import resolves to nothing.
     pub module: CompactStr,
+}
+
+/// Three names (an injection's class, field and type; an import's local, exported and module).
+#[derive(Serialize, Deserialize)]
+struct TripleRepr(CompactStr, CompactStr, CompactStr);
+
+impl From<InjectionFact> for TripleRepr {
+    fn from(i: InjectionFact) -> Self {
+        Self(i.class, i.field, i.declared_type)
+    }
+}
+
+impl From<TripleRepr> for InjectionFact {
+    fn from(r: TripleRepr) -> Self {
+        Self {
+            class: r.0,
+            field: r.1,
+            declared_type: r.2,
+        }
+    }
+}
+
+impl From<ImportFact> for TripleRepr {
+    fn from(i: ImportFact) -> Self {
+        Self(i.local, i.exported, i.module)
+    }
+}
+
+impl From<TripleRepr> for ImportFact {
+    fn from(r: TripleRepr) -> Self {
+        Self {
+            local: r.0,
+            exported: r.1,
+            module: r.2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,13 +248,13 @@ pub enum TypeFactKind {
 pub struct TypeFact {
     pub name: CompactStr,
     pub kind: TypeFactKind,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extends: Vec<CompactStr>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub implements: Vec<CompactStr>,
     /// Method names an interface declares (Go: its structural method set, matched
     /// against the methods of struct types; empty elsewhere).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub methods: Vec<CompactStr>,
 }
 
@@ -412,6 +515,41 @@ impl ContractGraph {
         self.derived_calls.stats.files_capped = files_capped;
         self.derived_calls.stats.facts_bytes = facts_bytes;
         let s = self.derived_calls.stats;
+        if tracing::enabled!(target: "mesh::calls", tracing::Level::DEBUG) {
+            let mut n = [0usize; 5];
+            let mut by_receiver = [0usize; 5];
+            for f in self.call_facts.values() {
+                let c = &f.facts;
+                for site in &c.call_sites {
+                    by_receiver[match site.receiver {
+                        CallReceiver::This => 0,
+                        CallReceiver::InjectedField(_) => 1,
+                        CallReceiver::ImportedSymbol => 2,
+                        CallReceiver::SameModule => 3,
+                        CallReceiver::Namespace(_) => 4,
+                    }] += 1;
+                }
+                for (slot, len) in n.iter_mut().zip([
+                    c.callables.len(),
+                    c.call_sites.len(),
+                    c.injections.len(),
+                    c.imports.len(),
+                    c.types.len(),
+                ]) {
+                    *slot += len;
+                }
+            }
+            tracing::debug!(
+                target: "mesh::calls",
+                "call facts stored: {} callables, {} call sites, {} injections, {} imports, {} types",
+                n[0], n[1], n[2], n[3], n[4]
+            );
+            tracing::debug!(
+                target: "mesh::calls",
+                "call sites by receiver: {} this, {} injected field, {} imported symbol, {} same module, {} namespace",
+                by_receiver[0], by_receiver[1], by_receiver[2], by_receiver[3], by_receiver[4]
+            );
+        }
         tracing::debug!(
             target: "mesh::calls",
             "calls derive: {:.1} ms (index {:.1} ms), {} files with facts ({} KiB), {} candidates, {} sites resolved \

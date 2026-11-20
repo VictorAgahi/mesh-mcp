@@ -62,6 +62,64 @@ const PREDECLARED: &[&str] = &[
     "uintptr",
 ];
 
+/// First path segments of the Go standard library: an import under one of them names
+/// no workspace directory, and its calls (`fmt.Errorf`, `strings.Join`, ...) are the
+/// bulk of all package-qualified calls, so they are not recorded at all.
+const STDLIB_ROOTS: &[&str] = &[
+    "archive",
+    "bufio",
+    "bytes",
+    "cmp",
+    "compress",
+    "container",
+    "context",
+    "crypto",
+    "database",
+    "debug",
+    "embed",
+    "encoding",
+    "errors",
+    "expvar",
+    "flag",
+    "fmt",
+    "go",
+    "hash",
+    "html",
+    "image",
+    "index",
+    "io",
+    "iter",
+    "log",
+    "maps",
+    "math",
+    "mime",
+    "net",
+    "os",
+    "path",
+    "plugin",
+    "reflect",
+    "regexp",
+    "runtime",
+    "slices",
+    "sort",
+    "strconv",
+    "strings",
+    "structs",
+    "sync",
+    "syscall",
+    "testing",
+    "text",
+    "time",
+    "unicode",
+    "unique",
+    "unsafe",
+    "weak",
+];
+
+fn is_stdlib(path: &str) -> bool {
+    STDLIB_ROOTS.contains(&path.split('/').next().unwrap_or(path))
+}
+
 /// `T`, `*T`, `T[X]`, `pkg.T`, `*pkg.T` -> `T` / `pkg.T`; slices, maps, channels,
 /// functions and predeclared types -> `None`.
 fn type_name(node: Node, source: &[u8]) -> Option<String> {
@@ -192,6 +250,9 @@ pub fn extract(tree: &Tree, source: &[u8]) -> CallFacts {
             else {
                 return;
             };
+            if is_stdlib(path) {
+                return;
+            }
             let local = match node
                 .child_by_field_name("name")
                 .and_then(|n| text(n, source))
@@ -479,9 +540,9 @@ func audit(x float64) {}
         assert!(s.contains(&(h.clone(), "audit".into(), CallReceiver::SameModule, 31)));
         assert!(s.contains(&(h.clone(), "WriteMessages".into(), field("w"), 34)));
         assert!(s.contains(&(h.clone(), "Publish".into(), field("pub"), 35)));
-        // `fmt.Println` (not a workspace package: kept, the resolver finds nothing),
-        // `len` (builtin) and `other.thing.Run()` (not the receiver) give nothing more.
-        assert_eq!(s.len(), 8, "{s:?}");
+        // `fmt.Println` (standard library), `len` (builtin) and `other.thing.Run()` (not
+        // the receiver) give nothing more.
+        assert_eq!(s.len(), 7, "{s:?}");
         // Imports: only the packages a kept fact names, the alias and the version suffix applied.
         let imports: Vec<(&str, &str)> = f
             .imports
@@ -491,7 +552,6 @@ func audit(x float64) {}
         assert_eq!(
             imports,
             vec![
-                ("fmt", "fmt"),
                 ("kf", "github.com/segmentio/kafka-go"),
                 ("store", "example.com/app/store/v2")
             ]

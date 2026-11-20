@@ -26,6 +26,59 @@ const BUILTIN_TYPES: &[&str] = &[
     "object", "Set", "set", "str", "Tuple", "tuple",
 ];
 
+/// Standard-library modules a workspace rarely shadows: their calls (`os.path.join`,
+/// `json.dumps`, ...) are the bulk of all module-qualified calls and are not recorded.
+const STDLIB_MODULES: &[&str] = &[
+    "abc",
+    "argparse",
+    "asyncio",
+    "base64",
+    "collections",
+    "contextlib",
+    "copy",
+    "csv",
+    "dataclasses",
+    "datetime",
+    "decimal",
+    "enum",
+    "functools",
+    "hashlib",
+    "heapq",
+    "http",
+    "inspect",
+    "io",
+    "itertools",
+    "json",
+    "logging",
+    "math",
+    "operator",
+    "os",
+    "pathlib",
+    "pickle",
+    "random",
+    "re",
+    "shutil",
+    "signal",
+    "socket",
+    "sqlite3",
+    "string",
+    "struct",
+    "subprocess",
+    "sys",
+    "tempfile",
+    "textwrap",
+    "threading",
+    "time",
+    "traceback",
+    "typing",
+    "unittest",
+    "urllib",
+    "uuid",
+    "warnings",
+    "weakref",
+    "zlib",
+];
+
 /// `Dep`, `"Dep"`, `Optional[Dep]`, `Dep | None`, `mod.Dep`, `Dep[T]` -> `Dep` / `mod.Dep`;
 /// containers, builtins and anything not a plain name -> `None`.
 fn annotation_type(raw: &str) -> Option<String> {
@@ -294,18 +347,21 @@ pub fn extract(tree: &Tree, source: &[u8]) -> CallFacts {
         .filter(|t| !t.extends.is_empty())
         .map(|t| t.name.clone())
         .collect();
+    let stdlib = |i: &mesh_core::ImportFact| {
+        STDLIB_MODULES.contains(&i.module.split('.').next().unwrap_or_default())
+    };
     let modules: HashSet<CompactStr> = b
         .facts
         .imports
         .iter()
-        .filter(|i| i.local != "*" && !i.local.starts_with(char::is_uppercase))
+        .filter(|i| i.local != "*" && !i.local.starts_with(char::is_uppercase) && !stdlib(i))
         .map(|i| i.local.clone())
         .collect();
     let functions: HashSet<CompactStr> = b
         .facts
         .imports
         .iter()
-        .filter(|i| i.exported != "*" && !i.local.starts_with(char::is_uppercase))
+        .filter(|i| i.exported != "*" && !i.local.starts_with(char::is_uppercase) && !stdlib(i))
         .map(|i| i.local.clone())
         .collect();
     let free: HashSet<CompactStr> = b

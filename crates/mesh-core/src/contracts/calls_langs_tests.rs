@@ -641,3 +641,29 @@ fn live_reloads_of_an_implementation_file_match_a_fresh_build() {
     assert_eq!(calls(&live), calls(&build(&one)));
     assert!(calls(&live).contains(&edge("OrderService.Handle", "KafkaPublisher.Publish", X)));
 }
+
+#[test]
+fn call_facts_round_trip_through_compact_json() {
+    let facts = CallFacts {
+        callables: vec![callable(Some("A"), "m", 1, 2), callable(None, "f", 3, 4)],
+        call_sites: vec![
+            site(0, "x", CallReceiver::This, 1),
+            site(0, "y", field("dep"), 2),
+            site(1, "z", CallReceiver::ImportedSymbol, 3),
+            site(1, "w", CallReceiver::SameModule, 4),
+            site(1, "q", CallReceiver::Namespace("ns".into()), 5),
+        ],
+        injections: vec![inject("A", "dep", "Dep")],
+        imports: vec![import("Dep", "pkg.dep")],
+        types: vec![iface("I", &["M"]), class("A", TypeFactKind::Class, &["I"])],
+        capped: true,
+    };
+    let json = serde_json::to_string(&facts).expect("serialize");
+    let back: CallFacts = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(facts, back);
+    // Arrays, not field-name maps: the cache holds every file's record at once.
+    assert!(json.contains(r#"[0,"y",1,"dep",2]"#), "{json}");
+    assert!(json.contains(r#"["m","A",1,2]"#), "{json}");
+    // A record of an unknown kind is an error, never a silent receiver.
+    assert!(serde_json::from_str::<CallFacts>(r#"{"call_sites":[[0,"x",9,"",1]]}"#).is_err());
+}

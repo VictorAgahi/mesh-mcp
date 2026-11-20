@@ -39,7 +39,11 @@ fn index(corpus: &str, edit: &dyn Fn(&str, String) -> String) -> ContractGraph {
     let mut graph = ContractGraph::new();
     for f in files {
         let name = f.file_name().unwrap().to_str().unwrap().to_string();
-        let content = edit(&name, std::fs::read_to_string(&f).expect("read"));
+        // CRLF checkouts (Windows) would defeat the textual edits below.
+        let text = std::fs::read_to_string(&f)
+            .expect("read")
+            .replace("\r\n", "\n");
+        let content = edit(&name, text);
         PolyglotIndexer::index_file(&f, &content, 0, &mut graph);
     }
     graph.reconcile_edges();
