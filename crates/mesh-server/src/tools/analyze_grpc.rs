@@ -534,6 +534,50 @@ pub(crate) struct WireReport {
     outcome: WireOutcome,
 }
 
+/// What a wire-format check concluded, for a one-line summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WireClass {
+    /// At least one `WIRE_FORMAT_BREAKING_CHANGE`.
+    Breaking,
+    /// No comparison happened (a version did not parse): nothing is claimed.
+    NotCompared,
+    /// Compared without a breaking change, or new at the base (nothing to break).
+    Clean,
+}
+
+impl WireReport {
+    /// Number of `WIRE_FORMAT_BREAKING_CHANGE` findings (0 for a new or
+    /// unparseable file, which claim none).
+    pub(crate) fn breaking_count(&self) -> usize {
+        match &self.outcome {
+            WireOutcome::Compared(diff) => diff.breaking.len(),
+            _ => 0,
+        }
+    }
+
+    /// The outcome's class and its one-line wording, each outcome its own.
+    pub(crate) fn summary(&self) -> (WireClass, String) {
+        match &self.outcome {
+            WireOutcome::NewFile => (
+                WireClass::Clean,
+                "new file (absent from the base): no breaking change possible".to_string(),
+            ),
+            WireOutcome::Unparseable { side, reason } => (
+                WireClass::NotCompared,
+                format!("not compared: the {side} version could not be parsed ({reason})"),
+            ),
+            WireOutcome::Compared(diff) if diff.breaking.is_empty() => (
+                WireClass::Clean,
+                "no wire-format breaking change".to_string(),
+            ),
+            WireOutcome::Compared(diff) => (
+                WireClass::Breaking,
+                format!("{} `WIRE_FORMAT_BREAKING_CHANGE`", diff.breaking.len()),
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum WireOutcome {
     /// The file does not exist in the base: new file, nothing to break.
@@ -574,12 +618,8 @@ pub(crate) fn check_wire_format(
         git::SMALL_OUTPUT,
     )?;
     if !exists.success {
-        return Ok(WireReport {
-            rel_path,
-            base: choice,
-            base_sha,
-            outcome: WireOutcome::NewFile,
-        });
+        // Absent from the base: nothing to compare, the working tree is not read.
+        return Ok(compare_wire(rel_path, choice, base_sha, None, ""));
     }
     let shown = run(
         &[os("show"), os("--no-textconv"), OsStr::new(&object)],
@@ -593,10 +633,36 @@ pub(crate) fn check_wire_format(
     }
     let before = String::from_utf8_lossy(&shown.stdout);
     let after = read_bounded(file)?;
+    Ok(compare_wire(
+        rel_path,
+        choice,
+        base_sha,
+        Some(&before),
+        &after,
+    ))
+}
 
+/// The wire-format comparison of `before` (the `.proto` at the base, `None`
+/// when absent there) with `after` (the working tree), for callers that already
+/// hold both versions (`diff_mesh` reads them in one `git cat-file --batch`).
+pub(crate) fn compare_wire(
+    rel_path: String,
+    base: BaseChoice,
+    base_sha: String,
+    before: Option<&str>,
+    after: &str,
+) -> WireReport {
+    let Some(before) = before else {
+        return WireReport {
+            rel_path,
+            base,
+            base_sha,
+            outcome: WireOutcome::NewFile,
+        };
+    };
     let outcome = match (
-        ProtoExtractor::wire_schema(&before),
-        ProtoExtractor::wire_schema(&after),
+        ProtoExtractor::wire_schema(before),
+        ProtoExtractor::wire_schema(after),
     ) {
         (Err(reason), _) => WireOutcome::Unparseable {
             side: "base",
@@ -608,12 +674,12 @@ pub(crate) fn check_wire_format(
         },
         (Ok(old), Ok(new)) => WireOutcome::Compared(diff_wire_schemas(&old, &new)),
     };
-    Ok(WireReport {
+    WireReport {
         rel_path,
-        base: choice,
+        base,
         base_sha,
         outcome,
-    })
+    }
 }
 
 /// Reads the working-tree file, refusing it before the read when it exceeds the
@@ -638,7 +704,7 @@ fn read_bounded(file: &Path) -> Result<String, WireCheckError> {
 /// At most this many findings are listed; the rest are counted.
 const MAX_LISTED_FINDINGS: usize = 100;
 
-fn render_report(report: &WireReport) -> String {
+pub(crate) fn render_report(report: &WireReport) -> String {
     let short_sha = report.base_sha.get(..12).unwrap_or(&report.base_sha);
     let base = match &report.base {
         BaseChoice::Explicit(b) => format!("`{b}` (`{short_sha}`)"),

@@ -1,5 +1,6 @@
 pub mod analyze_grpc;
 pub mod analyze_impact;
+pub mod diff_mesh;
 pub mod find_dependents;
 pub mod search_docs;
 pub mod smart_search;
@@ -10,6 +11,7 @@ pub mod visualize_mesh;
 use crate::protocol::RequestMeta;
 use analyze_grpc::AnalyzeGrpcTool;
 use analyze_impact::AnalyzeImpactTool;
+use diff_mesh::DiffMeshTool;
 use find_dependents::FindDependentsTool;
 use mesh_core::AppState;
 use schemars::{schema_for, JsonSchema};
@@ -106,6 +108,7 @@ impl ToolRegistry {
                 ToolRegistry::describe::<AnalyzeImpactTool>(),
                 ToolRegistry::describe::<SearchDocsTool>(),
                 ToolRegistry::describe::<VisualizeMeshTool>(),
+                ToolRegistry::describe::<DiffMeshTool>(),
             ])
         });
         TOOLS.clone()
@@ -132,6 +135,7 @@ impl ToolRegistry {
                 | AnalyzeImpactTool::NAME
                 | SearchDocsTool::NAME
                 | VisualizeMeshTool::NAME
+                | DiffMeshTool::NAME
         ) || {
             #[cfg(feature = "test-util")]
             {
@@ -194,6 +198,7 @@ impl ToolRegistry {
             VisualizeMeshTool::NAME => {
                 Self::invoke::<VisualizeMeshTool>(arguments, state, session).await?
             }
+            DiffMeshTool::NAME => Self::invoke::<DiffMeshTool>(arguments, state, session).await?,
             #[cfg(feature = "test-util")]
             TestSlowOpTool::NAME => {
                 Self::invoke::<TestSlowOpTool>(arguments, state, session).await?
@@ -1001,6 +1006,8 @@ roots = ["."]
             let mut args = match name {
                 "smart_search" | "search_docs" => json!({ "query": "x" }),
                 "visualize_mesh" => json!({}),
+                // Refused before any `git` runs: only `_meta` acceptance is tested.
+                "diff_mesh" => json!({ "base": "--x" }),
                 _ => json!({ "target": "x" }),
             };
             args["_meta"] = json!({
@@ -1022,7 +1029,7 @@ roots = ["."]
     fn test_list_tools_contains_all_tools() {
         let tools = ToolRegistry::list_tools();
         let arr = tools.as_array().expect("tools array");
-        assert_eq!(arr.len(), 6);
+        assert_eq!(arr.len(), 7);
         let names: Vec<_> = arr.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"smart_search"));
         assert!(names.contains(&"find_dependents"));
@@ -1030,6 +1037,7 @@ roots = ["."]
         assert!(names.contains(&"analyze_impact"));
         assert!(names.contains(&"search_docs"));
         assert!(names.contains(&"visualize_mesh"));
+        assert!(names.contains(&"diff_mesh"));
     }
 
     /// Regression test for Issue 3: assert generated JSON schemas match real tool structs

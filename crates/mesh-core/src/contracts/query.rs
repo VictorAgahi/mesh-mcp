@@ -330,6 +330,119 @@ impl ContractGraph {
         }
     }
 
+    /// Call sites recorded for `service.method`, whether or not they resolved
+    /// to a declared RPC. A caller of an RPC that no longer exists has no
+    /// `CallsRpc` edge (there is no node left to link it to), so `analyze_grpc`
+    /// cannot list it: `diff_mesh` asks here instead.
+    ///
+    /// - A method-level record (`=Service.Method`, or `~Service.Method` when the
+    ///   service was inferred from a field name, heuristic) may name the service
+    ///   with its proto package (`=demo.v1.UserService.DeleteUser`). The package
+    ///   is stripped: the same as `package` (the `.proto`'s own, when known) keeps
+    ///   the record's confidence; no known package makes it heuristic; another
+    ///   package makes it ambiguous (a homonym service, or the same one renamed).
+    /// - A service-level record (a client constructed for the service, without
+    ///   the method resolved: Go `NewUserServiceClient`, a Python stub, a Java
+    ///   `newBlockingStub`) is a [`RecordedCaller::ServiceClient`] that may call
+    ///   the method, heuristic, listed only for a file with no method-level call.
+    ///
+    /// Names compare with [`fold_rpc_name`]. Sorted by location, each node once.
+    pub fn recorded_rpc_callers(
+        &self,
+        service: &str,
+        method: &str,
+        package: Option<&str>,
+    ) -> Vec<(&ContractNode, EdgeConfidence, RecordedCaller)> {
+        let (want_service, want_method) = (fold_rpc_name(service), fold_rpc_name(method));
+        // Splits `[pkg.]Service`, comparing the service; the package decides
+        // the confidence.
+        let service_confidence = |qualified: &str, recorded: EdgeConfidence| {
+            let (pkg, bare) = match qualified.rsplit_once('.') {
+                Some((pkg, bare)) => (Some(pkg), bare),
+                None => (None, qualified),
+            };
+            if fold_rpc_name(bare) != want_service {
+                return None;
+            }
+            Some(match (pkg, package) {
+                (None, _) => recorded,
+                (Some(p), Some(want)) if fold_rpc_name(p) == fold_rpc_name(want) => recorded,
+                (Some(_), Some(_)) => EdgeConfidence::Ambiguous,
+                (Some(_), None) => EdgeConfidence::Heuristic,
+            })
+        };
+        let strength = |c: EdgeConfidence| match c {
+            EdgeConfidence::Exact => 2u8,
+            EdgeConfidence::Heuristic => 1,
+            EdgeConfidence::Ambiguous => 0,
+        };
+        let mut methods: Vec<(&ContractNode, EdgeConfidence, RecordedCaller)> = Vec::new();
+        let mut clients: Vec<(&ContractNode, EdgeConfidence, RecordedCaller)> = Vec::new();
+        for (caller_id, recorded) in &self.rpc_calls {
+            let (found, kind) = if let Some(t) = recorded
+                .strip_prefix(RPC_EXACT_METHOD_PREFIX)
+                .map(|t| (t, EdgeConfidence::Exact))
+                .or_else(|| {
+                    recorded
+                        .strip_prefix(RPC_INFERRED_METHOD_PREFIX)
+                        .map(|t| (t, EdgeConfidence::Heuristic))
+                }) {
+                let (target, recorded_confidence) = t;
+                let Some((s, m)) = target.rsplit_once('.') else {
+                    continue;
+                };
+                if fold_rpc_name(m) != want_method {
+                    continue;
+                }
+                (
+                    service_confidence(s, recorded_confidence),
+                    RecordedCaller::Method,
+                )
+            } else if recorded
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                && recorded
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            {
+                (
+                    service_confidence(recorded, EdgeConfidence::Heuristic).map(|c| match c {
+                        EdgeConfidence::Exact => EdgeConfidence::Heuristic,
+                        weaker => weaker,
+                    }),
+                    RecordedCaller::ServiceClient,
+                )
+            } else {
+                continue;
+            };
+            let (Some(confidence), Some(node)) = (found, self.nodes.get(caller_id)) else {
+                continue;
+            };
+            let list = match kind {
+                RecordedCaller::Method => &mut methods,
+                RecordedCaller::ServiceClient => &mut clients,
+            };
+            match list.iter_mut().find(|(n, _, _)| n.id == node.id) {
+                Some(seen) if strength(confidence) > strength(seen.1) => seen.1 = confidence,
+                Some(_) => {}
+                None => list.push((node, confidence, kind)),
+            }
+        }
+        let called: HashSet<&FilePath> = methods.iter().map(|(n, _, _)| &n.file_path).collect();
+        let mut seen: HashSet<NodeId> = methods.iter().map(|(n, _, _)| n.id).collect();
+        let clients: Vec<_> = clients
+            .into_iter()
+            .filter(|(n, _, _)| !called.contains(&n.file_path) && seen.insert(n.id))
+            .collect();
+        let mut out = methods;
+        out.extend(clients);
+        out.sort_by(|(a, _, _), (b, _, _)| {
+            (&a.file_path, a.line_start, a.id).cmp(&(&b.file_path, b.line_start, b.id))
+        });
+        out
+    }
+
     /// Asynchronous causal impact flow resolution
     pub fn analyze_impact(&self, target: &str) -> ImpactFlow<'_> {
         let mut norm_target = normalize_topic_key(target);

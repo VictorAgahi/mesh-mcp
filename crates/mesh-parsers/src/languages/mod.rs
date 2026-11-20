@@ -567,13 +567,34 @@ impl PolyglotIndexer {
         repo_id: RepoId,
         cfg: &ExtractConfig,
     ) -> FileIndex {
+        Self::extract_with_budget(
+            file_path,
+            content,
+            repo_id,
+            cfg,
+            AstGuard::INDEX_PARSE_TIMEOUT_MICROS,
+        )
+    }
+
+    /// [`Self::extract_with_config`] with the tree-sitter parse budget made explicit:
+    /// indexing passes `AstGuard::INDEX_PARSE_TIMEOUT_MICROS` (through
+    /// `extract_with_config`), an extraction on an agent's synchronous request path
+    /// (`diff_mesh`) passes `AstGuard::QUERY_PARSE_TIMEOUT_MICROS`. CLAUDE.md
+    /// commandment 2: the two budgets are never one constant.
+    pub fn extract_with_budget(
+        file_path: &Path,
+        content: &str,
+        repo_id: RepoId,
+        cfg: &ExtractConfig,
+        timeout_micros: u64,
+    ) -> FileIndex {
         // A single-file component is its script blocks, read with the JS / TS grammar;
         // the component itself is a declaration named after its file.
         if sfc::is_sfc(file_path) {
-            return Self::extract_component(file_path, content, repo_id, cfg);
+            return Self::extract_component(file_path, content, repo_id, cfg, timeout_micros);
         }
         let lang_kind = LanguageKind::from_path(&file_path.to_string_lossy());
-        Self::extract_as(file_path, content, repo_id, cfg, lang_kind)
+        Self::extract_as(file_path, content, repo_id, cfg, lang_kind, timeout_micros)
     }
 
     /// `.vue` / `.svelte` / `.astro`: the script is extracted (line numbers are the file's),
@@ -583,6 +604,7 @@ impl PolyglotIndexer {
         content: &str,
         repo_id: RepoId,
         cfg: &ExtractConfig,
+        timeout_micros: u64,
     ) -> FileIndex {
         let mut out = match sfc::script_view(file_path, content) {
             // Same lexical guard as any parsed source, on the script alone.
@@ -596,7 +618,14 @@ impl PolyglotIndexer {
                         // script's own width counts.
                         .all(|l| l.trim_end().len() <= AstGuard::MAX_LINE_LEN_BYTES) =>
             {
-                Self::extract_as(file_path, &view.script, repo_id, cfg, view.kind)
+                Self::extract_as(
+                    file_path,
+                    &view.script,
+                    repo_id,
+                    cfg,
+                    view.kind,
+                    timeout_micros,
+                )
             }
             _ => FileIndex::default(),
         };
@@ -664,23 +693,20 @@ impl PolyglotIndexer {
         repo_id: RepoId,
         cfg: &ExtractConfig,
         lang_kind: LanguageKind,
+        timeout_micros: u64,
     ) -> FileIndex {
         let path_str = file_path.to_string_lossy();
         let mut out = FileIndex::default();
 
-        // Parses `content` once for `lang_kind` at the indexing budget
-        // (`AstGuard::INDEX_PARSE_TIMEOUT_MICROS`) and marks `out.parse_failed` on a
+        // Parses `content` once for `lang_kind` at the caller's budget
+        // (`timeout_micros`: `AstGuard::INDEX_PARSE_TIMEOUT_MICROS` when indexing) and
+        // marks `out.parse_failed` on a
         // real failure — as opposed to `AstGuard::with_parser`'s bare `Option`, which
         // made "the parse failed" and "this language has no grammar" indistinguishable
         // from "it parsed and produced nothing" at every one of these call sites.
         macro_rules! parsed {
             ($f:expr) => {
-                match AstGuard::parse_with(
-                    lang_kind,
-                    content,
-                    AstGuard::INDEX_PARSE_TIMEOUT_MICROS,
-                    $f,
-                ) {
+                match AstGuard::parse_with(lang_kind, content, timeout_micros, $f) {
                     ParseOutcome::Parsed(r) => Some(r),
                     ParseOutcome::ParseFailed => {
                         out.parse_failed = true;
@@ -752,39 +778,34 @@ impl PolyglotIndexer {
                 // One parse under `kind`'s grammar, extracted from unless
                 // `defer_if_erroneous` and the tree holds syntax errors (`None`).
                 let run = |kind: LanguageKind, defer_if_erroneous: bool| {
-                    AstGuard::parse_with(
-                        kind,
-                        content,
-                        AstGuard::INDEX_PARSE_TIMEOUT_MICROS,
-                        |tree| {
-                            if defer_if_erroneous && tree.root_node().has_error() {
-                                return None;
-                            }
-                            let mut imports = Vec::new();
-                            let mut rpc_calls = Vec::new();
-                            let mut nodes = typescript::TypeScriptExtractor::extract_with_config(
+                    AstGuard::parse_with(kind, content, timeout_micros, |tree| {
+                        if defer_if_erroneous && tree.root_node().has_error() {
+                            return None;
+                        }
+                        let mut imports = Vec::new();
+                        let mut rpc_calls = Vec::new();
+                        let mut nodes = typescript::TypeScriptExtractor::extract_with_config(
+                            file_path,
+                            content,
+                            repo_id,
+                            tree,
+                            &mut imports,
+                            &mut rpc_calls,
+                            &cfg.controller_annotations,
+                        );
+                        // The path a file-system router is read from is the one below
+                        // the workspace root, not the whole checkout path.
+                        if let Some(routing_path) = Self::routing_path(cfg, file_path) {
+                            nodes.extend(typescript::TypeScriptExtractor::file_route_nodes(
+                                &routing_path,
                                 file_path,
                                 content,
                                 repo_id,
                                 tree,
-                                &mut imports,
-                                &mut rpc_calls,
-                                &cfg.controller_annotations,
-                            );
-                            // The path a file-system router is read from is the one below
-                            // the workspace root, not the whole checkout path.
-                            if let Some(routing_path) = Self::routing_path(cfg, file_path) {
-                                nodes.extend(typescript::TypeScriptExtractor::file_route_nodes(
-                                    &routing_path,
-                                    file_path,
-                                    content,
-                                    repo_id,
-                                    tree,
-                                ));
-                            }
-                            Some((nodes, imports, rpc_calls))
-                        },
-                    )
+                            ));
+                        }
+                        Some((nodes, imports, rpc_calls))
+                    })
                 };
                 // Plain JavaScript is parsed by its own grammar. A `.js` file
                 // that carries Flow / Babel annotations does not parse

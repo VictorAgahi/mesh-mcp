@@ -94,7 +94,7 @@ const DEFAULT_PAGE_BUDGET_BYTES: usize = 8 * 1024;
 const GLOBAL_SCOPE_LABEL: &str = "* (all configured roots)";
 
 /// What a `scope` argument designates.
-enum SearchScope {
+pub(crate) enum SearchScope {
     /// Every configured root: `scope` omitted, `"."`, `"*"`, or the exact
     /// workspace root. Decided *before* the jail, which rightly rejects the
     /// workspace root when it is only the parent of several roots — see
@@ -105,7 +105,7 @@ enum SearchScope {
 }
 
 impl SearchScope {
-    fn resolve(raw: Option<&str>, state: &AppState) -> Result<Self, ToolError> {
+    pub(crate) fn resolve(raw: Option<&str>, state: &AppState) -> Result<Self, ToolError> {
         let workspace_root = state.config.workspace.resolved_workspace_root.as_deref();
         if Self::is_global(raw, workspace_root, &state.allowed_roots) {
             return Ok(Self::Global);
