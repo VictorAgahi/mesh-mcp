@@ -100,6 +100,8 @@ class Config(unittest.TestCase):
         self.assertTrue(run.unsafe_claude_args(["--dangerously-skip-permissions"]))
         self.assertTrue(run.unsafe_claude_args(["--permission-mode", "bypassPermissions"]))
         self.assertTrue(run.unsafe_claude_args(["--allowedTools", "Read", "Bash(git:*)"]))
+        self.assertTrue(run.unsafe_claude_args(["--settings", "s.json"]))
+        self.assertTrue(run.unsafe_claude_args(["--settings=s.json"]))
         self.assertFalse(run.unsafe_claude_args(["--permission-mode=plan", "--allowedTools", "Read"]))
 
 
@@ -128,7 +130,7 @@ class Main(unittest.TestCase):
     def test_execute_needs_a_positive_budget(self):
         env = {"MESH_AB_APPROVED_RUNS": "99"}
         self.assertEqual(self.main(["--execute"], env), 3)
-        self.assertEqual(self.main(["--execute", "--max-budget-usd", "0"], env), 2)  # argparse error
+        self.assertEqual(self.main(["--execute", "--max-budget-usd", "0"], env), 2)  # exit 2 is intended: argparse usage error
 
     def test_execute_needs_approval(self):
         os.environ.pop("MESH_AB_APPROVED_RUNS", None)

@@ -6,8 +6,8 @@ usage:
     eda_unresolved_share.py --config PATH/mesh-mcp.toml --binary PATH/mesh-mcp
                             [--per-call-timeout 60] [--max-seconds 900] [--json]
 
-Runs `mesh-mcp graph --format json` for the topic list (every EventStream /
-KafkaTopic / Queue / Saga node, unique by name), then one `run --standalone`
+Runs `mesh-mcp graph --format json` for the topic list (every hub node, file_path
+"event-bus", unique by name), then one `run --standalone`
 session (isolated HOME, audit DB and socket: it never touches a running meshd)
 and calls analyze_impact(target=topic, depth=1) once per topic. Test-file rows
 are hidden by the tool (include_tests is not set), as an agent would see them.
@@ -32,7 +32,7 @@ NO_CONSUMER = "No consumer statically resolved"
 
 
 def topics_of(graph):
-    return sorted({n["name"] for n in graph.get("nodes", []) if se._is_topic(n)})
+    return sorted({n["name"] for n in graph.get("nodes", []) if se._is_hub(n)})
 
 
 def share(n, total):

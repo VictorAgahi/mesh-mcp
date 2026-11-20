@@ -212,7 +212,7 @@ def unsafe_claude_args(argv):
     bad, a = [], list(argv or [])
     for i, x in enumerate(a):
         flag, _, val = x.partition("=")
-        if flag in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"):
+        if flag in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--settings"):  # settings can set permissions.defaultMode
             bad.append(x)
         elif flag == "--permission-mode":
             if (val or (a[i + 1] if i + 1 < len(a) else "")) not in SAFE_MODES:
@@ -236,6 +236,7 @@ def selftest():
     assert len(runs) == 12 and [x["arm"] for x in runs[:4]] == ["A", "B", "B", "A"]
     assert unsafe_claude_args(["--dangerously-skip-permissions"]) and unsafe_claude_args(["--permission-mode", "bypassPermissions"])
     assert unsafe_claude_args(["--allowedTools", "Read", "Bash(git:*)"]) and unsafe_claude_args(["--permission-mode=acceptEdits"])
+    assert unsafe_claude_args(["--settings", "x.json"]) and unsafe_claude_args(["--settings=x.json"])
     assert not unsafe_claude_args(["--permission-mode", "plan", "--allowedTools", "Read", "--max-turns", "5"])
     print("selftest ok")
 

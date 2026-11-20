@@ -5,6 +5,7 @@
 """
 import contextlib
 import io
+import json
 import os
 import re
 import sys
@@ -314,30 +315,82 @@ class Session(unittest.TestCase):
 
 
 class Optional(unittest.TestCase):
+    def opt(self, i="p1", line=5):
+        return dict(item(i, "t", "src/a.ts", line, tags=("declared_pattern",)), optional=True)
+
     def test_optional_items_ignored_both_ways(self):
-        opt = dict(item("p1", "t", "src/a.ts", 5), optional=True)
         # found: neither tp nor fp
-        recs, _ = run(golden(producers=[opt]), graph(("Produces", "src/a.ts", 5, "f", "t", "exact")))
+        recs, _ = run(golden(producers=[self.opt()]), graph(("Produces", "src/a.ts", 5, "f", "t", "exact")))
         self.assertEqual(recs, [])
         # not found: not an fn
-        recs, _ = run(golden(producers=[opt]), graph())
-        self.assertEqual(recs, [])
-        meta = se.score_corpus(golden(producers=[opt]), se.extract_sites(graph(), ROOT), None)[2]
-        self.assertEqual(meta["optional_ignored"], 1)
+        self.assertEqual(run(golden(producers=[self.opt()]), graph())[0], [])
+        meta = se.score_corpus(golden(producers=[self.opt()]), se.extract_sites(graph(), ROOT), None)[2]
+        self.assertEqual((meta["optional_ignored"], meta["optional_ids"]), (1, ["producer p1"]))
 
-    def test_optional_hop_and_chain_step(self):
-        hop = dict(Hops.HOP, optional=True)
+    def test_optional_hop_ignored(self):
+        hop = dict(Hops.HOP, optional=True, tags=["declared_pattern"])
         self.assertEqual(run(golden(hops=[hop]), graph())[0], [])
-        steps = [{"kind": "consume", "file": "src/a.ts", "line": 9}, {"kind": "call", "file": "src/b.ts", "line": 2, "optional": True}]
-        g = golden(chains=[{"id": "ch1", "entry": {"kind": "topic", "value": "t"}, "steps": steps}])
-        recs, _ = run(g, graph(), {"ch1": ""})
-        self.assertEqual(recs, [])
-        self.assertEqual(se.score_corpus(g, se.extract_sites(graph(), ROOT), {"ch1": ""})[2]["optional_ignored"], 1)
+
+    def test_fp_does_not_inherit_from_optional_items(self):
+        g = golden(producers=[self.opt(), item("p2", "real", "src/a.ts", 40, tags=("kafka_basic",))])
+        gr = graph(("Produces", "src/a.ts", 6, "f", "other", "exact"),   # near the optional item only
+                   ("Produces", "src/a.ts", 41, "g", "other2", "exact"))  # near the real item
+        fps = {r["tags"][0] for r in run(g, gr)[0] if r["outcome"] == "fp"}
+        self.assertEqual(fps, {"untagged", "kafka_basic"})
+
+    def test_fp_inherits_nearest_in_file_then_topic(self):
+        g = golden(producers=[item("p1", "t", "src/a.ts", 10, tags=("config_topic",), lang="java"),
+                              item("p2", "u", "src/a.ts", 80, tags=("kafka_basic",))])
+        gr = graph(("Produces", "src/a.ts", 11, "f", "zzz", "exact"), ("Produces", "src/other.ts", 3, "g", "u", "exact"),
+                   ("Produces", "src/other.ts", 9, "h", "nope", "exact"))
+        by_line = {r["tags"][0]: r["language"] for r in run(g, gr)[0] if r["outcome"] == "fp"}
+        self.assertEqual(by_line, {"config_topic": "java", "kafka_basic": "ts", "untagged": "unknown"})
+
+    def test_validation_rules(self):
+        base = dict(GOOD_DICT)
+        cases = {
+            "optional without declared_pattern": dict(base, producers=[dict(item("p1", "t", "a.ts", 1), optional=True)]),
+            "declared_pattern without optional": dict(base, producers=[item("p1", "t", "a.ts", 1, tags=("declared_pattern",))]),
+            "optional on a chain": dict(base, chains=[dict(GOOD_DICT["chains"][0], optional=True)]),
+            "optional on a step": dict(base, chains=[dict(GOOD_DICT["chains"][0], steps=[{"kind": "call", "file": "a.ts", "line": 1, "optional": True}])]),
+            "chain references an optional item": dict(base, producers=[dict(item("p1", "t", "a.ts", 1, tags=("declared_pattern",)), optional=True)]),
+            "id duplicated across categories": dict(base, producers=[item("ch1", "t", "a.ts", 1)]),
+        }
+        for name, g in cases.items():
+            with self.subTest(name), self.assertRaises(se.ScorerError):
+                se.validate_golden(json.loads(json.dumps(g)), "g")
+        ok = dict(base, producers=[dict(item("p1", "t", "other.ts", 50, tags=("declared_pattern",)), optional=True)])
+        se.validate_golden(ok, "g")
+
+
+GOOD_DICT = {"corpus": "c", "root": "examples/x", "producers": [], "chains": [
+    {"id": "ch1", "entry": {"kind": "topic", "value": "t"}, "steps": [{"kind": "consume", "file": "a.ts", "line": 1}]}]}
+
+
+class HubTopics(unittest.TestCase):
+    def test_consumes_code_node_of_topic_kind(self):
+        # Shaped like 8.0.1: the Consumes code node itself has kind KafkaTopic.
+        gr = {"nodes": [{"id": 0, "name": "order.requested", "kind": "EventStream", "file_path": "event-bus", "line_start": 1},
+                        {"id": 1, "name": "handle", "kind": "KafkaTopic", "file_path": f"{ROOT}/src/h.ts", "line_start": 12},
+                        {"id": 2, "name": "emit", "kind": "ServiceClass", "file_path": f"{ROOT}/src/p.ts", "line_start": 7}],
+              "edges": [{"from": 0, "to": 1, "kind": "Consumes", "confidence": "exact"},
+                        {"from": 2, "to": 0, "kind": "Produces", "confidence": "exact"}]}
+        sites = se.extract_sites(gr, ROOT)
+        self.assertEqual([(x["file"], x["line"], x["topic"]) for x in sites["consumer"]], [("src/h.ts", 12, "order.requested")])
+        self.assertEqual([(x["file"], x["line"], x["topic"]) for x in sites["producer"]], [("src/p.ts", 7, "order.requested")])
 
 
 class ChainSummary(unittest.TestCase):
     def call(self, i):
         return {"kind": "call", "file": f"src/s{i}.ts", "line": 3}
+
+    def test_direction_and_long_slices(self):
+        steps = [{"kind": "consume", "file": "src/a.ts", "line": 1}] + [self.call(i) for i in range(6)]
+        chains = [{"id": "rev", "entry": {"kind": "topic", "value": "t"}, "direction": "reverse", "steps": steps[:2]},
+                  {"id": "long", "entry": {"kind": "topic", "value": "t"}, "steps": steps}]
+        cs = se.chain_summary(run(golden(chains=chains), graph(), {"rev": "", "long": ""})[0])
+        self.assertEqual((cs["per_direction"]["reverse"]["chains"], cs["per_direction"]["forward"]["chains"]), (1, 1))
+        self.assertEqual(cs["longer_than_cap"]["chains"], 1)
 
     def test_min_hops_slice_and_tags(self):
         long_steps = [{"kind": "consume", "file": "src/a.ts", "line": 1}] + [self.call(i) for i in range(3)]
@@ -351,6 +404,8 @@ class ChainSummary(unittest.TestCase):
         cs = se.chain_summary(recs)
         self.assertEqual((cs["all"]["chains"], cs["all"]["in_order"], cs["all"]["presence"]), (3, 2, 3))
         self.assertEqual((cs["min_hops_ge_3"]["chains"], cs["min_hops_ge_3"]["in_order"], cs["min_hops_ge_3"]["presence"]), (2, 1, 2))
+        self.assertEqual(cs["per_direction"]["forward"]["chains"], 3)
+        self.assertEqual(cs["depth_cap"], 5)
         self.assertEqual(cs["per_tag"]["cqrs"]["recall_in_order"], 1.0)
         self.assertEqual(cs["per_tag"]["layered_calls"]["recall_in_order"], 0.0)
         self.assertEqual(cs["per_tag"]["layered_calls"]["recall_presence"], 1.0)

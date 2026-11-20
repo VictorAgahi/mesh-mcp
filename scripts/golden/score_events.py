@@ -40,9 +40,9 @@ Behaviour that is easy to get wrong, stated once
   with ambiguous counted.
 - Line accuracy: a matched producer / consumer whose line is within 2 of the
   golden line. Never a miss by itself. Reported as a separate stat.
-- A false positive cannot be attributed to a feature tag by itself: it
-  inherits the tags (and language) of the golden items in the same file or on
-  the same topic, else "untagged".
+- A false positive cannot be attributed to a feature tag by itself: it inherits the tags and
+  language of the nearest NON-optional golden item in the same file within --line-tolerance,
+  else of the non-optional golden items on the same topic, else "untagged" / "unknown".
 - Hops: precision is not defined (the golden lists only the hops that lie on
   a chain, not every call edge), so a hop has tp / fn only.
 - Topic keys are compared by strict equality after normalize_topic_key (no separator
@@ -62,7 +62,9 @@ Behaviour that is easy to get wrong, stated once
   exit code 2.
 - Optional items (`optional: true`, tag `declared_pattern`) are ignored both ways: a match
   is neither tp nor fp, a miss is not an fn; their count is reported as "optional ignored".
-  A chain with an optional step (or flagged itself) is optional as a whole.
+  `optional` is allowed only on a producer, consumer or hop that also carries the tag
+  `declared_pattern` (and `declared_pattern` requires `optional`); a chain, a chain step or
+  a chain that references an optional item is an error. Dropped items are listed by id.
 - Chain table: chain recall for all chains, for the `min_hops >= 3` slice (min_hops is the
   explicit value, else the number of `call` steps) and per tag, in order and as presence.
 - Chains: tp = traced, fn = not traced; precision is not defined. Precision columns
@@ -278,9 +280,20 @@ def validate_golden(g, path="golden"):
         _need(all(i is not None for i in ids), f"{path}: every item of '{key}' needs an 'id'")
         dup = sorted({str(i) for i in ids if ids.count(i) > 1})
         _need(not dup, f"{path}: duplicate ids in '{key}': {', '.join(dup)}")
+    all_ids = [str(x["id"]) for key in ("producers", "consumers", "hops", "chains") for x in g[key]]
+    cross = sorted({i for i in all_ids if all_ids.count(i) > 1})
+    _need(not cross, f"{path}: ids must be unique across the file, duplicated: {', '.join(cross)}")
+    for key in ("producers", "consumers", "hops", "chains"):
         for x in g[key]:
             _need(isinstance(x.get("tags") or [], list), f"{path}: {key} {x.get('id')}: 'tags' must be a list")
             _need(isinstance(x.get("optional", False), bool), f"{path}: {key} {x.get('id')}: 'optional' must be true or false")
+            declared = "declared_pattern" in (x.get("tags") or [])
+            if key in ("producers", "consumers", "hops"):
+                _need(bool(x.get("optional")) == declared,
+                      f"{path}: {key} {x.get('id')}: 'optional: true' and the tag 'declared_pattern' must go together")
+            else:
+                _need(not x.get("optional") and not declared,
+                      f"{path}: {key} {x.get('id')}: 'optional' / 'declared_pattern' is not allowed on {key}")
             _need(not key == "chains" or x.get("min_hops") is None or _is_int(x["min_hops"]),
                   f"{path}: chain {x.get('id')}: 'min_hops' must be an integer")
     for cat in ("producers", "consumers"):
@@ -300,6 +313,15 @@ def validate_golden(g, path="golden"):
         for st in steps:
             _need(isinstance(st, dict) and isinstance(st.get("file"), str) and _is_int(st.get("line")),
                   f"{path}: chain {x.get('id')}: every step needs string 'file' and integer 'line'")
+            _need(not st.get("optional"), f"{path}: chain {x.get('id')}: 'optional' is not allowed on a chain step")
+    optional_locs = [(i["file"], i["line"]) for k in ("producers", "consumers") for i in g[k] if i.get("optional")]
+    for h in g["hops"]:
+        if h.get("optional"):
+            optional_locs += [(h[side]["file"], h[side]["line"]) for side in ("from", "to") if _is_int(h[side].get("line"))]
+    for x in g["chains"]:
+        for st in x["steps"]:
+            _need(not any(same_file(st["file"], f) and abs(st["line"] - ln) <= LINE_TOL for f, ln in optional_locs),
+                  f"{path}: chain {x.get('id')} step {st['file']}:{st['line']} references an optional item")
     for x in g["negatives"]:
         _need(x.get("kind") in ("producer", "consumer") and isinstance(x.get("file"), str) and _is_int(x.get("line")),
               f"{path}: negatives need kind producer|consumer, string 'file' and integer 'line'")
@@ -384,9 +406,10 @@ def extract_sites(graph, root):
     Shape (verified on 8.0.1): nodes {id, name, kind, file_path (absolute),
     line_start, ...}; edges {from, to, kind, confidence}. A Produces edge goes
     from the code node (file_path, line_start) to a topic node; a Consumes edge
-    goes from the topic node to the code node. Topic nodes are `EventStream` /
-    `KafkaTopic` / `Queue` / `Saga` with `name` = topic key (e.g. `cache:purged`)
-    and file_path "event-bus" for the cross-repo hub.
+    goes from the topic node to the code node. The topic end is the hub node whose
+    file_path is "event-bus" (`name` = topic key, e.g. `cache:purged`); its kind
+    (EventStream / KafkaTopic / Queue / Saga) is NOT reliable, since a code node can
+    carry a topic kind too.
     """
     nodes = {n["id"]: n for n in graph.get("nodes", [])}
     sites = {"producer": [], "consumer": [], "call": []}
@@ -397,8 +420,14 @@ def extract_sites(graph, root):
             continue
         conf = str(e.get("confidence", "exact")).lower()
         if kind in ("Produces", "Consumes"):
-            # Produces: code -> topic; Consumes: topic -> code (verified on 8.0.1).
-            code, topic = (b, a) if _is_topic(a) and not _is_topic(b) else (a, b)
+            # The topic end is the hub node (file_path == "event-bus"), NOT a node of a topic
+            # kind: on 8.0.1 a Consumes edge's code node can itself be of kind KafkaTopic /
+            # EventStream. Without a hub end, fall back on the edge direction
+            # (Produces: code -> topic; Consumes: topic -> code).
+            if _is_hub(a) != _is_hub(b):
+                topic, code = (a, b) if _is_hub(a) else (b, a)
+            else:
+                code, topic = (a, b) if kind == "Produces" else (b, a)
             sites["producer" if kind == "Produces" else "consumer"].append({
                 "file": norm_path(code.get("file_path", ""), root),
                 "line": int(code.get("line_start") or 0),
@@ -420,6 +449,14 @@ _TOPIC_KINDS = {"kafkatopic", "eventstream", "queue", "saga"}
 
 def _is_topic(node):
     return str(node.get("kind", "")).replace("_", "").lower() in _TOPIC_KINDS
+
+
+HUB_FILE = "event-bus"
+
+
+def _is_hub(node):
+    """The topic hub node of the graph: file_path is the literal "event-bus"."""
+    return str(node.get("file_path", "")) == HUB_FILE
 
 
 # --------------------------------------------------------------------------
@@ -493,11 +530,6 @@ def chain_traced(steps, occurrences):
     return True
 
 
-def _chain_optional(ch):
-    """A chain is optional when flagged, or when any of its steps is an optional item."""
-    return bool(ch.get("optional")) or any(isinstance(st, dict) and st.get("optional") for st in ch.get("steps") or [])
-
-
 def chain_min_hops(ch):
     """min_hops of a chain: the explicit value, else its number of `call` steps."""
     if ch.get("min_hops") is not None:
@@ -515,7 +547,7 @@ def chain_present(steps, occurrences):
 # Scoring
 # --------------------------------------------------------------------------
 
-def score_corpus(golden, sites, answers, include_tests=False, chain_order="strict"):
+def score_corpus(golden, sites, answers, include_tests=False, chain_order="strict", line_tol=LINE_TOL):
     """Per-item outcome records for one corpus.
 
     answers: {chain id: Markdown answer} or None (chains skipped).
@@ -527,14 +559,21 @@ def score_corpus(golden, sites, answers, include_tests=False, chain_order="stric
     """
     corpus = golden["corpus"]
     recs, negatives_hit, ignored = [], [], 0
-    optional_n = sum(bool(x.get("optional")) for k in ("producers", "consumers", "hops") for x in golden[k]) \
-        + sum(_chain_optional(c) for c in golden["chains"])
-    file_tags, topic_tags, file_lang = defaultdict(set), defaultdict(set), {}
-    for cat in ("producers", "consumers"):
-        for g in golden[cat]:
-            file_tags[g["file"]].update(g.get("tags") or [])
-            topic_tags[normalize_topic_key(g["topic"])].update(g.get("tags") or [])
-            file_lang[g["file"]] = g.get("language")
+    optional_ids = [f"{k[:-1]} {x['id']}" for k in ("producers", "consumers", "hops") for x in golden[k] if x.get("optional")]
+    real = [(g, k) for k in ("producers", "consumers") for g in golden[k] if not g.get("optional")]
+
+    def inherit(f):
+        """Tags and language of a false positive: nearest non-optional golden item in the
+        same file within line_tol, else the non-optional items on the same topic."""
+        near = [(abs(f["line"] - g["line"]), i) for i, (g, _k) in enumerate(real)
+                if same_file(f["file"], g["file"]) and abs(f["line"] - g["line"]) <= line_tol]
+        if near:
+            g = real[min(near)[1]][0]
+            return set(g.get("tags") or []), g.get("language")
+        same = [g for g, _k in real if same_topic(g["topic"], f["topic"])]
+        if same:
+            return {t for g in same for t in (g.get("tags") or [])}, same[0].get("language")
+        return set(), None
 
     def rec(category, outcome, language, tags, ambiguous=False, dline=None, **extra):
         recs.append(dict({"corpus": corpus, "category": category, "language": language or "unknown",
@@ -558,11 +597,7 @@ def score_corpus(golden, sites, answers, include_tests=False, chain_order="stric
         for g in missed:
             rec(kind, "fn", g.get("language"), g.get("tags") or [])
         for f in extra:
-            tags = set(topic_tags.get(normalize_topic_key(f["topic"]), set()))
-            for gf, ts in file_tags.items():
-                if same_file(f["file"], gf):
-                    tags |= ts
-            lang = next((l for gf, l in file_lang.items() if same_file(f["file"], gf)), None) or lang_of(f["file"])
+            tags, lang = inherit(f)
             rec(kind, "fp", lang, tags, f["confidence"] == "ambiguous")
             for n in golden["negatives"]:
                 if n.get("kind") == kind and same_file(f["file"], n["file"]) and abs(f["line"] - int(n["line"])) <= LINE_TOL:
@@ -576,14 +611,14 @@ def score_corpus(golden, sites, answers, include_tests=False, chain_order="stric
 
     if answers is not None:
         for ch in golden["chains"]:
-            if _chain_optional(ch):
-                continue
             occ = extract_occurrences(answers.get(ch["id"], ""))
             strict, presence = chain_traced(ch["steps"], occ), chain_present(ch["steps"], occ)
             ok = presence if chain_order == "any" else strict
             rec("chain", "tp" if ok else "fn", lang_of(ch["steps"][0]["file"]), ch.get("tags") or [],
-                strict=strict, presence=presence, min_hops=chain_min_hops(ch))
-    return recs, negatives_hit, {"ignored_test_sites": ignored, "optional_ignored": optional_n}
+                strict=strict, presence=presence, min_hops=chain_min_hops(ch),
+                direction=ch.get("direction") or "forward", n_steps=len(ch["steps"]))
+    return recs, negatives_hit, {"ignored_test_sites": ignored, "optional_ignored": len(optional_ids),
+                                 "optional_ids": optional_ids}
 
 
 def _ratio(num, den):
@@ -630,7 +665,13 @@ def chain_summary(recs):
     for r in ch:
         for t in r["tags"]:
             per_tag[t].append(r)
+    per_dir = defaultdict(list)
+    for r in ch:
+        per_dir[r.get("direction", "forward")].append(r)
     return {"all": _chain_row(ch), "min_hops_ge_3": _chain_row([r for r in ch if (r.get("min_hops") or 0) >= 3]),
+            "per_direction": {d: _chain_row(v) for d, v in sorted(per_dir.items())},
+            "longer_than_cap": _chain_row([r for r in ch if r.get("n_steps", 0) - 1 > CHAIN_DEPTH]),
+            "depth_cap": CHAIN_DEPTH,
             "per_tag": {t: _chain_row(v) for t, v in sorted(per_tag.items())}}
 
 
@@ -779,7 +820,7 @@ def trace_chain(session, tool_name, chain, include_tests):
     return "\n".join(pages)
 
 
-def score_file(golden_path, binary, chain_tool, include_tests, run_chains, chain_order="strict"):
+def score_file(golden_path, binary, chain_tool, include_tests, run_chains, chain_order="strict", line_tol=LINE_TOL):
     golden = load_golden(golden_path)
     root, config = resolve_corpus_paths(golden)
     if not root.is_dir():
@@ -798,7 +839,7 @@ def score_file(golden_path, binary, chain_tool, include_tests, run_chains, chain
                 answers = {ch["id"]: trace_chain(session, chain_tool, ch, include_tests) for ch in golden["chains"]}
             finally:
                 session.close()
-        return score_corpus(golden, sites, answers, include_tests, chain_order)
+        return score_corpus(golden, sites, answers, include_tests, chain_order, line_tol)
     finally:
         shutil.rmtree(home, ignore_errors=True)
 
@@ -823,9 +864,13 @@ def _table(title, rows, tol=LINE_TOL):
 
 
 def _chain_table(cs):
+    cap = cs["depth_cap"]
     rows = [("all chains", cs["all"]), ("chains with min_hops >= 3", cs["min_hops_ge_3"])]
+    rows += [(f"direction: {d}", v) for d, v in cs["per_direction"].items()]
+    rows.append((f"longer than the cap (> {cap} hops after the entry step)", cs["longer_than_cap"]))
     rows += [(f"tag: {t}", v) for t, v in cs["per_tag"].items()]
-    out = ["### chains", "", "| slice | chains | traced in order | recall in order | presence (any order) | recall presence |",
+    out = [f"### chains (tool depth cap: {cap}; reverse chains and chains longer than the cap miss by construction, "
+           "and still count as misses)", "", "| slice | chains | traced in order | recall in order | presence (any order) | recall presence |",
            "|---|---|---|---|---|---|"]
     for name, r in rows:
         out.append(f"| {name} | {r['chains']} | {r['in_order']} | {_pct(r['recall_in_order'])} | {r['presence']} | {_pct(r['recall_presence'])} |")
@@ -843,7 +888,8 @@ def markdown(report):
         out.append(_chain_table(rep["chains"]))
         la = rep["total"]
         out.append(f"Line accuracy (within {tol}): {_pct(la['line_accuracy'])} of {la['line_samples']} matched sites. "
-                   f"Sites ignored as test files: {rep['ignored_test_sites']}. Optional ignored: {rep['optional_ignored']}.\n")
+                   f"Sites ignored as test files: {rep['ignored_test_sites']}. Optional ignored: {rep['optional_ignored']}"
+                   + (f" ({', '.join(rep['optional_ids'])})" if rep["optional_ids"] else "") + ".\n")
         if rep["negatives_hit"]:
             out.append("Negatives hit: " + ", ".join(f"{n['file']}:{n['line']}" for n in rep["negatives_hit"]) + "\n")
     t = report["all"]
@@ -878,7 +924,7 @@ def main():
     try:
         for path in args.golden:
             recs, neg, meta = score_file(path, args.binary, args.chain_tool, args.include_tests, not args.no_chains,
-                                         args.chain_order)
+                                         args.chain_order, args.line_tolerance)
             name = recs[0]["corpus"] if recs else Path(path).stem
             corpora[name] = dict(slices(recs, args.line_tolerance), negatives_hit=neg, **meta)
             all_recs += recs

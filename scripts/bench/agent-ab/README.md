@@ -11,11 +11,12 @@ A run spends real money. The default is a dry run (prints the plan, the example 
 number of runs, calls nothing). A real run needs both `--execute` and
 `MESH_AB_APPROVED_RUNS=<N>` with N at least the number of runs still to execute; otherwise the
 script refuses (exit 3). `--execute` also requires `--max-budget-usd` (> 0, passed to every `claude`
-run). Agree the run count and budget before setting the variable.
+run); a value of 0 or less is an argparse usage error (exit 2, intended). Agree the run count and budget before setting the variable.
 
 Permission-bypassing `--claude-arg` values are refused (exit 3) unless
 `MESH_AB_ALLOW_UNSAFE_CLAUDE_ARGS=1`: `--dangerously-skip-permissions`, `--permission-mode` other than
-`default`/`plan`, and `--allowedTools` naming `Bash`. The runner's own `--permission-mode` is limited to
+`default`/`plan`, `--allowedTools` naming `Bash`, and `--settings` (it can set
+`permissions.defaultMode`). The runner's own `--permission-mode` is limited to
 `default`, `acceptEdits` (the default) and `plan`.
 
 ## Use
