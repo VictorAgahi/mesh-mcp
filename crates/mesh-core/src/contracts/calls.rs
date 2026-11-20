@@ -49,6 +49,7 @@
 use super::*;
 use serde::Deserialize;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// First id of the derived `Callable` nodes. Real nodes are numbered from 0 by
 /// `add_node` and never get near it.
@@ -319,7 +320,9 @@ impl CallFacts {
 pub(super) struct FileCallFacts {
     pub(super) repo_id: RepoId,
     pub(super) package: CompactStr,
-    pub(super) facts: CallFacts,
+    /// Shared: a reload clones the whole graph to patch it, and the facts of the files
+    /// it did not touch are by far the largest part of the layer.
+    pub(super) facts: Arc<CallFacts>,
 }
 
 /// Counters of the last derive.
@@ -379,7 +382,7 @@ impl ContractGraph {
             FileCallFacts {
                 repo_id,
                 package,
-                facts,
+                facts: Arc::new(facts),
             },
         );
     }
