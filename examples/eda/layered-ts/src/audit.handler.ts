@@ -1,7 +1,7 @@
 import { Controller, Inject } from '@nestjs/common';
 import { ClientKafka, EventPattern, Payload } from '@nestjs/microservices';
 
-// Control: consumer and producer in the same file and the same method.
+// Audit trail handler.
 @Controller()
 export class AuditHandler {
   constructor(@Inject('KAFKA_CLIENT') private readonly client: ClientKafka) {}

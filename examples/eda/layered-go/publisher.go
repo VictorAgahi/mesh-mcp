@@ -6,7 +6,7 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// Publisher has two implementations; main.go picks one at startup.
+// Publisher announces a priced order.
 type Publisher interface {
 	Publish(ctx context.Context, orderID string, total float64) error
 }

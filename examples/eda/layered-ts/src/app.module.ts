@@ -14,7 +14,7 @@ import { NotificationService } from './notification.service';
     SmsNotifier,
     NotificationService,
     {
-      // Which channel is active is decided at runtime, so a static reader sees two candidates.
+      // Channel selected from the CHANNEL environment variable.
       provide: NOTIFIER,
       useFactory: (email: EmailNotifier, sms: SmsNotifier) => (process.env.CHANNEL === 'sms' ? sms : email),
       inject: [EmailNotifier, SmsNotifier],

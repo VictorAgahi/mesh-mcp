@@ -1,6 +1,12 @@
 # Hand-annotated from the source of examples/unresolved-flow (no fixture edits). Redis streams, so
 # no broker tag applies; tags only mark the features a later ticket must add.
 # The ghost.spec.ts items are test code: hidden by default (include_tests=false), so they are negatives.
+# Chains are limited to what the source links: both ends of a chain are in ONE function (each
+# listenChainN / listenCycleX reads a stream and then writes the next one). The deletion pipeline
+# (user.service -> gather.processor -> purge.consumer -> audit.consumer) is NOT a chain: no function
+# calls GatherPostProcessor.complete or purgeCaches, so only its topic-level producers and consumers
+# are annotated. user:deletion:success is built at runtime in completion.registry.ts
+# (['user','deletion','success'].join(':')); a reader who evaluates it gets that name (config_topic).
 corpus: unresolved-flow
 root: examples/unresolved-flow
 config: mesh-mcp.toml
@@ -68,22 +74,7 @@ chains:
       - {kind: consume, file: src/chain6.ts, line: 6, topic: chain:6}
     tags: []
     min_hops: 0
-  # Deletion pipeline. The success topic is built at runtime in completion.registry.ts
-  # (['user','deletion','success'].join(':')); a reader who evaluates it gets user:deletion:success.
-  # Consumer and producer sit in the same file (the post-processor), as in the same-file control.
   - id: ch2
-    entry: {kind: topic, value: user:deletion:requested}
-    direction: forward
-    steps:
-      - {kind: produce, file: src/user.service.ts, line: 6, topic: user:deletion:requested}
-      - {kind: consume, file: src/gather.processor.ts, line: 7, topic: user:deletion:requested}
-      - {kind: produce, file: src/gather.processor.ts, line: 13, topic: user:deletion:success}
-      - {kind: consume, file: src/purge.consumer.ts, line: 6, topic: user:deletion:success}
-      - {kind: produce, file: src/purge.consumer.ts, line: 10, topic: cache:purged}
-      - {kind: consume, file: src/audit.consumer.ts, line: 6, topic: cache:purged}
-    tags: [config_topic]
-    min_hops: 0
-  - id: ch3
     entry: {kind: topic, value: cycle:a}
     direction: forward
     steps:

@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events';
 import { Injectable, Logger } from '@nestjs/common';
 
-// Negatives: a local EventEmitter and a logger are not message buses.
+// In-process metrics counters.
 @Injectable()
 export class MetricsService {
   private readonly logger = new Logger(MetricsService.name);

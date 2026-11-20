@@ -1,6 +1,6 @@
 package main
 
-// Pricer has exactly one implementation (DefaultPricer).
+// Pricer prices an order line.
 type Pricer interface {
 	Price(sku string, qty int) float64
 }

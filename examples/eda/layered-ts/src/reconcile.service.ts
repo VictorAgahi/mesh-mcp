@@ -13,7 +13,7 @@ export class ReconcileService {
     this.ledger.post(batchId);
   }
 
-  // Called back by LedgerService; re-posts until the batch is balanced (call cycle).
+  // Called back by LedgerService; re-posts until the batch is balanced.
   confirm(batchId: string) {
     if (this.depth++ < 2) {
       this.ledger.post(batchId);
