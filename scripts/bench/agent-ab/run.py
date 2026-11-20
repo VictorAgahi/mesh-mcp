@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "golden"))
 import score_events as se  # noqa: E402  (parse_yaml only)
 
 MESH_TOOL_PREFIX = "mcp__mesh-mcp__"
+SUCCESS_TIMEOUT_S = 600
 
 
 def load_tasks(path):
@@ -87,7 +88,10 @@ def mcp_config(arm, args, task, workdir):
     if arm == "A":
         cfg = {"mcpServers": {}}
     else:
-        env = {"MESH_AUDIT_DB": str(Path(args.results).resolve().with_suffix(".audit.db")),
+        # A per-run HOME keeps the run away from the user's ~/.cache/mesh-mcp index cache and meshd.
+        home = Path(workdir) / "home"
+        home.mkdir(exist_ok=True)
+        env = {"HOME": str(home), "MESH_AUDIT_DB": str(Path(args.results).resolve().with_suffix(".audit.db")),
                "MESH_SOCKET_PATH": str(Path(workdir) / "mesh.sock")}
         cfg = {"mcpServers": {"mesh-mcp": {
             "command": str(Path(args.mesh_binary).resolve()),
@@ -106,7 +110,7 @@ def claude_cmd(arm, args, task, workdir):
         cmd.append("--verbose")
     if args.model:
         cmd += ["--model", args.model]
-    if args.max_budget_usd:
+    if args.max_budget_usd is not None:
         cmd += ["--max-budget-usd", str(args.max_budget_usd)]
     return cmd + list(args.claude_arg or [])
 
@@ -141,7 +145,7 @@ def row_from(run, result, tools, have_transcript):
 
 
 def git(repo, *a):
-    return subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, timeout=60)
+    return subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, timeout=60, check=True)
 
 
 def prepare_repo(task, reset):
@@ -150,33 +154,75 @@ def prepare_repo(task, reset):
         git(repo, "reset", "--hard", task["commit"])
         git(repo, "clean", "-fdq")
     if git(repo, "status", "--porcelain").stdout.strip():
-        raise SystemExit(f"error: {repo} has a dirty working tree (clean it or pass --reset-worktree)")
+        raise RuntimeError(f"{repo} has a dirty working tree (clean it or pass --reset-worktree)")
     head = git(repo, "rev-parse", "HEAD").stdout.strip()
     if task.get("commit") and not head.startswith(task["commit"]):
-        raise SystemExit(f"error: {repo} is at {head[:12]}, task wants {task['commit']}")
+        raise RuntimeError(f"{repo} is at {head[:12]}, task wants {task['commit']}")
     return head
 
 
-def execute(run, task, args, workdir):
-    head = prepare_repo(task, args.reset_worktree)
-    cmd = claude_cmd(run["arm"], args, task, workdir)
+def _text(x):
+    return x.decode("utf-8", "replace") if isinstance(x, bytes) else (x or "")
+
+
+def execute(run, task, args):
+    """One run; always returns a row. A paid run's row is never lost: failures after
+    the `claude` call (success_cmd, parsing) are recorded in `error`, and a row that
+    carries usage keeps status ok so a rerun does not pay twice."""
     t0 = time.monotonic()
+    row = dict(run, status="error", success=None, model=args.model, ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
     try:
-        p = subprocess.run(cmd, cwd=task["repo"], capture_output=True, text=True, timeout=args.timeout, stdin=subprocess.DEVNULL)
-        result, tools, have = parse_output(p.stdout)
-        row = row_from(run, result, tools, have)
-        if p.returncode != 0 and row["status"] == "ok":
-            row["status"] = "error"
-    except subprocess.TimeoutExpired:
-        row = dict(run, status="timeout")
-    except (json.JSONDecodeError, OSError) as e:
-        row = dict(run, status="error", error=str(e)[:300])
-    row.update(wall_s=round(time.monotonic() - t0, 2), commit=head, model=args.model,
-               success=None, ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+        row["commit"] = prepare_repo(task, args.reset_worktree)
+    except (subprocess.SubprocessError, OSError, RuntimeError) as e:
+        row["error"] = f"prepare_repo: {type(e).__name__}: {e}"[:300]  # nothing was spent
+        row["wall_s"] = round(time.monotonic() - t0, 2)
+        return row
+    with tempfile.TemporaryDirectory(prefix="ab-") as workdir:
+        try:
+            p = subprocess.run(claude_cmd(run["arm"], args, task, workdir), cwd=task["repo"], capture_output=True,
+                               text=True, timeout=args.timeout, stdin=subprocess.DEVNULL)
+            result, tools, have = parse_output(p.stdout)
+            row.update(row_from(run, result, tools, have))
+            if p.returncode != 0 and row["status"] == "ok":
+                row["status"] = "error"
+        except subprocess.TimeoutExpired as e:
+            row["status"] = "timeout"
+            try:  # keep whatever usage the partial transcript carries
+                row.update(row_from(run, *parse_output(_text(e.stdout))), status="timeout")
+            except (ValueError, OSError):
+                pass
+        except (ValueError, OSError, subprocess.SubprocessError) as e:
+            row["error"] = f"claude run: {type(e).__name__}: {e}"[:300]
     if task.get("success_cmd") and row["status"] == "ok":
-        row["success"] = subprocess.run(task["success_cmd"], shell=True, cwd=task["repo"], capture_output=True,
-                                        timeout=600, stdin=subprocess.DEVNULL).returncode == 0
+        try:
+            row["success"] = subprocess.run(task["success_cmd"], shell=True, cwd=task["repo"], capture_output=True,
+                                            timeout=SUCCESS_TIMEOUT_S, stdin=subprocess.DEVNULL).returncode == 0
+        except (subprocess.SubprocessError, OSError) as e:
+            row["error"] = f"success_cmd: {type(e).__name__}"  # usage kept, status stays ok
+    row["wall_s"] = round(time.monotonic() - t0, 2)
     return row
+
+
+UNSAFE_ENV = "MESH_AB_ALLOW_UNSAFE_CLAUDE_ARGS"
+SAFE_MODES = ("default", "plan")
+
+
+def unsafe_claude_args(argv):
+    """Permission-bypassing flags in a passthrough argument list (empty when safe)."""
+    bad, a = [], list(argv or [])
+    for i, x in enumerate(a):
+        flag, _, val = x.partition("=")
+        if flag in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"):
+            bad.append(x)
+        elif flag == "--permission-mode":
+            if (val or (a[i + 1] if i + 1 < len(a) else "")) not in SAFE_MODES:
+                bad.append(x)
+        elif flag in ("--allowedTools", "--allowed-tools"):
+            vals = [val] if val else []
+            vals += [y for y in a[i + 1:] if not y.startswith("--")] if not val else []
+            if any("Bash" in v for v in vals):
+                bad.append(x)
+    return bad
 
 
 def selftest():
@@ -188,6 +234,9 @@ def selftest():
     assert (r["status"], r["tool_calls"], r["mesh_tool_calls"], r["cache_write_tokens"], r["cost_usd"]) == ("ok", 2, 1, 4, 0.5), r
     runs = plan_runs([{"id": "T1"}, {"id": "T2"}], ["A", "B"], 3)
     assert len(runs) == 12 and [x["arm"] for x in runs[:4]] == ["A", "B", "B", "A"]
+    assert unsafe_claude_args(["--dangerously-skip-permissions"]) and unsafe_claude_args(["--permission-mode", "bypassPermissions"])
+    assert unsafe_claude_args(["--allowedTools", "Read", "Bash(git:*)"]) and unsafe_claude_args(["--permission-mode=acceptEdits"])
+    assert not unsafe_claude_args(["--permission-mode", "plan", "--allowedTools", "Read", "--max-turns", "5"])
     print("selftest ok")
 
 
@@ -202,7 +251,7 @@ def main():
     ap.add_argument("--model")
     ap.add_argument("--claude", default="claude")
     ap.add_argument("--output-format", choices=["stream-json", "json"], default="stream-json")
-    ap.add_argument("--permission-mode", default="acceptEdits")
+    ap.add_argument("--permission-mode", default="acceptEdits", choices=["default", "acceptEdits", "plan"])
     ap.add_argument("--max-budget-usd", type=float)
     ap.add_argument("--timeout", type=float, default=900)
     ap.add_argument("--reset-worktree", action="store_true")
@@ -219,6 +268,12 @@ def main():
     if "B" in args.arms and not (args.mesh_binary and args.mesh_config):
         ap.error("arm B needs --mesh-binary and --mesh-config")
 
+    if args.max_budget_usd is not None and args.max_budget_usd <= 0:
+        ap.error("--max-budget-usd must be > 0")
+    unsafe = unsafe_claude_args(args.claude_arg)
+    if unsafe and os.environ.get(UNSAFE_ENV) != "1":
+        print(f"refused: permission-bypassing --claude-arg {unsafe} (set {UNSAFE_ENV}=1 to allow)", file=sys.stderr)
+        return 3
     tasks = {t["id"]: t for t in load_tasks(args.tasks)}
     planned = plan_runs(list(tasks.values()), args.arms, args.reps)
     done = done_keys(args.results, args.retry_errors)
@@ -226,7 +281,7 @@ def main():
 
     print(f"plan: {len(tasks)} tasks x {len(args.arms)} arms x {args.reps} reps = {len(planned)} runs; "
           f"{len(planned) - len(todo)} already in {args.results}; {len(todo)} to execute")
-    if args.max_budget_usd:
+    if args.max_budget_usd is not None:
         print(f"upper bound: {len(todo)} x ${args.max_budget_usd} = ${len(todo) * args.max_budget_usd:.2f}")
     for r in todo[:12]:
         print(f"  {r['task']} arm {r['arm']} rep {r['rep']}")
@@ -239,13 +294,16 @@ def main():
     if not args.execute:
         print("dry run: nothing executed (pass --execute and set MESH_AB_APPROVED_RUNS to run)")
         return 0
+    if args.max_budget_usd is None:
+        print("refused: --execute requires --max-budget-usd > 0", file=sys.stderr)
+        return 3
     approved = os.environ.get("MESH_AB_APPROVED_RUNS", "")
     if not approved.isdigit() or int(approved) < len(todo):
         print(f"refused: set MESH_AB_APPROVED_RUNS=<N> with N >= {len(todo)} (got {approved or 'unset'})", file=sys.stderr)
         return 3
-    with tempfile.TemporaryDirectory(prefix="ab-") as w, open(args.results, "a") as out:
+    with open(args.results, "a") as out:
         for i, run in enumerate(todo, 1):
-            row = execute(run, tasks[run["task"]], args, w)
+            row = execute(run, tasks[run["task"]], args)
             out.write(json.dumps(row) + "\n")
             out.flush()
             print(f"[{i}/{len(todo)}] {run['task']} {run['arm']} rep {run['rep']}: {row['status']}", file=sys.stderr)

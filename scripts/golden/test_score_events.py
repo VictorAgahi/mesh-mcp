@@ -3,9 +3,12 @@
 
     python3 -I -m unittest scripts/golden/test_score_events.py
 """
+import contextlib
+import io
 import os
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -44,8 +47,8 @@ def item(i, topic, file, line, tags=("kafka_basic",), lang="ts"):
     return {"id": i, "topic": topic, "file": file, "line": line, "language": lang, "tags": list(tags)}
 
 
-def run(g, gr, answers=None, include_tests=False):
-    recs, neg = se.score_corpus(g, se.extract_sites(gr, ROOT), answers, include_tests)
+def run(g, gr, answers=None, include_tests=False, chain_order="strict"):
+    recs, neg, _meta = se.score_corpus(g, se.extract_sites(gr, ROOT), answers, include_tests, chain_order)
     return recs, neg
 
 
@@ -101,7 +104,9 @@ class ProducerConsumer(unittest.TestCase):
     def test_topic_key_normalisation(self):
         self.assertEqual(se.normalize_topic_key("Streams.EVENT_CREATED"), "event_created")
         self.assertEqual(se.normalize_topic_key("Orders.Created"), "orders.created")
-        self.assertTrue(se.same_topic("event.created", "event_created"))
+        self.assertFalse(se.same_topic("event.created", "event_created"))
+        self.assertFalse(se.same_topic("order:created", "order_created"))
+        self.assertTrue(se.same_topic("Order.Created", "order.created"))
 
     def test_test_files_hidden_unless_included(self):
         g = golden(producers=[item("p1", "t", "src/a.ts", 5)])
@@ -167,6 +172,145 @@ class Yaml(unittest.TestCase):
         self.assertEqual(len(g["chains"][0]["steps"]), 4)
         self.assertEqual(g["chains"][0]["entry"], {"kind": "topic", "value": "order.created"})
         self.assertEqual(g["negatives"][0]["note"], "logger.emit is not a bus")
+
+class StrictTopics(unittest.TestCase):
+    def test_separator_variants_are_different_topics(self):
+        g = golden(producers=[item("p1", "order_created", "src/a.ts", 5)])
+        recs, _ = run(g, graph(("Produces", "src/a.ts", 5, "f", "order:created", "exact")))
+        self.assertEqual((count(recs, "producer", "tp"), count(recs, "producer", "fp"), count(recs, "producer", "fn")), (0, 1, 1))
+
+
+class LineAndTests(unittest.TestCase):
+    def test_tp_with_line_within_tolerance_column(self):
+        g = golden(producers=[item("p1", "t", "src/a.ts", 10), item("p2", "u", "src/a.ts", 50)])
+        gr = graph(("Produces", "src/a.ts", 15, "f", "t", "exact"), ("Produces", "src/a.ts", 50, "g", "u", "exact"))
+        recs, _ = run(g, gr)
+        self.assertEqual(se.summarize(recs)["tp"], 2)  # matching ignores the line
+        self.assertEqual(se.summarize(recs, 2)["tp_line_ok"], 1)
+        self.assertEqual(se.summarize(recs, 5)["tp_line_ok"], 2)
+
+    def test_ignored_test_sites_are_counted(self):
+        g = golden(producers=[item("p1", "t", "src/a.ts", 5)])
+        gr = graph(("Produces", "src/a.ts", 5, "f", "t", "exact"), ("Produces", "src/a.spec.ts", 5, "g", "t", "exact"))
+        _recs, _neg, meta = se.score_corpus(g, se.extract_sites(gr, ROOT), None, False)
+        self.assertEqual(meta["ignored_test_sites"], 1)
+        self.assertEqual(se.score_corpus(g, se.extract_sites(gr, ROOT), None, True)[2]["ignored_test_sites"], 0)
+
+
+class ChainOrder(unittest.TestCase):
+    STEPS = Chains.STEPS
+
+    def verdict(self, answer, order="strict"):
+        g = golden(chains=[{"id": "ch1", "entry": {"kind": "topic", "value": "t"}, "steps": self.STEPS, "tags": []}])
+        recs, _ = run(g, graph(), {"ch1": answer}, chain_order=order)
+        s = se.summarize(recs)
+        return recs[0]["outcome"], s["chains_in_order"], s["chains_presence"]
+
+    def test_in_order(self):
+        self.assertEqual(self.verdict("src/a.ts:9 src/b.ts:20 src/c.ts:12"), ("tp", 1, 1))
+
+    def test_out_of_order_strict_not_traced_any_traced(self):
+        ans = "src/c.ts:12 src/a.ts:9 src/b.ts:20"
+        self.assertEqual(self.verdict(ans, "strict"), ("fn", 0, 1))
+        self.assertEqual(self.verdict(ans, "any"), ("tp", 0, 1))
+
+    def test_missing_step_neither(self):
+        ans = "src/a.ts:9 src/c.ts:12"
+        self.assertEqual(self.verdict(ans, "strict"), ("fn", 0, 0))
+        self.assertEqual(self.verdict(ans, "any"), ("fn", 0, 0))
+
+    def test_empty_steps_never_traced(self):
+        self.assertFalse(se.chain_traced([], [("a.ts", 1)]))
+
+
+GOOD = """corpus: c
+root: examples/x
+producers:
+  - {id: p1, topic: t, file: a.ts, line: 1}
+chains:
+  - id: ch1
+    entry: {kind: topic, value: t}
+    steps:
+      - {kind: consume, file: a.ts, line: 1}
+"""
+
+CHAIN2 = """  - id: ch1
+    entry: {kind: topic, value: t}
+    steps:
+      - {file: a.ts, line: 1}
+"""
+
+
+class Validation(unittest.TestCase):
+    def load(self, text):
+        return se.validate_golden(se.parse_yaml(text), "g.yaml")
+
+    def test_good_golden_passes(self):
+        self.assertEqual(self.load(GOOD)["corpus"], "c")
+
+    def test_rejections(self):
+        bad = {
+            "empty steps": GOOD.replace("    steps:\n      - {kind: consume, file: a.ts, line: 1}\n", "    steps: []\n"),
+            "duplicate chain ids": GOOD + CHAIN2,
+            "duplicate producer ids": GOOD.replace("producers:\n", "producers:\n  - {id: p1, topic: t, file: b.ts, line: 2}\n"),
+            "top-level list": "- a\n- b\n",
+            "unterminated flow": GOOD.replace("line: 1}\nchains", "line: 1\nchains"),
+            "unterminated quote": GOOD.replace("topic: t,", 'topic: "t,'),
+            "unterminated quote scalar": GOOD.replace("root: examples/x", 'root: "examples/x'),
+            "bad line type": GOOD.replace("line: 1}\nchains", "line: one}\nchains"),
+        }
+        for name, text in bad.items():
+            with self.subTest(name), self.assertRaises(se.ScorerError):
+                self.load(text)
+
+    def test_main_exit_code_2_on_malformed(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "bad.expected.yaml"
+            f.write_text("- just\n- a list\n")
+            argv = sys.argv
+            sys.argv = ["score_events.py", str(f), "--binary", "/nonexistent"]
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(se.main(), 2)
+            finally:
+                sys.argv = argv
+
+    def test_root_and_config_must_stay_in_repo(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            (repo / "ex").mkdir(parents=True)
+            root, cfg = se.resolve_corpus_paths({"corpus": "c", "root": "ex", "config": "m.toml"}, repo)
+            self.assertTrue(root.is_dir() and cfg.name == "m.toml")
+            for g in ({"corpus": "c", "root": "../outside"}, {"corpus": "c", "root": "/etc"},
+                      {"corpus": "c", "root": "ex", "config": "../../etc/passwd"}):
+                with self.subTest(g), self.assertRaises(se.ScorerError):
+                    se.resolve_corpus_paths(g, repo)
+
+
+FAKE_SERVER = r"""
+import json, sys
+for line in sys.stdin:
+    m = json.loads(line)
+    if "id" not in m:
+        continue
+    res = {"initialize": {}, "tools/list": {"tools": [{"name": "analyze_impact", "inputSchema": {"properties": {}}}]},
+           "tools/call": {"content": [{"type": "text", "text": "src/a.ts:9"}]}}[m["method"]]
+    note = json.dumps({"jsonrpc": "2.0", "method": "notifications/message", "params": {}})
+    resp = json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": res})
+    sys.stdout.write(note + "\n" + resp + "\n")  # one write: notification and response together
+    sys.stdout.flush()
+"""
+
+
+class Session(unittest.TestCase):
+    def test_two_lines_in_one_write(self):
+        se.CALL_TIMEOUT_S = 10
+        s = se.McpSession(None, None, ".", None, argv=[sys.executable, "-I", "-c", FAKE_SERVER])
+        try:
+            self.assertIn("analyze_impact", s.tools)
+            self.assertEqual(s.call("analyze_impact", {"target": "t"}), "src/a.ts:9")
+        finally:
+            s.close()
 
 
 class Tools(unittest.TestCase):

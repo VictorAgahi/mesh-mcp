@@ -45,6 +45,21 @@ Behaviour that is easy to get wrong, stated once
   the same topic, else "untagged".
 - Hops: precision is not defined (the golden lists only the hops that lie on
   a chain, not every call edge), so a hop has tp / fn only.
+- Topic keys are compared by strict equality after normalize_topic_key (no separator
+  folding: `order:created` is not `order_created`).
+- Chain order: analyze_impact's table is not in chain order, so every run reports BOTH
+  "chains in order" (strict, the in-order rule of SCHEMA.md) and "chains presence" (every
+  step location present, any order). `--chain-order strict|any` picks which one is the
+  tp/fn of the chain category and therefore feeds the --fail-under-* thresholds.
+- Line columns: matching never depends on the line. "tp with line <= N" (N =
+  --line-tolerance, default 2) counts matched sites whose line is that close; the number
+  of found sites dropped by the default test-file exclusion is reported per corpus.
+- Cost: the matcher is O(golden x found) per category; golden files are expected to hold
+  at most a few hundred items per category. same_file is a path-suffix test (a golden file
+  `a.ts` also matches `x/a.ts`): golden paths should be root-relative and specific.
+- Golden validation: a malformed golden file (empty chain steps, duplicate ids, wrong
+  types, unterminated flow value or quote, root or config outside the repo) is an error,
+  exit code 2.
 - Chains: tp = traced, fn = not traced; precision is not defined. Precision columns
   are computed over producers and consumers only; recall over every category.
 - Negatives: a found site within 2 lines of a negative (same file, same kind)
@@ -57,11 +72,13 @@ is built in. A `.json` golden file is also accepted.
 import argparse
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -106,6 +123,8 @@ def _strip_comment(s):
 
 def _scalar(tok):
     tok = tok.strip()
+    if tok[:1] in ("'", '"') and not (len(tok) >= 2 and tok[-1] == tok[0]):
+        raise ScorerError(f"unterminated quote: {tok[:40]!r}")
     if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "'\"":
         return tok[1:-1]
     if tok in ("null", "~", ""):
@@ -148,7 +167,9 @@ def _flow(s, i=0):
             arr.append(val)
     if s[i] in "'\"":
         q = s[i]
-        j = s.index(q, i + 1)
+        j = s.find(q, i + 1)
+        if j < 0:
+            raise ScorerError(f"unterminated quote: {s[i:i + 40]!r}")
         return s[i + 1:j], j + 1
     j = i
     while j < len(s) and s[j] not in ",}]":
@@ -159,7 +180,10 @@ def _flow(s, i=0):
 def _value(s):
     s = s.strip()
     if s[:1] in ("{", "["):
-        val, end = _flow(s)
+        try:
+            val, end = _flow(s)
+        except IndexError:
+            raise ScorerError(f"unterminated flow value: {s[:60]!r}") from None
         if s[end:].strip():
             raise ScorerError(f"trailing text after flow value: {s!r}")
         return val
@@ -218,20 +242,82 @@ def parse_yaml(text):
 
     if not lines:
         return {}
-    val, end = block(0, lines[0][0])
+    try:
+        val, end = block(0, lines[0][0])
+    except IndexError:
+        raise ScorerError("malformed YAML: unterminated flow value ('{' or '[' never closed)") from None
     if end != len(lines):
         raise ScorerError(f"unparsed YAML near: {lines[end][1]!r}")
     return val
 
 
-def load_golden(path):
-    text = Path(path).read_text()
-    g = json.loads(text) if str(path).endswith(".json") else parse_yaml(text)
+def _need(cond, msg):
+    if not cond:
+        raise ScorerError(msg)
+
+
+def _is_int(x):
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def validate_golden(g, path="golden"):
+    """Reject a malformed golden file with a clear message (never a free score)."""
+    _need(isinstance(g, dict), f"{path}: top level must be a mapping, got {type(g).__name__}")
+    for key in ("corpus", "root"):
+        _need(isinstance(g.get(key), str) and g[key], f"{path}: '{key}' is required (non-empty string)")
     for key in ("producers", "consumers", "hops", "chains", "negatives"):
         g[key] = g.get(key) or []
-    if not g.get("corpus") or not g.get("root"):
-        raise ScorerError(f"{path}: 'corpus' and 'root' are required")
+        _need(isinstance(g[key], list) and all(isinstance(x, dict) for x in g[key]),
+              f"{path}: '{key}' must be a list of mappings")
+        ids = [x.get("id") for x in g[key]] if key != "negatives" else []
+        _need(all(i is not None for i in ids), f"{path}: every item of '{key}' needs an 'id'")
+        dup = sorted({str(i) for i in ids if ids.count(i) > 1})
+        _need(not dup, f"{path}: duplicate ids in '{key}': {', '.join(dup)}")
+        for x in g[key]:
+            _need(isinstance(x.get("tags") or [], list), f"{path}: {key} {x.get('id')}: 'tags' must be a list")
+    for cat in ("producers", "consumers"):
+        for x in g[cat]:
+            _need(isinstance(x.get("topic"), str) and x["topic"] and isinstance(x.get("file"), str) and _is_int(x.get("line")),
+                  f"{path}: {cat} {x.get('id')}: needs string 'topic', string 'file' and integer 'line'")
+    for x in g["hops"]:
+        for side in ("from", "to"):
+            e = x.get(side)
+            _need(isinstance(e, dict) and isinstance(e.get("file"), str) and isinstance(e.get("symbol"), str),
+                  f"{path}: hop {x.get('id')}: '{side}' needs string 'file' and 'symbol'")
+    for x in g["chains"]:
+        _need(isinstance(x.get("entry"), dict) and isinstance(x["entry"].get("value"), str) and x["entry"]["value"],
+              f"{path}: chain {x.get('id')}: 'entry.value' is required")
+        steps = x.get("steps")
+        _need(isinstance(steps, list) and steps, f"{path}: chain {x.get('id')}: 'steps' must be a non-empty list")
+        for st in steps:
+            _need(isinstance(st, dict) and isinstance(st.get("file"), str) and _is_int(st.get("line")),
+                  f"{path}: chain {x.get('id')}: every step needs string 'file' and integer 'line'")
+    for x in g["negatives"]:
+        _need(x.get("kind") in ("producer", "consumer") and isinstance(x.get("file"), str) and _is_int(x.get("line")),
+              f"{path}: negatives need kind producer|consumer, string 'file' and integer 'line'")
     return g
+
+
+def load_golden(path):
+    try:
+        text = Path(path).read_text()
+        g = json.loads(text) if str(path).endswith(".json") else parse_yaml(text)
+    except (OSError, ValueError, RecursionError) as e:  # ValueError covers JSON and Unicode errors
+        raise ScorerError(f"{path}: cannot read or parse: {e}") from None
+    return validate_golden(g, str(path))
+
+
+def resolve_corpus_paths(golden, repo_root=None):
+    """(root dir, config path or None); both must lie inside the repository."""
+    repo = Path(repo_root or REPO_ROOT).resolve()
+    root = (repo / golden["root"]).resolve()
+    _need(root.is_relative_to(repo), f"{golden['corpus']}: root {golden['root']!r} escapes the repository")
+    cfg = None
+    if golden.get("config"):
+        _need(isinstance(golden["config"], str), f"{golden['corpus']}: 'config' must be a string")
+        cfg = (root / golden["config"]).resolve()
+        _need(cfg.is_relative_to(repo), f"{golden['corpus']}: config {golden['config']!r} escapes the repository")
+    return root, cfg
 
 
 # --------------------------------------------------------------------------
@@ -252,13 +338,11 @@ def normalize_topic_key(topic):
     return t.lower()
 
 
-def _loose(key):
-    return re.sub(r"[.:\-/]", "_", key)
-
-
 def same_topic(a, b):
-    a, b = normalize_topic_key(a), normalize_topic_key(b)
-    return a == b or _loose(a) == _loose(b)
+    """Strict equality after normalize_topic_key (lower-case + constant-member
+    reduction). No separator folding: `order:created` and `order_created` are
+    different topics."""
+    return normalize_topic_key(a) == normalize_topic_key(b)
 
 
 def norm_path(p, root):
@@ -386,7 +470,9 @@ def extract_occurrences(answer):
 
 def chain_traced(steps, occurrences):
     """True when every step (file, line within LINE_TOL) appears IN ORDER (greedy
-    earliest match; optimal for a subsequence test)."""
+    earliest match; optimal for a subsequence test). An empty step list is never traced."""
+    if not steps:
+        return False
     pos = 0
     for st in steps:
         for j in range(pos, len(occurrences)):
@@ -399,18 +485,28 @@ def chain_traced(steps, occurrences):
     return True
 
 
+def chain_present(steps, occurrences):
+    """True when every step location appears somewhere in the answer, in any order."""
+    return all(any(same_file(p, st["file"]) and abs(ln - int(st["line"])) <= LINE_TOL for p, ln in occurrences)
+               for st in steps)
+
+
 # --------------------------------------------------------------------------
 # Scoring
 # --------------------------------------------------------------------------
 
-def score_corpus(golden, sites, answers, include_tests=False):
+def score_corpus(golden, sites, answers, include_tests=False, chain_order="strict"):
     """Per-item outcome records for one corpus.
 
     answers: {chain id: Markdown answer} or None (chains skipped).
+    chain_order: "strict" (steps in order) or "any" (every step present): decides the
+    chain tp/fn outcome; both verdicts are kept on the record (`strict`, `presence`).
     record = {corpus, category, language, tags, outcome: tp|fp|fn, ambiguous, dline}
+    Returns (records, negatives_hit, meta); meta["ignored_test_sites"] counts the
+    found producer/consumer sites dropped by the default test-file exclusion.
     """
     corpus = golden["corpus"]
-    recs, negatives_hit = [], []
+    recs, negatives_hit, ignored = [], [], 0
     file_tags, topic_tags, file_lang = defaultdict(set), defaultdict(set), {}
     for cat in ("producers", "consumers"):
         for g in golden[cat]:
@@ -418,16 +514,18 @@ def score_corpus(golden, sites, answers, include_tests=False):
             topic_tags[normalize_topic_key(g["topic"])].update(g.get("tags") or [])
             file_lang[g["file"]] = g.get("language")
 
-    def rec(category, outcome, language, tags, ambiguous=False, dline=None):
-        recs.append({"corpus": corpus, "category": category, "language": language or "unknown",
-                     "tags": sorted(tags) or ["untagged"], "outcome": outcome,
-                     "ambiguous": ambiguous, "dline": dline})
+    def rec(category, outcome, language, tags, ambiguous=False, dline=None, **extra):
+        recs.append(dict({"corpus": corpus, "category": category, "language": language or "unknown",
+                          "tags": sorted(tags) or ["untagged"], "outcome": outcome,
+                          "ambiguous": ambiguous, "dline": dline}, **extra))
 
     for cat, kind in (("producers", "producer"), ("consumers", "consumer")):
         found = sites[kind]
         gold_files = {g["file"] for g in golden[cat]}
         if not include_tests:
-            found = [f for f in found if not is_test_path(f["file"]) or any(same_file(f["file"], gf) for gf in gold_files)]
+            kept = [f for f in found if not is_test_path(f["file"]) or any(same_file(f["file"], gf) for gf in gold_files)]
+            ignored += len(found) - len(kept)
+            found = kept
         pairs, missed, extra = match_sites(golden[cat], found)
         for g, f in pairs:
             rec(kind, "tp", g.get("language"), g.get("tags") or [], f["confidence"] == "ambiguous", abs(f["line"] - int(g["line"])))
@@ -452,16 +550,19 @@ def score_corpus(golden, sites, answers, include_tests=False):
 
     if answers is not None:
         for ch in golden["chains"]:
-            ok = chain_traced(ch["steps"], extract_occurrences(answers.get(ch["id"], "")))
-            rec("chain", "tp" if ok else "fn", lang_of(ch["steps"][0]["file"]) if ch["steps"] else None, ch.get("tags") or [])
-    return recs, negatives_hit
+            occ = extract_occurrences(answers.get(ch["id"], ""))
+            strict, presence = chain_traced(ch["steps"], occ), chain_present(ch["steps"], occ)
+            ok = presence if chain_order == "any" else strict
+            rec("chain", "tp" if ok else "fn", lang_of(ch["steps"][0]["file"]), ch.get("tags") or [],
+                strict=strict, presence=presence)
+    return recs, negatives_hit, {"ignored_test_sites": ignored}
 
 
 def _ratio(num, den):
     return None if den == 0 else num / den
 
 
-def summarize(recs):
+def summarize(recs, line_tol=LINE_TOL):
     tp = sum(r["outcome"] == "tp" for r in recs)
     fp = sum(r["outcome"] == "fp" for r in recs)
     fn = sum(r["outcome"] == "fn" for r in recs)
@@ -472,24 +573,29 @@ def summarize(recs):
     ptp_x = sum(r["outcome"] == "tp" and not r["ambiguous"] for r in pr)
     pfp_x = sum(r["outcome"] == "fp" and not r["ambiguous"] for r in pr)
     dl = [r["dline"] for r in recs if r["dline"] is not None]
+    ch = [r for r in recs if r["category"] == "chain" and "strict" in r]
     return {
         "tp": tp, "fp": fp, "fn": fn,
         "precision_ambiguous_counted": _ratio(ptp, ptp + pfp),
         "precision_ambiguous_excluded": _ratio(ptp_x, ptp_x + pfp_x),
         "recall": _ratio(tp, tp + fn),
-        "line_accuracy": _ratio(sum(d <= LINE_TOL for d in dl), len(dl)),
+        "line_accuracy": _ratio(sum(d <= line_tol for d in dl), len(dl)),
         "line_samples": len(dl),
+        "tp_line_ok": sum(d <= line_tol for d in dl),
+        "chains_total": len(ch),
+        "chains_in_order": sum(r["strict"] for r in ch),
+        "chains_presence": sum(r["presence"] for r in ch),
     }
 
 
-def slices(recs):
-    out = {"total": summarize(recs), "category": {}, "language": {}, "tag": {}}
+def slices(recs, line_tol=LINE_TOL):
+    out = {"total": summarize(recs, line_tol), "category": {}, "language": {}, "tag": {}}
     for key, getter in (("category", lambda r: [r["category"]]), ("language", lambda r: [r["language"]]), ("tag", lambda r: r["tags"])):
         groups = defaultdict(list)
         for r in recs:
             for k in getter(r):
                 groups[k].append(r)
-        out[key] = {k: summarize(v) for k, v in sorted(groups.items())}
+        out[key] = {k: summarize(v, line_tol) for k, v in sorted(groups.items())}
     return out
 
 
@@ -507,9 +613,9 @@ def isolated_env(home):
     return env
 
 
-def corpus_config(golden, root, home):
-    if golden.get("config"):
-        return Path(root) / golden["config"]
+def corpus_config(golden, root, home, config=None):
+    if config:
+        return config
     cfg = Path(home) / "mesh-mcp.toml"
     cfg.write_text(
         f'[workspace]\nname = "{golden["corpus"]}"\nversion = "1.0.0"\nroots = ["{root}"]\n'
@@ -526,12 +632,19 @@ def run_graph(binary, cfg, root, env, home):
 
 
 class McpSession:
-    """Minimal `run --standalone` stdio client (ndjson, as scripts/bench/mcp_client.py)."""
+    """Minimal `run --standalone` stdio client (ndjson, as scripts/bench/mcp_client.py).
 
-    def __init__(self, binary, cfg, root, env):
-        self.proc = subprocess.Popen([str(binary), "--config", str(cfg), "run", "--standalone"], cwd=root, env=env,
+    stdout is drained by a reader thread into a queue, so several lines arriving
+    in one write (a notification plus a response) are all seen. `argv` replaces
+    the mesh-mcp command line (used by the self-tests with a fake server)."""
+
+    def __init__(self, binary, cfg, root, env, argv=None):
+        self.proc = subprocess.Popen(argv or [str(binary), "--config", str(cfg), "run", "--standalone"], cwd=root, env=env,
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                      text=True, bufsize=1)
+        self._lines = queue.Queue()
+        self._reader = threading.Thread(target=self._drain, daemon=True)
+        self._reader.start()
         self._id = 0
         self.rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
                                 "clientInfo": {"name": "score-events", "version": "0"}})
@@ -539,25 +652,33 @@ class McpSession:
         self.proc.stdin.flush()
         self.tools = {t["name"]: t for t in self.rpc("tools/list", {}).get("tools", [])}
 
+    def _drain(self):
+        for line in self.proc.stdout:
+            self._lines.put(line)
+        self._lines.put(None)
+
     def rpc(self, method, params):
         self._id += 1
         self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": self._id, "method": method, "params": params}) + "\n")
         self.proc.stdin.flush()
         deadline = time.monotonic() + CALL_TIMEOUT_S
-        import select
         while True:
-            left = deadline - time.monotonic()
-            if left <= 0 or not select.select([self.proc.stdout], [], [], left)[0]:
-                raise ScorerError(f"{method}: no response within {CALL_TIMEOUT_S:.0f}s")
-            line = self.proc.stdout.readline()
-            if line == "":
+            try:
+                line = self._lines.get(timeout=max(deadline - time.monotonic(), 0.001))
+            except queue.Empty:
+                raise ScorerError(f"{method}: no response within {CALL_TIMEOUT_S:.0f}s") from None
+            if line is None:
                 raise ScorerError(f"{method}: server closed stdout")
-            if line.strip():
+            if not line.strip():
+                continue
+            try:
                 msg = json.loads(line)
-                if msg.get("id") == self._id:
-                    if "error" in msg:
-                        raise ScorerError(f"{method}: {msg['error']}")
-                    return msg.get("result", {})
+            except ValueError:
+                raise ScorerError(f"{method}: non-JSON line on stdout: {line[:80]!r}") from None
+            if isinstance(msg, dict) and msg.get("id") == self._id:
+                if "error" in msg:
+                    raise ScorerError(f"{method}: {msg['error']}")
+                return msg.get("result", {})
 
     def call(self, name, args):
         res = self.rpc("tools/call", {"name": name, "arguments": args})
@@ -572,6 +693,8 @@ class McpSession:
             self.proc.wait(timeout=5)
         except Exception:
             self.proc.kill()
+        self._reader.join(timeout=2)
+        self.proc.stdout.close()
 
 
 def _impact_args(chain, include_tests):
@@ -610,15 +733,17 @@ def trace_chain(session, tool_name, chain, include_tests):
     return "\n".join(pages)
 
 
-def score_file(golden_path, binary, chain_tool, include_tests, run_chains):
+def score_file(golden_path, binary, chain_tool, include_tests, run_chains, chain_order="strict"):
     golden = load_golden(golden_path)
-    root = (REPO_ROOT / golden["root"]).resolve()
+    root, config = resolve_corpus_paths(golden)
     if not root.is_dir():
         raise ScorerError(f"{golden_path}: root {root} does not exist")
+    if config is not None and not config.is_file():
+        raise ScorerError(f"{golden_path}: config {config} does not exist")
     home = Path(tempfile.mkdtemp(prefix="se-"))
     try:
         env = isolated_env(home)
-        cfg = corpus_config(golden, root, home)
+        cfg = corpus_config(golden, root, home, config)
         sites = extract_sites(run_graph(binary, cfg, root, env, home), root)
         answers = None
         if run_chains and golden["chains"]:
@@ -627,7 +752,7 @@ def score_file(golden_path, binary, chain_tool, include_tests, run_chains):
                 answers = {ch["id"]: trace_chain(session, chain_tool, ch, include_tests) for ch in golden["chains"]}
             finally:
                 session.close()
-        return score_corpus(golden, sites, answers, include_tests)
+        return score_corpus(golden, sites, answers, include_tests, chain_order)
     finally:
         shutil.rmtree(home, ignore_errors=True)
 
@@ -640,32 +765,37 @@ def _pct(x):
     return "n/a" if x is None else f"{x:.1%}"
 
 
-def _table(title, rows):
-    out = [f"### {title}", "", "| slice | tp | fp | fn | precision (ambiguous counted) | precision (ambiguous excluded) | recall |",
-           "|---|---|---|---|---|---|---|"]
+def _table(title, rows, tol=LINE_TOL):
+    out = [f"### {title}", "",
+           f"| slice | tp | fp | fn | precision (ambiguous counted) | precision (ambiguous excluded) | recall | tp with line <= {tol} | chains in order | chains presence (any order) |",
+           "|---|---|---|---|---|---|---|---|---|---|"]
     for name, s in rows:
+        chains = (f"{s['chains_in_order']}/{s['chains_total']}", f"{s['chains_presence']}/{s['chains_total']}") if s["chains_total"] else ("n/a", "n/a")
         out.append(f"| {name} | {s['tp']} | {s['fp']} | {s['fn']} | {_pct(s['precision_ambiguous_counted'])} | "
-                   f"{_pct(s['precision_ambiguous_excluded'])} | {_pct(s['recall'])} |")
+                   f"{_pct(s['precision_ambiguous_excluded'])} | {_pct(s['recall'])} | {s['tp_line_ok']} | {chains[0]} | {chains[1]} |")
     return "\n".join(out) + "\n"
 
 
 def markdown(report):
+    tol = report["line_tolerance"]
     out = []
     for name, rep in report["corpora"].items():
         out.append(f"## {name}\n")
-        out.append(_table("total", [("total", rep["total"])]))
+        out.append(_table("total", [("total", rep["total"])], tol))
         for key in ("category", "language", "tag"):
-            out.append(_table(f"per {key}", list(rep[key].items())))
+            out.append(_table(f"per {key}", list(rep[key].items()), tol))
         la = rep["total"]
-        out.append(f"Line accuracy (within {LINE_TOL}): {_pct(la['line_accuracy'])} of {la['line_samples']} matched sites.\n")
+        out.append(f"Line accuracy (within {tol}): {_pct(la['line_accuracy'])} of {la['line_samples']} matched sites. "
+                   f"Sites ignored as test files: {rep['ignored_test_sites']}.\n")
         if rep["negatives_hit"]:
             out.append("Negatives hit: " + ", ".join(f"{n['file']}:{n['line']}" for n in rep["negatives_hit"]) + "\n")
     t = report["all"]
     out.append("## all corpora\n")
-    out.append(_table("total", [("total", t["total"])]))
+    out.append(_table("total", [("total", t["total"])], tol))
     for key in ("category", "language", "tag"):
-        out.append(_table(f"per {key}", list(t[key].items())))
-    out.append(f"Line accuracy (within {LINE_TOL}): {_pct(t['total']['line_accuracy'])} of {t['total']['line_samples']} matched sites.\n")
+        out.append(_table(f"per {key}", list(t[key].items()), tol))
+    out.append(f"Line accuracy (within {tol}): {_pct(t['total']['line_accuracy'])} of {t['total']['line_samples']} matched sites. "
+               f"Sites ignored as test files: {report['ignored_test_sites']}.\n")
     return "\n".join(out)
 
 
@@ -676,22 +806,34 @@ def main():
     ap.add_argument("--chain-tool", choices=sorted(TOOL_ADAPTERS), default="analyze_impact")
     ap.add_argument("--include-tests", action="store_true", help="count test-file sites and pass include_tests=true")
     ap.add_argument("--no-chains", action="store_true", help="skip the MCP session (graph-only categories)")
+    ap.add_argument("--line-tolerance", type=int, default=LINE_TOL,
+                    help="tolerance of the 'tp with line' column and line accuracy only (default 2); matching ignores it")
+    ap.add_argument("--chain-order", choices=("strict", "any"), default="strict",
+                    help="strict: steps must appear in order; any: presence only. Decides chain tp/fn and the thresholds; "
+                         "both numbers are always reported")
     ap.add_argument("--json", action="store_true", help="JSON report instead of Markdown")
     ap.add_argument("--fail-under-precision", type=float, default=None, help="on the total (ambiguous counted)")
     ap.add_argument("--fail-under-recall", type=float, default=None, help="on the total")
     args = ap.parse_args()
 
-    all_recs, corpora = [], {}
+    all_recs, corpora, ignored = [], {}, 0
     try:
         for path in args.golden:
-            recs, neg = score_file(path, args.binary, args.chain_tool, args.include_tests, not args.no_chains)
+            recs, neg, meta = score_file(path, args.binary, args.chain_tool, args.include_tests, not args.no_chains,
+                                         args.chain_order)
             name = recs[0]["corpus"] if recs else Path(path).stem
-            corpora[name] = dict(slices(recs), negatives_hit=neg)
+            corpora[name] = dict(slices(recs, args.line_tolerance), negatives_hit=neg, **meta)
             all_recs += recs
+            ignored += meta["ignored_test_sites"]
     except (ScorerError, subprocess.SubprocessError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    report = {"binary": str(args.binary), "chain_tool": args.chain_tool, "corpora": corpora, "all": slices(all_recs)}
+    except (KeyError, TypeError, AttributeError, IndexError, ValueError) as e:  # malformed input that slipped validation
+        print(f"error: malformed input ({type(e).__name__}: {e})", file=sys.stderr)
+        return 2
+    report = {"binary": str(args.binary), "chain_tool": args.chain_tool, "chain_order": args.chain_order,
+              "line_tolerance": args.line_tolerance, "ignored_test_sites": ignored, "corpora": corpora,
+              "all": slices(all_recs, args.line_tolerance)}
     print(json.dumps(report, indent=2) if args.json else markdown(report))
 
     total = report["all"]["total"]
