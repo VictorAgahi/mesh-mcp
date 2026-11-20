@@ -9,9 +9,21 @@
 //! drift from a full rebuild. Its index pass is linear in ALL files with facts
 //! (resolution only in the candidate files), and it is skipped when no re-folded
 //! file has call facts or no file holds both kinds of endpoint. The raw facts of
-//! every non-test TS file stay in memory: pruning happens at derive time, not at
-//! fold time (design note 6.5 asked for fold-time pruning; a file off every path
-//! today can be on one after another file changes, and its facts are then needed).
+//! every non-test TS, Java, Go and Python file stay in memory: pruning happens at
+//! derive time, not at fold time (design note 6.5 asked for fold-time pruning; a
+//! file off every path today can be on one after another file changes, and its
+//! facts are then needed).
+//!
+//! Languages (by file extension, [`Lang`]): TypeScript resolves relative module
+//! specifiers; Java types resolve through a qualified import (matched against the
+//! file path), a wildcard import or the package, which is the directory; Go
+//! resolves a package-qualified call through the directory an import path's tail
+//! names, sees every file of its own directory, files methods under the file
+//! declaring the receiver type and matches interfaces to struct types by method
+//! set (at most [`MAX_STRUCTURAL_IMPLS`]); Python resolves relative and absolute
+//! dotted module imports, `from pkg import mod` and package `__init__` re-exports.
+//! A path that matches several files resolves to the closest to the importer, a
+//! tie to nothing.
 //!
 //! Derivation, in order:
 //! 1. File-level pruning: a file takes part only when it lies on an import path
