@@ -60,6 +60,11 @@ Behaviour that is easy to get wrong, stated once
 - Golden validation: a malformed golden file (empty chain steps, duplicate ids, wrong
   types, unterminated flow value or quote, root or config outside the repo) is an error,
   exit code 2.
+- Optional items (`optional: true`, tag `declared_pattern`) are ignored both ways: a match
+  is neither tp nor fp, a miss is not an fn; their count is reported as "optional ignored".
+  A chain with an optional step (or flagged itself) is optional as a whole.
+- Chain table: chain recall for all chains, for the `min_hops >= 3` slice (min_hops is the
+  explicit value, else the number of `call` steps) and per tag, in order and as presence.
 - Chains: tp = traced, fn = not traced; precision is not defined. Precision columns
   are computed over producers and consumers only; recall over every category.
 - Negatives: a found site within 2 lines of a negative (same file, same kind)
@@ -275,6 +280,9 @@ def validate_golden(g, path="golden"):
         _need(not dup, f"{path}: duplicate ids in '{key}': {', '.join(dup)}")
         for x in g[key]:
             _need(isinstance(x.get("tags") or [], list), f"{path}: {key} {x.get('id')}: 'tags' must be a list")
+            _need(isinstance(x.get("optional", False), bool), f"{path}: {key} {x.get('id')}: 'optional' must be true or false")
+            _need(not key == "chains" or x.get("min_hops") is None or _is_int(x["min_hops"]),
+                  f"{path}: chain {x.get('id')}: 'min_hops' must be an integer")
     for cat in ("producers", "consumers"):
         for x in g[cat]:
             _need(isinstance(x.get("topic"), str) and x["topic"] and isinstance(x.get("file"), str) and _is_int(x.get("line")),
@@ -485,6 +493,18 @@ def chain_traced(steps, occurrences):
     return True
 
 
+def _chain_optional(ch):
+    """A chain is optional when flagged, or when any of its steps is an optional item."""
+    return bool(ch.get("optional")) or any(isinstance(st, dict) and st.get("optional") for st in ch.get("steps") or [])
+
+
+def chain_min_hops(ch):
+    """min_hops of a chain: the explicit value, else its number of `call` steps."""
+    if ch.get("min_hops") is not None:
+        return ch["min_hops"]
+    return sum(st.get("kind") == "call" for st in ch["steps"])
+
+
 def chain_present(steps, occurrences):
     """True when every step location appears somewhere in the answer, in any order."""
     return all(any(same_file(p, st["file"]) and abs(ln - int(st["line"])) <= LINE_TOL for p, ln in occurrences)
@@ -507,6 +527,8 @@ def score_corpus(golden, sites, answers, include_tests=False, chain_order="stric
     """
     corpus = golden["corpus"]
     recs, negatives_hit, ignored = [], [], 0
+    optional_n = sum(bool(x.get("optional")) for k in ("producers", "consumers", "hops") for x in golden[k]) \
+        + sum(_chain_optional(c) for c in golden["chains"])
     file_tags, topic_tags, file_lang = defaultdict(set), defaultdict(set), {}
     for cat in ("producers", "consumers"):
         for g in golden[cat]:
@@ -527,6 +549,10 @@ def score_corpus(golden, sites, answers, include_tests=False, chain_order="stric
             ignored += len(found) - len(kept)
             found = kept
         pairs, missed, extra = match_sites(golden[cat], found)
+        # Optional golden items take part in the matching (they consume the site they
+        # match) but are ignored both ways: never tp / fp / fn.
+        pairs = [(g, f) for g, f in pairs if not g.get("optional")]
+        missed = [g for g in missed if not g.get("optional")]
         for g, f in pairs:
             rec(kind, "tp", g.get("language"), g.get("tags") or [], f["confidence"] == "ambiguous", abs(f["line"] - int(g["line"])))
         for g in missed:
@@ -542,7 +568,7 @@ def score_corpus(golden, sites, answers, include_tests=False, chain_order="stric
                 if n.get("kind") == kind and same_file(f["file"], n["file"]) and abs(f["line"] - int(n["line"])) <= LINE_TOL:
                     negatives_hit.append({"kind": kind, "file": n["file"], "line": n["line"], "note": n.get("note")})
 
-    pairs, missed = match_hops(golden["hops"], sites["call"])
+    pairs, missed = match_hops([h for h in golden["hops"] if not h.get("optional")], sites["call"])
     for h, c in pairs:
         rec("hop", "tp", lang_of(h["from"]["file"]), h.get("tags") or [], c["confidence"] == "ambiguous")
     for h in missed:
@@ -550,12 +576,14 @@ def score_corpus(golden, sites, answers, include_tests=False, chain_order="stric
 
     if answers is not None:
         for ch in golden["chains"]:
+            if _chain_optional(ch):
+                continue
             occ = extract_occurrences(answers.get(ch["id"], ""))
             strict, presence = chain_traced(ch["steps"], occ), chain_present(ch["steps"], occ)
             ok = presence if chain_order == "any" else strict
             rec("chain", "tp" if ok else "fn", lang_of(ch["steps"][0]["file"]), ch.get("tags") or [],
-                strict=strict, presence=presence)
-    return recs, negatives_hit, {"ignored_test_sites": ignored}
+                strict=strict, presence=presence, min_hops=chain_min_hops(ch))
+    return recs, negatives_hit, {"ignored_test_sites": ignored, "optional_ignored": optional_n}
 
 
 def _ratio(num, den):
@@ -588,8 +616,26 @@ def summarize(recs, line_tol=LINE_TOL):
     }
 
 
+def _chain_row(rs):
+    n = len(rs)
+    a, b = sum(r["strict"] for r in rs), sum(r["presence"] for r in rs)
+    return {"chains": n, "in_order": a, "presence": b, "recall_in_order": _ratio(a, n), "recall_presence": _ratio(b, n)}
+
+
+def chain_summary(recs):
+    """Chain recall, all chains next to the `min_hops >= 3` slice and per tag; in order
+    (strict) and presence (any order) side by side."""
+    ch = [r for r in recs if r["category"] == "chain" and "strict" in r]
+    per_tag = defaultdict(list)
+    for r in ch:
+        for t in r["tags"]:
+            per_tag[t].append(r)
+    return {"all": _chain_row(ch), "min_hops_ge_3": _chain_row([r for r in ch if (r.get("min_hops") or 0) >= 3]),
+            "per_tag": {t: _chain_row(v) for t, v in sorted(per_tag.items())}}
+
+
 def slices(recs, line_tol=LINE_TOL):
-    out = {"total": summarize(recs, line_tol), "category": {}, "language": {}, "tag": {}}
+    out = {"total": summarize(recs, line_tol), "category": {}, "language": {}, "tag": {}, "chains": chain_summary(recs)}
     for key, getter in (("category", lambda r: [r["category"]]), ("language", lambda r: [r["language"]]), ("tag", lambda r: r["tags"])):
         groups = defaultdict(list)
         for r in recs:
@@ -776,6 +822,16 @@ def _table(title, rows, tol=LINE_TOL):
     return "\n".join(out) + "\n"
 
 
+def _chain_table(cs):
+    rows = [("all chains", cs["all"]), ("chains with min_hops >= 3", cs["min_hops_ge_3"])]
+    rows += [(f"tag: {t}", v) for t, v in cs["per_tag"].items()]
+    out = ["### chains", "", "| slice | chains | traced in order | recall in order | presence (any order) | recall presence |",
+           "|---|---|---|---|---|---|"]
+    for name, r in rows:
+        out.append(f"| {name} | {r['chains']} | {r['in_order']} | {_pct(r['recall_in_order'])} | {r['presence']} | {_pct(r['recall_presence'])} |")
+    return "\n".join(out) + "\n"
+
+
 def markdown(report):
     tol = report["line_tolerance"]
     out = []
@@ -784,9 +840,10 @@ def markdown(report):
         out.append(_table("total", [("total", rep["total"])], tol))
         for key in ("category", "language", "tag"):
             out.append(_table(f"per {key}", list(rep[key].items()), tol))
+        out.append(_chain_table(rep["chains"]))
         la = rep["total"]
         out.append(f"Line accuracy (within {tol}): {_pct(la['line_accuracy'])} of {la['line_samples']} matched sites. "
-                   f"Sites ignored as test files: {rep['ignored_test_sites']}.\n")
+                   f"Sites ignored as test files: {rep['ignored_test_sites']}. Optional ignored: {rep['optional_ignored']}.\n")
         if rep["negatives_hit"]:
             out.append("Negatives hit: " + ", ".join(f"{n['file']}:{n['line']}" for n in rep["negatives_hit"]) + "\n")
     t = report["all"]
@@ -794,8 +851,9 @@ def markdown(report):
     out.append(_table("total", [("total", t["total"])], tol))
     for key in ("category", "language", "tag"):
         out.append(_table(f"per {key}", list(t[key].items()), tol))
+    out.append(_chain_table(t["chains"]))
     out.append(f"Line accuracy (within {tol}): {_pct(t['total']['line_accuracy'])} of {t['total']['line_samples']} matched sites. "
-               f"Sites ignored as test files: {report['ignored_test_sites']}.\n")
+               f"Sites ignored as test files: {report['ignored_test_sites']}. Optional ignored: {report['optional_ignored']}.\n")
     return "\n".join(out)
 
 
@@ -816,7 +874,7 @@ def main():
     ap.add_argument("--fail-under-recall", type=float, default=None, help="on the total")
     args = ap.parse_args()
 
-    all_recs, corpora, ignored = [], {}, 0
+    all_recs, corpora, ignored, optional = [], {}, 0, 0
     try:
         for path in args.golden:
             recs, neg, meta = score_file(path, args.binary, args.chain_tool, args.include_tests, not args.no_chains,
@@ -825,6 +883,7 @@ def main():
             corpora[name] = dict(slices(recs, args.line_tolerance), negatives_hit=neg, **meta)
             all_recs += recs
             ignored += meta["ignored_test_sites"]
+            optional += meta["optional_ignored"]
     except (ScorerError, subprocess.SubprocessError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -832,7 +891,7 @@ def main():
         print(f"error: malformed input ({type(e).__name__}: {e})", file=sys.stderr)
         return 2
     report = {"binary": str(args.binary), "chain_tool": args.chain_tool, "chain_order": args.chain_order,
-              "line_tolerance": args.line_tolerance, "ignored_test_sites": ignored, "corpora": corpora,
+              "line_tolerance": args.line_tolerance, "ignored_test_sites": ignored, "optional_ignored": optional, "corpora": corpora,
               "all": slices(all_recs, args.line_tolerance)}
     print(json.dumps(report, indent=2) if args.json else markdown(report))
 

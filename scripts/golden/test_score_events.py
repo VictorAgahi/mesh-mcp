@@ -313,6 +313,49 @@ class Session(unittest.TestCase):
             s.close()
 
 
+class Optional(unittest.TestCase):
+    def test_optional_items_ignored_both_ways(self):
+        opt = dict(item("p1", "t", "src/a.ts", 5), optional=True)
+        # found: neither tp nor fp
+        recs, _ = run(golden(producers=[opt]), graph(("Produces", "src/a.ts", 5, "f", "t", "exact")))
+        self.assertEqual(recs, [])
+        # not found: not an fn
+        recs, _ = run(golden(producers=[opt]), graph())
+        self.assertEqual(recs, [])
+        meta = se.score_corpus(golden(producers=[opt]), se.extract_sites(graph(), ROOT), None)[2]
+        self.assertEqual(meta["optional_ignored"], 1)
+
+    def test_optional_hop_and_chain_step(self):
+        hop = dict(Hops.HOP, optional=True)
+        self.assertEqual(run(golden(hops=[hop]), graph())[0], [])
+        steps = [{"kind": "consume", "file": "src/a.ts", "line": 9}, {"kind": "call", "file": "src/b.ts", "line": 2, "optional": True}]
+        g = golden(chains=[{"id": "ch1", "entry": {"kind": "topic", "value": "t"}, "steps": steps}])
+        recs, _ = run(g, graph(), {"ch1": ""})
+        self.assertEqual(recs, [])
+        self.assertEqual(se.score_corpus(g, se.extract_sites(graph(), ROOT), {"ch1": ""})[2]["optional_ignored"], 1)
+
+
+class ChainSummary(unittest.TestCase):
+    def call(self, i):
+        return {"kind": "call", "file": f"src/s{i}.ts", "line": 3}
+
+    def test_min_hops_slice_and_tags(self):
+        long_steps = [{"kind": "consume", "file": "src/a.ts", "line": 1}] + [self.call(i) for i in range(3)]
+        short_steps = [{"kind": "consume", "file": "src/a.ts", "line": 1}, self.call(9)]
+        chains = [{"id": "long", "entry": {"kind": "topic", "value": "t"}, "steps": long_steps, "tags": ["layered_calls"]},
+                  {"id": "short", "entry": {"kind": "topic", "value": "t"}, "steps": short_steps, "tags": ["cqrs"]},
+                  {"id": "explicit", "entry": {"kind": "topic", "value": "t"}, "steps": short_steps, "min_hops": 3, "tags": ["cqrs"]}]
+        ans = {"long": "src/s2.ts:3 src/s1.ts:3 src/s0.ts:3 src/a.ts:1",  # presence only
+               "short": "src/a.ts:1 src/s9.ts:3", "explicit": "src/a.ts:1 src/s9.ts:3"}
+        recs, _ = run(golden(chains=chains), graph(), ans)
+        cs = se.chain_summary(recs)
+        self.assertEqual((cs["all"]["chains"], cs["all"]["in_order"], cs["all"]["presence"]), (3, 2, 3))
+        self.assertEqual((cs["min_hops_ge_3"]["chains"], cs["min_hops_ge_3"]["in_order"], cs["min_hops_ge_3"]["presence"]), (2, 1, 2))
+        self.assertEqual(cs["per_tag"]["cqrs"]["recall_in_order"], 1.0)
+        self.assertEqual(cs["per_tag"]["layered_calls"]["recall_in_order"], 0.0)
+        self.assertEqual(cs["per_tag"]["layered_calls"]["recall_presence"], 1.0)
+
+
 class Tools(unittest.TestCase):
     def test_missing_chain_tool_is_a_clear_error(self):
         class S:
