@@ -35,7 +35,11 @@ fn calls(graph: &ContractGraph) -> Vec<(String, String, EdgeConfidence)> {
         .call_edges()
         .iter()
         .map(|e| {
-            let name = |id| graph.get_node(id).map_or(String::new(), |n| n.name.to_string());
+            let name = |id| {
+                graph
+                    .get_node(id)
+                    .map_or(String::new(), |n| n.name.to_string())
+            };
             (name(e.from), name(e.to), e.confidence)
         })
         .collect()
@@ -52,10 +56,26 @@ fn layered_ts_resolves_every_golden_hop() {
         ("OrderConsumer.handle", "OrderService.place", x),
         ("OrderController.create", "OrderService.place", x),
         ("OrderService.place", "InventoryService.reserve", x),
-        ("InventoryService.reserve", "StockPublisher.publishReserved", x),
-        ("ShippingConsumer.onStockReserved", "ShippingService.schedule", x),
-        ("ShippingService.schedule", "ShipmentPublisher.publishScheduled", x),
-        ("NotificationConsumer.onShipmentScheduled", "NotificationService.dispatch", x),
+        (
+            "InventoryService.reserve",
+            "StockPublisher.publishReserved",
+            x,
+        ),
+        (
+            "ShippingConsumer.onStockReserved",
+            "ShippingService.schedule",
+            x,
+        ),
+        (
+            "ShippingService.schedule",
+            "ShipmentPublisher.publishScheduled",
+            x,
+        ),
+        (
+            "NotificationConsumer.onShipmentScheduled",
+            "NotificationService.dispatch",
+            x,
+        ),
         // The Notifier token is bound by a runtime factory: both implementations.
         ("NotificationService.dispatch", "EmailNotifier.send", a),
         ("NotificationService.dispatch", "SmsNotifier.send", a),
@@ -71,7 +91,10 @@ fn layered_ts_resolves_every_golden_hop() {
     want.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
     assert_eq!(got, want);
     // MetricsService (local EventEmitter, logger) is on no path.
-    assert!(graph.callable_nodes().iter().all(|n| !n.name.starts_with("Metrics")));
+    assert!(graph
+        .callable_nodes()
+        .iter()
+        .all(|n| !n.name.starts_with("Metrics")));
 
     // Producers sit on the publish line (8.0.1 defects N2 / N9) and anchor on the
     // enclosing method.
@@ -82,7 +105,9 @@ fn layered_ts_resolves_every_golden_hop() {
         .filter_map(|e| graph.get_node(e.from))
         .map(|n| {
             (
-                n.file_path.file_name().map_or(String::new(), |f| f.to_string_lossy().into_owned()),
+                n.file_path
+                    .file_name()
+                    .map_or(String::new(), |f| f.to_string_lossy().into_owned()),
                 n.line_start,
                 graph.enclosing_callable(n).map(|c| c.name.to_string()),
             )
@@ -115,7 +140,10 @@ fn monolith_hops_resolve_once_a_producer_is_known() {
     assert!(graph.call_edges().is_empty());
     // Declare the two publishes the source makes (`eventEmitter.emit` in
     // OrderEvents.announce, `commandBus.execute` in RefundService.request).
-    for (file, line, topic) in [("order.events.ts", 9, "order.created"), ("refund.service.ts", 10, "IssueRefundCommand")] {
+    for (file, line, topic) in [
+        ("order.events.ts", 9, "order.created"),
+        ("refund.service.ts", 10, "IssueRefundCommand"),
+    ] {
         let path = fixture_dir("nestjs-monolith-bus").join(file);
         let id = graph.add_node(mesh_core::ContractNode {
             id: 0,
@@ -139,7 +167,8 @@ fn monolith_hops_resolve_once_a_producer_is_known() {
         ("RefundController.request", "RefundService.request"),
     ] {
         assert!(
-            got.iter().any(|(f, t, c)| f == from && t == to && *c == EdgeConfidence::Exact),
+            got.iter()
+                .any(|(f, t, c)| f == from && t == to && *c == EdgeConfidence::Exact),
             "{from} -> {to} in {got:?}"
         );
     }

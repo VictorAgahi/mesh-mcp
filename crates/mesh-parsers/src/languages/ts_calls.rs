@@ -57,13 +57,21 @@ fn bare_type_name(raw: &str) -> Option<&str> {
     let head = head.split('<').next()?.trim();
     let name = head.rsplit('.').next()?.trim();
     let ident = !name.is_empty()
-        && name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
-        && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
     ident.then_some(name)
 }
 
 fn is_class_node(node: Node) -> bool {
-    matches!(node.kind(), "class_declaration" | "abstract_class_declaration" | "class")
+    matches!(
+        node.kind(),
+        "class_declaration" | "abstract_class_declaration" | "class"
+    )
 }
 
 /// Whether a declaration sits at module level (under the program, an `export`).
@@ -72,7 +80,9 @@ fn is_module_level(node: Node) -> bool {
     while let Some(n) = current {
         match n.kind() {
             "program" => return true,
-            "export_statement" | "lexical_declaration" | "variable_declaration"
+            "export_statement"
+            | "lexical_declaration"
+            | "variable_declaration"
             | "variable_declarator" => current = n.parent(),
             _ => return false,
         }
@@ -96,7 +106,9 @@ fn owner_class<'s>(member: Node, source: &'s [u8]) -> Option<&'s str> {
 /// The string of a module specifier node (`'./x'`), quotes removed.
 fn module_text(node: Node, source: &[u8]) -> Option<String> {
     let raw = text(node, source)?;
-    let inner = raw.trim().trim_matches(|c| c == '\'' || c == '"' || c == '`');
+    let inner = raw
+        .trim()
+        .trim_matches(|c| c == '\'' || c == '"' || c == '`');
     (!inner.is_empty()).then(|| inner.to_string())
 }
 
@@ -243,8 +255,9 @@ pub fn extract(tree: &Tree, source: &[u8], rewrite: &dyn Fn(&str) -> Option<Stri
                                     if spec.kind() != "import_specifier" {
                                         continue;
                                     }
-                                    let Some(exported) =
-                                        spec.child_by_field_name("name").and_then(|n| text(n, source))
+                                    let Some(exported) = spec
+                                        .child_by_field_name("name")
+                                        .and_then(|n| text(n, source))
                                     else {
                                         continue;
                                     };
@@ -274,8 +287,9 @@ pub fn extract(tree: &Tree, source: &[u8], rewrite: &dyn Fn(&str) -> Option<Stri
                                 if spec.kind() != "export_specifier" {
                                     continue;
                                 }
-                                let Some(exported) =
-                                    spec.child_by_field_name("name").and_then(|n| text(n, source))
+                                let Some(exported) = spec
+                                    .child_by_field_name("name")
+                                    .and_then(|n| text(n, source))
                                 else {
                                     continue;
                                 };
@@ -301,7 +315,10 @@ pub fn extract(tree: &Tree, source: &[u8], rewrite: &dyn Fn(&str) -> Option<Stri
     // Types, callables and injections.
     walk(root, &mut |node| match node.kind() {
         "class_declaration" | "abstract_class_declaration" | "class" | "interface_declaration" => {
-            let Some(name) = node.child_by_field_name("name").and_then(|n| text(n, source)) else {
+            let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+            else {
                 return;
             };
             let kind = match node.kind() {
@@ -316,7 +333,12 @@ pub fn extract(tree: &Tree, source: &[u8], rewrite: &dyn Fn(&str) -> Option<Stri
                 extends,
                 implements,
             };
-            Builder::push_capped(&mut b.facts.types, fact, MAX_DECLS_PER_FILE, &mut b.facts.capped);
+            Builder::push_capped(
+                &mut b.facts.types,
+                fact,
+                MAX_DECLS_PER_FILE,
+                &mut b.facts.capped,
+            );
         }
         "method_definition" => {
             let Some(owner) = owner_class(node, source) else {
@@ -347,7 +369,12 @@ pub fn extract(tree: &Tree, source: &[u8], rewrite: &dyn Fn(&str) -> Option<Stri
             let Some(name) = name else { return };
             let value = node.child_by_field_name("value");
             // `handle = async (x) => { ... }`: a method in all but syntax.
-            if let Some(v) = value.filter(|v| matches!(v.kind(), "arrow_function" | "function_expression" | "function")) {
+            if let Some(v) = value.filter(|v| {
+                matches!(
+                    v.kind(),
+                    "arrow_function" | "function_expression" | "function"
+                )
+            }) {
                 b.callable(v, name, Some(owner));
                 return;
             }
@@ -364,7 +391,10 @@ pub fn extract(tree: &Tree, source: &[u8], rewrite: &dyn Fn(&str) -> Option<Stri
             if !is_module_level(node) {
                 return;
             }
-            if let Some(name) = node.child_by_field_name("name").and_then(|n| text(n, source)) {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+            {
                 b.callable(node, name, None);
             }
         }
@@ -372,12 +402,17 @@ pub fn extract(tree: &Tree, source: &[u8], rewrite: &dyn Fn(&str) -> Option<Stri
             let Some(value) = node.child_by_field_name("value") else {
                 return;
             };
-            if !matches!(value.kind(), "arrow_function" | "function_expression" | "function")
-                || !is_module_level(node)
+            if !matches!(
+                value.kind(),
+                "arrow_function" | "function_expression" | "function"
+            ) || !is_module_level(node)
             {
                 return;
             }
-            if let Some(name) = node.child_by_field_name("name").and_then(|n| text(n, source)) {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+            {
                 b.callable(value, name, None);
             }
         }
@@ -397,7 +432,12 @@ impl Builder {
             exported: CompactStr::new(exported),
             module: CompactStr::new(module),
         };
-        Self::push_capped(&mut self.facts.imports, fact, MAX_DECLS_PER_FILE, &mut self.facts.capped);
+        Self::push_capped(
+            &mut self.facts.imports,
+            fact,
+            MAX_DECLS_PER_FILE,
+            &mut self.facts.capped,
+        );
     }
 
     fn injection(&mut self, class: &str, field: &str, declared_type: &str) {
@@ -431,7 +471,9 @@ impl Builder {
             if !is_property {
                 continue;
             }
-            let field = p.child_by_field_name("pattern").and_then(|n| text(n, source));
+            let field = p
+                .child_by_field_name("pattern")
+                .and_then(|n| text(n, source));
             let declared = p
                 .child_by_field_name("type")
                 .and_then(|t| text(t, source))
@@ -535,7 +577,10 @@ impl Builder {
         let callable_at = &self.callable_at;
         let callables = &self.facts.callables;
         walk(root, &mut |node| {
-            while open.last().is_some_and(|&(end, _)| end <= node.start_byte()) {
+            while open
+                .last()
+                .is_some_and(|&(end, _)| end <= node.start_byte())
+            {
                 open.pop();
             }
             if let Some(&idx) = callable_at.get(&node.start_byte()) {
@@ -564,7 +609,9 @@ impl Builder {
                 "member_expression" => {
                     let (Some(object), Some(property)) = (
                         function.child_by_field_name("object"),
-                        function.child_by_field_name("property").and_then(|p| text(p, source)),
+                        function
+                            .child_by_field_name("property")
+                            .and_then(|p| text(p, source)),
                     ) else {
                         return;
                     };
@@ -637,7 +684,11 @@ mod tests {
             LanguageKind::TypeScript,
             code,
             AstGuard::INDEX_PARSE_TIMEOUT_MICROS,
-            |tree| extract(tree, code.as_bytes(), &|m| (m == "@app/svc").then(|| "./svc".to_string())),
+            |tree| {
+                extract(tree, code.as_bytes(), &|m| {
+                    (m == "@app/svc").then(|| "./svc".to_string())
+                })
+            },
         ) {
             ParseOutcome::Parsed(f) => f,
             _ => CallFacts::default(),
@@ -695,20 +746,43 @@ function local(x: unknown) {}
         assert!(inj.iter().all(|i| i.1 != "plain"));
         let s = sites(&f);
         let h = "Consumer.handle".to_string();
-        assert!(s.contains(&(h.clone(), "place".into(), CallReceiver::InjectedField("orders".into()), 11)));
-        assert!(s.contains(&(h.clone(), "save".into(), CallReceiver::InjectedField("repo".into()), 12)));
+        assert!(s.contains(&(
+            h.clone(),
+            "place".into(),
+            CallReceiver::InjectedField("orders".into()),
+            11
+        )));
+        assert!(s.contains(&(
+            h.clone(),
+            "save".into(),
+            CallReceiver::InjectedField("repo".into()),
+            12
+        )));
         // Inherited field: the class extends a base, kept for the resolver.
-        assert!(s.contains(&(h.clone(), "go".into(), CallReceiver::InjectedField("inherited".into()), 13)));
+        assert!(s.contains(&(
+            h.clone(),
+            "go".into(),
+            CallReceiver::InjectedField("inherited".into()),
+            13
+        )));
         assert!(s.contains(&(h.clone(), "audit".into(), CallReceiver::This, 14)));
         assert!(s.contains(&(h.clone(), "helper".into(), CallReceiver::ImportedSymbol, 15)));
         assert!(s.contains(&(h.clone(), "local".into(), CallReceiver::SameModule, 16)));
-        assert!(s.contains(&(h.clone(), "log".into(), CallReceiver::InjectedField("local".into()), 18)));
+        assert!(s.contains(&(
+            h.clone(),
+            "log".into(),
+            CallReceiver::InjectedField("local".into()),
+            18
+        )));
         // A parameter (`plain`) gives nothing; the repeated `this.orders.place` in the
         // callback is de-duplicated.
         assert_eq!(s.len(), 7, "{s:?}");
         // Imports: relative kept, the alias rewritten, a package import only when named.
         let modules: Vec<&str> = f.imports.iter().map(|i| i.module.as_str()).collect();
-        assert_eq!(modules, vec!["./order.service", "./svc", "./helpers", "some-logger"]);
+        assert_eq!(
+            modules,
+            vec!["./order.service", "./svc", "./helpers", "some-logger"]
+        );
         let t = &f.types[0];
         assert_eq!((t.name.as_str(), t.kind), ("Consumer", TypeFactKind::Class));
         assert_eq!(t.extends, vec![CompactStr::new("Base")]);
@@ -723,15 +797,26 @@ function local(x: unknown) {}
              export abstract class Abstrait { abstract run(): void }\n\
              export const flèche = () => { autre(); };\nfunction autre() {}\n",
         );
-        let imports: Vec<(&str, &str)> =
-            f.imports.iter().map(|i| (i.local.as_str(), i.exported.as_str())).collect();
+        let imports: Vec<(&str, &str)> = f
+            .imports
+            .iter()
+            .map(|i| (i.local.as_str(), i.exported.as_str()))
+            .collect();
         assert_eq!(imports, vec![("Sender", "Émetteur"), ("*", "*")]);
         let kinds: Vec<(&str, TypeFactKind)> =
             f.types.iter().map(|t| (t.name.as_str(), t.kind)).collect();
         assert!(kinds.contains(&("Notifié", TypeFactKind::Interface)));
         assert!(kinds.contains(&("Abstrait", TypeFactKind::Abstract)));
         let s = sites(&f);
-        assert_eq!(s, vec![(".flèche".into(), "autre".into(), CallReceiver::SameModule, 5)]);
+        assert_eq!(
+            s,
+            vec![(
+                ".flèche".into(),
+                "autre".into(),
+                CallReceiver::SameModule,
+                5
+            )]
+        );
     }
 
     #[test]

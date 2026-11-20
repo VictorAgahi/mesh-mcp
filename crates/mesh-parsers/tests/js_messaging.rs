@@ -515,7 +515,10 @@ fn an_interaction_is_the_call_site_itself() {
         .collect();
     // A one-line method spans exactly the call's lines: it keeps the fact (no line lost).
     assert_eq!(produced, vec![("notify@3".to_string(), "chan".to_string())]);
-    assert_eq!(consumed, vec![("listen@4".to_string(), "other".to_string())]);
+    assert_eq!(
+        consumed,
+        vec![("listen@4".to_string(), "other".to_string())]
+    );
     let multi = index(
         "svc/owner2.ts",
         "import Redis from 'ioredis';\n\
@@ -557,13 +560,17 @@ fn a_redis_producer_and_a_nats_free_consumer_meet_on_one_topic_in_the_graph() {
     };
     let produces = graph.all_edges().iter().any(|e| {
         e.kind == EdgeKind::Produces
-            && graph.get_node(e.from).is_some_and(|n| n.file_path.ends_with("pub.ts"))
+            && graph
+                .get_node(e.from)
+                .is_some_and(|n| n.file_path.ends_with("pub.ts"))
             && name(e.to) == "orders:created"
     });
     let consumes = graph.all_edges().iter().any(|e| {
         e.kind == EdgeKind::Consumes
             && name(e.from) == "orders:created"
-            && graph.get_node(e.to).is_some_and(|n| n.file_path.ends_with("sub.ts"))
+            && graph
+                .get_node(e.to)
+                .is_some_and(|n| n.file_path.ends_with("sub.ts"))
     });
     assert!(produces, "pub.ts -> orders:created");
     assert!(consumes, "orders:created -> sub.ts");

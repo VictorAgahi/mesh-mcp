@@ -23,8 +23,7 @@ use crate::decapitate::LanguageKind;
 use crate::guard::{AstGuard, ParseOutcome};
 use mesh_core::{
     CallFacts, CompactStr, ContractGraph, ContractNode, ContractsConfig, CustomPatternConfig,
-    FilePath,
-    NodeKind, PatternKind, RepoId,
+    FilePath, NodeKind, PatternKind, RepoId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -1634,11 +1633,20 @@ export class BillingController {
         graph.reconcile_edges();
         // 9.0: a call-site producer / consumer is the call itself (its line), not the
         // method enclosing it; an `@EventPattern` handler is still the method.
-        for (topic, producer_line, consumer_line) in [("order.placed", 4, 4), ("order.shipped", 5, 5)] {
+        for (topic, producer_line, consumer_line) in
+            [("order.placed", 4, 4), ("order.shipped", 5, 5)]
+        {
             let flow = graph.analyze_impact(topic);
-            let producers: Vec<usize> = flow.upstream_producers.iter().map(|n| n.line_start).collect();
-            let consumers: Vec<usize> =
-                flow.downstream_consumers.iter().map(|n| n.line_start).collect();
+            let producers: Vec<usize> = flow
+                .upstream_producers
+                .iter()
+                .map(|n| n.line_start)
+                .collect();
+            let consumers: Vec<usize> = flow
+                .downstream_consumers
+                .iter()
+                .map(|n| n.line_start)
+                .collect();
             assert_eq!(producers, vec![producer_line], "{topic}");
             assert_eq!(consumers, vec![consumer_line], "{topic}");
         }

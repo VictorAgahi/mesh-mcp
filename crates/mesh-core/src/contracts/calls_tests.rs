@@ -170,10 +170,26 @@ fn injected_field_this_and_interface_dispatch() {
     assert_eq!(
         calls(&g),
         vec![
-            ("Consumer.handle".into(), "Service.run".into(), EdgeConfidence::Exact),
-            ("Service.run".into(), "Service.helper".into(), EdgeConfidence::Exact),
-            ("Service.helper".into(), "Email.send".into(), EdgeConfidence::Ambiguous),
-            ("Service.helper".into(), "Sms.send".into(), EdgeConfidence::Ambiguous),
+            (
+                "Consumer.handle".into(),
+                "Service.run".into(),
+                EdgeConfidence::Exact
+            ),
+            (
+                "Service.run".into(),
+                "Service.helper".into(),
+                EdgeConfidence::Exact
+            ),
+            (
+                "Service.helper".into(),
+                "Email.send".into(),
+                EdgeConfidence::Ambiguous
+            ),
+            (
+                "Service.helper".into(),
+                "Sms.send".into(),
+                EdgeConfidence::Ambiguous
+            ),
         ]
     );
     // Anchoring: the producer node at line 6 lies in Email.send.
@@ -186,7 +202,10 @@ fn injected_field_this_and_interface_dispatch() {
     // Callables are not in the reconciled node set nor its indices.
     assert!(g.all_nodes().all(|n| n.kind != NodeKind::Callable));
     assert!(g.search_symbols("Service.run", None).is_empty());
-    assert!(g.search_symbols("run", None).iter().all(|n| n.kind != NodeKind::Callable));
+    assert!(g
+        .search_symbols("run", None)
+        .iter()
+        .all(|n| n.kind != NodeKind::Callable));
 }
 
 #[test]
@@ -207,11 +226,21 @@ fn single_implementation_is_exact_and_unknown_receivers_give_no_edge() {
     files[2].facts.callables.pop();
     files[2].producers.pop();
     // A call through an undeclared field and an unresolvable import resolve to nothing.
-    files[1].facts.call_sites.push(site(0, "x", field("unknown"), 7));
-    files[1].facts.call_sites.push(site(0, "f", CallReceiver::ImportedSymbol, 7));
+    files[1]
+        .facts
+        .call_sites
+        .push(site(0, "x", field("unknown"), 7));
+    files[1]
+        .facts
+        .call_sites
+        .push(site(0, "f", CallReceiver::ImportedSymbol, 7));
     let g = build(&files);
     let c = calls(&g);
-    assert!(c.contains(&("Service.helper".into(), "Email.send".into(), EdgeConfidence::Exact)));
+    assert!(c.contains(&(
+        "Service.helper".into(),
+        "Email.send".into(),
+        EdgeConfidence::Exact
+    )));
     assert_eq!(c.len(), 3, "{c:?}");
 }
 
@@ -222,7 +251,10 @@ fn cyclic_injection_terminates_and_keeps_both_directions() {
         FileSpec {
             path: "/w/a.ts",
             facts: CallFacts {
-                callables: vec![callable(Some("A"), "post", 3, 6), callable(Some("A"), "entry", 7, 9)],
+                callables: vec![
+                    callable(Some("A"), "post", 3, 6),
+                    callable(Some("A"), "entry", 7, 9),
+                ],
                 call_sites: vec![
                     site(0, "confirm", field("b"), 5),
                     site(1, "post", CallReceiver::This, 8),
@@ -314,7 +346,11 @@ fn workspace_package_imports_are_heuristic() {
     files[0].facts.imports = vec![import("Service", "@scope/app")];
     let g = build(&files);
     let c = calls(&g);
-    assert!(c.contains(&("Consumer.handle".into(), "Service.run".into(), EdgeConfidence::Heuristic)));
+    assert!(c.contains(&(
+        "Consumer.handle".into(),
+        "Service.run".into(),
+        EdgeConfidence::Heuristic
+    )));
 }
 
 #[test]
@@ -324,8 +360,16 @@ fn output_is_independent_of_insertion_order_and_stable_across_reloads() {
     let mut rev: Vec<FileSpec> = layered();
     rev.reverse();
     let b = build(&rev);
-    let ca = a.canonical_lines().into_iter().filter(|l| l.contains("Calls") || l.contains("callable")).collect::<Vec<_>>();
-    let cb = b.canonical_lines().into_iter().filter(|l| l.contains("Calls") || l.contains("callable")).collect::<Vec<_>>();
+    let ca = a
+        .canonical_lines()
+        .into_iter()
+        .filter(|l| l.contains("Calls") || l.contains("callable"))
+        .collect::<Vec<_>>();
+    let cb = b
+        .canonical_lines()
+        .into_iter()
+        .filter(|l| l.contains("Calls") || l.contains("callable"))
+        .collect::<Vec<_>>();
     assert!(!ca.is_empty());
     assert_eq!(ca, cb);
 
@@ -354,7 +398,14 @@ fn deep_call_chain_is_walked_without_recursion_on_a_2mb_stack() {
                 .map(|k| callable(None, &format!("f{k}"), 2 * k + 1, 2 * k + 2))
                 .collect();
             let call_sites = (0..DEPTH - 1)
-                .map(|k| site(k, &format!("f{}", k + 1), CallReceiver::SameModule, 2 * k + 1))
+                .map(|k| {
+                    site(
+                        k,
+                        &format!("f{}", k + 1),
+                        CallReceiver::SameModule,
+                        2 * k + 1,
+                    )
+                })
                 .collect();
             let files = vec![FileSpec {
                 path: "/w/deep.ts",

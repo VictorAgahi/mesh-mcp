@@ -323,8 +323,7 @@ fn join_module(dir: &str, module: &str) -> String {
 /// `a/b.service.ts` -> `a/b.service`; `None` for another extension.
 fn strip_script_ext_str(s: &str) -> Option<&str> {
     let (base, ext) = s.rsplit_once('.')?;
-    (SCRIPT_EXTENSIONS.contains(&ext) && !base.is_empty() && !base.ends_with('/'))
-        .then_some(base)
+    (SCRIPT_EXTENSIONS.contains(&ext) && !base.is_empty() && !base.ends_with('/')).then_some(base)
 }
 
 /// FxHash (rustc's): the derive runs after every reload over every file's facts, and
@@ -408,7 +407,11 @@ fn package_key(module: &str) -> Option<&str> {
     }
     let mut parts = module.split('/');
     let first = parts.next()?;
-    let key = if first.starts_with('@') { parts.next()? } else { first };
+    let key = if first.starts_with('@') {
+        parts.next()?
+    } else {
+        first
+    };
     (!key.is_empty()).then_some(key)
 }
 
@@ -504,9 +507,10 @@ impl<'g> Deriver<'g> {
             }
             let (dir, _) = slashed[importer].as_deref()?.rsplit_once('/')?;
             let joined = join_module(dir, module);
-            by_module.get(joined.as_str()).copied().or_else(|| {
-                strip_script_ext_str(&joined).and_then(|s| by_module.get(s).copied())
-            })
+            by_module
+                .get(joined.as_str())
+                .copied()
+                .or_else(|| strip_script_ext_str(&joined).and_then(|s| by_module.get(s).copied()))
         };
         for (i, (path, f)) in self.files.iter().enumerate() {
             let mut map = FastMap::default();
@@ -747,10 +751,15 @@ impl<'g> Deriver<'g> {
                 "this"
             }
             CallReceiver::InjectedField(field) => {
-                if let Some((decl_file, t)) = owner.and_then(|o| self.field_type((file, o), field)) {
+                if let Some((decl_file, t)) = owner.and_then(|o| self.field_type((file, o), field))
+                {
                     for (ty, c) in self.resolve_type(decl_file, t) {
                         let impls = self.dispatch(ty, callee);
-                        let c = if impls.len() > 1 { EdgeConfidence::Ambiguous } else { c };
+                        let c = if impls.len() > 1 {
+                            EdgeConfidence::Ambiguous
+                        } else {
+                            c
+                        };
                         for target in impls {
                             keep_strongest(&mut found, target, c);
                         }
@@ -808,10 +817,20 @@ impl<'g> Deriver<'g> {
         }
 
         // Entry and producer nodes of each file.
-        let producer_ids: FastSet<NodeId> =
-            self.graph.topic_producers.values().flatten().copied().collect();
-        let consumer_ids: FastSet<NodeId> =
-            self.graph.topic_consumers.values().flatten().copied().collect();
+        let producer_ids: FastSet<NodeId> = self
+            .graph
+            .topic_producers
+            .values()
+            .flatten()
+            .copied()
+            .collect();
+        let consumer_ids: FastSet<NodeId> = self
+            .graph
+            .topic_consumers
+            .values()
+            .flatten()
+            .copied()
+            .collect();
         let mut entry_lines: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut producer_lines: Vec<Vec<usize>> = vec![Vec::new(); n];
         for (i, (path, _)) in self.files.iter().enumerate() {
@@ -861,16 +880,8 @@ impl<'g> Deriver<'g> {
                 radj[j].push(i);
             }
         }
-        let fwd_files = bfs(
-            (0..n).filter(|&i| !entry_lines[i].is_empty()),
-            &adj,
-            n,
-        );
-        let bwd_files = bfs(
-            (0..n).filter(|&i| !producer_lines[i].is_empty()),
-            &radj,
-            n,
-        );
+        let fwd_files = bfs((0..n).filter(|&i| !entry_lines[i].is_empty()), &adj, n);
+        let bwd_files = bfs((0..n).filter(|&i| !producer_lines[i].is_empty()), &radj, n);
         let candidate: Vec<bool> = (0..n).map(|i| fwd_files[i] && bwd_files[i]).collect();
         stats.candidate_files = candidate.iter().filter(|&&c| c).count();
 
@@ -895,7 +906,9 @@ impl<'g> Deriver<'g> {
                 let caller = self.offsets[i] + site.caller as usize;
                 let (targets, via) = self.resolve_site(i, caller_fact.owner.as_deref(), site);
                 for (t, confidence) in targets {
-                    let entry = pairs.entry((caller, t)).or_insert((site.line, confidence, via));
+                    let entry = pairs
+                        .entry((caller, t))
+                        .or_insert((site.line, confidence, via));
                     if (confidence_rank(confidence), site.line)
                         < (confidence_rank(entry.1), entry.0)
                     {
@@ -917,7 +930,11 @@ impl<'g> Deriver<'g> {
         let mut producers = BTreeSet::new();
         for i in (0..n).filter(|&i| candidate[i]) {
             entries.extend(entry_lines[i].iter().filter_map(|&l| self.enclosing(i, l)));
-            producers.extend(producer_lines[i].iter().filter_map(|&l| self.enclosing(i, l)));
+            producers.extend(
+                producer_lines[i]
+                    .iter()
+                    .filter_map(|&l| self.enclosing(i, l)),
+            );
         }
         let fwd = reach(entries, &out_edges);
         let bwd = reach(producers, &in_edges);
@@ -932,8 +949,13 @@ impl<'g> Deriver<'g> {
             })
             .collect();
         order.sort_by(|a, b| {
-            (a.0, a.1.line_start, &a.1.owner, &a.1.name, a.2)
-                .cmp(&(b.0, b.1.line_start, &b.1.owner, &b.1.name, b.2))
+            (a.0, a.1.line_start, &a.1.owner, &a.1.name, a.2).cmp(&(
+                b.0,
+                b.1.line_start,
+                &b.1.owner,
+                &b.1.name,
+                b.2,
+            ))
         });
         let mut id_of: HashMap<usize, NodeId> = HashMap::new();
         let mut callables = Vec::with_capacity(order.len());
