@@ -491,7 +491,7 @@ fn nestjs_clients_need_a_client_shaped_receiver() {
 // ---- wiring ---------------------------------------------------------------------------
 
 #[test]
-fn an_interaction_is_attributed_to_the_declaration_that_makes_it() {
+fn an_interaction_is_the_call_site_itself() {
     let fi = index(
         "svc/owner.ts",
         "import Redis from 'ioredis';\n\
@@ -500,7 +500,9 @@ fn an_interaction_is_attributed_to_the_declaration_that_makes_it() {
            async listen() { this.sub.subscribe('other'); }\n\
          }\n",
     );
-    let name_of = |i: usize| fi.nodes[i].name.to_string();
+    // 9.0: the call-site node, at the line of the call (8.0.1 N2 / N9); the method
+    // that makes it is found by line containment in the calls layer.
+    let name_of = |i: usize| format!("{}@{}", fi.nodes[i].name, fi.nodes[i].line_start);
     let produced: Vec<(String, String)> = fi
         .producers
         .iter()
@@ -511,8 +513,24 @@ fn an_interaction_is_attributed_to_the_declaration_that_makes_it() {
         .iter()
         .map(|(i, t)| (name_of(*i), t.to_string()))
         .collect();
-    assert_eq!(produced, vec![("notify".to_string(), "chan".to_string())]);
-    assert_eq!(consumed, vec![("listen".to_string(), "other".to_string())]);
+    // A one-line method spans exactly the call's lines: it keeps the fact (no line lost).
+    assert_eq!(produced, vec![("notify@3".to_string(), "chan".to_string())]);
+    assert_eq!(consumed, vec![("listen@4".to_string(), "other".to_string())]);
+    let multi = index(
+        "svc/owner2.ts",
+        "import Redis from 'ioredis';\n\
+         export class Notifier {\n\
+           async notify() {\n\
+             await this.redis.publish('chan', 'x');\n\
+           }\n\
+         }\n",
+    );
+    let at: Vec<(String, usize)> = multi
+        .producers
+        .iter()
+        .map(|(i, _)| (multi.nodes[*i].name.to_string(), multi.nodes[*i].line_start))
+        .collect();
+    assert_eq!(at, vec![("chan".to_string(), 4)]);
 }
 
 #[test]
@@ -538,13 +556,17 @@ fn a_redis_producer_and_a_nats_free_consumer_meet_on_one_topic_in_the_graph() {
             .unwrap_or_default()
     };
     let produces = graph.all_edges().iter().any(|e| {
-        e.kind == EdgeKind::Produces && name(e.from) == "notify" && name(e.to) == "orders:created"
+        e.kind == EdgeKind::Produces
+            && graph.get_node(e.from).is_some_and(|n| n.file_path.ends_with("pub.ts"))
+            && name(e.to) == "orders:created"
     });
     let consumes = graph.all_edges().iter().any(|e| {
-        e.kind == EdgeKind::Consumes && name(e.from) == "orders:created" && name(e.to) == "listen"
+        e.kind == EdgeKind::Consumes
+            && name(e.from) == "orders:created"
+            && graph.get_node(e.to).is_some_and(|n| n.file_path.ends_with("sub.ts"))
     });
-    assert!(produces, "notify -> orders:created");
-    assert!(consumes, "orders:created -> listen");
+    assert!(produces, "pub.ts -> orders:created");
+    assert!(consumes, "orders:created -> sub.ts");
 }
 
 // ---- review round 1 (PR #82) ------------------------------------------------------------
@@ -692,9 +714,10 @@ fn constants_respect_scope_and_mutability() {
     let sends: Vec<(String, String)> = fi
         .producers
         .iter()
-        .map(|(i, t)| (fi.nodes[*i].name.to_string(), t.to_string()))
+        .map(|(i, t)| (fi.nodes[*i].line_start.to_string(), t.to_string()))
         .collect();
-    assert_eq!(sends, vec![("k".to_string(), "a".to_string())], "{sends:?}");
+    // The send inside `k`, on line 8.
+    assert_eq!(sends, vec![("8".to_string(), "a".to_string())], "{sends:?}");
 }
 
 #[test]

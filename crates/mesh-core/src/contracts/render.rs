@@ -19,7 +19,7 @@ impl ContractGraph {
     /// in two directories gives the same lines (plan 4.12f).
     pub fn canonical_lines_rooted(&self, roots: &[std::path::PathBuf]) -> Vec<String> {
         let key_of = |id: NodeId| -> String {
-            self.nodes.get(&id).map_or_else(
+            self.get_node(id).map_or_else(
                 || String::from("<missing>"),
                 |n| Self::canonical_node_key(n, roots),
             )
@@ -56,6 +56,28 @@ impl ContractGraph {
                     ));
                 }
             }
+        }
+        for node in self.callable_nodes() {
+            lines.push(format!("node {}", Self::canonical_node_key(node, roots)));
+        }
+        for edge in self.call_edges() {
+            let line = serde_json::json!([
+                edge.kind,
+                key_of(edge.from),
+                key_of(edge.to),
+                edge.metadata,
+                edge.confidence
+            ]);
+            lines.push(format!("edge {line}"));
+        }
+        for (path, facts) in &self.call_facts {
+            lines.push(format!(
+                "call_facts {}",
+                serde_json::json!([
+                    crate::state::root_relative_path(path, roots, Some(facts.repo_id)),
+                    facts.facts
+                ])
+            ));
         }
         for (caller, target) in &self.rpc_calls {
             lines.push(format!(

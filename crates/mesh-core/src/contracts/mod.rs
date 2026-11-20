@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+mod calls;
 mod delta;
 mod index;
 mod query;
@@ -14,8 +15,14 @@ mod reconcile;
 mod render;
 mod resolve;
 
+pub use calls::{
+    CallFact, CallFacts, CallReceiver, CallStats, CallableFact, ImportFact, InjectionFact,
+    TypeFact, TypeFactKind, CALLABLE_ID_BASE, MAX_DERIVED_CALL_SITES,
+};
 pub use delta::ReconcileMode;
 
+#[cfg(test)]
+mod calls_tests;
 #[cfg(test)]
 mod delta_tests;
 #[cfg(test)]
@@ -433,6 +440,15 @@ pub struct ContractGraph {
     /// delta finds a changed handler's or call's candidates without a scan.
     grpc_index: delta::GrpcIndex,
 
+    /// Raw call facts per file (see `calls`), dropped with their file by `patch_files`.
+    call_facts: BTreeMap<FilePath, calls::FileCallFacts>,
+    /// `Callable` nodes and `Calls` edges, rebuilt from `call_facts` after every
+    /// reconcile. Kept apart from `nodes` / `edges`: no index or delta rule sees them.
+    derived_calls: calls::DerivedCalls,
+    /// Set by every change the calls layer reads (`call_facts`, a producer or consumer
+    /// registered on a node of a file with call facts); cleared by `derive_calls`.
+    calls_dirty: bool,
+
     next_node_id: u32,
 }
 
@@ -463,8 +479,12 @@ impl ContractGraph {
         self.file_to_nodes.len()
     }
 
+    /// A reconciled node, or a derived `Callable` (ids from [`CALLABLE_ID_BASE`]).
     pub fn get_node(&self, id: NodeId) -> Option<&ContractNode> {
-        self.nodes.get(&id)
+        match id.checked_sub(CALLABLE_ID_BASE) {
+            Some(k) => self.derived_calls.callables.get(k as usize),
+            None => self.nodes.get(&id),
+        }
     }
 
     #[inline]

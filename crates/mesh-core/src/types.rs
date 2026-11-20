@@ -84,6 +84,11 @@ pub enum NodeKind {
     /// holds the file's import facts so `find_dependents` can list the file;
     /// it is not a symbol and never a `smart_search` result.
     Module,
+    /// A method or function on a resolved call path between an entry (consumer,
+    /// route) and a producer: derived from the per-file call facts after every
+    /// reconcile (see `contracts::calls`). Like `Module`, never a `smart_search`
+    /// result, and never in the graph's name / file indices.
+    Callable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +114,9 @@ pub enum EdgeKind {
     Implements,
     Imports,
     DispatchesTo,
+    /// `Callable` -> `Callable`: an intra-repository call resolved from call facts
+    /// (see `contracts::calls`). Derived after every reconcile, never journaled.
+    Calls,
 }
 
 /// Confidence of a `ContractEdge`'s resolution. The graph is built from

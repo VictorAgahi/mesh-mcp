@@ -136,6 +136,10 @@ pub struct IndexHealth {
     /// every tool note (7.0.0 pilot feedback: `yarn.lock` and PNGs as "not indexed").
     #[serde(default)]
     pub files_skipped_non_source: usize,
+    /// Files whose call facts (9.0 calls layer) hit a per-file cap: some callables
+    /// or call sites of the file were dropped, so a call path through it may be cut.
+    #[serde(default)]
+    pub files_call_facts_capped: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -213,6 +217,11 @@ impl IndexHealth {
     #[inline]
     pub fn record_parse_failed(&mut self) {
         self.files_parse_failed += 1;
+    }
+
+    #[inline]
+    pub fn record_call_facts_capped(&mut self) {
+        self.files_call_facts_capped += 1;
     }
 
     #[inline]
@@ -385,6 +394,7 @@ impl IndexHealth {
         self.files_read_error += other.files_read_error;
         self.files_parse_failed += other.files_parse_failed;
         self.files_skipped_non_source += other.files_skipped_non_source;
+        self.files_call_facts_capped += other.files_call_facts_capped;
     }
 
     #[inline]

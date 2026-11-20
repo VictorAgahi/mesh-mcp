@@ -8,6 +8,7 @@
 #
 # usage: scripts/determinism.sh [workspace_dir ...]
 #   default workspaces: examples/polyglot-shop examples/volontariapp-fixture
+#                       examples/eda/layered-ts examples/eda/nestjs-monolith-bus (calls layer, 9.0)
 # env:
 #   MESH_MCP_BIN     binary to test (default: target/release/mesh-mcp, built if missing)
 #   SEQUENTIAL_RUNS  sequential runs per workspace (default: 5)
@@ -79,7 +80,8 @@ fi
 if [[ $# -gt 0 ]]; then
   WORKSPACES=("$@")
 else
-  WORKSPACES=("$REPO_ROOT/examples/polyglot-shop" "$REPO_ROOT/examples/volontariapp-fixture")
+  WORKSPACES=("$REPO_ROOT/examples/polyglot-shop" "$REPO_ROOT/examples/volontariapp-fixture"
+    "$REPO_ROOT/examples/eda/layered-ts" "$REPO_ROOT/examples/eda/nestjs-monolith-bus")
 fi
 
 OUT_DIR="$(mktemp -d)"

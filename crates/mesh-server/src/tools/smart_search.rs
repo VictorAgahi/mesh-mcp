@@ -586,7 +586,8 @@ impl SmartSearchTool {
             NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue | NodeKind::Saga => 2,
             NodeKind::PostProcessor => 3,
             NodeKind::ServiceClass => 4,
-            NodeKind::Module => 5,
+            // A `Callable` is never in the graph indices this search reads.
+            NodeKind::Module | NodeKind::Callable => 5,
         };
 
         (match_rank, kind_rank)

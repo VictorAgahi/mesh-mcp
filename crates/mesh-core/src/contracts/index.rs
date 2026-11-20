@@ -53,6 +53,7 @@ impl ContractGraph {
         // would keep it while a full rebuild drops it, so the next reconcile
         // must be a full one.
         self.journal.invalidate();
+        self.calls_dirty = true;
         match edge.kind {
             EdgeKind::Produces => {
                 if let Some(to_node) = self.nodes.get(&edge.to) {
@@ -90,6 +91,7 @@ impl ContractGraph {
     pub fn add_producer(&mut self, producer_node_id: NodeId, topic: &str) {
         let key = CompactStr::new(normalize_topic_key(topic));
         self.journal.topic(&key);
+        self.touch_calls_node(producer_node_id);
         self.topic_producers
             .entry(key)
             .or_default()
@@ -99,6 +101,7 @@ impl ContractGraph {
     pub fn add_consumer(&mut self, consumer_node_id: NodeId, topic: &str) {
         let key = CompactStr::new(normalize_topic_key(topic));
         self.journal.topic(&key);
+        self.touch_calls_node(consumer_node_id);
         self.topic_consumers
             .entry(key)
             .or_default()
@@ -135,6 +138,9 @@ impl ContractGraph {
     pub fn patch_files<'a>(&mut self, file_paths: impl IntoIterator<Item = &'a Path>) {
         let mut stale_set: HashSet<NodeId> = HashSet::new();
         for path in file_paths {
+            if self.call_facts.remove(path).is_some() {
+                self.calls_dirty = true;
+            }
             if let Some(ids) = self.file_to_nodes.remove(path) {
                 stale_set.extend(ids);
             }

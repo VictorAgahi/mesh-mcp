@@ -101,7 +101,9 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v12: one database per repository (`workspaces/<cache_family_id>/`), shared by its
 /// worktrees; keys hold the root-relative path and the path-derived extraction context,
 /// payloads store root-relative node paths (8.0.0).
-const SCHEMA_VERSION: u8 = 12;
+/// v13: `FileIndex::calls` (9.0 calls layer: callables, call sites, injections, imports,
+/// type heritage), and TypeScript producers / consumers registered on their call-site node.
+const SCHEMA_VERSION: u8 = 13;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

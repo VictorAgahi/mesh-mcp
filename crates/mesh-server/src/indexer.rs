@@ -133,7 +133,7 @@ struct FileFragment {
 /// package, and the first key holds `NeedsPackage` to send the lookup there.
 #[derive(serde::Deserialize)]
 enum CachedRecord {
-    Index(RootRelativeIndex),
+    Index(Box<RootRelativeIndex>),
     NeedsPackage,
 }
 
@@ -646,6 +646,16 @@ impl WorkspaceIndexer {
             }
         }
 
+        for frag in &fragments {
+            if frag.code.calls.capped {
+                tracing::warn!(
+                    target: "mesh::indexer",
+                    "{}: call facts capped (calls layer), a call path through it may be cut",
+                    frag.path.display()
+                );
+                health.record_call_facts_capped();
+            }
+        }
         if let Some(cache) = scan_cfg.cache {
             let writes: Vec<CacheEntry> = fragments
                 .iter_mut()
