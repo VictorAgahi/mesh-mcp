@@ -1,0 +1,101 @@
+# Hand-annotated from the source of examples/unresolved-flow (no fixture edits). Redis streams, so
+# no broker tag applies; tags only mark the features a later ticket must add.
+# The ghost.spec.ts items are test code: hidden by default (include_tests=false), so they are negatives.
+corpus: unresolved-flow
+root: examples/unresolved-flow
+config: mesh-mcp.toml
+languages: [ts]
+
+producers:
+  - {id: p1, topic: user:deletion:requested, file: src/user.service.ts, line: 6, language: ts, tags: []}
+  - {id: p2, topic: user:deletion:success, file: src/gather.processor.ts, line: 13, language: ts, tags: [config_topic]}
+  - {id: p3, topic: cache:purged, file: src/purge.consumer.ts, line: 10, language: ts, tags: []}
+  - {id: p4, topic: chain:1, file: src/chain0.ts, line: 7, language: ts, tags: []}
+  - {id: p5, topic: chain:2, file: src/chain1.ts, line: 7, language: ts, tags: []}
+  - {id: p6, topic: chain:3, file: src/chain2.ts, line: 7, language: ts, tags: []}
+  - {id: p7, topic: chain:4, file: src/chain3.ts, line: 7, language: ts, tags: []}
+  - {id: p8, topic: chain:5, file: src/chain4.ts, line: 7, language: ts, tags: []}
+  - {id: p9, topic: chain:6, file: src/chain5.ts, line: 7, language: ts, tags: []}
+  - {id: p10, topic: cycle:b, file: src/cycle.ts, line: 7, language: ts, tags: []}
+  - {id: p11, topic: cycle:a, file: src/cycle.ts, line: 12, language: ts, tags: []}
+  - {id: p12, topic: fan:out, file: src/fan.ts, line: 6, language: ts, tags: []}
+  - {id: p13, topic: ghost:events, file: src/ghost.ts, line: 6, language: ts, tags: []}
+  - {id: p14, topic: metrics:emitted, file: src/orphans.ts, line: 12, language: ts, tags: []}
+
+consumers:
+  - {id: c1, topic: user:deletion:requested, file: src/gather.processor.ts, line: 7, language: ts, tags: []}
+  - {id: c2, topic: user:deletion:success, file: src/purge.consumer.ts, line: 6, language: ts, tags: []}
+  - {id: c3, topic: cache:purged, file: src/audit.consumer.ts, line: 6, language: ts, tags: []}
+  - {id: c4, topic: chain:0, file: src/chain0.ts, line: 6, language: ts, tags: []}
+  - {id: c5, topic: chain:1, file: src/chain1.ts, line: 6, language: ts, tags: []}
+  - {id: c6, topic: chain:2, file: src/chain2.ts, line: 6, language: ts, tags: []}
+  - {id: c7, topic: chain:3, file: src/chain3.ts, line: 6, language: ts, tags: []}
+  - {id: c8, topic: chain:4, file: src/chain4.ts, line: 6, language: ts, tags: []}
+  - {id: c9, topic: chain:5, file: src/chain5.ts, line: 6, language: ts, tags: []}
+  - {id: c10, topic: chain:6, file: src/chain6.ts, line: 6, language: ts, tags: []}
+  - {id: c11, topic: cycle:a, file: src/cycle.ts, line: 6, language: ts, tags: []}
+  - {id: c12, topic: cycle:b, file: src/cycle.ts, line: 11, language: ts, tags: []}
+  - {id: c13, topic: fan:out, file: src/fan.ts, line: 10, language: ts, tags: []}
+  - {id: c14, topic: fan:out, file: src/fan.ts, line: 14, language: ts, tags: []}
+  - {id: c15, topic: fan:out, file: src/fan.ts, line: 18, language: ts, tags: []}
+  - {id: c16, topic: fan:out, file: src/fan.ts, line: 22, language: ts, tags: []}
+  - {id: c17, topic: fan:out, file: src/fan.ts, line: 26, language: ts, tags: []}
+  - {id: c18, topic: fan:out, file: src/fan.ts, line: 30, language: ts, tags: []}
+  - {id: c19, topic: fan:out, file: src/fan.ts, line: 34, language: ts, tags: []}
+  - {id: c20, topic: ghost:inbox, file: src/ghost.ts, line: 10, language: ts, tags: []}
+  - {id: c21, topic: legacy:orders, file: src/orphans.ts, line: 7, language: ts, tags: []}
+
+hops: []
+
+chains:
+  # Seven files, each consuming chain:N and publishing chain:N+1.
+  - id: ch1
+    entry: {kind: topic, value: chain:0}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/chain0.ts, line: 6, topic: chain:0}
+      - {kind: produce, file: src/chain0.ts, line: 7, topic: chain:1}
+      - {kind: consume, file: src/chain1.ts, line: 6, topic: chain:1}
+      - {kind: produce, file: src/chain1.ts, line: 7, topic: chain:2}
+      - {kind: consume, file: src/chain2.ts, line: 6, topic: chain:2}
+      - {kind: produce, file: src/chain2.ts, line: 7, topic: chain:3}
+      - {kind: consume, file: src/chain3.ts, line: 6, topic: chain:3}
+      - {kind: produce, file: src/chain3.ts, line: 7, topic: chain:4}
+      - {kind: consume, file: src/chain4.ts, line: 6, topic: chain:4}
+      - {kind: produce, file: src/chain4.ts, line: 7, topic: chain:5}
+      - {kind: consume, file: src/chain5.ts, line: 6, topic: chain:5}
+      - {kind: produce, file: src/chain5.ts, line: 7, topic: chain:6}
+      - {kind: consume, file: src/chain6.ts, line: 6, topic: chain:6}
+    tags: []
+    min_hops: 0
+  # Deletion pipeline. The success topic is built at runtime in completion.registry.ts
+  # (['user','deletion','success'].join(':')); a reader who evaluates it gets user:deletion:success.
+  # Consumer and producer sit in the same file (the post-processor), as in the same-file control.
+  - id: ch2
+    entry: {kind: topic, value: user:deletion:requested}
+    direction: forward
+    steps:
+      - {kind: produce, file: src/user.service.ts, line: 6, topic: user:deletion:requested}
+      - {kind: consume, file: src/gather.processor.ts, line: 7, topic: user:deletion:requested}
+      - {kind: produce, file: src/gather.processor.ts, line: 13, topic: user:deletion:success}
+      - {kind: consume, file: src/purge.consumer.ts, line: 6, topic: user:deletion:success}
+      - {kind: produce, file: src/purge.consumer.ts, line: 10, topic: cache:purged}
+      - {kind: consume, file: src/audit.consumer.ts, line: 6, topic: cache:purged}
+    tags: [config_topic]
+    min_hops: 0
+  - id: ch3
+    entry: {kind: topic, value: cycle:a}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/cycle.ts, line: 6, topic: cycle:a}
+      - {kind: produce, file: src/cycle.ts, line: 7, topic: cycle:b}
+      - {kind: consume, file: src/cycle.ts, line: 11, topic: cycle:b}
+      - {kind: produce, file: src/cycle.ts, line: 12, topic: cycle:a}
+    tags: []
+    min_hops: 0
+
+negatives:
+  - {kind: consumer, file: src/ghost.spec.ts, line: 6, note: "test file: ghost:events consumer is hidden by default"}
+  - {kind: producer, file: src/ghost.spec.ts, line: 10, note: "test file: ghost:inbox producer is hidden by default"}
+  - {kind: producer, file: src/ghost.spec.ts, line: 14, note: "test file: ghost:only producer is hidden by default"}
+  - {kind: consumer, file: src/ghost.spec.ts, line: 18, note: "test file: ghost:only consumer is hidden by default"}

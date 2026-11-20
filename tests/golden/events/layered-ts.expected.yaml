@@ -1,0 +1,217 @@
+# Hand-annotated from the source of examples/eda/layered-ts. Never generated from tool output.
+# Conventions (see README.md): a call step points at the callee declaration line, a hop
+# `from` line is the call site; min_hops = number of `call` steps (a route or cron entry
+# handler counts as one call step).
+corpus: layered-ts
+root: examples/eda/layered-ts
+config: mesh-mcp.toml
+languages: [ts]
+
+producers:
+  - {id: p1, topic: stock.reserved, file: src/stock.publisher.ts, line: 9, language: ts, tags: [kafka_basic]}
+  - {id: p2, topic: shipment.scheduled, file: src/shipment.publisher.ts, line: 9, language: ts, tags: [kafka_basic]}
+  - {id: p3, topic: email.queued, file: src/notifiers.ts, line: 15, language: ts, tags: [kafka_basic]}
+  - {id: p4, topic: sms.queued, file: src/notifiers.ts, line: 24, language: ts, tags: [kafka_basic]}
+  - {id: p5, topic: ledger.posted, file: src/ledger.service.ts, line: 13, language: ts, tags: [kafka_basic]}
+  - {id: p6, topic: audit.completed, file: src/audit.handler.ts, line: 11, language: ts, tags: [kafka_basic]}
+
+consumers:
+  - {id: c1, topic: order.requested, file: src/order.consumer.ts, line: 9, language: ts, tags: [kafka_basic]}
+  - {id: c2, topic: stock.reserved, file: src/shipping.consumer.ts, line: 9, language: ts, tags: [kafka_basic]}
+  - {id: c3, topic: shipment.scheduled, file: src/notification.consumer.ts, line: 9, language: ts, tags: [kafka_basic]}
+  - {id: c4, topic: ledger.reconcile, file: src/reconcile.consumer.ts, line: 9, language: ts, tags: [kafka_basic]}
+  - {id: c5, topic: audit.requested, file: src/audit.handler.ts, line: 9, language: ts, tags: [kafka_basic]}
+
+hops:
+  - id: h1
+    from: {symbol: OrderConsumer.handle, file: src/order.consumer.ts, line: 11}
+    to: {symbol: OrderService.place, file: src/order.service.ts, line: 8}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h2
+    from: {symbol: OrderController.create, file: src/order.controller.ts, line: 10}
+    to: {symbol: OrderService.place, file: src/order.service.ts, line: 8}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h3
+    from: {symbol: OrderService.place, file: src/order.service.ts, line: 10}
+    to: {symbol: InventoryService.reserve, file: src/inventory.service.ts, line: 8}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h4
+    from: {symbol: InventoryService.reserve, file: src/inventory.service.ts, line: 10}
+    to: {symbol: StockPublisher.publishReserved, file: src/stock.publisher.ts, line: 8}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h5
+    from: {symbol: ShippingConsumer.onStockReserved, file: src/shipping.consumer.ts, line: 11}
+    to: {symbol: ShippingService.schedule, file: src/shipping.service.ts, line: 8}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h6
+    from: {symbol: ShippingService.schedule, file: src/shipping.service.ts, line: 10}
+    to: {symbol: ShipmentPublisher.publishScheduled, file: src/shipment.publisher.ts, line: 8}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h7
+    from: {symbol: NotificationConsumer.onShipmentScheduled, file: src/notification.consumer.ts, line: 11}
+    to: {symbol: NotificationService.dispatch, file: src/notification.service.ts, line: 8}
+    via: injected_field
+    tags: [layered_calls]
+  # h8 and h9: the Notifier token is bound by a runtime factory in app.module.ts, so a static
+  # reader sees two candidate implementations (an ambiguous call).
+  - id: h8
+    from: {symbol: NotificationService.dispatch, file: src/notification.service.ts, line: 9}
+    to: {symbol: EmailNotifier.send, file: src/notifiers.ts, line: 14}
+    via: interface_impl
+    tags: [layered_calls]
+  - id: h9
+    from: {symbol: NotificationService.dispatch, file: src/notification.service.ts, line: 9}
+    to: {symbol: SmsNotifier.send, file: src/notifiers.ts, line: 23}
+    via: interface_impl
+    tags: [layered_calls]
+  - id: h10
+    from: {symbol: ReconcileConsumer.onReconcile, file: src/reconcile.consumer.ts, line: 11}
+    to: {symbol: ReconcileService.run, file: src/reconcile.service.ts, line: 12}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h11
+    from: {symbol: ReconcileService.run, file: src/reconcile.service.ts, line: 13}
+    to: {symbol: LedgerService.post, file: src/ledger.service.ts, line: 12}
+    via: injected_field
+    tags: [layered_calls]
+  # h12 and h13 close a call cycle between the two services (forwardRef injection).
+  - id: h12
+    from: {symbol: LedgerService.post, file: src/ledger.service.ts, line: 14}
+    to: {symbol: ReconcileService.confirm, file: src/reconcile.service.ts, line: 17}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h13
+    from: {symbol: ReconcileService.confirm, file: src/reconcile.service.ts, line: 19}
+    to: {symbol: LedgerService.post, file: src/ledger.service.ts, line: 12}
+    via: injected_field
+    tags: [layered_calls]
+
+chains:
+  - id: ch1
+    entry: {kind: topic, value: order.requested}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/order.consumer.ts, line: 9, topic: order.requested}
+      - {kind: call, file: src/order.service.ts, line: 8}
+      - {kind: call, file: src/inventory.service.ts, line: 8}
+      - {kind: call, file: src/stock.publisher.ts, line: 8}
+      - {kind: produce, file: src/stock.publisher.ts, line: 9, topic: stock.reserved}
+    tags: [layered_calls]
+    min_hops: 3
+  - id: ch2
+    entry: {kind: route, value: POST /orders}
+    direction: forward
+    steps:
+      - {kind: call, file: src/order.controller.ts, line: 9}
+      - {kind: call, file: src/order.service.ts, line: 8}
+      - {kind: call, file: src/inventory.service.ts, line: 8}
+      - {kind: call, file: src/stock.publisher.ts, line: 8}
+      - {kind: produce, file: src/stock.publisher.ts, line: 9, topic: stock.reserved}
+    tags: [layered_calls]
+    min_hops: 4
+  # Two-event chain: order.requested -> stock.reserved -> shipment.scheduled, across two handlers.
+  - id: ch3
+    entry: {kind: topic, value: order.requested}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/order.consumer.ts, line: 9, topic: order.requested}
+      - {kind: call, file: src/order.service.ts, line: 8}
+      - {kind: call, file: src/inventory.service.ts, line: 8}
+      - {kind: call, file: src/stock.publisher.ts, line: 8}
+      - {kind: produce, file: src/stock.publisher.ts, line: 9, topic: stock.reserved}
+      - {kind: consume, file: src/shipping.consumer.ts, line: 9, topic: stock.reserved}
+      - {kind: call, file: src/shipping.service.ts, line: 8}
+      - {kind: call, file: src/shipment.publisher.ts, line: 8}
+      - {kind: produce, file: src/shipment.publisher.ts, line: 9, topic: shipment.scheduled}
+    tags: [layered_calls]
+    min_hops: 5
+  - id: ch4
+    entry: {kind: topic, value: shipment.scheduled}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/notification.consumer.ts, line: 9, topic: shipment.scheduled}
+      - {kind: call, file: src/notification.service.ts, line: 8}
+      - {kind: call, file: src/notifiers.ts, line: 14}
+      - {kind: produce, file: src/notifiers.ts, line: 15, topic: email.queued}
+    tags: [layered_calls]
+    min_hops: 2
+  - id: ch5
+    entry: {kind: topic, value: shipment.scheduled}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/notification.consumer.ts, line: 9, topic: shipment.scheduled}
+      - {kind: call, file: src/notification.service.ts, line: 8}
+      - {kind: call, file: src/notifiers.ts, line: 23}
+      - {kind: produce, file: src/notifiers.ts, line: 24, topic: sms.queued}
+    tags: [layered_calls]
+    min_hops: 2
+  # Full route-to-notification flow: HTTP entry, three events, eight call steps.
+  - id: ch6
+    entry: {kind: route, value: POST /orders}
+    direction: forward
+    steps:
+      - {kind: call, file: src/order.controller.ts, line: 9}
+      - {kind: call, file: src/order.service.ts, line: 8}
+      - {kind: call, file: src/inventory.service.ts, line: 8}
+      - {kind: call, file: src/stock.publisher.ts, line: 8}
+      - {kind: produce, file: src/stock.publisher.ts, line: 9, topic: stock.reserved}
+      - {kind: consume, file: src/shipping.consumer.ts, line: 9, topic: stock.reserved}
+      - {kind: call, file: src/shipping.service.ts, line: 8}
+      - {kind: call, file: src/shipment.publisher.ts, line: 8}
+      - {kind: produce, file: src/shipment.publisher.ts, line: 9, topic: shipment.scheduled}
+      - {kind: consume, file: src/notification.consumer.ts, line: 9, topic: shipment.scheduled}
+      - {kind: call, file: src/notification.service.ts, line: 8}
+      - {kind: call, file: src/notifiers.ts, line: 14}
+      - {kind: produce, file: src/notifiers.ts, line: 15, topic: email.queued}
+    tags: [layered_calls]
+    min_hops: 8
+  - id: ch7
+    entry: {kind: topic, value: ledger.reconcile}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/reconcile.consumer.ts, line: 9, topic: ledger.reconcile}
+      - {kind: call, file: src/reconcile.service.ts, line: 12}
+      - {kind: call, file: src/ledger.service.ts, line: 12}
+      - {kind: produce, file: src/ledger.service.ts, line: 13, topic: ledger.posted}
+    tags: [layered_calls]
+    min_hops: 2
+  # Control: consumer and producer in one method; the only chain 8.0.1 is expected to trace.
+  - id: ch8
+    entry: {kind: topic, value: audit.requested}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/audit.handler.ts, line: 9, topic: audit.requested}
+      - {kind: produce, file: src/audit.handler.ts, line: 11, topic: audit.completed}
+    tags: [kafka_basic]
+    min_hops: 0
+  - id: ch9
+    entry: {kind: topic, value: stock.reserved}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/shipping.consumer.ts, line: 9, topic: stock.reserved}
+      - {kind: call, file: src/shipping.service.ts, line: 8}
+      - {kind: call, file: src/shipment.publisher.ts, line: 8}
+      - {kind: produce, file: src/shipment.publisher.ts, line: 9, topic: shipment.scheduled}
+    tags: [layered_calls]
+    min_hops: 2
+  # Reverse: what triggers stock.reserved?
+  - id: ch10
+    entry: {kind: topic, value: stock.reserved}
+    direction: reverse
+    steps:
+      - {kind: produce, file: src/stock.publisher.ts, line: 9, topic: stock.reserved}
+      - {kind: call, file: src/inventory.service.ts, line: 8}
+      - {kind: call, file: src/order.service.ts, line: 8}
+      - {kind: consume, file: src/order.consumer.ts, line: 9, topic: order.requested}
+    tags: [layered_calls]
+    min_hops: 2
+
+negatives:
+  - {kind: producer, file: src/metrics.service.ts, line: 12, note: "local EventEmitter.emit is not a message bus"}
+  - {kind: producer, file: src/metrics.service.ts, line: 11, note: "logger.log mentioning a topic name is not a publish"}

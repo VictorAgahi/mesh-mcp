@@ -1,0 +1,12 @@
+# Fixture: layered Go services on segmentio/kafka-go (consumer -> service -> publisher).
+[workspace]
+name = "layered-go"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/vendor/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true

@@ -1,0 +1,17 @@
+# Fixture: Spring Boot monolith with in-process events, Kafka and a scheduled job.
+[workspace]
+name = "spring-monolith"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/target/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true
+
+[engines.contracts.spring]
+enabled = true
+property_files = ["**/src/main/resources/application*.yml"]
+resolve_placeholders = true

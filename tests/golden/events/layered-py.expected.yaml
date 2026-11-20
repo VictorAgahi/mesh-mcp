@@ -1,0 +1,65 @@
+# Hand-annotated from the source of examples/eda/layered-py. Never generated from tool output.
+# The Celery task is a consumer keyed by the task function name; `generate_report.delay(...)` is
+# its producer. Dependencies reach each class through __init__ (self._x.method(...) calls).
+corpus: layered-py
+root: examples/eda/layered-py
+config: mesh-mcp.toml
+languages: [python]
+
+producers:
+  - {id: p1, topic: invoice.issued, file: src/layered_py/publisher.py, line: 7, language: python, tags: [kafka_basic]}
+  - {id: p2, topic: generate_report, file: src/layered_py/service.py, line: 10, language: python, tags: [py_broker]}
+  - {id: p3, topic: report.ready, file: src/layered_py/report.py, line: 8, language: python, tags: [kafka_basic]}
+
+consumers:
+  - {id: c1, topic: orders.created, file: src/layered_py/consumer.py, line: 10, language: python, tags: [kafka_basic]}
+  - {id: c2, topic: generate_report, file: src/layered_py/tasks.py, line: 9, language: python, tags: [py_broker]}
+
+hops:
+  - id: h1
+    from: {symbol: OrderConsumer.run, file: src/layered_py/consumer.py, line: 15}
+    to: {symbol: OrderHandler.handle, file: src/layered_py/handler.py, line: 5}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h2
+    from: {symbol: OrderHandler.handle, file: src/layered_py/handler.py, line: 7}
+    to: {symbol: InvoiceService.issue, file: src/layered_py/service.py, line: 8}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h3
+    from: {symbol: InvoiceService.issue, file: src/layered_py/service.py, line: 9}
+    to: {symbol: InvoicePublisher.announce, file: src/layered_py/publisher.py, line: 5}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h4
+    from: {symbol: generate_report, file: src/layered_py/tasks.py, line: 10}
+    to: {symbol: build_report, file: src/layered_py/report.py, line: 6}
+    via: imported_function
+    tags: [layered_calls]
+
+chains:
+  - id: ch1
+    entry: {kind: topic, value: orders.created}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/layered_py/consumer.py, line: 10, topic: orders.created}
+      - {kind: call, file: src/layered_py/handler.py, line: 5}
+      - {kind: call, file: src/layered_py/service.py, line: 8}
+      - {kind: call, file: src/layered_py/publisher.py, line: 5}
+      - {kind: produce, file: src/layered_py/publisher.py, line: 7, topic: invoice.issued}
+    tags: [layered_calls]
+    min_hops: 3
+  # Kafka message -> Celery task -> second Kafka topic.
+  - id: ch2
+    entry: {kind: topic, value: orders.created}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/layered_py/consumer.py, line: 10, topic: orders.created}
+      - {kind: call, file: src/layered_py/handler.py, line: 5}
+      - {kind: call, file: src/layered_py/service.py, line: 8}
+      - {kind: produce, file: src/layered_py/service.py, line: 10, topic: generate_report}
+      - {kind: consume, file: src/layered_py/tasks.py, line: 9, topic: generate_report}
+      - {kind: call, file: src/layered_py/report.py, line: 6}
+      - {kind: produce, file: src/layered_py/report.py, line: 8, topic: report.ready}
+    tags: [layered_calls, py_broker]
+    min_hops: 3

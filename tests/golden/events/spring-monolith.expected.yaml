@@ -1,0 +1,126 @@
+# Hand-annotated from the source of examples/eda/spring-monolith. Never generated from tool output.
+# Spring in-process events are keyed by the event class name; the shipments consumer topic is the
+# value of app.topics.shipments in src/main/resources/application.yml (shipments.dispatched).
+corpus: spring-monolith
+root: examples/eda/spring-monolith
+config: mesh-mcp.toml
+languages: [java]
+
+producers:
+  - {id: p1, topic: OrderPlacedEvent, file: src/main/java/com/shop/OrderEventPublisher.java, line: 16, language: java, tags: [inproc_bus]}
+  - {id: p2, topic: FulfilmentStartedEvent, file: src/main/java/com/shop/FulfilmentService.java, line: 16, language: java, tags: [inproc_bus]}
+  - {id: p3, topic: payments.charged, file: src/main/java/com/shop/PaymentPublisher.java, line: 16, language: java, tags: [kafka_basic]}
+  - {id: p4, topic: payments.reconciled, file: src/main/java/com/shop/PaymentPublisher.java, line: 20, language: java, tags: [kafka_basic]}
+  - {id: p5, topic: shipments.dispatched, file: src/main/java/com/shop/ShipmentService.java, line: 16, language: java, tags: [kafka_basic]}
+
+consumers:
+  - {id: c1, topic: OrderPlacedEvent, file: src/main/java/com/shop/BillingListener.java, line: 16, language: java, tags: [inproc_bus]}
+  - {id: c2, topic: FulfilmentStartedEvent, file: src/main/java/com/shop/ShipmentListener.java, line: 18, language: java, tags: [inproc_bus]}
+  - {id: c3, topic: payments.charged, file: src/main/java/com/shop/PaymentsKafkaListener.java, line: 15, language: java, tags: [kafka_basic]}
+  - {id: c4, topic: shipments.dispatched, file: src/main/java/com/shop/ShipmentListener.java, line: 23, language: java, tags: [kafka_basic, config_topic]}
+
+hops:
+  - id: h1
+    from: {symbol: OrderController.create, file: src/main/java/com/shop/OrderController.java, line: 18}
+    to: {symbol: OrderService.place, file: src/main/java/com/shop/OrderService.java, line: 14}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h2
+    from: {symbol: OrderService.place, file: src/main/java/com/shop/OrderService.java, line: 15}
+    to: {symbol: OrderEventPublisher.announce, file: src/main/java/com/shop/OrderEventPublisher.java, line: 15}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h3
+    from: {symbol: BillingListener.onOrderPlaced, file: src/main/java/com/shop/BillingListener.java, line: 17}
+    to: {symbol: BillingService.charge, file: src/main/java/com/shop/BillingService.java, line: 12}
+    via: injected_field
+    tags: [layered_calls]
+  # h4 goes through the one @Autowired field of the corpus.
+  - id: h4
+    from: {symbol: BillingService.charge, file: src/main/java/com/shop/BillingService.java, line: 13}
+    to: {symbol: PaymentPublisher.publishCharged, file: src/main/java/com/shop/PaymentPublisher.java, line: 15}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h5
+    from: {symbol: PaymentsKafkaListener.onCharged, file: src/main/java/com/shop/PaymentsKafkaListener.java, line: 17}
+    to: {symbol: FulfilmentService.start, file: src/main/java/com/shop/FulfilmentService.java, line: 15}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h6
+    from: {symbol: ShipmentListener.onFulfilmentStarted, file: src/main/java/com/shop/ShipmentListener.java, line: 19}
+    to: {symbol: ShipmentService.dispatch, file: src/main/java/com/shop/ShipmentService.java, line: 15}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h7
+    from: {symbol: ReconcileJob.hourly, file: src/main/java/com/shop/ReconcileJob.java, line: 17}
+    to: {symbol: BillingService.reconcile, file: src/main/java/com/shop/BillingService.java, line: 16}
+    via: injected_field
+    tags: [layered_calls, cron]
+  - id: h8
+    from: {symbol: BillingService.reconcile, file: src/main/java/com/shop/BillingService.java, line: 17}
+    to: {symbol: PaymentPublisher.publishReconciled, file: src/main/java/com/shop/PaymentPublisher.java, line: 19}
+    via: injected_field
+    tags: [layered_calls, cron]
+
+chains:
+  # HTTP route -> Spring event -> Kafka -> Spring event -> Kafka topic from application.yml.
+  - id: ch1
+    entry: {kind: route, value: POST /orders}
+    direction: forward
+    steps:
+      - {kind: call, file: src/main/java/com/shop/OrderController.java, line: 17}
+      - {kind: call, file: src/main/java/com/shop/OrderService.java, line: 14}
+      - {kind: call, file: src/main/java/com/shop/OrderEventPublisher.java, line: 15}
+      - {kind: produce, file: src/main/java/com/shop/OrderEventPublisher.java, line: 16, topic: OrderPlacedEvent}
+      - {kind: consume, file: src/main/java/com/shop/BillingListener.java, line: 16, topic: OrderPlacedEvent}
+      - {kind: call, file: src/main/java/com/shop/BillingService.java, line: 12}
+      - {kind: call, file: src/main/java/com/shop/PaymentPublisher.java, line: 15}
+      - {kind: produce, file: src/main/java/com/shop/PaymentPublisher.java, line: 16, topic: payments.charged}
+      - {kind: consume, file: src/main/java/com/shop/PaymentsKafkaListener.java, line: 15, topic: payments.charged}
+      - {kind: call, file: src/main/java/com/shop/FulfilmentService.java, line: 15}
+      - {kind: produce, file: src/main/java/com/shop/FulfilmentService.java, line: 16, topic: FulfilmentStartedEvent}
+      - {kind: consume, file: src/main/java/com/shop/ShipmentListener.java, line: 18, topic: FulfilmentStartedEvent}
+      - {kind: call, file: src/main/java/com/shop/ShipmentService.java, line: 15}
+      - {kind: produce, file: src/main/java/com/shop/ShipmentService.java, line: 16, topic: shipments.dispatched}
+      - {kind: consume, file: src/main/java/com/shop/ShipmentListener.java, line: 23, topic: shipments.dispatched}
+    tags: [inproc_bus, kafka_basic, layered_calls, config_topic]
+    min_hops: 7
+  - id: ch2
+    entry: {kind: topic, value: OrderPlacedEvent}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/main/java/com/shop/BillingListener.java, line: 16, topic: OrderPlacedEvent}
+      - {kind: call, file: src/main/java/com/shop/BillingService.java, line: 12}
+      - {kind: call, file: src/main/java/com/shop/PaymentPublisher.java, line: 15}
+      - {kind: produce, file: src/main/java/com/shop/PaymentPublisher.java, line: 16, topic: payments.charged}
+    tags: [inproc_bus, layered_calls]
+    min_hops: 2
+  - id: ch3
+    entry: {kind: topic, value: payments.charged}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/main/java/com/shop/PaymentsKafkaListener.java, line: 15, topic: payments.charged}
+      - {kind: call, file: src/main/java/com/shop/FulfilmentService.java, line: 15}
+      - {kind: produce, file: src/main/java/com/shop/FulfilmentService.java, line: 16, topic: FulfilmentStartedEvent}
+    tags: [kafka_basic, inproc_bus, layered_calls]
+    min_hops: 1
+  - id: ch4
+    entry: {kind: topic, value: FulfilmentStartedEvent}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/main/java/com/shop/ShipmentListener.java, line: 18, topic: FulfilmentStartedEvent}
+      - {kind: call, file: src/main/java/com/shop/ShipmentService.java, line: 15}
+      - {kind: produce, file: src/main/java/com/shop/ShipmentService.java, line: 16, topic: shipments.dispatched}
+      - {kind: consume, file: src/main/java/com/shop/ShipmentListener.java, line: 23, topic: shipments.dispatched}
+    tags: [inproc_bus, config_topic, layered_calls]
+    min_hops: 1
+  - id: ch5
+    entry: {kind: cron, value: ReconcileJob.hourly}
+    direction: forward
+    steps:
+      - {kind: call, file: src/main/java/com/shop/ReconcileJob.java, line: 16}
+      - {kind: call, file: src/main/java/com/shop/BillingService.java, line: 16}
+      - {kind: call, file: src/main/java/com/shop/PaymentPublisher.java, line: 19}
+      - {kind: produce, file: src/main/java/com/shop/PaymentPublisher.java, line: 20, topic: payments.reconciled}
+    tags: [cron, kafka_basic, layered_calls]
+    min_hops: 3

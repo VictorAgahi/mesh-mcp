@@ -1,0 +1,98 @@
+# Hand-annotated from the source of examples/polyglot-shop (no fixture edits); events only, the gRPC
+# edges are scored elsewhere. Several services here are demo stubs: the payment-worker topics are
+# fields of PaymentWorker and the inventory-manager topics are string arguments of subscribe/publish,
+# with no broker client; a reader still sees a consumer and a producer there, so they are annotated
+# (tags go_broker / untagged for Rust, expected to score 0 on 8.0.1). The python consumers use the
+# project's own @kafka_consumer decorator, which a reader recognises as a consumer registration.
+corpus: polyglot-shop
+root: examples/polyglot-shop
+config: mesh-mcp.toml
+languages: [ts, java, go, python, rust]
+
+producers:
+  - {id: p1, topic: order-created-topic, file: services/order-gateway/order.service.ts, line: 37, language: ts, tags: [kafka_basic]}
+  - {id: p2, topic: invoice-generated-topic, file: services/billing-saga/BillingSaga.java, line: 24, language: java, tags: [kafka_basic]}
+  - {id: p3, topic: payment-settled-topic, file: services/payment-worker/main.go, line: 29, language: go, tags: [go_broker]}
+  - {id: p4, topic: stock-reserved-topic, file: services/inventory-manager/src/main.rs, line: 39, language: rust, tags: []}
+
+consumers:
+  - {id: c1, topic: order-created-topic, file: services/billing-saga/BillingSaga.java, line: 16, language: java, tags: [kafka_basic]}
+  - {id: c2, topic: order-created-topic, file: services/notification-hub/main.py, line: 18, language: python, tags: [py_broker]}
+  - {id: c3, topic: payment-settled-topic, file: services/notification-hub/main.py, line: 22, language: python, tags: [py_broker]}
+  - {id: c4, topic: stock-reserved-topic, file: services/notification-hub/main.py, line: 26, language: python, tags: [py_broker]}
+  - {id: c5, topic: order-created-topic, file: services/payment-worker/main.go, line: 28, language: go, tags: [go_broker]}
+  - {id: c6, topic: payment-settled-topic, file: services/inventory-manager/src/main.rs, line: 32, language: rust, tags: []}
+
+hops:
+  # `server := &PaymentServer{}` is a local object of a known type in the same file.
+  - id: h1
+    from: {symbol: PaymentWorker.HandleOrderCreated, file: services/payment-worker/main.go, line: 35}
+    to: {symbol: PaymentServer.ProcessPayment, file: services/payment-worker/main.go, line: 15}
+    via: same_module
+    tags: [layered_calls]
+  - id: h2
+    from: {symbol: InventoryConsumer.listen, file: services/inventory-manager/src/main.rs, line: 32}
+    to: {symbol: InventoryConsumer.subscribe, file: services/inventory-manager/src/main.rs, line: 35}
+    via: this
+    tags: [layered_calls]
+  - id: h3
+    from: {symbol: InventoryConsumer.subscribe, file: services/inventory-manager/src/main.rs, line: 37}
+    to: {symbol: InventoryServiceServer.reserve_stock, file: services/inventory-manager/src/main.rs, line: 13}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h4
+    from: {symbol: InventoryConsumer.subscribe, file: services/inventory-manager/src/main.rs, line: 39}
+    to: {symbol: InventoryConsumer.publish, file: services/inventory-manager/src/main.rs, line: 43}
+    via: this
+    tags: [layered_calls]
+
+chains:
+  # Same-file control: consumer and producer in one handler.
+  - id: ch1
+    entry: {kind: topic, value: order-created-topic}
+    direction: forward
+    steps:
+      - {kind: consume, file: services/billing-saga/BillingSaga.java, line: 16, topic: order-created-topic}
+      - {kind: produce, file: services/billing-saga/BillingSaga.java, line: 24, topic: invoice-generated-topic}
+    tags: [kafka_basic]
+    min_hops: 0
+  - id: ch2
+    entry: {kind: topic, value: order-created-topic}
+    direction: forward
+    steps:
+      - {kind: consume, file: services/payment-worker/main.go, line: 28, topic: order-created-topic}
+      - {kind: call, file: services/payment-worker/main.go, line: 15}
+      - {kind: produce, file: services/payment-worker/main.go, line: 29, topic: payment-settled-topic}
+    tags: [go_broker, layered_calls]
+    min_hops: 1
+  - id: ch3
+    entry: {kind: topic, value: payment-settled-topic}
+    direction: forward
+    steps:
+      - {kind: consume, file: services/inventory-manager/src/main.rs, line: 32, topic: payment-settled-topic}
+      - {kind: call, file: services/inventory-manager/src/main.rs, line: 35}
+      - {kind: call, file: services/inventory-manager/src/main.rs, line: 13}
+      - {kind: produce, file: services/inventory-manager/src/main.rs, line: 39, topic: stock-reserved-topic}
+    tags: [layered_calls]
+    min_hops: 2
+  # Whole shop flow across four languages, from the gRPC handler to the notification.
+  - id: ch4
+    entry: {kind: handler, value: OrderService.createOrder}
+    direction: forward
+    steps:
+      - {kind: call, file: services/order-gateway/order.service.ts, line: 27}
+      - {kind: produce, file: services/order-gateway/order.service.ts, line: 37, topic: order-created-topic}
+      - {kind: consume, file: services/payment-worker/main.go, line: 28, topic: order-created-topic}
+      - {kind: call, file: services/payment-worker/main.go, line: 15}
+      - {kind: produce, file: services/payment-worker/main.go, line: 29, topic: payment-settled-topic}
+      - {kind: consume, file: services/inventory-manager/src/main.rs, line: 32, topic: payment-settled-topic}
+      - {kind: call, file: services/inventory-manager/src/main.rs, line: 35}
+      - {kind: call, file: services/inventory-manager/src/main.rs, line: 13}
+      - {kind: produce, file: services/inventory-manager/src/main.rs, line: 39, topic: stock-reserved-topic}
+      - {kind: consume, file: services/notification-hub/main.py, line: 26, topic: stock-reserved-topic}
+    tags: [layered_calls, go_broker, py_broker]
+    min_hops: 4
+
+negatives:
+  - {kind: producer, file: services/billing-saga/BillingSaga.java, line: 28, note: "the nested KafkaTemplate.send declaration is not a publish call"}
+  - {kind: consumer, file: services/notification-hub/main.py, line: 12, note: "the decorator factory body is not a consumer registration"}

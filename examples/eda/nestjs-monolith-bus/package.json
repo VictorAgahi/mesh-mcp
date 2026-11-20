@@ -1,0 +1,12 @@
+{
+  "name": "nestjs-monolith-bus",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@nestjs/common": "^10.0.0",
+    "@nestjs/core": "^10.0.0",
+    "@nestjs/cqrs": "^10.2.0",
+    "@nestjs/event-emitter": "^2.0.0",
+    "@nestjs/schedule": "^4.0.0"
+  }
+}

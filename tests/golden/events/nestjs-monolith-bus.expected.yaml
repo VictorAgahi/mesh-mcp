@@ -1,0 +1,128 @@
+# Hand-annotated from the source of examples/eda/nestjs-monolith-bus. Never generated from tool output.
+# In-process buses: the topic key of EventEmitter2 is the event name string; the topic key of
+# NestJS CQRS is the command or event CLASS name (written as in the source; scorers lower-case it).
+# A cron entry is not a consumer item: it appears as the entry of a chain (kind: cron).
+corpus: nestjs-monolith-bus
+root: examples/eda/nestjs-monolith-bus
+config: mesh-mcp.toml
+languages: [ts]
+
+producers:
+  - {id: p1, topic: order.created, file: src/order.events.ts, line: 9, language: ts, tags: [inproc_bus]}
+  - {id: p2, topic: invoice.issued, file: src/invoice.service.ts, line: 10, language: ts, tags: [inproc_bus]}
+  - {id: p3, topic: report.generated, file: src/report.service.ts, line: 9, language: ts, tags: [inproc_bus]}
+  - {id: p4, topic: report.purged, file: src/report.service.ts, line: 13, language: ts, tags: [inproc_bus]}
+  - {id: p5, topic: IssueRefundCommand, file: src/refund.service.ts, line: 10, language: ts, tags: [inproc_bus, cqrs]}
+  - {id: p6, topic: RefundIssuedEvent, file: src/refund.ledger.ts, line: 10, language: ts, tags: [inproc_bus, cqrs]}
+  - {id: p7, topic: SendReceiptCommand, file: src/refund.saga.ts, line: 12, language: ts, tags: [inproc_bus, cqrs]}
+
+consumers:
+  - {id: c1, topic: order.created, file: src/invoice.listener.ts, line: 9, language: ts, tags: [inproc_bus]}
+  - {id: c2, topic: invoice.issued, file: src/ledger.listener.ts, line: 6, language: ts, tags: [inproc_bus]}
+  - {id: c3, topic: report.generated, file: src/report.listener.ts, line: 6, language: ts, tags: [inproc_bus]}
+  - {id: c4, topic: report.purged, file: src/report.listener.ts, line: 11, language: ts, tags: [inproc_bus]}
+  - {id: c5, topic: IssueRefundCommand, file: src/refund.handlers.ts, line: 5, language: ts, tags: [inproc_bus, cqrs]}
+  - {id: c6, topic: RefundIssuedEvent, file: src/refund.handlers.ts, line: 21, language: ts, tags: [inproc_bus, cqrs]}
+  - {id: c7, topic: RefundIssuedEvent, file: src/refund.saga.ts, line: 11, language: ts, tags: [inproc_bus, cqrs]}
+  - {id: c8, topic: SendReceiptCommand, file: src/refund.handlers.ts, line: 14, language: ts, tags: [inproc_bus, cqrs]}
+
+hops:
+  - id: h1
+    from: {symbol: OrderController.create, file: src/order.controller.ts, line: 10}
+    to: {symbol: OrderService.create, file: src/order.service.ts, line: 8}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h2
+    from: {symbol: OrderService.create, file: src/order.service.ts, line: 10}
+    to: {symbol: OrderEvents.announce, file: src/order.events.ts, line: 8}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h3
+    from: {symbol: InvoiceListener.onOrderCreated, file: src/invoice.listener.ts, line: 11}
+    to: {symbol: InvoiceService.issue, file: src/invoice.service.ts, line: 8}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h4
+    from: {symbol: RefundController.request, file: src/refund.controller.ts, line: 10}
+    to: {symbol: RefundService.request, file: src/refund.service.ts, line: 9}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h5
+    from: {symbol: IssueRefundHandler.execute, file: src/refund.handlers.ts, line: 10}
+    to: {symbol: RefundLedger.record, file: src/refund.ledger.ts, line: 9}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h6
+    from: {symbol: ReportScheduler.hourly, file: src/report.scheduler.ts, line: 11}
+    to: {symbol: ReportService.generate, file: src/report.service.ts, line: 8}
+    via: injected_field
+    tags: [layered_calls, cron]
+  - id: h7
+    from: {symbol: ReportScheduler.nightlyPurge, file: src/report.scheduler.ts, line: 16}
+    to: {symbol: ReportService.purge, file: src/report.service.ts, line: 12}
+    via: injected_field
+    tags: [layered_calls, cron]
+
+chains:
+  # HTTP route -> two EventEmitter2 events across four layers and three files.
+  - id: ch1
+    entry: {kind: route, value: POST /orders}
+    direction: forward
+    steps:
+      - {kind: call, file: src/order.controller.ts, line: 9}
+      - {kind: call, file: src/order.service.ts, line: 8}
+      - {kind: call, file: src/order.events.ts, line: 8}
+      - {kind: produce, file: src/order.events.ts, line: 9, topic: order.created}
+      - {kind: consume, file: src/invoice.listener.ts, line: 9, topic: order.created}
+      - {kind: call, file: src/invoice.service.ts, line: 8}
+      - {kind: produce, file: src/invoice.service.ts, line: 10, topic: invoice.issued}
+      - {kind: consume, file: src/ledger.listener.ts, line: 6, topic: invoice.issued}
+    tags: [inproc_bus, layered_calls]
+    min_hops: 4
+  # HTTP route -> command -> event -> saga -> second command (the topic key is the class name).
+  - id: ch2
+    entry: {kind: route, value: POST /refunds}
+    direction: forward
+    steps:
+      - {kind: call, file: src/refund.controller.ts, line: 9}
+      - {kind: call, file: src/refund.service.ts, line: 9}
+      - {kind: produce, file: src/refund.service.ts, line: 10, topic: IssueRefundCommand}
+      - {kind: consume, file: src/refund.handlers.ts, line: 5, topic: IssueRefundCommand}
+      - {kind: call, file: src/refund.ledger.ts, line: 9}
+      - {kind: produce, file: src/refund.ledger.ts, line: 10, topic: RefundIssuedEvent}
+      - {kind: consume, file: src/refund.saga.ts, line: 11, topic: RefundIssuedEvent}
+      - {kind: produce, file: src/refund.saga.ts, line: 12, topic: SendReceiptCommand}
+      - {kind: consume, file: src/refund.handlers.ts, line: 14, topic: SendReceiptCommand}
+    tags: [inproc_bus, cqrs, layered_calls]
+    min_hops: 3
+  # Bus-only part of the CQRS flow; RefundIssuedEvent fans out to the saga and to an audit handler.
+  - id: ch3
+    entry: {kind: topic, value: IssueRefundCommand}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/refund.handlers.ts, line: 5, topic: IssueRefundCommand}
+      - {kind: call, file: src/refund.ledger.ts, line: 9}
+      - {kind: produce, file: src/refund.ledger.ts, line: 10, topic: RefundIssuedEvent}
+      - {kind: consume, file: src/refund.handlers.ts, line: 21, topic: RefundIssuedEvent}
+    tags: [inproc_bus, cqrs]
+    min_hops: 1
+  - id: ch4
+    entry: {kind: cron, value: ReportScheduler.hourly}
+    direction: forward
+    steps:
+      - {kind: call, file: src/report.scheduler.ts, line: 10}
+      - {kind: call, file: src/report.service.ts, line: 8}
+      - {kind: produce, file: src/report.service.ts, line: 9, topic: report.generated}
+      - {kind: consume, file: src/report.listener.ts, line: 6, topic: report.generated}
+    tags: [cron, inproc_bus, layered_calls]
+    min_hops: 2
+  - id: ch5
+    entry: {kind: cron, value: ReportScheduler.nightlyPurge}
+    direction: forward
+    steps:
+      - {kind: call, file: src/report.scheduler.ts, line: 15}
+      - {kind: call, file: src/report.service.ts, line: 12}
+      - {kind: produce, file: src/report.service.ts, line: 13, topic: report.purged}
+      - {kind: consume, file: src/report.listener.ts, line: 11, topic: report.purged}
+    tags: [cron, inproc_bus, layered_calls]
+    min_hops: 2

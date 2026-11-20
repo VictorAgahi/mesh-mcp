@@ -1,0 +1,12 @@
+# Fixture: NestJS monolith with in-process buses (EventEmitter2, CQRS) and cron entries.
+[workspace]
+name = "nestjs-monolith-bus"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/node_modules/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true

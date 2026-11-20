@@ -1,0 +1,4 @@
+[project]
+name = "layered-py"
+version = "1.0.0"
+dependencies = ["confluent-kafka>=2.3", "celery>=5.3"]
