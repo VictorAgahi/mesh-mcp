@@ -1,0 +1,69 @@
+{
+ "corpus": "/Users/victoragahi/bench-repos/kubernetes",
+ "variant": "plain",
+ "platform": "darwin",
+ "real_repo": true,
+ "runs": [
+  {
+   "boot_ms": 8061.5,
+   "rss_peak_mb": 341.1,
+   "search_p50_ms": 0.2,
+   "search_p95_ms": 56.2,
+   "reload_ms": null,
+   "load1_start": 3.18,
+   "load1_end": 3.73,
+   "calm_at_start": true,
+   "wall_s": 8.4,
+   "rss_peak_source": "time -l peak memory footprint",
+   "scopes_used": 1,
+   "files_indexed": 30527,
+   "contract_nodes": 194934,
+   "error": null,
+   "violations": []
+  },
+  {
+   "boot_ms": 6395.4,
+   "rss_peak_mb": 319.1,
+   "search_p50_ms": 0.2,
+   "search_p95_ms": 52.8,
+   "reload_ms": null,
+   "load1_start": 3.73,
+   "load1_end": 3.98,
+   "calm_at_start": true,
+   "wall_s": 6.7,
+   "rss_peak_source": "time -l peak memory footprint",
+   "scopes_used": 1,
+   "files_indexed": 30527,
+   "contract_nodes": 194934,
+   "error": null,
+   "violations": []
+  },
+  {
+   "boot_ms": 6124.3,
+   "rss_peak_mb": 315.2,
+   "search_p50_ms": 0.2,
+   "search_p95_ms": 54.7,
+   "reload_ms": null,
+   "load1_start": 3.98,
+   "load1_end": 4.39,
+   "calm_at_start": true,
+   "wall_s": 6.5,
+   "rss_peak_source": "time -l peak memory footprint",
+   "scopes_used": 1,
+   "files_indexed": 30527,
+   "contract_nodes": 194934,
+   "error": null,
+   "violations": []
+  }
+ ],
+ "medians": {
+  "boot_ms": 6395.4,
+  "rss_peak_mb": 319.1,
+  "search_p50_ms": 0.2,
+  "search_p95_ms": 54.7,
+  "reload_ms": null
+ },
+ "calm": true,
+ "violations": [],
+ "ok": true
+}

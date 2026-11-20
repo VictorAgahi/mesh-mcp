@@ -1,0 +1,1 @@
+- Add `docs/baselines/8.0.1/`: event scores (golden corpora), Volontariapp and fixture unresolved share, kubernetes memory and latency, all measured with the 8.0.1 binary (no code change).

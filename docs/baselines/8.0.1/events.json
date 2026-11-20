@@ -1,0 +1,1721 @@
+{
+  "binary": "/Users/victoragahi/cargo-targets/baseline-8.0.1/mesh-mcp",
+  "chain_tool": "analyze_impact",
+  "chain_order": "strict",
+  "line_tolerance": 2,
+  "ignored_test_sites": 4,
+  "optional_ignored": 8,
+  "corpora": {
+    "layered-go": {
+      "total": {
+        "tp": 5,
+        "fp": 0,
+        "fn": 10,
+        "precision_ambiguous_counted": 1.0,
+        "precision_ambiguous_excluded": 1.0,
+        "recall": 0.3333333333333333,
+        "line_accuracy": 1.0,
+        "line_samples": 5,
+        "tp_line_ok": 5,
+        "chains_total": 4,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "category": {
+        "chain": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 4,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 4,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "consumer": {
+          "tp": 2,
+          "fp": 0,
+          "fn": 0,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 1.0,
+          "line_accuracy": 1.0,
+          "line_samples": 2,
+          "tp_line_ok": 2,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "hop": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 6,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "producer": {
+          "tp": 3,
+          "fp": 0,
+          "fn": 0,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 1.0,
+          "line_accuracy": 1.0,
+          "line_samples": 3,
+          "tp_line_ok": 3,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "language": {
+        "go": {
+          "tp": 5,
+          "fp": 0,
+          "fn": 10,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 0.3333333333333333,
+          "line_accuracy": 1.0,
+          "line_samples": 5,
+          "tp_line_ok": 5,
+          "chains_total": 4,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "tag": {
+        "kafka_basic": {
+          "tp": 5,
+          "fp": 0,
+          "fn": 0,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 1.0,
+          "line_accuracy": 1.0,
+          "line_samples": 5,
+          "tp_line_ok": 5,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "layered_calls": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 10,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 4,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "chains": {
+        "all": {
+          "chains": 4,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "min_hops_ge_3": {
+          "chains": 1,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "per_direction": {
+          "forward": {
+            "chains": 4,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          }
+        },
+        "longer_than_cap": {
+          "chains": 1,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "depth_cap": 5,
+        "per_tag": {
+          "layered_calls": {
+            "chains": 4,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          }
+        }
+      },
+      "negatives_hit": [],
+      "ignored_test_sites": 0,
+      "optional_ignored": 0,
+      "optional_ids": []
+    },
+    "layered-py": {
+      "total": {
+        "tp": 5,
+        "fp": 0,
+        "fn": 6,
+        "precision_ambiguous_counted": 1.0,
+        "precision_ambiguous_excluded": 1.0,
+        "recall": 0.45454545454545453,
+        "line_accuracy": 1.0,
+        "line_samples": 5,
+        "tp_line_ok": 5,
+        "chains_total": 2,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "category": {
+        "chain": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 2,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 2,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "consumer": {
+          "tp": 2,
+          "fp": 0,
+          "fn": 0,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 1.0,
+          "line_accuracy": 1.0,
+          "line_samples": 2,
+          "tp_line_ok": 2,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "hop": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 4,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "producer": {
+          "tp": 3,
+          "fp": 0,
+          "fn": 0,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 1.0,
+          "line_accuracy": 1.0,
+          "line_samples": 3,
+          "tp_line_ok": 3,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "language": {
+        "python": {
+          "tp": 5,
+          "fp": 0,
+          "fn": 6,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 0.45454545454545453,
+          "line_accuracy": 1.0,
+          "line_samples": 5,
+          "tp_line_ok": 5,
+          "chains_total": 2,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "tag": {
+        "kafka_basic": {
+          "tp": 3,
+          "fp": 0,
+          "fn": 0,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 1.0,
+          "line_accuracy": 1.0,
+          "line_samples": 3,
+          "tp_line_ok": 3,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "layered_calls": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 6,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 2,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "py_broker": {
+          "tp": 2,
+          "fp": 0,
+          "fn": 1,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 0.6666666666666666,
+          "line_accuracy": 1.0,
+          "line_samples": 2,
+          "tp_line_ok": 2,
+          "chains_total": 1,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "chains": {
+        "all": {
+          "chains": 2,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "min_hops_ge_3": {
+          "chains": 2,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "per_direction": {
+          "forward": {
+            "chains": 2,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          }
+        },
+        "longer_than_cap": {
+          "chains": 1,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "depth_cap": 5,
+        "per_tag": {
+          "layered_calls": {
+            "chains": 2,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          },
+          "py_broker": {
+            "chains": 1,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          }
+        }
+      },
+      "negatives_hit": [],
+      "ignored_test_sites": 0,
+      "optional_ignored": 0,
+      "optional_ids": []
+    },
+    "layered-ts": {
+      "total": {
+        "tp": 12,
+        "fp": 0,
+        "fn": 22,
+        "precision_ambiguous_counted": 1.0,
+        "precision_ambiguous_excluded": 1.0,
+        "recall": 0.35294117647058826,
+        "line_accuracy": 0.9090909090909091,
+        "line_samples": 11,
+        "tp_line_ok": 10,
+        "chains_total": 10,
+        "chains_in_order": 1,
+        "chains_presence": 1
+      },
+      "category": {
+        "chain": {
+          "tp": 1,
+          "fp": 0,
+          "fn": 9,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.1,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 10,
+          "chains_in_order": 1,
+          "chains_presence": 1
+        },
+        "consumer": {
+          "tp": 5,
+          "fp": 0,
+          "fn": 0,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 1.0,
+          "line_accuracy": 1.0,
+          "line_samples": 5,
+          "tp_line_ok": 5,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "hop": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 13,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "producer": {
+          "tp": 6,
+          "fp": 0,
+          "fn": 0,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 1.0,
+          "line_accuracy": 0.8333333333333334,
+          "line_samples": 6,
+          "tp_line_ok": 5,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "language": {
+        "ts": {
+          "tp": 12,
+          "fp": 0,
+          "fn": 22,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 0.35294117647058826,
+          "line_accuracy": 0.9090909090909091,
+          "line_samples": 11,
+          "tp_line_ok": 10,
+          "chains_total": 10,
+          "chains_in_order": 1,
+          "chains_presence": 1
+        }
+      },
+      "tag": {
+        "kafka_basic": {
+          "tp": 12,
+          "fp": 0,
+          "fn": 0,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 1.0,
+          "line_accuracy": 0.9090909090909091,
+          "line_samples": 11,
+          "tp_line_ok": 10,
+          "chains_total": 1,
+          "chains_in_order": 1,
+          "chains_presence": 1
+        },
+        "layered_calls": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 22,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 9,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "chains": {
+        "all": {
+          "chains": 10,
+          "in_order": 1,
+          "presence": 1,
+          "recall_in_order": 0.1,
+          "recall_presence": 0.1
+        },
+        "min_hops_ge_3": {
+          "chains": 4,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "per_direction": {
+          "forward": {
+            "chains": 9,
+            "in_order": 1,
+            "presence": 1,
+            "recall_in_order": 0.1111111111111111,
+            "recall_presence": 0.1111111111111111
+          },
+          "reverse": {
+            "chains": 1,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          }
+        },
+        "longer_than_cap": {
+          "chains": 2,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "depth_cap": 5,
+        "per_tag": {
+          "kafka_basic": {
+            "chains": 1,
+            "in_order": 1,
+            "presence": 1,
+            "recall_in_order": 1.0,
+            "recall_presence": 1.0
+          },
+          "layered_calls": {
+            "chains": 9,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          }
+        }
+      },
+      "negatives_hit": [],
+      "ignored_test_sites": 0,
+      "optional_ignored": 0,
+      "optional_ids": []
+    },
+    "nestjs-monolith-bus": {
+      "total": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 27,
+        "precision_ambiguous_counted": null,
+        "precision_ambiguous_excluded": null,
+        "recall": 0.0,
+        "line_accuracy": null,
+        "line_samples": 0,
+        "tp_line_ok": 0,
+        "chains_total": 5,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "category": {
+        "chain": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 5,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 5,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "consumer": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 8,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "hop": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 7,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "producer": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 7,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "language": {
+        "ts": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 27,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 5,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "tag": {
+        "cqrs": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 9,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 2,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "cron": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 4,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 2,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "inproc_bus": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 20,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 5,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "layered_calls": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 11,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 4,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "chains": {
+        "all": {
+          "chains": 5,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "min_hops_ge_3": {
+          "chains": 2,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "per_direction": {
+          "forward": {
+            "chains": 5,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          }
+        },
+        "longer_than_cap": {
+          "chains": 2,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "depth_cap": 5,
+        "per_tag": {
+          "cqrs": {
+            "chains": 2,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          },
+          "cron": {
+            "chains": 2,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          },
+          "inproc_bus": {
+            "chains": 5,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          },
+          "layered_calls": {
+            "chains": 4,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          }
+        }
+      },
+      "negatives_hit": [],
+      "ignored_test_sites": 0,
+      "optional_ignored": 0,
+      "optional_ids": []
+    },
+    "polyglot-shop": {
+      "total": {
+        "tp": 3,
+        "fp": 2,
+        "fn": 6,
+        "precision_ambiguous_counted": 0.6,
+        "precision_ambiguous_excluded": 0.6,
+        "recall": 0.3333333333333333,
+        "line_accuracy": 1.0,
+        "line_samples": 3,
+        "tp_line_ok": 3,
+        "chains_total": 2,
+        "chains_in_order": 0,
+        "chains_presence": 1
+      },
+      "category": {
+        "chain": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 2,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 2,
+          "chains_in_order": 0,
+          "chains_presence": 1
+        },
+        "consumer": {
+          "tp": 1,
+          "fp": 0,
+          "fn": 0,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 1.0,
+          "line_accuracy": 1.0,
+          "line_samples": 1,
+          "tp_line_ok": 1,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "hop": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 4,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "producer": {
+          "tp": 2,
+          "fp": 2,
+          "fn": 0,
+          "precision_ambiguous_counted": 0.5,
+          "precision_ambiguous_excluded": 0.5,
+          "recall": 1.0,
+          "line_accuracy": 1.0,
+          "line_samples": 2,
+          "tp_line_ok": 2,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "language": {
+        "go": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 1,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "java": {
+          "tp": 2,
+          "fp": 1,
+          "fn": 1,
+          "precision_ambiguous_counted": 0.6666666666666666,
+          "precision_ambiguous_excluded": 0.6666666666666666,
+          "recall": 0.6666666666666666,
+          "line_accuracy": 1.0,
+          "line_samples": 2,
+          "tp_line_ok": 2,
+          "chains_total": 1,
+          "chains_in_order": 0,
+          "chains_presence": 1
+        },
+        "rust": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 3,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "ts": {
+          "tp": 1,
+          "fp": 1,
+          "fn": 1,
+          "precision_ambiguous_counted": 0.5,
+          "precision_ambiguous_excluded": 0.5,
+          "recall": 0.5,
+          "line_accuracy": 1.0,
+          "line_samples": 1,
+          "tp_line_ok": 1,
+          "chains_total": 1,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "tag": {
+        "kafka_basic": {
+          "tp": 3,
+          "fp": 2,
+          "fn": 2,
+          "precision_ambiguous_counted": 0.6,
+          "precision_ambiguous_excluded": 0.6,
+          "recall": 0.6,
+          "line_accuracy": 1.0,
+          "line_samples": 3,
+          "tp_line_ok": 3,
+          "chains_total": 2,
+          "chains_in_order": 0,
+          "chains_presence": 1
+        },
+        "layered_calls": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 4,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "chains": {
+        "all": {
+          "chains": 2,
+          "in_order": 0,
+          "presence": 1,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.5
+        },
+        "min_hops_ge_3": {
+          "chains": 0,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": null,
+          "recall_presence": null
+        },
+        "per_direction": {
+          "forward": {
+            "chains": 2,
+            "in_order": 0,
+            "presence": 1,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.5
+          }
+        },
+        "longer_than_cap": {
+          "chains": 0,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": null,
+          "recall_presence": null
+        },
+        "depth_cap": 5,
+        "per_tag": {
+          "kafka_basic": {
+            "chains": 2,
+            "in_order": 0,
+            "presence": 1,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.5
+          }
+        }
+      },
+      "negatives_hit": [],
+      "ignored_test_sites": 0,
+      "optional_ignored": 8,
+      "optional_ids": [
+        "producer p3",
+        "producer p4",
+        "consumer c2",
+        "consumer c3",
+        "consumer c4",
+        "consumer c5",
+        "consumer c6",
+        "consumer c7"
+      ]
+    },
+    "spring-monolith": {
+      "total": {
+        "tp": 4,
+        "fp": 1,
+        "fn": 18,
+        "precision_ambiguous_counted": 0.8,
+        "precision_ambiguous_excluded": 0.8,
+        "recall": 0.18181818181818182,
+        "line_accuracy": 1.0,
+        "line_samples": 4,
+        "tp_line_ok": 4,
+        "chains_total": 5,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "category": {
+        "chain": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 5,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 5,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "consumer": {
+          "tp": 1,
+          "fp": 1,
+          "fn": 3,
+          "precision_ambiguous_counted": 0.5,
+          "precision_ambiguous_excluded": 0.5,
+          "recall": 0.25,
+          "line_accuracy": 1.0,
+          "line_samples": 1,
+          "tp_line_ok": 1,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "hop": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 8,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "producer": {
+          "tp": 3,
+          "fp": 0,
+          "fn": 2,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 0.6,
+          "line_accuracy": 1.0,
+          "line_samples": 3,
+          "tp_line_ok": 3,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "language": {
+        "java": {
+          "tp": 4,
+          "fp": 1,
+          "fn": 18,
+          "precision_ambiguous_counted": 0.8,
+          "precision_ambiguous_excluded": 0.8,
+          "recall": 0.18181818181818182,
+          "line_accuracy": 1.0,
+          "line_samples": 4,
+          "tp_line_ok": 4,
+          "chains_total": 5,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "tag": {
+        "config_topic": {
+          "tp": 0,
+          "fp": 1,
+          "fn": 3,
+          "precision_ambiguous_counted": 0.0,
+          "precision_ambiguous_excluded": 0.0,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 2,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "cron": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 3,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 1,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "inproc_bus": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 8,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 4,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "kafka_basic": {
+          "tp": 4,
+          "fp": 1,
+          "fn": 4,
+          "precision_ambiguous_counted": 0.8,
+          "precision_ambiguous_excluded": 0.8,
+          "recall": 0.5,
+          "line_accuracy": 1.0,
+          "line_samples": 4,
+          "tp_line_ok": 4,
+          "chains_total": 3,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "layered_calls": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 13,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 5,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "chains": {
+        "all": {
+          "chains": 5,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "min_hops_ge_3": {
+          "chains": 2,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "per_direction": {
+          "forward": {
+            "chains": 5,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          }
+        },
+        "longer_than_cap": {
+          "chains": 1,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "depth_cap": 5,
+        "per_tag": {
+          "config_topic": {
+            "chains": 2,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          },
+          "cron": {
+            "chains": 1,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          },
+          "inproc_bus": {
+            "chains": 4,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          },
+          "kafka_basic": {
+            "chains": 3,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          },
+          "layered_calls": {
+            "chains": 5,
+            "in_order": 0,
+            "presence": 0,
+            "recall_in_order": 0.0,
+            "recall_presence": 0.0
+          }
+        }
+      },
+      "negatives_hit": [],
+      "ignored_test_sites": 0,
+      "optional_ignored": 0,
+      "optional_ids": []
+    },
+    "unresolved-flow": {
+      "total": {
+        "tp": 35,
+        "fp": 0,
+        "fn": 2,
+        "precision_ambiguous_counted": 1.0,
+        "precision_ambiguous_excluded": 1.0,
+        "recall": 0.9459459459459459,
+        "line_accuracy": 1.0,
+        "line_samples": 34,
+        "tp_line_ok": 34,
+        "chains_total": 2,
+        "chains_in_order": 1,
+        "chains_presence": 1
+      },
+      "category": {
+        "chain": {
+          "tp": 1,
+          "fp": 0,
+          "fn": 1,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.5,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 2,
+          "chains_in_order": 1,
+          "chains_presence": 1
+        },
+        "consumer": {
+          "tp": 21,
+          "fp": 0,
+          "fn": 0,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 1.0,
+          "line_accuracy": 1.0,
+          "line_samples": 21,
+          "tp_line_ok": 21,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "producer": {
+          "tp": 13,
+          "fp": 0,
+          "fn": 1,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 0.9285714285714286,
+          "line_accuracy": 1.0,
+          "line_samples": 13,
+          "tp_line_ok": 13,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        }
+      },
+      "language": {
+        "ts": {
+          "tp": 35,
+          "fp": 0,
+          "fn": 2,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 0.9459459459459459,
+          "line_accuracy": 1.0,
+          "line_samples": 34,
+          "tp_line_ok": 34,
+          "chains_total": 2,
+          "chains_in_order": 1,
+          "chains_presence": 1
+        }
+      },
+      "tag": {
+        "config_topic": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 1,
+          "precision_ambiguous_counted": null,
+          "precision_ambiguous_excluded": null,
+          "recall": 0.0,
+          "line_accuracy": null,
+          "line_samples": 0,
+          "tp_line_ok": 0,
+          "chains_total": 0,
+          "chains_in_order": 0,
+          "chains_presence": 0
+        },
+        "untagged": {
+          "tp": 35,
+          "fp": 0,
+          "fn": 1,
+          "precision_ambiguous_counted": 1.0,
+          "precision_ambiguous_excluded": 1.0,
+          "recall": 0.9722222222222222,
+          "line_accuracy": 1.0,
+          "line_samples": 34,
+          "tp_line_ok": 34,
+          "chains_total": 2,
+          "chains_in_order": 1,
+          "chains_presence": 1
+        }
+      },
+      "chains": {
+        "all": {
+          "chains": 2,
+          "in_order": 1,
+          "presence": 1,
+          "recall_in_order": 0.5,
+          "recall_presence": 0.5
+        },
+        "min_hops_ge_3": {
+          "chains": 0,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": null,
+          "recall_presence": null
+        },
+        "per_direction": {
+          "forward": {
+            "chains": 2,
+            "in_order": 1,
+            "presence": 1,
+            "recall_in_order": 0.5,
+            "recall_presence": 0.5
+          }
+        },
+        "longer_than_cap": {
+          "chains": 1,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "depth_cap": 5,
+        "per_tag": {
+          "untagged": {
+            "chains": 2,
+            "in_order": 1,
+            "presence": 1,
+            "recall_in_order": 0.5,
+            "recall_presence": 0.5
+          }
+        }
+      },
+      "negatives_hit": [],
+      "ignored_test_sites": 4,
+      "optional_ignored": 0,
+      "optional_ids": []
+    }
+  },
+  "all": {
+    "total": {
+      "tp": 64,
+      "fp": 3,
+      "fn": 91,
+      "precision_ambiguous_counted": 0.9538461538461539,
+      "precision_ambiguous_excluded": 0.9538461538461539,
+      "recall": 0.4129032258064516,
+      "line_accuracy": 0.9838709677419355,
+      "line_samples": 62,
+      "tp_line_ok": 61,
+      "chains_total": 30,
+      "chains_in_order": 2,
+      "chains_presence": 3
+    },
+    "category": {
+      "chain": {
+        "tp": 2,
+        "fp": 0,
+        "fn": 28,
+        "precision_ambiguous_counted": null,
+        "precision_ambiguous_excluded": null,
+        "recall": 0.06666666666666667,
+        "line_accuracy": null,
+        "line_samples": 0,
+        "tp_line_ok": 0,
+        "chains_total": 30,
+        "chains_in_order": 2,
+        "chains_presence": 3
+      },
+      "consumer": {
+        "tp": 32,
+        "fp": 1,
+        "fn": 11,
+        "precision_ambiguous_counted": 0.9696969696969697,
+        "precision_ambiguous_excluded": 0.9696969696969697,
+        "recall": 0.7441860465116279,
+        "line_accuracy": 1.0,
+        "line_samples": 32,
+        "tp_line_ok": 32,
+        "chains_total": 0,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "hop": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 42,
+        "precision_ambiguous_counted": null,
+        "precision_ambiguous_excluded": null,
+        "recall": 0.0,
+        "line_accuracy": null,
+        "line_samples": 0,
+        "tp_line_ok": 0,
+        "chains_total": 0,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "producer": {
+        "tp": 30,
+        "fp": 2,
+        "fn": 10,
+        "precision_ambiguous_counted": 0.9375,
+        "precision_ambiguous_excluded": 0.9375,
+        "recall": 0.75,
+        "line_accuracy": 0.9666666666666667,
+        "line_samples": 30,
+        "tp_line_ok": 29,
+        "chains_total": 0,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      }
+    },
+    "language": {
+      "go": {
+        "tp": 5,
+        "fp": 0,
+        "fn": 11,
+        "precision_ambiguous_counted": 1.0,
+        "precision_ambiguous_excluded": 1.0,
+        "recall": 0.3125,
+        "line_accuracy": 1.0,
+        "line_samples": 5,
+        "tp_line_ok": 5,
+        "chains_total": 4,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "java": {
+        "tp": 6,
+        "fp": 2,
+        "fn": 19,
+        "precision_ambiguous_counted": 0.75,
+        "precision_ambiguous_excluded": 0.75,
+        "recall": 0.24,
+        "line_accuracy": 1.0,
+        "line_samples": 6,
+        "tp_line_ok": 6,
+        "chains_total": 6,
+        "chains_in_order": 0,
+        "chains_presence": 1
+      },
+      "python": {
+        "tp": 5,
+        "fp": 0,
+        "fn": 6,
+        "precision_ambiguous_counted": 1.0,
+        "precision_ambiguous_excluded": 1.0,
+        "recall": 0.45454545454545453,
+        "line_accuracy": 1.0,
+        "line_samples": 5,
+        "tp_line_ok": 5,
+        "chains_total": 2,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "rust": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 3,
+        "precision_ambiguous_counted": null,
+        "precision_ambiguous_excluded": null,
+        "recall": 0.0,
+        "line_accuracy": null,
+        "line_samples": 0,
+        "tp_line_ok": 0,
+        "chains_total": 0,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "ts": {
+        "tp": 48,
+        "fp": 1,
+        "fn": 52,
+        "precision_ambiguous_counted": 0.9787234042553191,
+        "precision_ambiguous_excluded": 0.9787234042553191,
+        "recall": 0.48,
+        "line_accuracy": 0.9782608695652174,
+        "line_samples": 46,
+        "tp_line_ok": 45,
+        "chains_total": 18,
+        "chains_in_order": 2,
+        "chains_presence": 2
+      }
+    },
+    "tag": {
+      "config_topic": {
+        "tp": 0,
+        "fp": 1,
+        "fn": 4,
+        "precision_ambiguous_counted": 0.0,
+        "precision_ambiguous_excluded": 0.0,
+        "recall": 0.0,
+        "line_accuracy": null,
+        "line_samples": 0,
+        "tp_line_ok": 0,
+        "chains_total": 2,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "cqrs": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 9,
+        "precision_ambiguous_counted": null,
+        "precision_ambiguous_excluded": null,
+        "recall": 0.0,
+        "line_accuracy": null,
+        "line_samples": 0,
+        "tp_line_ok": 0,
+        "chains_total": 2,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "cron": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 7,
+        "precision_ambiguous_counted": null,
+        "precision_ambiguous_excluded": null,
+        "recall": 0.0,
+        "line_accuracy": null,
+        "line_samples": 0,
+        "tp_line_ok": 0,
+        "chains_total": 3,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "inproc_bus": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 28,
+        "precision_ambiguous_counted": null,
+        "precision_ambiguous_excluded": null,
+        "recall": 0.0,
+        "line_accuracy": null,
+        "line_samples": 0,
+        "tp_line_ok": 0,
+        "chains_total": 9,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "kafka_basic": {
+        "tp": 27,
+        "fp": 3,
+        "fn": 6,
+        "precision_ambiguous_counted": 0.896551724137931,
+        "precision_ambiguous_excluded": 0.896551724137931,
+        "recall": 0.8181818181818182,
+        "line_accuracy": 0.9615384615384616,
+        "line_samples": 26,
+        "tp_line_ok": 25,
+        "chains_total": 6,
+        "chains_in_order": 1,
+        "chains_presence": 2
+      },
+      "layered_calls": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 66,
+        "precision_ambiguous_counted": null,
+        "precision_ambiguous_excluded": null,
+        "recall": 0.0,
+        "line_accuracy": null,
+        "line_samples": 0,
+        "tp_line_ok": 0,
+        "chains_total": 24,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "py_broker": {
+        "tp": 2,
+        "fp": 0,
+        "fn": 1,
+        "precision_ambiguous_counted": 1.0,
+        "precision_ambiguous_excluded": 1.0,
+        "recall": 0.6666666666666666,
+        "line_accuracy": 1.0,
+        "line_samples": 2,
+        "tp_line_ok": 2,
+        "chains_total": 1,
+        "chains_in_order": 0,
+        "chains_presence": 0
+      },
+      "untagged": {
+        "tp": 35,
+        "fp": 0,
+        "fn": 1,
+        "precision_ambiguous_counted": 1.0,
+        "precision_ambiguous_excluded": 1.0,
+        "recall": 0.9722222222222222,
+        "line_accuracy": 1.0,
+        "line_samples": 34,
+        "tp_line_ok": 34,
+        "chains_total": 2,
+        "chains_in_order": 1,
+        "chains_presence": 1
+      }
+    },
+    "chains": {
+      "all": {
+        "chains": 30,
+        "in_order": 2,
+        "presence": 3,
+        "recall_in_order": 0.06666666666666667,
+        "recall_presence": 0.1
+      },
+      "min_hops_ge_3": {
+        "chains": 11,
+        "in_order": 0,
+        "presence": 0,
+        "recall_in_order": 0.0,
+        "recall_presence": 0.0
+      },
+      "per_direction": {
+        "forward": {
+          "chains": 29,
+          "in_order": 2,
+          "presence": 3,
+          "recall_in_order": 0.06896551724137931,
+          "recall_presence": 0.10344827586206896
+        },
+        "reverse": {
+          "chains": 1,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        }
+      },
+      "longer_than_cap": {
+        "chains": 8,
+        "in_order": 0,
+        "presence": 0,
+        "recall_in_order": 0.0,
+        "recall_presence": 0.0
+      },
+      "depth_cap": 5,
+      "per_tag": {
+        "config_topic": {
+          "chains": 2,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "cqrs": {
+          "chains": 2,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "cron": {
+          "chains": 3,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "inproc_bus": {
+          "chains": 9,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "kafka_basic": {
+          "chains": 6,
+          "in_order": 1,
+          "presence": 2,
+          "recall_in_order": 0.16666666666666666,
+          "recall_presence": 0.3333333333333333
+        },
+        "layered_calls": {
+          "chains": 24,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "py_broker": {
+          "chains": 1,
+          "in_order": 0,
+          "presence": 0,
+          "recall_in_order": 0.0,
+          "recall_presence": 0.0
+        },
+        "untagged": {
+          "chains": 2,
+          "in_order": 1,
+          "presence": 1,
+          "recall_in_order": 0.5,
+          "recall_presence": 0.5
+        }
+      }
+    }
+  }
+}

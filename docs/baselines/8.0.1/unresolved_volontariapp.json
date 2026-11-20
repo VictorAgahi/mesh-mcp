@@ -1,0 +1,13 @@
+{
+  "binary": "/Users/victoragahi/cargo-targets/baseline-8.0.1/mesh-mcp",
+  "config": "/Users/victoragahi/Developer/meta/.agents/mesh-mcp.toml",
+  "total_topics": 136,
+  "answered": 136,
+  "errors": 0,
+  "skipped": 0,
+  "no_producer": 82,
+  "no_producer_share": 0.6029411764705882,
+  "no_consumer": 31,
+  "no_consumer_share": 0.22794117647058823,
+  "wall_seconds": 2.16
+}
