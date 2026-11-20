@@ -837,8 +837,7 @@ fn a_huge_function_of_new_expressions_and_sends_stays_fast() {
     // `parse_failed`, not an extraction bug) and indexing retries such a file. Do
     // the same here: retry a parse that timed out, and time only the attempt that
     // parsed. The quadratic regression this catches would exceed the bound on every
-    // attempt, so retrying does not hide it; the bound is generous for the same
-    // reason (a quadratic scan of 12,000 statements takes minutes, not seconds).
+    // attempt, so retrying does not hide it.
     let mut last = None;
     for _ in 0..8 {
         let start = std::time::Instant::now();
@@ -852,7 +851,7 @@ fn a_huge_function_of_new_expressions_and_sends_stays_fast() {
     let (fi, elapsed) = last.expect("svc/big.ts must parse within 8 attempts");
     assert_eq!(events(&fi), vec![ev('P', "topic-a")]);
     // Linear: a block is scanned once however many names are looked up in it.
-    assert!(elapsed.as_secs() < 30, "took {elapsed:?}");
+    assert!(elapsed.as_secs() < 10, "took {elapsed:?}");
 }
 
 #[test]

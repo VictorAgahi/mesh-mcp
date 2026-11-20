@@ -417,16 +417,7 @@ mod tests {
         }
         assert!(path.exists(), "socket file should remain after drop");
 
-        // Cleanup is idempotent; poll to a generous deadline so a transient failure of
-        // the liveness probe on a loaded machine cannot fail the test.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            cleanup_stale_socket(&path);
-            if !path.exists() || std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        cleanup_stale_socket(&path);
 
         assert!(
             !path.exists(),

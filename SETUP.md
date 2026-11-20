@@ -250,7 +250,7 @@ mesh-mcp doctor
 Abridged output (the exact lines depend on the platform and configuration):
 
 ```
-🔍 Running MeshMCP Diagnostic Healthcheck (v8.0.0, commit: ...)...
+Running MeshMCP Diagnostic Healthcheck (v8.0.0, commit: ...)...
 
 ✔ Config syntax: valid (.agents/mesh-mcp.toml)
 ℹ Project skills: none configured ([engines.policy.skills])
@@ -658,7 +658,7 @@ Every key below changes behaviour.
 | `[engines.policy.stop_rules]` | **wired** — evaluated in tool dispatch according to `read_governance_mode` (not used by the Git hook) |
 | `[engines.policy.skills]` | **wired** |
 | `[engines.policy]` `enabled`, `enforce_git_hooks`, `cryptographic_audit_trail`, `read_governance_mode` | **wired** — `enabled=false` turns off stop rules/skills; `enforce_git_hooks` gates hook installation; `cryptographic_audit_trail` gates audit logging; `read_governance_mode` (`allow_all`, `audit_warn`, `enforce_refusal`) decides whether stop rules refuse read-only calls |
-| `[cache]` `max_size_mb` | **wired** — quota (MiB, default `2048`) of this workspace's parse cache `~/.cache/mesh-mcp/workspaces/<workspace_id>/index-cache.db`, database + WAL. Checked on open and after every scan writing more than 100 entries; over quota, least recently used entries are evicted down to 80 % of it |
+| `[cache]` `max_size_mb` | **wired** — quota (MiB, default `2048`) of this repository's parse cache, `~/.cache/mesh-mcp/workspaces/<cache_family_id>/index-cache.db` inside Git and `~/.cache/mesh-mcp/workspaces/<workspace_id>/index-cache.db` outside it, database + WAL. Checked on open and after every scan writing more than 100 entries; over quota, least recently used entries are evicted down to 80 % of it |
 
 Secret masking and prompt-injection sanitisation are on by default.
 

@@ -1315,7 +1315,7 @@ Raising thresholds or adding new golden repositories is a tracked quality milest
 ## 8.0.0 end-to-end (2026-11-19)
 
 Measured on `~/bench-repos/kubernetes` at `16b319ff` (30,526 files), two git worktrees of it, an
-isolated `HOME`. 8.0 is `p8/base` at `45a4e00`; 7.1.11 is the `v7.1.11` tag. The machine ran other
+isolated `HOME`. 8.0 is `p8/base` at `45a4e00` (before the `diff_mesh` tool landed); 7.1.11 is the `v7.1.11` tag. The machine ran other
 jobs during the measurement (load average 20 to 190), so cold times carry about +-5 s of noise.
 
 | Measurement | 8.0 | 7.1.11 |

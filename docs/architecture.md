@@ -344,7 +344,7 @@ simply never found again rather than serving newer clients against an outdated s
 socket accepts connections (and `initialize`/`ping` succeed) immediately, while the initial
 ingestion runs in the background. A `tools/call` made before that first scan installs its
 snapshot gets an explicit "still indexing" error instead of an answer computed against the
-still-empty default snapshot — and `mesh-mcp`'s own 500ms wait for the socket to appear is no
+still-empty default snapshot — and `mesh-mcp`'s own wait for the socket to appear (`SOCKET_WAIT`, 5 s, `spawn_lock.rs`) is no
 longer a race against a large repo's indexing time, since the socket now exists independently of
 how long that indexing takes.
 

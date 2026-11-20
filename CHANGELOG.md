@@ -9,11 +9,11 @@ at 3.0.0 — there is no reconstructed history before it.
 
 One `meshd` per Git repository, one view per worktree. Open a session in each worktree of a
 repository and they find the same daemon; each session only ever sees its own worktree. The parse
-cache is shared by every worktree of the repository (one binary version), so a second worktree of
-the same commit boots on cache hits. Reloads are faster, and there is a new `diff_mesh` tool.
+cache is one database per repository, shared by its worktrees (records are keyed by binary
+version), so a second worktree of the same commit boots on cache hits. Reloads are faster, and there is a new `diff_mesh` tool.
 
 Measured on kubernetes (30,526 files, two worktrees): the second worktree is ready in 2.5 s
-instead of 8.1 s, four simultaneous sessions are all ready in 8.1 s instead of 26 s, and one
+instead of 8.1 s, four simultaneous sessions are all ready in 8.1 s instead of 24-26 s, and one
 daemon replaces four (peak 402-410 MB total instead of 1,027-1,183 MB). On a 30,000-file
 synthetic workspace a one-file reload goes from a median 289 ms to 106 ms. Figures and caveats:
 `docs/quality.md`.
