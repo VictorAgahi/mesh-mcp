@@ -5,7 +5,7 @@ All notable changes to MeshMCP (`mesh-mcp` / `meshd`) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This file starts
 at 3.0.0 — there is no reconstructed history before it.
 
-## [8.0.0] - 2026-11-19
+## [8.0.0] - 2026-11-20
 
 One `meshd` per Git repository, one view per worktree. Open a session in each worktree of a
 repository and they find the same daemon; each session only ever sees its own worktree. The parse
@@ -51,7 +51,18 @@ synthetic workspace a one-file reload goes from a median 289 ms to 106 ms. Figur
   the identity unchanged.
 
 ### Added
-- `diff_mesh` tool (see `docs/mcp-tools.md`).
+- `diff_mesh`, the seventh MCP tool: a contract-level diff of the working tree (uncommitted and
+  untracked files included) against a Git base, per root and per repository. It lists, per
+  changed file, declarations, gRPC services and RPCs, HTTP routes, topics, imports and RPC calls
+  that were added, removed or changed; then, from the live graph, the callers and dependents of
+  every removed or changed symbol and RPC; then the `.proto` wire-format check against the same
+  base. Arguments `base` and `scope`. Bounded: about 20 s per call (files not reached are named
+  as not analysed), 2,000 files, and output under the 48 KB cap with wire-format results kept
+  first. A root outside Git or an unknown or malformed `base` is an explicit error. Details:
+  `docs/mcp-tools.md`.
+- Library additions behind it: `ContractGraph::recorded_rpc_callers`,
+  `PolyglotIndexer::extract_with_budget`, `AstGuard::check_content`,
+  `GitRunner::run_with_input`.
 - `mesh-mcp doctor` lists the views the running daemon serves (count, worktree, config file,
   sessions, views built since start).
 - `mesh_core::identity`: `RepoFamily`, `family_id`, `cache_family_id`, `ViewKey` and
