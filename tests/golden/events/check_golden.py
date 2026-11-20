@@ -2,7 +2,8 @@
 """Validate tests/golden/events/*.expected.yaml (stdlib only).
 
 Checks per file: structure and types (never a traceback: malformed input is reported and the
-exit code is 1), enum values, unique ids, `optional` is a bool, every `file` exists under `root`,
+exit code is 1), enum values, unique ids across all categories, `optional` is a bool that is
+allowed only on producers, consumers and hops and goes with the tag `declared_pattern` both ways, every `file` exists under `root`,
 every `line` is inside its file, and that the line carries the name it claims:
 
   * producer / consumer / consume / produce step: the topic, matched on identifier and segment
@@ -293,6 +294,8 @@ class Checker:
                 self.err(where, f"optional must be a bool, got {item['optional']!r}")
             if "declared_pattern" in tags and item.get("optional") is not True:
                 self.err(where, "tag declared_pattern requires optional: true")
+            if item.get("optional") is True and "declared_pattern" not in tags:
+                self.err(where, "optional: true requires the tag declared_pattern")
             return tags
 
         sites = {"producers": {}, "consumers": {}}  # (file, topic.lower()) -> [(line, optional)]
@@ -307,8 +310,11 @@ class Checker:
                 if it.get("language") not in LANGS:
                     self.err(w, f"bad language {it.get('language')!r}")
                 text = self.line_text(w, root, it.get("file"), it.get("line"))
+                # A declared_pattern site is emitted by a custom pattern (often at the enclosing
+                # function), so its line need not carry the topic.
                 self.need(w, text, lambda t, tp=topic: has_topic(t, tp), f"topic {topic!r}",
-                          "config_topic" in tags or (text is not None and "${" in text))
+                          "config_topic" in tags or "declared_pattern" in tags
+                          or (text is not None and "${" in text))
                 sites[kind].setdefault((it.get("file"), str(topic).lower()), []).append(
                     (it.get("line"), it.get("optional") is True))
         hop_targets = set()
@@ -332,6 +338,8 @@ class Checker:
         for n, it in enumerate(self.listing(g, "chains"), 1):
             w = f"chains/{it.get('id', n)}"
             common(w, it)
+            if "optional" in it:
+                self.err(w, "optional is not allowed on chains (only on producers, consumers and hops)")
             e = it.get("entry")
             if not isinstance(e, dict) or e.get("kind") not in ENTRY_KINDS or not e.get("value"):
                 self.err(w, f"bad entry {e!r}")
@@ -349,6 +357,8 @@ class Checker:
                     self.err(sw, f"bad step {st!r}")
                     continue
                 kind = st["kind"]
+                if "optional" in st:
+                    self.err(sw, "optional is not allowed on a chain step")
                 text = self.line_text(sw, root, st.get("file"), st.get("line"))
                 if kind == "call":
                     calls += 1
@@ -384,6 +394,8 @@ class Checker:
                 self.err(w, f"min_hops {it.get('min_hops')} != number of call steps {calls}")
         for n, it in enumerate(self.listing(g, "negatives"), 1):
             w = f"negatives/{n}"
+            if "optional" in it:
+                self.err(w, "optional is not allowed on negatives")
             if it.get("kind") not in NEG_KINDS:
                 self.err(w, f"bad kind {it.get('kind')!r}")
             self.line_text(w, root, it.get("file"), it.get("line"))

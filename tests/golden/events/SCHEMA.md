@@ -11,13 +11,13 @@ config: mesh-mcp.toml              # optional, relative to root; default: a gene
 languages: [ts]                    # informational; every item also carries its own language
 
 producers:
-  - id: p1                         # unique within the file
+  - id: p1                         # unique within the file, across all categories
     topic: order.created           # topic key as an agent would name it (lower-case, see normalize_topic_key)
     file: src/order.publisher.ts   # relative to root
     line: 14                       # 1-based line of the publish call expression
     language: ts                   # ts | js | java | go | python | csharp | rust | sql
     tags: [kafka_basic]            # feature tags, see below; used for per-ticket score slices
-    optional: false                # optional, default false; true: ignored by the scorer both ways
+    optional: false                # default false; true (needs tag declared_pattern): ignored both ways
 consumers:
   - id: c1
     topic: order.created
@@ -77,7 +77,10 @@ negatives:
 - `optional: true` marks a site the scorer ignores both ways: not a false negative when missing and
   not a false positive when found. It is used with the tag `declared_pattern` for sites that exist
   only because a fixture's own custom pattern declares them, while the source makes no broker call.
-  An optional item must not be a step of any chain.
+  `optional` is allowed only on producers, consumers and hops, and only together with
+  `declared_pattern` (each requires the other). It is never allowed on a chain, a chain step or a
+  negative, and a chain step must not point at an optional item.
+- Ids (`p1`, `c1`, `h1`, `ch1`, ...) are unique within a file across all categories.
 
 ## Tags (feature slices, one per later ticket)
 

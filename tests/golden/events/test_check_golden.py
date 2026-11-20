@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 import check_golden as cg  # noqa: E402
 
 SOURCE = """\
@@ -76,6 +77,10 @@ MUTATIONS = [
     ("optional is not a bool", "language: ts, tags: [kafka_basic]}\nconsumers", "language: ts, tags: [kafka_basic], optional: yes please}\nconsumers"),
     ("chain step with no matching item", "{kind: produce, file: src/a.ts, line: 16, topic: stock.reserved}", "{kind: produce, file: src/a.ts, line: 17, topic: stock.reserved}"),
     ("unknown tag", "tags: [layered_calls]\n    min_hops", "tags: [made_up]\n    min_hops"),
+    ("optional hop without declared_pattern", "  - id: h2\n", "  - id: h2\n    optional: true\n"),
+    ("declared_pattern without optional", "language: ts, tags: [kafka_basic]}\nconsumers", "language: ts, tags: [declared_pattern]}\nconsumers"),
+    ("optional on a chain", "  - id: ch1\n", "  - id: ch1\n    optional: true\n"),
+    ("optional on a chain step", "{kind: consume, file: src/a.ts, line: 3, topic: order.created}", "{kind: consume, file: src/a.ts, line: 3, topic: order.created, optional: true}"),
     ("not a mapping at all", GOLDEN, "- 1\n- 2\n"),
     ("garbage", GOLDEN, "corpus: [unclosed\n"),
 ]
@@ -116,6 +121,25 @@ class CheckGolden(unittest.TestCase):
                 errors = self.run_text(GOLDEN + f"{section}: nope\n" if section not in GOLDEN
                                        else GOLDEN.replace(f"{section}:", f"{section}: nope\nx{section}:", 1), False)
                 self.assertTrue(errors)
+
+    def test_optional_rules_on_the_real_layered_ts_golden(self):
+        real = (HERE / "layered-ts.expected.yaml").read_text()
+        mutations = [
+            ("optional on hop h13 without the tag", "  - id: h13\n", "  - id: h13\n    optional: true\n"),
+            ("optional on the whole chain ch8", "  - id: ch8\n", "  - id: ch8\n    optional: true\n"),
+            ("optional key on a chain step",
+             "{kind: consume, file: src/audit.handler.ts, line: 9, topic: audit.requested}",
+             "{kind: consume, file: src/audit.handler.ts, line: 9, topic: audit.requested, optional: true}"),
+        ]
+        path = Path(self.tmp.name) / "layered-ts.expected.yaml"
+        for use in (False, True):
+            path.write_text(real)
+            self.assertEqual(cg.run_one(path, cg.REPO, use)[0], [], "the real golden must pass")
+            for name, old, new in mutations:
+                with self.subTest(mutation=name, pyyaml=use):
+                    self.assertIn(old, real)
+                    path.write_text(real.replace(old, new, 1))
+                    self.assertTrue(cg.run_one(path, cg.REPO, use)[0], f"not detected: {name}")
 
     def test_topic_boundary(self):
         self.assertTrue(cg.has_topic("emit('stock.reserved', e)", "stock.reserved"))

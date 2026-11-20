@@ -30,6 +30,13 @@ intra-repo call hops and end-to-end chains. The format and matching rules are in
 - `polyglot-shop` mixes real sites (the TypeScript producer, the Java listener and producer) with
   sites declared only by the fixture's own custom patterns, where the source makes no broker call.
   Those are `optional: true` with the tag `declared_pattern`: the scorer ignores them both ways.
+- Decision on `polyglot-shop` p2 and its chain: `BillingSaga.java` calls `kafkaTemplate.send(topic,
+  payload)` on a nested class named `KafkaTemplate` whose `send` only prints. The producer and the
+  chain's produce step stay REAL, because the call has the shape of the Spring API, unlike the Go,
+  Rust and Python sites, which use no messaging idiom at all.
+- Wrong sites reported by the tool (for example a producer reported on the `@KafkaListener` method
+  line instead of the publish line) are baseline defects counted against the tool. Reverse chains and
+  chains longer than the tool's depth cap (5) are failures by construction on 8.0.1.
 - `unresolved-flow` chains are limited to what one function links; its deletion pipeline is only
   annotated at topic level. The `ghost.spec.ts` negatives only count when the answer is produced with
   `--include-tests` (test files are hidden by default).
@@ -61,7 +68,7 @@ golden must be rejected).
 | layered-py | python | 3 | 2 | 4 | 2 | 2 | 0 | kafka_basic 3, layered_calls 6, py_broker 3 |
 | layered-ts | ts | 6 | 5 | 13 | 10 | 4 | 0 | kafka_basic 12, layered_calls 22 |
 | nestjs-monolith-bus | ts | 7 | 8 | 7 | 5 | 2 | 0 | cqrs 9, cron 4, inproc_bus 20, layered_calls 11 |
-| polyglot-shop | go, java, python, rust, ts | 4 | 6 | 4 | 2 | 0 | 7 | declared_pattern 7, go_broker 2, kafka_basic 5, layered_calls 4, py_broker 3 |
+| polyglot-shop | go, java, python, rust, ts | 4 | 7 | 4 | 2 | 0 | 8 | declared_pattern 8, go_broker 2, kafka_basic 5, layered_calls 4, py_broker 3 |
 | spring-monolith | java | 5 | 4 | 8 | 5 | 2 | 0 | config_topic 3, cron 3, inproc_bus 8, kafka_basic 8, layered_calls 13 |
 | unresolved-flow | ts | 14 | 21 | 0 | 2 | 0 | 0 | config_topic 1 |
 

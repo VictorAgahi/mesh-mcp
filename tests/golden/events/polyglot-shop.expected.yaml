@@ -7,6 +7,10 @@
 # subscribe()/publish() only print, and the Python @kafka_consumer decorator only sets
 # fn.__topic__. Those items are `optional: true` with the tag `declared_pattern` (ignored by the
 # scorer both ways) and no chain depends on them. The intra-file hops stay: they are real calls.
+# Decision (G1): BillingSaga.java calls `kafkaTemplate.send(topic, payload)` on a nested class named
+# KafkaTemplate whose send only prints. p2 and the ch1 produce step stay REAL: the call has the shape
+# of the Spring API (a type named KafkaTemplate, send(topic, payload)), unlike the Go, Rust and
+# Python sites, which use no messaging idiom at all.
 corpus: polyglot-shop
 root: examples/polyglot-shop
 config: mesh-mcp.toml
@@ -25,6 +29,8 @@ consumers:
   - {id: c4, topic: stock-reserved-topic, file: services/notification-hub/main.py, line: 26, language: python, tags: [declared_pattern, py_broker], optional: true}
   - {id: c5, topic: order-created-topic, file: services/payment-worker/main.go, line: 28, language: go, tags: [declared_pattern, go_broker], optional: true}
   - {id: c6, topic: payment-settled-topic, file: services/inventory-manager/src/main.rs, line: 32, language: rust, tags: [declared_pattern], optional: true}
+  # c7: the same pattern also emits a second consumer record on the `listen` caller of subscribe.
+  - {id: c7, topic: payment-settled-topic, file: services/inventory-manager/src/main.rs, line: 30, language: rust, tags: [declared_pattern], optional: true}
 
 hops:
   # `server := &PaymentServer{}` is a local object of a known type in the same file.
