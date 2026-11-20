@@ -415,7 +415,7 @@ path in the file (`Outer.Inner`); `oneof` members belong to the enclosing messag
 |---|---|
 | Field number reused | Number N now names a different field: the old name still exists at another number, the new name existed at another number in the base (swap/move), or the name changed together with an incompatible type; or a number `reserved` in the base is used again |
 | Incompatible type | Same number and name, but the value types are not in the same group below, or the cardinality changed in a way the other side cannot parse (see below) |
-| Deleted without `reserved` | A field of the base is gone and neither its number (single, `N to M`, `N to max`) nor its name is `reserved` |
+| Deleted without `reserved` | A field of the base is gone and neither its number (single, `N to M`, `N to max`) nor its name is `reserved`. A field kept under its name with another number is this rule too, said as "field `x` renumbered 2 -> 5" |
 | Enum number reused | Enum value N now names a different constant and a name really moved (the old constant now has another number, or the new one had another number in the base — a renumbering or swap), or a number `reserved` in the base is used again. Constants go on the wire as numbers only: the other version reads N as the other constant |
 | Enum value deleted without `reserved` | A constant's number is gone from the enum and not `reserved` |
 
@@ -742,18 +742,31 @@ repositories), the working tree is compared with a base revision at the **contra
   working-tree file is read through the path jail, never through a symlink.
 - **Contract diff** per file: declarations (classes, functions, interfaces, messages) added,
   removed or with a changed signature; gRPC services and RPCs; HTTP routes; topics produced and
-  consumed; imports; RPC calls. A body-only edit changes no signature: such files are counted
-  and named in one line, never listed as changes.
+  consumed; imports; RPC calls. RPC calls are resolved the way the graph resolves them, so a call
+  through a client field inherited from a base class in another file (`^Base#field.method`)
+  counts like a direct one; each is shown as the declared `Service.Method` when the graph declares
+  it, else as the call names it, and a call through an inherited field no binding resolves is
+  listed raw, marked unresolved. A body-only edit changes no signature: such files are counted
+  and named in one line, never listed as changes. A `.proto` whose wire check is not clean (a
+  field renumbered changes no declaration) is a contract change, never body-only: its file section
+  carries the wire result.
 - **Impact** (live graph): for every removed or changed declaration, its dependents
   (`find_dependents` matching); for every removed or changed RPC, its recorded call sites, plus,
   for a changed one, the `analyze_grpc` callers and server handlers; for a removed producer or
   consumer, the other side of the topic. A caller of a removed RPC has no resolved edge left, so
-  the recorded call targets are read directly (`ContractGraph::recorded_rpc_callers`): a
-  method-level call may name the service with its proto package (`demo.v1.UserService.DeleteUser`,
-  matched against the `.proto`'s own `package`: same package keeps the record's confidence, no
-  package known is `heuristic`, another package `ambiguous`); a client built for the service with
-  no method-level call in its file (Go `NewUserServiceClient`, a Python stub, a Java
-  `newBlockingStub`) is listed as a "service-level client, may call", `heuristic`. Each row gives
+  the recorded call targets are read directly (`ContractGraph::recorded_rpc_callers`), each
+  resolved as the graph's reconcile resolves it (a client binding, a field inherited from a base
+  class, a field name), at the calling method's own line. A method-level call may name the service
+  with its proto package (`demo.v1.UserService.DeleteUser`, matched against the `.proto`'s own
+  `package`: same package keeps the record's confidence, no package known is `heuristic`, another
+  package `ambiguous`). A class that binds a client field to the service while neither it nor a
+  subclass calling through that field calls the RPC is listed once as "holds a `UserService`
+  client, no call to `GetPublicUser` found", `heuristic`; a base class whose subclass makes the
+  call is not listed. A client built for the service with no method-level call and no field
+  binding in its file (Go `NewUserServiceClient`, a Python stub, a Java `newBlockingStub`) is
+  listed as a "service-level client, may call", `heuristic`. The server handlers of a removed RPC
+  (`@GrpcMethod` arguments resolved through string constants, as the graph resolves them) are
+  listed as "orphaned handler: implements a removed RPC". Each row gives
   `path:line` and its match (`exact`, `heuristic`, `ambiguous`). Generic names (`constructor`,
   `main`, ...) are not looked up; routes and gRPC services are not looked up either, and one line
   says so (HTTP callers are not linked in the graph; a service's callers are listed under its RPCs).
@@ -831,7 +844,7 @@ shortened:
 ### Wire-format check: `proto/user.proto`
 - **Base**: merge-base of `HEAD` and `main` (`f12cc14677f9`), compared with the working tree
 - **Result**: 1 `WIRE_FORMAT_BREAKING_CHANGE`
-  - `WIRE_FORMAT_BREAKING_CHANGE` field deleted without `reserved` — `User` #2 (L19): `email` (`string`) was removed; add `reserved 2;` and `reserved "email";` so the number is never reused
+  - `WIRE_FORMAT_BREAKING_CHANGE` field deleted without `reserved` — `User` #2 (L19): field `email` (`string`) renumbered 2 -> 3: a peer on the other version no longer reads it; keep 2, or add `reserved 2;` if the move is intended
 
 ### Impact (live graph)
 

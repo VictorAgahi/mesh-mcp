@@ -11,7 +11,8 @@ use crate::tools::smart_search::SearchScope;
 use crate::tools::{McpTool, ToolError, ToolOutput};
 use mesh_core::{
     AppState, CompactStr, ContractGraph, ContractNode, DependentsMatch, EdgeConfidence,
-    ExcludeMatcher, FilesystemCrawler, NodeKind, RecordedCaller, RepoId, ValidatedScope,
+    ExcludeMatcher, FilesystemCrawler, NodeKind, RecordedCaller, RepoId, RpcRecordResolver,
+    ValidatedScope,
 };
 use mesh_parsers::{AstGuard, FileIndex};
 use schemars::JsonSchema;
@@ -592,7 +593,13 @@ enum Fact {
     Produces(String),
     Consumes(String),
     Import(String),
+    /// A method-level RPC call, resolved as the graph resolves it (binding,
+    /// inherited field, field name): the declared `Service.Method` when the
+    /// graph declares it, else `Service.method` as the call names it.
     Calls(String),
+    /// A call through an inherited field (`Base#field.method`) that resolves
+    /// to no service: the raw record.
+    CallsUnresolved(String),
 }
 
 impl Fact {
@@ -610,6 +617,9 @@ impl Fact {
             Self::Consumes(t) => format!("consumes topic `{t}`"),
             Self::Import(t) => format!("import `{t}`"),
             Self::Calls(t) => format!("calls RPC `{t}`"),
+            Self::CallsUnresolved(t) => {
+                format!("calls `{t}` (unresolved: no client binding found)")
+            }
         }
     }
 }
@@ -660,7 +670,15 @@ fn add_fact<'f>(
     entry
 }
 
-fn facts_of(index: &FileIndex) -> BTreeMap<Fact, FactVal> {
+/// The contract facts of one extracted file of root `repo`. Its RPC call
+/// records are resolved with `resolver` (the live graph's client bindings),
+/// so a call through a field inherited from a base class in another file
+/// counts like a direct one.
+fn facts_of(
+    index: &FileIndex,
+    resolver: &RpcRecordResolver<'_>,
+    repo: RepoId,
+) -> BTreeMap<Fact, FactVal> {
     let mut facts: BTreeMap<Fact, FactVal> = BTreeMap::new();
     for node in &index.nodes {
         let name = node.name.to_string();
@@ -703,12 +721,18 @@ fn facts_of(index: &FileIndex) -> BTreeMap<Fact, FactVal> {
                 .map(|(i, t)| (*i, Fact::Import(t.to_string()))),
         )
         .chain(index.rpc_calls.iter().filter_map(|(i, recorded)| {
-            let target = recorded
-                .strip_prefix(mesh_core::RPC_EXACT_METHOD_PREFIX)
-                .or_else(|| recorded.strip_prefix(mesh_core::RPC_INFERRED_METHOD_PREFIX))?;
-            target
-                .contains('.')
-                .then(|| (*i, Fact::Calls(target.to_string())))
+            match resolver.resolve(Some(repo), recorded) {
+                Some(r) if r.method_level && r.target.contains('.') => Some((
+                    *i,
+                    Fact::Calls(r.declared.map_or(r.target, |d| d.to_string())),
+                )),
+                // A service-level client is not a call; a binding, constant
+                // or handler reference resolves to nothing.
+                Some(_) => None,
+                None => recorded
+                    .strip_prefix(mesh_core::RPC_INHERITED_METHOD_PREFIX)
+                    .map(|raw| (*i, Fact::CallsUnresolved(raw.to_string()))),
+            }
         }));
     for (i, fact) in relations {
         let n = node(i);
@@ -970,7 +994,10 @@ fn run_with(
         }
     }
 
-    // 3-4. Extract both sides, diff the contract facts.
+    // 3-4. Extract both sides, diff the contract facts. Call records resolve
+    // against the live graph's client bindings (a base class in another file).
+    let snapshot = state.snapshot();
+    let resolver = snapshot.contract_graph.rpc_record_resolver();
     let extractor: ContentExtractor =
         WorkspaceIndexer::content_extractor(&state.config, &state.allowed_roots);
     let mut reports: Vec<FileReport> = Vec::new();
@@ -1028,7 +1055,7 @@ fn run_with(
                         skipped.get_or_insert_with(|| format!("{label}: the parse failed"));
                         BTreeMap::new()
                     }
-                    Ok(index) => facts_of(&index),
+                    Ok(index) => facts_of(&index, &resolver, c.repo_id),
                     Err(why) => {
                         skipped.get_or_insert_with(|| format!("{label}: {why}"));
                         BTreeMap::new()
@@ -1053,7 +1080,6 @@ fn run_with(
     }
 
     // 5. Impact from the live graph, and the wire check of every changed .proto.
-    let snapshot = state.snapshot();
     let impact = render_impact(&reports, &snapshot.contract_graph, &view, deadline);
     let mut wire: Vec<WireEntry> = reports
         .iter()
@@ -1289,7 +1315,13 @@ fn render_impact(
             continue;
         }
         let (rows, empty_note) = match lookup {
-            Lookup::Rpc(name, package) => rpc_impact(graph, name, *package, &r.abs),
+            Lookup::Rpc(name, package) => rpc_impact(
+                graph,
+                name,
+                *package,
+                &r.abs,
+                ch.kind == ChangeKind::Removed,
+            ),
             Lookup::Symbol(name) => symbol_impact(graph, name, &r.abs),
             Lookup::Topic(topic, producer) => topic_impact(graph, topic, *producer, &r.abs),
         };
@@ -1341,6 +1373,7 @@ fn rpc_impact<'g>(
     name: &str,
     package: Option<&str>,
     file: &Path,
+    removed: bool,
 ) -> Rows<'g> {
     let Some((service, method)) = name.rsplit_once('.') else {
         return (
@@ -1353,10 +1386,27 @@ fn rpc_impact<'g>(
     for (node, confidence, how) in graph.recorded_rpc_callers(service, method, package) {
         if seen.insert(node.id) {
             let role = match how {
-                RecordedCaller::Method => "caller",
-                RecordedCaller::ServiceClient => "service-level client, may call",
+                RecordedCaller::Method => "caller".to_string(),
+                RecordedCaller::BoundClient => {
+                    format!("holds a `{service}` client, no call to `{method}` found")
+                }
+                RecordedCaller::ServiceClient => "service-level client, may call".to_string(),
             };
             rows.push((node, format!("{role}, match: {}", confidence.label())));
+        }
+    }
+    // Removed: the handlers still serving it are left with nothing to implement.
+    if removed {
+        for (node, confidence) in graph.handlers_naming_rpc(service, method, package) {
+            if seen.insert(node.id) {
+                rows.push((
+                    node,
+                    format!(
+                        "orphaned handler: implements a removed RPC, match: {}",
+                        confidence.label()
+                    ),
+                ));
+            }
         }
     }
     // Still declared (a changed RPC): the trace adds callers linked by an edge
@@ -1564,7 +1614,7 @@ fn tally(reports: &[FileReport]) -> Tally {
             Fact::Produces(_) => &mut t.produces,
             Fact::Consumes(_) => &mut t.consumes,
             Fact::Import(_) => &mut t.imports,
-            Fact::Calls(_) => &mut t.calls,
+            Fact::Calls(_) | Fact::CallsUnresolved(_) => &mut t.calls,
         };
         slot[i] += 1;
     }
@@ -1646,7 +1696,16 @@ fn render(
     view: &RootView<'_>,
 ) -> String {
     let t = tally(reports);
-    let with_changes = reports.iter().filter(|r| !r.changes.is_empty()).count();
+    // A `.proto` whose wire check is anything but clean (a break, not
+    // checked, not compared) changed its contract even with no declaration
+    // added or removed (a field renumbered): never "body edits only".
+    let wire_of = |r: &FileReport| {
+        wire.iter()
+            .find(|w| w.rank != WireRank::Clean && w.display == r.display)
+    };
+    let has_contract_change =
+        |r: &FileReport| r.skipped.is_none() && (!r.changes.is_empty() || wire_of(r).is_some());
+    let with_changes = reports.iter().filter(|r| has_contract_change(r)).count();
     let skipped = reports.iter().filter(|r| r.skipped.is_some()).count();
     let body_only = reports.len() - with_changes - skipped;
     let wire_breaks: usize = wire.iter().map(|w| w.breaks).sum();
@@ -1810,7 +1869,7 @@ fn render(
     // 4. Per-file sections.
     let listed: Vec<&FileReport> = reports
         .iter()
-        .filter(|r| !r.changes.is_empty() || r.skipped.is_some())
+        .filter(|r| has_contract_change(r) || r.skipped.is_some())
         .collect();
     if !listed.is_empty() {
         push_within(
@@ -1825,6 +1884,13 @@ fn render(
         let mut section = format!("\n#### `{}` ({})\n", r.display, r.status.label());
         if let Some(why) = &r.skipped {
             let _ = writeln!(section, "- skipped: {}", clip_line(why));
+        }
+        if let Some(w) = wire_of(r).filter(|w| w.rank != WireRank::Removed) {
+            let _ = writeln!(
+                section,
+                "- wire format: {} (see the wire-format checks)",
+                w.result
+            );
         }
         for ch in r.changes.iter().take(MAX_CHANGES_PER_FILE) {
             section.push_str(&render_change(ch));
@@ -1850,7 +1916,7 @@ fn render(
     if body_only > 0 {
         let names = reports
             .iter()
-            .filter(|r| r.changes.is_empty() && r.skipped.is_none())
+            .filter(|r| !has_contract_change(r) && r.skipped.is_none())
             .map(|r| &r.display);
         let line = format!(
             "\n*No contract-level change (body edits only): {}*\n",
@@ -2659,5 +2725,262 @@ func Connect(conn any) {
         assert_ne!(shown_a, shown_b);
         assert_eq!(shown_a, "a/api/x.ts");
         assert_eq!(view.root(&roots[1]), "b/api");
+    }
+
+    // --- NestJS gateway fixture (the Volontariapp field patterns) ----------
+
+    const NEST_PROTO: &str = r#"syntax = "proto3";
+package demo.v1;
+
+service UserService {
+  rpc GetPublicUser(GetPublicUserQuery) returns (PublicUser);
+  rpc GetUser(GetUserQuery) returns (PublicUser);
+}
+
+message GetPublicUserQuery {
+  string id = 1;
+}
+
+message GetUserQuery {
+  string id = 1;
+  string pagination = 2;
+}
+
+message PublicUser {
+  string id = 1;
+}
+"#;
+
+    /// Holds the client obtained in `onModuleInit`; never calls it itself.
+    const NEST_BASE: &str = r#"import { OnModuleInit } from '@nestjs/common';
+import type { ClientGrpc } from '@nestjs/microservices';
+
+export abstract class BaseUserGrpcController implements OnModuleInit {
+  protected userClient!: UserServiceClient;
+
+  constructor(protected client: ClientGrpc) {}
+
+  onModuleInit() {
+    this.userClient = this.client.getService<UserServiceClient>('UserService');
+  }
+}
+"#;
+
+    /// Calls through the field it inherits: the real call site.
+    const NEST_QUERY: &str = r#"import { BaseUserGrpcController } from './base-user-grpc.controller';
+
+export class UserQueryController extends BaseUserGrpcController {
+  async getPublicUser(id: string) {
+    return this.userClient.getPublicUser({ id });
+  }
+}
+"#;
+
+    /// Binds a client of the service, never calls `getPublicUser`.
+    const NEST_SEED: &str = r#"import { OnModuleInit } from '@nestjs/common';
+import type { ClientGrpc } from '@nestjs/microservices';
+
+export class SystemSeedService implements OnModuleInit {
+  private userClient!: UserServiceClient;
+
+  constructor(private readonly client: ClientGrpc) {}
+
+  onModuleInit() {
+    this.userClient = this.client.getService<UserServiceClient>('UserService');
+  }
+
+  async seed() {
+    return 1;
+  }
+}
+"#;
+
+    /// An `onModuleInit` with no client at all.
+    const NEST_HEALTH: &str = r#"import { OnModuleInit } from '@nestjs/common';
+
+export class HealthService implements OnModuleInit {
+  private ready = false;
+
+  onModuleInit() {
+    this.ready = true;
+  }
+}
+"#;
+
+    const NEST_CONSTANTS: &str = r#"export const USER_SERVICE = 'UserService';
+
+export const METHODS = {
+  GET_PUBLIC_USER: 'GetPublicUser',
+  GET_USER: 'GetUser',
+} as const;
+"#;
+
+    /// The server side: handlers named through constants.
+    const NEST_HANDLER: &str = r#"import { Controller } from '@nestjs/common';
+import { GrpcMethod } from '@nestjs/microservices';
+import { METHODS, USER_SERVICE } from './constants';
+
+@Controller()
+export class UserGrpcController {
+  @GrpcMethod(USER_SERVICE, METHODS.GET_PUBLIC_USER)
+  async getPublicUser(data: { id: string }) {
+    return { id: data.id };
+  }
+
+  @GrpcMethod(USER_SERVICE, METHODS.GET_USER)
+  async getUser(data: { id: string }) {
+    return { id: data.id };
+  }
+}
+"#;
+
+    /// A second subclass calling another RPC through the inherited field.
+    const NEST_ADMIN: &str = r#"import { BaseUserGrpcController } from './base-user-grpc.controller';
+
+export class UserAdminController extends BaseUserGrpcController {
+  async getUser(id: string) {
+    return this.userClient.getUser({ id });
+  }
+}
+"#;
+
+    fn nest_repo() -> TempRepo {
+        let repo = TempRepo::new();
+        repo.write("proto/user.proto", NEST_PROTO);
+        repo.write("gateway/base-user-grpc.controller.ts", NEST_BASE);
+        repo.write("gateway/user.query-controller.ts", NEST_QUERY);
+        repo.write("gateway/seed.service.ts", NEST_SEED);
+        repo.write("gateway/health.service.ts", NEST_HEALTH);
+        repo.write("users/constants.ts", NEST_CONSTANTS);
+        repo.write("users/user.grpc-controller.ts", NEST_HANDLER);
+        repo.commit("base");
+        repo
+    }
+
+    /// Removing `GetPublicUser`: the subclass call through the inherited
+    /// field is the caller (at its own node, exact through the base class's
+    /// binding), the base class that only binds the field is not listed, the
+    /// bind-only class says it holds a client with no call found, the
+    /// unrelated `onModuleInit` is absent, and the handler named through
+    /// constants is reported orphaned.
+    #[test]
+    fn removed_rpc_lists_inherited_callers_bind_only_classes_and_orphaned_handlers() {
+        let repo = nest_repo();
+        repo.write(
+            "proto/user.proto",
+            &NEST_PROTO.replace(
+                "  rpc GetPublicUser(GetPublicUserQuery) returns (PublicUser);\n",
+                "",
+            ),
+        );
+        let state = indexed_state(&repo.root);
+        let out =
+            run_with(&args(Some("main"), None), &state, &repo.runner(), files(20)).expect("diff");
+        let text = &out.text;
+        let rpc = text
+            .split("#### RPC `UserService.GetPublicUser` removed")
+            .nth(1)
+            .expect("rpc impact")
+            .split("\n### ")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            rpc.contains(
+                "- `getPublicUser` in `gateway/user.query-controller.ts:4` _(caller, match: exact)_"
+            ),
+            "{text}"
+        );
+        assert!(!rpc.contains("base-user-grpc.controller.ts"), "{text}");
+        assert!(
+            rpc.contains(
+                "- `SystemSeedService` in `gateway/seed.service.ts:4` _(holds a `UserService` client, no call to `GetPublicUser` found, match: heuristic)_"
+            ),
+            "{text}"
+        );
+        assert!(!rpc.contains("health.service.ts"), "{text}");
+        assert!(!rpc.contains("may call"), "{text}");
+        assert!(
+            rpc.contains("in `users/user.grpc-controller.ts:")
+                && rpc.contains("_(orphaned handler: implements a removed RPC, match: exact)_"),
+            "{text}"
+        );
+        // Only the removed RPC's handler, not its neighbour's.
+        assert_eq!(rpc.matches("orphaned handler").count(), 1, "{text}");
+        assert!(
+            text.contains("Impacted call sites / dependents: 3."),
+            "{text}"
+        );
+    }
+
+    /// A branch adding a call through the inherited field: the per-file RPC
+    /// call diff counts it, under its resolved, declared name.
+    #[test]
+    fn an_added_inherited_call_is_counted_with_its_resolved_name() {
+        let repo = nest_repo();
+        repo.write("gateway/user.admin-controller.ts", NEST_ADMIN);
+        let state = indexed_state(&repo.root);
+        let out =
+            run_with(&args(Some("main"), None), &state, &repo.runner(), files(20)).expect("diff");
+        let text = &out.text;
+        assert!(text.contains("RPC calls +1 -0"), "{text}");
+        assert!(
+            text.contains("- + calls RPC `UserService.GetUser` (L4) in `getUser`"),
+            "{text}"
+        );
+    }
+
+    /// A call through an inherited field no base class binds, on a field whose
+    /// name names no service: listed raw, marked unresolved.
+    #[test]
+    fn an_unresolvable_inherited_call_is_listed_raw() {
+        let repo = nest_repo();
+        repo.write(
+            "gateway/odd.controller.ts",
+            "import { Base } from './base';\n\nexport class OddController extends Base {\n  async run() {\n    return this.transport.send({});\n  }\n}\n",
+        );
+        let state = indexed_state(&repo.root);
+        let out =
+            run_with(&args(Some("main"), None), &state, &repo.runner(), files(20)).expect("diff");
+        let text = &out.text;
+        assert!(
+            text.contains("+ calls `Base#transport.send` (unresolved: no client binding found)"),
+            "{text}"
+        );
+    }
+
+    /// A renumbered field: the wire result names both numbers, the `.proto` is
+    /// a contract change (never "body edits only"), and the summary always
+    /// ends with a count of impacted sites.
+    #[test]
+    fn a_renumbered_field_is_named_and_never_body_only() {
+        let repo = nest_repo();
+        repo.write(
+            "proto/user.proto",
+            &NEST_PROTO.replace("string pagination = 2;", "string pagination = 5;"),
+        );
+        let state = indexed_state(&repo.root);
+        let out =
+            run_with(&args(Some("main"), None), &state, &repo.runner(), files(20)).expect("diff");
+        let text = &out.text;
+        assert!(
+            text.contains("field `pagination` (`string`) renumbered 2 -> 5"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1 changed source file(s) — 1 with contract changes, 0 body-only"),
+            "{text}"
+        );
+        assert!(!text.contains("body edits only"), "{text}");
+        assert!(
+            text.contains(
+                "#### `proto/user.proto` (modified)\n- wire format: 1 `WIRE_FORMAT_BREAKING_CHANGE`"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Impacted call sites / dependents: 0."),
+            "{text}"
+        );
+        assert!(!text.contains("dependents: \n"), "{text}");
     }
 }

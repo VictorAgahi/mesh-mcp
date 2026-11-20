@@ -449,6 +449,19 @@ impl ContractGraph {
         Some(text)
     }
 
+    /// Every [`CONST_VALUE_PREFIX`] record: constant path -> (repository, value).
+    pub(super) fn const_values(&self) -> HashMap<&str, Vec<(RepoId, &str)>> {
+        let mut consts: HashMap<&str, Vec<(RepoId, &str)>> = HashMap::new();
+        for (id, recorded) in &self.rpc_calls {
+            if let Some(c) = recorded.strip_prefix(CONST_VALUE_PREFIX) {
+                if let (Some(node), Some((key, value))) = (self.nodes.get(id), c.split_once('=')) {
+                    consts.entry(key).or_default().push((node.repo_id, value));
+                }
+            }
+        }
+        consts
+    }
+
     /// Resolves every [`HANDLER_REF_PREFIX`] record to `Service.Method` when
     /// both arguments reduce to a literal (a quoted string, or a constant /
     /// enum member / `as const` key recorded as [`CONST_VALUE_PREFIX`], same
@@ -460,20 +473,17 @@ impl ContractGraph {
         proto_methods: &[(NodeId, CompactStr)],
     ) -> HashMap<NodeId, CompactStr> {
         let mut out = HashMap::new();
-        let mut consts: HashMap<&str, Vec<(RepoId, &str)>> = HashMap::new();
-        let mut refs: Vec<(NodeId, &str)> = Vec::new();
-        for (id, recorded) in &self.rpc_calls {
-            if let Some(c) = recorded.strip_prefix(CONST_VALUE_PREFIX) {
-                if let (Some(node), Some((key, value))) = (self.nodes.get(id), c.split_once('=')) {
-                    consts.entry(key).or_default().push((node.repo_id, value));
-                }
-            } else if let Some(r) = recorded.strip_prefix(HANDLER_REF_PREFIX) {
-                refs.push((*id, r));
-            }
-        }
+        let refs: Vec<(NodeId, &str)> = self
+            .rpc_calls
+            .iter()
+            .filter_map(|(id, recorded)| {
+                recorded.strip_prefix(HANDLER_REF_PREFIX).map(|r| (*id, r))
+            })
+            .collect();
         if refs.is_empty() {
             return out;
         }
+        let consts = self.const_values();
         // One pass over the proto methods, not one per handler reference: a
         // reload re-runs this over every handler in the workspace.
         let mut by_name: HashMap<&str, Vec<NodeId>> = HashMap::with_capacity(proto_methods.len());
