@@ -42,7 +42,8 @@ pub use contracts::{
     ImpactMatrix, ImpactRole, ImpactRow, ImpactScope, ImportFact, InjectionFact, ReconcileMode,
     RecordedCaller, ResolvedRpcRecord, RpcRecordResolver, TypeFact, TypeFactKind, CALLABLE_ID_BASE,
     CLIENT_FIELD_BINDING_PREFIX, CONST_VALUE_PREFIX, HANDLER_REF_PREFIX, MAX_DERIVED_CALL_SITES,
-    RPC_EXACT_METHOD_PREFIX, RPC_INFERRED_METHOD_PREFIX, RPC_INHERITED_METHOD_PREFIX,
+    MAX_STRUCTURAL_IMPLS, RPC_EXACT_METHOD_PREFIX, RPC_INFERRED_METHOD_PREFIX,
+    RPC_INHERITED_METHOD_PREFIX,
 };
 pub use crawler::{ExcludeMatcher, FilesystemCrawler, WatchPlan};
 pub use docs::{DocIndex, DocSection};

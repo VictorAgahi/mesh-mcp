@@ -17,10 +17,12 @@ mod resolve;
 
 pub use calls::{
     CallFact, CallFacts, CallReceiver, CallStats, CallableFact, ImportFact, InjectionFact,
-    TypeFact, TypeFactKind, CALLABLE_ID_BASE, MAX_DERIVED_CALL_SITES,
+    TypeFact, TypeFactKind, CALLABLE_ID_BASE, MAX_DERIVED_CALL_SITES, MAX_STRUCTURAL_IMPLS,
 };
 pub use delta::ReconcileMode;
 
+#[cfg(test)]
+mod calls_langs_tests;
 #[cfg(test)]
 mod calls_tests;
 #[cfg(test)]

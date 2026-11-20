@@ -28,7 +28,7 @@ pub const MAX_CALL_SITES_PER_FILE: usize = 8000;
 pub const MAX_DECLS_PER_FILE: usize = 4000;
 
 /// Pre-order iterative walk.
-fn walk<'t>(root: Node<'t>, visit: &mut impl FnMut(Node<'t>)) {
+pub(super) fn walk<'t>(root: Node<'t>, visit: &mut impl FnMut(Node<'t>)) {
     let mut cursor = root.walk();
     loop {
         visit(cursor.node());
@@ -46,7 +46,7 @@ fn walk<'t>(root: Node<'t>, visit: &mut impl FnMut(Node<'t>)) {
     }
 }
 
-fn text<'s>(node: Node, source: &'s [u8]) -> Option<&'s str> {
+pub(super) fn text<'s>(node: Node, source: &'s [u8]) -> Option<&'s str> {
     node.utf8_text(source).ok()
 }
 
@@ -178,14 +178,26 @@ fn inject_call_type<'s>(value: Node, source: &'s [u8]) -> Option<&'s str> {
     text(first, source).and_then(bare_type_name)
 }
 
-struct Builder {
-    facts: CallFacts,
+pub(super) struct Builder {
+    pub(super) facts: CallFacts,
     /// Start byte of each recorded callable's node -> its index.
-    callable_at: HashMap<usize, u32>,
+    pub(super) callable_at: HashMap<usize, u32>,
 }
 
 impl Builder {
-    fn push_capped<T>(list: &mut Vec<T>, item: T, cap: usize, capped: &mut bool) -> bool {
+    pub(super) fn new() -> Self {
+        Self {
+            facts: CallFacts::default(),
+            callable_at: HashMap::new(),
+        }
+    }
+
+    pub(super) fn push_capped<T>(
+        list: &mut Vec<T>,
+        item: T,
+        cap: usize,
+        capped: &mut bool,
+    ) -> bool {
         if list.len() >= cap {
             *capped = true;
             return false;
@@ -194,9 +206,11 @@ impl Builder {
         true
     }
 
-    fn callable(&mut self, node: Node, name: &str, owner: Option<&str>) {
+    /// Records the callable declared by `node`; its index, or `None` when the name is
+    /// empty, the node was recorded already or the per-file cap was hit.
+    pub(super) fn callable(&mut self, node: Node, name: &str, owner: Option<&str>) -> Option<u32> {
         if name.is_empty() || self.callable_at.contains_key(&node.start_byte()) {
-            return;
+            return None;
         }
         let idx = self.facts.callables.len() as u32;
         let fact = CallableFact {
@@ -212,7 +226,9 @@ impl Builder {
             &mut self.facts.capped,
         ) {
             self.callable_at.insert(node.start_byte(), idx);
+            return Some(idx);
         }
+        None
     }
 }
 
@@ -332,6 +348,7 @@ pub fn extract(tree: &Tree, source: &[u8], rewrite: &dyn Fn(&str) -> Option<Stri
                 kind,
                 extends,
                 implements,
+                methods: Vec::new(),
             };
             Builder::push_capped(
                 &mut b.facts.types,
@@ -427,7 +444,7 @@ pub fn extract(tree: &Tree, source: &[u8], rewrite: &dyn Fn(&str) -> Option<Stri
 }
 
 impl Builder {
-    fn import(&mut self, local: &str, exported: &str, module: &str) {
+    pub(super) fn import(&mut self, local: &str, exported: &str, module: &str) {
         let fact = ImportFact {
             local: CompactStr::new(local),
             exported: CompactStr::new(exported),
@@ -441,7 +458,7 @@ impl Builder {
         );
     }
 
-    fn injection(&mut self, class: &str, field: &str, declared_type: &str) {
+    pub(super) fn injection(&mut self, class: &str, field: &str, declared_type: &str) {
         let fact = InjectionFact {
             class: CompactStr::new(class),
             field: CompactStr::new(field),

@@ -49,6 +49,11 @@ pub const MAX_DERIVED_CALL_SITES: usize = 2_000_000;
 /// Longest chain of base classes / re-exports followed for one lookup.
 const MAX_TYPE_HOPS: usize = 16;
 
+/// Most struct types a Go interface may resolve to, matched structurally (the
+/// methods of the interface are a subset of the struct's). Past it the interface
+/// resolves to nothing and is counted in [`CallStats::dispatch_overflow`].
+pub const MAX_STRUCTURAL_IMPLS: usize = 64;
+
 /// Extensions a relative module specifier may omit.
 const SCRIPT_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
@@ -75,8 +80,11 @@ pub enum CallReceiver {
     InjectedField(CompactStr),
     /// `f()` where `f` is an imported binding (the callee is the local name).
     ImportedSymbol,
-    /// `f()` where `f` is a free function of the same file.
+    /// `f()` where `f` is a free function of the same file (Go: of the same package).
     SameModule,
+    /// `ns.f()` where `ns` is an imported module or package (a Go package alias, a
+    /// Python module): the callee is `f`, a free function of that module.
+    Namespace(CompactStr),
 }
 
 /// One call site, inside a callable of the same file.
@@ -129,6 +137,10 @@ pub struct TypeFact {
     pub extends: Vec<CompactStr>,
     #[serde(default)]
     pub implements: Vec<CompactStr>,
+    /// Method names an interface declares (Go: its structural method set, matched
+    /// against the methods of struct types; empty elsewhere).
+    #[serde(default)]
+    pub methods: Vec<CompactStr>,
 }
 
 /// Every call fact of one file. Stored in the parse cache with the rest of the
@@ -167,6 +179,7 @@ impl CallFacts {
         for t in &mut self.types {
             t.extends.shrink_to_fit();
             t.implements.shrink_to_fit();
+            t.methods.shrink_to_fit();
         }
     }
 
@@ -211,6 +224,10 @@ pub struct CallStats {
     pub calls: usize,
     /// Files whose stored call facts hit a per-file cap (`CallFacts::capped`).
     pub files_capped: usize,
+    /// Go interfaces left without implementations because more than
+    /// [`MAX_STRUCTURAL_IMPLS`] struct types satisfy them (a calls path through such an
+    /// interface is cut, counted in `IndexHealth`).
+    pub dispatch_overflow: usize,
     /// Approximate bytes of the stored raw facts (vector lengths times element
     /// sizes; strings over 24 bytes, rare in identifiers, are not counted).
     pub facts_bytes: usize,
@@ -293,7 +310,10 @@ impl ContractGraph {
                 + c.types.len() * size_of::<TypeFact>()
                 + c.types
                     .iter()
-                    .map(|t| (t.extends.len() + t.implements.len()) * size_of::<CompactStr>())
+                    .map(|t| {
+                        (t.extends.len() + t.implements.len() + t.methods.len())
+                            * size_of::<CompactStr>()
+                    })
                     .sum::<usize>();
         }
         (capped, bytes)
@@ -493,6 +513,69 @@ fn confidence_rank(c: EdgeConfidence) -> u8 {
 /// A type (or free function) by (file index, name).
 type TypeKey<'g> = (usize, &'g str);
 
+/// Source language of a file with call facts, from its extension: it picks how an
+/// import is resolved and whether files of one directory see each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    /// TypeScript / JavaScript: relative module specifiers.
+    Script,
+    /// Java: dotted imports, one package per directory.
+    Java,
+    /// Go: import paths name a directory, one package per directory.
+    Go,
+    /// Python: dotted or relative module imports.
+    Python,
+    Other,
+}
+
+fn lang_of(path: &str) -> Lang {
+    match path.rsplit_once('.').map(|(_, e)| e) {
+        Some(e) if SCRIPT_EXTENSIONS.contains(&e) => Lang::Script,
+        Some("java") => Lang::Java,
+        Some("go") => Lang::Go,
+        Some("py") => Lang::Python,
+        _ => Lang::Other,
+    }
+}
+
+/// `a/b/c.py` -> `a/b/c`; `a/b/__init__.py` -> `a/b`; for a Java file the path
+/// without its extension. `None` for any other file.
+fn module_stem(path: &str, lang: Lang) -> Option<&str> {
+    let (base, _) = path.rsplit_once('.')?;
+    match lang {
+        Lang::Java => Some(base),
+        Lang::Python => Some(base.strip_suffix("/__init__").unwrap_or(base)),
+        _ => None,
+    }
+}
+
+/// Last path segment.
+fn last_segment(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Whether `path` ends with the `/`-separated `suffix` on a segment boundary.
+fn ends_with_path(path: &str, suffix: &str) -> bool {
+    path.strip_suffix(suffix)
+        .is_some_and(|rest| rest.is_empty() || rest.ends_with('/'))
+}
+
+/// Number of trailing `/`-separated segments `a` and `b` share.
+fn common_tail(a: &str, b: &str) -> usize {
+    a.rsplit('/')
+        .zip(b.rsplit('/'))
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
+/// Number of leading `/`-separated segments `a` and `b` share.
+fn common_head(a: &str, b: &str) -> usize {
+    a.split('/')
+        .zip(b.split('/'))
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
 /// What an import binding names.
 #[derive(Debug, Clone, Copy)]
 enum Binding<'g> {
@@ -501,6 +584,8 @@ enum Binding<'g> {
     /// `exported` of a workspace package (`@scope/name` -> `name`), matched against
     /// the package each file was indexed under: `heuristic`, `ambiguous` on a tie.
     Package(&'g str, &'g str),
+    /// `exported` of a package directory (Go): `*` names the package itself.
+    Dir(usize, &'g str),
 }
 
 /// `@scope/name/sub` -> `name`, `name/sub` -> `name`; `None` for a relative or
@@ -540,24 +625,60 @@ struct Deriver<'g> {
     files: Vec<(&'g FilePath, &'g FileCallFacts)>,
     /// Global index of each file's first callable.
     offsets: Vec<usize>,
+    lang: Vec<Lang>,
     /// Per file: import local name -> binding; `export * from` targets apart.
     imports: Vec<FastMap<&'g str, Binding<'g>>>,
     star_exports: Vec<Vec<usize>>,
     types: FastMap<TypeKey<'g>, &'g TypeFact>,
     /// (package, name, is_type) -> files declaring it, sorted (test files carry no
-    /// call facts, see the TypeScript extractor).
+    /// call facts, see the TypeScript extractor). TypeScript only.
     package_decls: FastMap<(&'g str, &'g str, bool), Vec<usize>>,
+    /// Directory of each Java / Go file (`usize::MAX` for any other file): the files of
+    /// one directory form one package and see each other's declarations.
+    dir_of: Vec<usize>,
+    dir_files: Vec<Vec<usize>>,
+    /// (directory, name, is_type) -> files of the directory declaring it, sorted.
+    dir_decls: FastMap<(usize, &'g str, bool), Vec<usize>>,
+    /// Per file: directories brought in by wildcard imports (Java `import a.b.*`).
+    star_dirs: Vec<Vec<usize>>,
     /// (file, class) -> resolved base classes.
     bases: FastMap<TypeKey<'g>, Vec<TypeKey<'g>>>,
     /// Resolved type -> types extending or implementing it (sorted).
     subtypes: FastMap<TypeKey<'g>, Vec<TypeKey<'g>>>,
     /// (file, owner, name) -> global callable index; free functions have owner "".
+    /// A Go method is filed under the file declaring its receiver type.
     methods: FastMap<(usize, &'g str, &'g str), usize>,
+    /// Go: type -> its methods (global callable indices, sorted).
+    methods_of: FastMap<TypeKey<'g>, Vec<usize>>,
     /// (file, class, field) -> declared type.
     injections: FastMap<(usize, &'g str, &'g str), &'g str>,
     /// `dispatch` results: an interface with thousands of implementations is
     /// walked once per method name, not once per call site.
     dispatched: std::cell::RefCell<FastMap<(TypeKey<'g>, CompactStr), Vec<usize>>>,
+    /// Go interfaces dropped past [`MAX_STRUCTURAL_IMPLS`].
+    dispatch_overflow: usize,
+}
+
+/// The one candidate closest to `importer` (most leading path segments shared); `None`
+/// when there is no candidate or the best is a tie.
+fn pick_closest<'a>(
+    importer: &str,
+    candidates: impl Iterator<Item = (usize, &'a str)>,
+) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    let mut tie = false;
+    for (id, path) in candidates {
+        let score = common_head(importer, path);
+        match best {
+            Some((s, _)) if score < s => {}
+            Some((s, _)) if score == s => tie = true,
+            _ => {
+                best = Some((score, id));
+                tie = false;
+            }
+        }
+    }
+    best.filter(|_| !tie).map(|(_, id)| id)
 }
 
 impl<'g> Deriver<'g> {
@@ -569,19 +690,27 @@ impl<'g> Deriver<'g> {
             offsets.push(total);
             total += f.facts.callables.len();
         }
+        let n = files.len();
         let mut d = Self {
             graph,
             files,
             offsets,
+            lang: Vec::new(),
             imports: Vec::new(),
             star_exports: Vec::new(),
             types: FastMap::default(),
             package_decls: FastMap::default(),
+            dir_of: vec![usize::MAX; n],
+            dir_files: Vec::new(),
+            dir_decls: FastMap::default(),
+            star_dirs: vec![Vec::new(); n],
             bases: FastMap::default(),
             subtypes: FastMap::default(),
             methods: FastMap::default(),
+            methods_of: FastMap::default(),
             injections: FastMap::default(),
             dispatched: std::cell::RefCell::default(),
+            dispatch_overflow: 0,
         };
         d.index();
         d
@@ -595,6 +724,11 @@ impl<'g> Deriver<'g> {
             .iter()
             .map(|(p, _)| p.to_str().map(|s| s.replace('\\', "/")))
             .collect();
+        self.lang = slashed
+            .iter()
+            .map(|s| s.as_deref().map_or(Lang::Other, lang_of))
+            .collect();
+        let langs = self.lang.clone();
         let mut by_module: FastMap<&str, usize> = FastMap::default();
         for (i, s) in slashed.iter().enumerate() {
             if let Some(stem) = s.as_deref().and_then(strip_script_ext_str) {
@@ -621,20 +755,162 @@ impl<'g> Deriver<'g> {
                 .copied()
                 .or_else(|| strip_script_ext_str(&joined).and_then(|s| by_module.get(s).copied()))
         };
+
+        // Java / Python module files by the last segment of their module path (a
+        // Python `__init__.py` by its directory), Java / Go directories by name.
+        let mut stems: Vec<Option<&str>> = vec![None; slashed.len()];
+        let mut by_stem: FastMap<&str, Vec<usize>> = FastMap::default();
+        let mut dir_ids: FastMap<&str, usize> = FastMap::default();
+        let mut dir_paths: Vec<&str> = Vec::new();
+        let mut dirs_by_name: FastMap<&str, Vec<usize>> = FastMap::default();
+        let mut dir_files: Vec<Vec<usize>> = Vec::new();
+        for (i, s) in slashed.iter().enumerate() {
+            let Some(s) = s.as_deref() else { continue };
+            let lang = self.lang[i];
+            if matches!(lang, Lang::Java | Lang::Python) {
+                if let Some(stem) = module_stem(s, lang) {
+                    stems[i] = Some(stem);
+                    by_stem.entry(last_segment(stem)).or_default().push(i);
+                }
+            }
+            if matches!(lang, Lang::Java | Lang::Go) {
+                if let Some((dir, _)) = s.rsplit_once('/') {
+                    let d = *dir_ids.entry(dir).or_insert_with(|| {
+                        dir_paths.push(dir);
+                        dir_files.push(Vec::new());
+                        dirs_by_name
+                            .entry(last_segment(dir))
+                            .or_default()
+                            .push(dir_paths.len() - 1);
+                        dir_paths.len() - 1
+                    });
+                    dir_files[d].push(i);
+                    self.dir_of[i] = d;
+                }
+            }
+        }
+        // The module file `suffix` (`a/b/c`) names, closest to the importer.
+        let module_file = |importer: usize, lang: Lang, suffix: &str| -> Option<usize> {
+            let cands = by_stem.get(last_segment(suffix))?;
+            pick_closest(
+                slashed[importer].as_deref()?,
+                cands.iter().filter_map(|&c| {
+                    let stem = stems[c]?;
+                    (langs[c] == lang && ends_with_path(stem, suffix)).then_some((c, stem))
+                }),
+            )
+        };
+        // The directory whose path ends with `suffix` (`a/b`), closest to the importer.
+        let package_dir = |importer: usize, suffix: &str| -> Option<usize> {
+            let cands = dirs_by_name.get(last_segment(suffix))?;
+            pick_closest(
+                slashed[importer].as_deref()?,
+                cands
+                    .iter()
+                    .filter(|&&d| ends_with_path(dir_paths[d], suffix))
+                    .map(|&d| (d, dir_paths[d])),
+            )
+        };
+        // A Go import path names the directory sharing the longest tail with it; one
+        // segment is a standard-library package, never a workspace directory.
+        let go_dir = |importer: usize, path: &str| -> Option<usize> {
+            let (_, last) = path.rsplit_once('/')?;
+            let cands = dirs_by_name.get(last)?;
+            let best = cands
+                .iter()
+                .map(|&d| common_tail(dir_paths[d], path))
+                .max()?;
+            // `net/http`, `encoding/json`: without a host the match must be a long one.
+            if best < 2 && !path.split('/').next().is_some_and(|h| h.contains('.')) {
+                return None;
+            }
+            pick_closest(
+                slashed[importer].as_deref()?,
+                cands
+                    .iter()
+                    .filter(|&&d| common_tail(dir_paths[d], path) == best)
+                    .map(|&d| (d, dir_paths[d])),
+            )
+        };
+        // A Python module (relative: leading dots; absolute: matched by path suffix).
+        let py_module = |importer: usize, module: &str, sub: Option<&str>| -> Option<usize> {
+            let dots = module.bytes().take_while(|&b| b == b'.').count();
+            let mut path = module[dots..].replace('.', "/");
+            if let Some(sub) = sub {
+                if !path.is_empty() {
+                    path.push('/');
+                }
+                path.push_str(sub);
+            }
+            if dots == 0 {
+                return module_file(importer, Lang::Python, &path);
+            }
+            // `.x` is a sibling of the importer, `..x` one directory up.
+            let mut dir = slashed[importer].as_deref()?.rsplit_once('/')?.0;
+            for _ in 1..dots {
+                dir = dir.rsplit_once('/')?.0;
+            }
+            let wanted = if path.is_empty() {
+                dir.to_string()
+            } else {
+                format!("{dir}/{path}")
+            };
+            by_stem
+                .get(last_segment(&wanted))?
+                .iter()
+                .copied()
+                .find(|&c| langs[c] == Lang::Python && stems[c] == Some(wanted.as_str()))
+        };
+
         for (i, (_, f)) in self.files.iter().enumerate() {
             let mut map = FastMap::default();
             let mut stars = Vec::new();
             for imp in &f.facts.imports {
-                let binding = match resolve(i, &imp.module) {
-                    Some(target) => Binding::File(target, imp.exported.as_str()),
-                    None => match package_key(&imp.module) {
-                        Some(pkg) => Binding::Package(pkg, imp.exported.as_str()),
+                let binding = match self.lang[i] {
+                    Lang::Java => {
+                        let as_path = imp.module.replace('.', "/");
+                        if imp.local == "*" {
+                            if let Some(d) = package_dir(i, &as_path) {
+                                self.star_dirs[i].push(d);
+                            }
+                            continue;
+                        }
+                        // `a.b.C` is the file `a/b/C`; `a.b.Outer.Inner` a type of `a/b/Outer`.
+                        let file =
+                            module_file(i, Lang::Java, &format!("{as_path}/{}", imp.exported))
+                                .or_else(|| module_file(i, Lang::Java, &as_path));
+                        match file {
+                            Some(t) => Binding::File(t, imp.exported.as_str()),
+                            None => continue,
+                        }
+                    }
+                    Lang::Go => match go_dir(i, &imp.module) {
+                        Some(d) => Binding::Dir(d, "*"),
                         None => continue,
+                    },
+                    Lang::Python => {
+                        let exported = imp.exported.as_str();
+                        // `from pkg import mod` names a module when `pkg/mod` is one.
+                        let sub = (exported != "*")
+                            .then(|| py_module(i, &imp.module, Some(exported)))
+                            .flatten();
+                        match (sub, py_module(i, &imp.module, None)) {
+                            (Some(m), _) => Binding::File(m, "*"),
+                            (None, Some(m)) => Binding::File(m, exported),
+                            (None, None) => continue,
+                        }
+                    }
+                    _ => match resolve(i, &imp.module) {
+                        Some(target) => Binding::File(target, imp.exported.as_str()),
+                        None => match package_key(&imp.module) {
+                            Some(pkg) => Binding::Package(pkg, imp.exported.as_str()),
+                            None => continue,
+                        },
                     },
                 };
                 match (imp.local == "*", binding) {
                     (true, Binding::File(target, _)) => stars.push(target),
-                    (true, Binding::Package(..)) => {}
+                    (true, _) => {}
                     (false, b) => {
                         map.entry(imp.local.as_str()).or_insert(b);
                     }
@@ -642,23 +918,38 @@ impl<'g> Deriver<'g> {
             }
             stars.sort_unstable();
             stars.dedup();
+            self.star_dirs[i].sort_unstable();
+            self.star_dirs[i].dedup();
             self.imports.push(map);
             self.star_exports.push(stars);
             for t in &f.facts.types {
                 self.types.entry((i, t.name.as_str())).or_insert(t);
-                self.package_decls
-                    .entry((f.package.as_str(), t.name.as_str(), true))
-                    .or_default()
-                    .push(i);
+                if self.lang[i] == Lang::Script {
+                    self.package_decls
+                        .entry((f.package.as_str(), t.name.as_str(), true))
+                        .or_default()
+                        .push(i);
+                }
+                if self.dir_of[i] != usize::MAX {
+                    self.dir_decls
+                        .entry((self.dir_of[i], t.name.as_str(), true))
+                        .or_default()
+                        .push(i);
+                }
             }
-            for (k, c) in f.facts.callables.iter().enumerate() {
-                let owner = c.owner.as_deref().unwrap_or("");
-                self.methods
-                    .entry((i, owner, c.name.as_str()))
-                    .or_insert(self.offsets[i] + k);
-                if owner.is_empty() {
+            for c in &f.facts.callables {
+                if c.owner.is_some() {
+                    continue;
+                }
+                if self.lang[i] == Lang::Script {
                     self.package_decls
                         .entry((f.package.as_str(), c.name.as_str(), false))
+                        .or_default()
+                        .push(i);
+                }
+                if self.dir_of[i] != usize::MAX {
+                    self.dir_decls
+                        .entry((self.dir_of[i], c.name.as_str(), false))
                         .or_default()
                         .push(i);
                 }
@@ -669,10 +960,39 @@ impl<'g> Deriver<'g> {
                     .or_insert(inj.declared_type.as_str());
             }
         }
-        for v in self.package_decls.values_mut() {
+        self.dir_files = dir_files;
+        for v in self
+            .package_decls
+            .values_mut()
+            .chain(self.dir_decls.values_mut())
+        {
             v.sort_unstable();
             v.dedup();
         }
+        // Methods, after the type declarations: a Go method is filed under the file
+        // declaring its receiver type, which may be another file of the package.
+        for (i, (_, f)) in self.files.iter().enumerate() {
+            for (k, c) in f.facts.callables.iter().enumerate() {
+                let owner = c.owner.as_deref().unwrap_or("");
+                let global = self.offsets[i] + k;
+                let at = if self.lang[i] == Lang::Go && !owner.is_empty() {
+                    self.owner_file(i, owner)
+                } else {
+                    i
+                };
+                self.methods
+                    .entry((at, owner, c.name.as_str()))
+                    .or_insert(global);
+                if self.lang[i] == Lang::Go && !owner.is_empty() {
+                    self.methods_of.entry((at, owner)).or_default().push(global);
+                }
+            }
+        }
+        for v in self.methods_of.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+
         let mut bases: FastMap<TypeKey<'g>, Vec<TypeKey<'g>>> = FastMap::default();
         let mut subtypes: FastMap<TypeKey<'g>, Vec<TypeKey<'g>>> = FastMap::default();
         for (i, (_, f)) in self.files.iter().enumerate() {
@@ -691,12 +1011,162 @@ impl<'g> Deriver<'g> {
                 }
             }
         }
-        for v in subtypes.values_mut().chain(bases.values_mut()) {
+        self.bases = bases;
+        self.structural_impls(&mut subtypes);
+        for v in subtypes.values_mut().chain(self.bases.values_mut()) {
             v.sort_unstable();
             v.dedup();
         }
-        self.bases = bases;
         self.subtypes = subtypes;
+    }
+
+    /// Go: a struct implements an interface when its methods (own and promoted from
+    /// embedded types) include every method of the interface. Only the interfaces a
+    /// struct field is declared with are matched. More than [`MAX_STRUCTURAL_IMPLS`]
+    /// implementations drop the interface (counted).
+    fn structural_impls(&mut self, subtypes: &mut FastMap<TypeKey<'g>, Vec<TypeKey<'g>>>) {
+        let mut ifaces: BTreeSet<TypeKey<'g>> = BTreeSet::new();
+        for (i, (_, f)) in self.files.iter().enumerate() {
+            if self.lang[i] != Lang::Go {
+                continue;
+            }
+            for inj in &f.facts.injections {
+                for (k, _) in self.resolve_type(i, inj.declared_type.as_str()) {
+                    if self
+                        .types
+                        .get(&k)
+                        .is_some_and(|t| t.kind == TypeFactKind::Interface)
+                    {
+                        ifaces.insert(k);
+                    }
+                }
+            }
+        }
+        if ifaces.is_empty() {
+            return;
+        }
+        // Method name -> struct types having it (own methods; promoted ones are
+        // found by the superset test, which follows embedding).
+        let mut method_types: FastMap<&'g str, Vec<TypeKey<'g>>> = FastMap::default();
+        for (&t, globals) in &self.methods_of {
+            if self.types.get(&t).map(|f| f.kind) != Some(TypeFactKind::Class) {
+                continue;
+            }
+            for &g in globals {
+                let (_, c) = self.callable(g);
+                method_types.entry(c.name.as_str()).or_default().push(t);
+            }
+        }
+        for v in method_types.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+        let mut sets: FastMap<TypeKey<'g>, BTreeSet<&'g str>> = FastMap::default();
+        let mut dropped = 0;
+        for iface in ifaces {
+            let want = self.method_set(iface, &mut sets);
+            let Some(rarest) = want
+                .iter()
+                .min_by_key(|m| method_types.get(*m).map_or(0, Vec::len))
+            else {
+                continue;
+            };
+            let candidates: Vec<TypeKey<'g>> =
+                method_types.get(rarest).cloned().unwrap_or_default();
+            let mut found = Vec::new();
+            for t in candidates {
+                let have = self.method_set(t, &mut sets);
+                if want.iter().all(|m| have.contains(m)) {
+                    found.push(t);
+                }
+            }
+            if found.len() > MAX_STRUCTURAL_IMPLS {
+                dropped += 1;
+                continue;
+            }
+            subtypes.entry(iface).or_default().extend(found);
+        }
+        self.dispatch_overflow = dropped;
+    }
+
+    /// Method names of `t`: an interface's declared ones and a struct's own, plus those
+    /// of its embedded types (`bases`), bounded by [`MAX_TYPE_HOPS`].
+    fn method_set(
+        &self,
+        t: TypeKey<'g>,
+        cache: &mut FastMap<TypeKey<'g>, BTreeSet<&'g str>>,
+    ) -> BTreeSet<&'g str> {
+        if let Some(hit) = cache.get(&t) {
+            return hit.clone();
+        }
+        let mut out = BTreeSet::new();
+        let mut stack = vec![t];
+        let mut seen = FastSet::default();
+        while let Some(c) = stack.pop() {
+            if seen.len() > MAX_TYPE_HOPS || !seen.insert(c) {
+                continue;
+            }
+            if let Some(fact) = self.types.get(&c) {
+                out.extend(fact.methods.iter().map(CompactStr::as_str));
+            }
+            if let Some(globals) = self.methods_of.get(&c) {
+                out.extend(globals.iter().map(|&g| self.callable(g).1.name.as_str()));
+            }
+            if let Some(bs) = self.bases.get(&c) {
+                stack.extend(bs.iter().copied());
+            }
+        }
+        cache.insert(t, out.clone());
+        out
+    }
+
+    /// The file declaring class `owner` as seen from `file`: the file itself, or for a
+    /// Java / Go package the sibling declaring it (a Go method may sit in another file
+    /// than its receiver type).
+    fn owner_file(&self, file: usize, owner: &str) -> usize {
+        if self.types.contains_key(&(file, owner)) {
+            return file;
+        }
+        match self.dir_of[file] {
+            usize::MAX => file,
+            d => self
+                .dir_decls
+                .get(&(d, owner, true))
+                .and_then(|v| v.first().copied())
+                .unwrap_or(file),
+        }
+    }
+
+    /// Declarations of the package `file` belongs to (Java / Go: its own directory,
+    /// else the directories of its wildcard imports) named `name`.
+    fn scope_candidates(
+        &self,
+        file: usize,
+        name: &'g str,
+        is_type: bool,
+    ) -> Vec<(TypeKey<'g>, EdgeConfidence)> {
+        let d = self.dir_of[file];
+        if d == usize::MAX {
+            return Vec::new();
+        }
+        let mut files: Vec<usize> = Vec::new();
+        for dir in std::iter::once(d).chain(self.star_dirs[file].iter().copied()) {
+            if let Some(v) = self.dir_decls.get(&(dir, name, is_type)) {
+                files.extend(v.iter().copied());
+            }
+            // The own package shadows wildcard imports.
+            if !files.is_empty() {
+                break;
+            }
+        }
+        files.sort_unstable();
+        files.dedup();
+        let confidence = if files.len() > 1 {
+            EdgeConfidence::Ambiguous
+        } else {
+            EdgeConfidence::Exact
+        };
+        files.into_iter().map(|f| ((f, name), confidence)).collect()
     }
 
     fn declared(&self, f: usize, n: &str, is_type: bool) -> bool {
@@ -728,14 +1198,21 @@ impl<'g> Deriver<'g> {
 
     /// Where `name`, as written in file `file`, is declared: through an import
     /// binding (re-exports of relative modules followed, `exact`; a workspace
-    /// package matched by name, see [`Binding::Package`]), else the file itself.
+    /// package matched by name, see [`Binding::Package`]), else the file itself, else
+    /// the package it belongs to (Java, Go). `ns.T` names `T` of the module or package
+    /// imported as `ns`.
     fn resolve_export(
         &self,
         file: usize,
         name: &'g str,
         is_type: bool,
     ) -> Vec<(TypeKey<'g>, EdgeConfidence)> {
+        if let Some((ns, rest)) = name.split_once('.') {
+            return self.resolve_qualified(file, ns, rest, is_type);
+        }
         let start = match self.imports.get(file).and_then(|m| m.get(name)) {
+            // A namespace import names a module, not a symbol.
+            Some(&Binding::File(_, "*")) | Some(&Binding::Dir(..)) => return Vec::new(),
             Some(&Binding::File(f, exported)) => (f, exported),
             Some(&Binding::Package(pkg, exported)) => {
                 return self.package_candidates(pkg, exported, is_type)
@@ -743,9 +1220,13 @@ impl<'g> Deriver<'g> {
             None if self.declared(file, name, is_type) => {
                 return vec![((file, name), EdgeConfidence::Exact)]
             }
-            None => return Vec::new(),
+            None => return self.scope_candidates(file, name, is_type),
         };
-        // Follow re-exports: a barrel imports (or re-exports) the name from another file.
+        self.follow(start, is_type)
+    }
+
+    /// `name` exported by file `start.0` as `start.1`, through re-exports.
+    fn follow(&self, start: TypeKey<'g>, is_type: bool) -> Vec<(TypeKey<'g>, EdgeConfidence)> {
         let mut queue = VecDeque::from([start]);
         let mut seen: FastSet<TypeKey<'g>> = FastSet::default();
         while let Some((f, n)) = queue.pop_front() {
@@ -756,17 +1237,46 @@ impl<'g> Deriver<'g> {
                 return vec![((f, n), EdgeConfidence::Exact)];
             }
             match self.imports.get(f).and_then(|m| m.get(n)) {
-                Some(&Binding::File(g, exported)) => queue.push_back((g, exported)),
+                Some(&Binding::File(g, exported)) if exported != "*" => {
+                    queue.push_back((g, exported))
+                }
                 Some(&Binding::Package(pkg, exported)) => {
                     return self.package_candidates(pkg, exported, is_type)
                 }
-                None => {}
+                _ => {}
             }
             for &g in self.star_exports.get(f).map_or(&[][..], Vec::as_slice) {
                 queue.push_back((g, n));
             }
         }
         Vec::new()
+    }
+
+    /// `ns.name`: `name` declared by the module (Python) or package (Go) `ns` names.
+    fn resolve_qualified(
+        &self,
+        file: usize,
+        ns: &'g str,
+        name: &'g str,
+        is_type: bool,
+    ) -> Vec<(TypeKey<'g>, EdgeConfidence)> {
+        match self.imports.get(file).and_then(|m| m.get(ns)) {
+            Some(&Binding::File(f, "*")) => self.follow((f, name), is_type),
+            Some(&Binding::Dir(d, "*")) => {
+                let found: Vec<usize> = self.dir_files[d]
+                    .iter()
+                    .copied()
+                    .filter(|&f| self.declared(f, name, is_type))
+                    .collect();
+                let confidence = if found.len() > 1 {
+                    EdgeConfidence::Ambiguous
+                } else {
+                    EdgeConfidence::Exact
+                };
+                found.into_iter().map(|f| ((f, name), confidence)).collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn resolve_type(&self, file: usize, name: &'g str) -> Vec<(TypeKey<'g>, EdgeConfidence)> {
@@ -861,14 +1371,15 @@ impl<'g> Deriver<'g> {
         let mut found = BTreeMap::new();
         let via = match &site.receiver {
             CallReceiver::This => {
-                if let Some(t) = owner.and_then(|o| self.find_method((file, o), callee)) {
+                let class = owner.map(|o| (self.owner_file(file, o), o));
+                if let Some(t) = class.and_then(|c| self.find_method(c, callee)) {
                     found.insert(t, EdgeConfidence::Exact);
                 }
                 "this"
             }
             CallReceiver::InjectedField(field) => {
-                if let Some((decl_file, t)) = owner.and_then(|o| self.field_type((file, o), field))
-                {
+                let class = owner.map(|o| (self.owner_file(file, o), o));
+                if let Some((decl_file, t)) = class.and_then(|c| self.field_type(c, field)) {
                     for (ty, c) in self.resolve_type(decl_file, t) {
                         let impls = self.dispatch(ty, callee);
                         let c = if impls.len() > 1 {
@@ -896,8 +1407,23 @@ impl<'g> Deriver<'g> {
             CallReceiver::SameModule => {
                 if let Some(&t) = self.methods.get(&(file, "", callee)) {
                     found.insert(t, EdgeConfidence::Exact);
+                } else {
+                    // Go: a function of another file of the package.
+                    for ((f2, name), c) in self.scope_candidates(file, callee, false) {
+                        if let Some(&t) = self.methods.get(&(f2, "", name)) {
+                            keep_strongest(&mut found, t, c);
+                        }
+                    }
                 }
                 "same_module"
+            }
+            CallReceiver::Namespace(ns) => {
+                for ((f2, name), c) in self.resolve_qualified(file, ns.as_str(), callee, false) {
+                    if let Some(&t) = self.methods.get(&(f2, "", name)) {
+                        keep_strongest(&mut found, t, c);
+                    }
+                }
+                "namespace"
             }
         };
         (finish(found), via)
@@ -920,6 +1446,63 @@ impl<'g> Deriver<'g> {
             .filter(|(_, c)| (c.line_start as usize) <= line && line <= c.line_end as usize)
             .min_by_key(|(k, c)| (c.line_end - c.line_start, *k))
             .map(|(k, _)| self.offsets[file] + k)
+    }
+
+    /// Go: a client is built in the constructor `NewT` of the struct `T` that holds it
+    /// (`&T{writer: &kafka.Writer{Topic: "t"}}`), and `T`'s methods use it. When the
+    /// topic site lies in such a constructor, the methods of `T` that call through one
+    /// of their fields are the entry (or producer) callables too. Anything not named
+    /// `New<Type>` with that type in the package anchors on its own callable only.
+    fn constructed_methods(&self, file: usize, callable: usize) -> Vec<usize> {
+        let d = self.dir_of[file];
+        if self.lang[file] != Lang::Go || d == usize::MAX {
+            return Vec::new();
+        }
+        let (_, c) = self.callable(callable);
+        if c.owner.is_some() {
+            return Vec::new();
+        }
+        let Some(rest) = c
+            .name
+            .strip_prefix("New")
+            .or_else(|| c.name.strip_prefix("new"))
+            .filter(|r| !r.is_empty())
+        else {
+            return Vec::new();
+        };
+        let mut lowered = rest.to_string();
+        if let Some(first) = lowered.get_mut(..1) {
+            first.make_ascii_lowercase();
+        }
+        for ty in [rest, lowered.as_str()] {
+            let Some(&at) = self
+                .dir_decls
+                .get(&(d, ty, true))
+                .and_then(|files| files.first())
+            else {
+                continue;
+            };
+            let Some(methods) = self.methods_of.get(&(at, ty)) else {
+                continue;
+            };
+            return methods
+                .iter()
+                .copied()
+                .filter(|&m| self.uses_fields(m))
+                .collect();
+        }
+        Vec::new()
+    }
+
+    /// Whether the callable makes a call through a field of its type.
+    fn uses_fields(&self, global: usize) -> bool {
+        let (file, _) = self.callable(global);
+        let local = (global - self.offsets[file]) as u32;
+        let (_, f) = self.files[file];
+        f.facts
+            .call_sites
+            .iter()
+            .any(|s| s.caller == local && matches!(s.receiver, CallReceiver::InjectedField(_)))
     }
 
     fn run(self) -> DerivedCalls {
@@ -966,12 +1549,23 @@ impl<'g> Deriver<'g> {
             }
         }
 
-        // 1. File-level pruning over imports and implementation links.
-        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        // 1. File-level pruning over imports and implementation links. The files of a
+        // Java / Go package see each other: one hub node per directory (`n + dir`)
+        // links them without a quadratic edge list.
+        let hubs = self.dir_files.len();
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n + hubs];
+        for (d, members) in self.dir_files.iter().enumerate() {
+            adj[n + d] = members.clone();
+        }
         for (i, map) in self.imports.iter().enumerate() {
+            if self.dir_of[i] != usize::MAX {
+                adj[i].push(n + self.dir_of[i]);
+            }
+            adj[i].extend(self.star_dirs[i].iter().map(|d| n + d));
             for b in map.values() {
                 match *b {
                     Binding::File(f, _) => adj[i].push(f),
+                    Binding::Dir(d, _) => adj[i].push(n + d),
                     Binding::Package(pkg, name) => {
                         for is_type in [true, false] {
                             adj[i].extend(
@@ -988,7 +1582,7 @@ impl<'g> Deriver<'g> {
         for (base, subs) in &self.subtypes {
             adj[base.0].extend(subs.iter().map(|s| s.0));
         }
-        let mut radj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut radj: Vec<Vec<usize>> = vec![Vec::new(); n + hubs];
         for (i, out) in adj.iter_mut().enumerate() {
             out.sort_unstable();
             out.dedup();
@@ -996,8 +1590,16 @@ impl<'g> Deriver<'g> {
                 radj[j].push(i);
             }
         }
-        let fwd_files = bfs((0..n).filter(|&i| !entry_lines[i].is_empty()), &adj, n);
-        let bwd_files = bfs((0..n).filter(|&i| !producer_lines[i].is_empty()), &radj, n);
+        let fwd_files = bfs(
+            (0..n).filter(|&i| !entry_lines[i].is_empty()),
+            &adj,
+            n + hubs,
+        );
+        let bwd_files = bfs(
+            (0..n).filter(|&i| !producer_lines[i].is_empty()),
+            &radj,
+            n + hubs,
+        );
         let candidate: Vec<bool> = (0..n).map(|i| fwd_files[i] && bwd_files[i]).collect();
         stats.candidate_files = candidate.iter().filter(|&&c| c).count();
 
@@ -1048,12 +1650,18 @@ impl<'g> Deriver<'g> {
         let mut entries = BTreeSet::new();
         let mut producers = BTreeSet::new();
         for i in (0..n).filter(|&i| candidate[i]) {
-            entries.extend(entry_lines[i].iter().filter_map(|&l| self.enclosing(i, l)));
-            producers.extend(
-                producer_lines[i]
-                    .iter()
-                    .filter_map(|&l| self.enclosing(i, l)),
-            );
+            for &l in &entry_lines[i] {
+                if let Some(c) = self.enclosing(i, l) {
+                    entries.insert(c);
+                    entries.extend(self.constructed_methods(i, c));
+                }
+            }
+            for &l in &producer_lines[i] {
+                if let Some(c) = self.enclosing(i, l) {
+                    producers.insert(c);
+                    producers.extend(self.constructed_methods(i, c));
+                }
+            }
         }
         let fwd = reach(entries, &out_edges);
         let bwd = reach(producers, &in_edges);
@@ -1116,6 +1724,7 @@ impl<'g> Deriver<'g> {
         edges.sort_by_key(|e| (e.from, e.to));
         stats.callables = callables.len();
         stats.calls = edges.len();
+        stats.dispatch_overflow = self.dispatch_overflow;
         DerivedCalls {
             callables,
             edges,
