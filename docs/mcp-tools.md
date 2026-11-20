@@ -1,6 +1,6 @@
 # MeshMCP MCP Tools Reference
 
-This document specifies the six Model Context Protocol (MCP) tools exposed by MeshMCP: their arguments, output formats and error handling. The JSON schemas below are checked against the code by `test_mcp_tools_md_schema_drift_check` (`crates/mesh-server/src/tools/mod.rs`).
+This document specifies the seven Model Context Protocol (MCP) tools exposed by MeshMCP: their arguments, output formats and error handling. The JSON schemas below are checked against the code by `test_mcp_tools_md_schema_drift_check` (`crates/mesh-server/src/tools/mod.rs`).
 
 ---
 
@@ -33,6 +33,7 @@ graph LR
     T -->|analyze_impact| TI[Causal Event & Async Blast Radius]
     T -->|search_docs| TDO[Sanitized Architecture Docs]
     T -->|visualize_mesh| TV[Mermaid / HTML Topology]
+    T -->|diff_mesh| TDM[Branch Contract Diff & Impact]
 ```
 
 ---
@@ -714,6 +715,149 @@ graph LR
 ​```
 *2271 contracts, 247 edges folded into 32 of 32 groups (grouping: one service per root).*
 👉 Zoom into one service: `visualize_mesh(service: "shipping")`.
+```
+
+---
+
+### Tool 7: `diff_mesh`
+
+#### Description
+Answers "what does my branch change in the mesh, and what will it break". For every configured
+root inside a Git repository (each root resolves its own base: roots may be different
+repositories), the working tree is compared with a base revision at the **contract level**:
+
+- **Changed files**: `git diff --name-only -z --no-renames <base>` (base against the working tree,
+  so uncommitted and staged edits count) plus untracked files (`git ls-files --others
+  --exclude-standard`), restricted to `scope`, filtered by the crawler's `exclude_patterns` and
+  ignore files, and by source extension (a `.md` is counted, not analysed). A rename is a removal
+  plus an addition.
+- **Base contents**: one `git cat-file --batch-check` and one `git cat-file --batch` per repository
+  and base, read in memory. A file absent at the base is `added`, absent from the working tree
+  `removed`.
+- **Extraction**: both versions go through the indexer's guards (size budget, binary sniff,
+  1,024-byte lines, nesting ≤ 64, UTF-8) and its extractor (`extract_with_budget` plus custom
+  patterns), so the facts compared are the ones the index holds. The tree-sitter parse budget is
+  the query one (`QUERY_PARSE_TIMEOUT_MICROS`, 500 ms), not indexing's 2 s: this runs on the
+  agent's request path. A refused version is listed as `skipped` with the guard's reason. The
+  working-tree file is read through the path jail, never through a symlink.
+- **Contract diff** per file: declarations (classes, functions, interfaces, messages) added,
+  removed or with a changed signature; gRPC services and RPCs; HTTP routes; topics produced and
+  consumed; imports; RPC calls. A body-only edit changes no signature: such files are counted
+  and named in one line, never listed as changes.
+- **Impact** (live graph): for every removed or changed declaration, its dependents
+  (`find_dependents` matching); for every removed or changed RPC, its recorded call sites, plus,
+  for a changed one, the `analyze_grpc` callers and server handlers; for a removed producer or
+  consumer, the other side of the topic. A caller of a removed RPC has no resolved edge left, so
+  the recorded call targets are read directly (`ContractGraph::recorded_rpc_callers`): a
+  method-level call may name the service with its proto package (`demo.v1.UserService.DeleteUser`,
+  matched against the `.proto`'s own `package`: same package keeps the record's confidence, no
+  package known is `heuristic`, another package `ambiguous`); a client built for the service with
+  no method-level call in its file (Go `NewUserServiceClient`, a Python stub, a Java
+  `newBlockingStub`) is listed as a "service-level client, may call", `heuristic`. Each row gives
+  `path:line` and its match (`exact`, `heuristic`, `ambiguous`). Generic names (`constructor`,
+  `main`, ...) are not looked up; routes and gRPC services are not looked up either, and one line
+  says so (HTTP callers are not linked in the graph; a service's callers are listed under its RPCs).
+- **Wire-format check** of every changed `.proto`, against the same base, with the rules of
+  `analyze_grpc` (see [Wire-format check](#wire-format-check)). It reuses the base sha and the two
+  versions already read: no further `git` run.
+
+**Output**: dense Markdown, budgeted inside the tool within 44 KB (under the 48 KB cap, with room
+for the notes the registry prepends); a final clamp enforces the bound. In order:
+1. The roots and their base (at most 10 listed), the summary of counts and the notes (files left
+   out by the cap or the time budget, at most 20 names each; roots not compared). The summary
+   always carries the count of `WIRE_FORMAT_BREAKING_CHANGE` and of `.proto` files not checked
+   (time budget, file cap, a version not read or not parsed).
+2. `### Wire-format checks (N changed .proto)`, within 16 KB: breaking results first (the full
+   report, else its result line), then not checked or not compared, removed, clean. Past the
+   budget, results collapse into counts: "N more breaking `.proto` not listed", "N `.proto` with
+   no wire-format breaking change".
+3. The impact rows; the "impact not computed" notes always fit.
+4. The per-file sections.
+
+Each section that is cut ends with an "N more ... narrow `scope`" line. Paths are clipped to 160
+characters, prose lines to 320.
+
+**Bounds**: at most 2,000 changed files analysed per call (the rest counted in a note naming
+`scope`); a time budget of about 20 s for the whole call, checked between files and between
+impact queries: the files not yet extracted are named as "not analysed: time budget", the
+`.proto` files not yet checked are counted as not checked, and the elements whose impact was not
+looked up are counted ("impact not computed for N element(s): cap" or ": time budget"). Impact
+queries run in order of importance (removed RPCs, removed declarations, signature changes,
+topics), and the 60-element cap is applied before a query runs; 10 impact rows each. 4 MB per path
+listing; 32 MB of base contents in total across repositories; 40 changes listed per file;
+signatures cut at 160 characters; 5 s per `git` command, no shell, the same hardened environment
+as `analyze_grpc`.
+
+**Errors**: a malformed `base` (starts with `-`, contains `:`, whitespace) is refused before any
+`git` runs (`-32602`); an explicit `base` that names no commit is `-32602` and, in a shallow clone,
+says how to fetch it. A root that is not inside a Git repository is named in the error; when
+other roots could be compared it is listed as "Root not compared" and the call succeeds. Without
+`base`, a repository with no `origin/HEAD`, `origin/main` or `main` (or no merge-base with it)
+falls back to `HEAD`, which the root line says. A detached `HEAD` works like a branch.
+
+**Negative Constraints**: This is the tool for 'what does my branch change in the mesh / what will this change break'. Body-only edits are counted, never listed. The time budget is about 20 s, checked between files: files, .proto and elements it does not reach are counted and named, never dropped. DO NOT USE to trace one known symbol, RPC or topic (use find_dependents, analyze_grpc or analyze_impact). DO NOT pass a file path or a `--option` as `base`.
+
+#### JSON Schema
+```json
+{
+  "type": "object",
+  "properties": {
+    "base": {
+      "type": ["string", "null"],
+      "description": "Git revision the working tree is compared against (ex: 'main', 'origin/main', 'v1.4.0', a commit SHA), resolved in each root's own repository. Omit to use the merge-base of HEAD with the first existing of origin/HEAD, origin/main, main (falling back to HEAD). Uncommitted edits and untracked files always count. NOT a file path; must not start with '-' or contain ':'."
+    },
+    "scope": {
+      "type": ["string", "null"],
+      "description": "Repository or directory to restrict the diff to, resolved within the configured roots. Omit it (or pass \".\" or \"*\") for every configured root. DO NOT pass a path outside the roots: it is rejected."
+    }
+  },
+  "additionalProperties": false
+}
+```
+
+#### Sample Response
+From the test fixture `reports_contract_changes_impact_and_the_wire_break` (an RPC removed and a
+signature changed on a branch; a field renumbered, a new producer and a binary file uncommitted),
+shortened:
+```markdown
+## Mesh diff: working tree against the Git base
+
+- **Root** `/work/demo`: base merge-base of `HEAD` and `main` (`f12cc14677f9`)
+
+**Summary**: 5 changed source file(s) — 3 with contract changes, 1 body-only, 1 skipped. Declarations +3 -0 ~1; RPCs/services +0 -1 ~0; routes +0 -0 ~0; producers +1 -0; consumers +0 -0; imports +2 -0; RPC calls +0 -0. Wire-format breaking changes: 1 in 1 `.proto`. Impacted call sites / dependents: 2.
+
+### Wire-format checks (1 changed `.proto`)
+
+### Wire-format check: `proto/user.proto`
+- **Base**: merge-base of `HEAD` and `main` (`f12cc14677f9`), compared with the working tree
+- **Result**: 1 `WIRE_FORMAT_BREAKING_CHANGE`
+  - `WIRE_FORMAT_BREAKING_CHANGE` field deleted without `reserved` — `User` #2 (L19): `email` (`string`) was removed; add `reserved 2;` and `reserved "email";` so the number is never reused
+
+### Impact (live graph)
+
+#### symbol `formatUser` signature changed — `lib/format.ts`
+- `renderUser` in `client/view.ts:3` _(imports it, match: exact)_
+
+#### RPC `UserService.DeleteUser` removed — `proto/user.proto`
+- `purge` in `client/cleaner.ts:16` _(caller, match: exact)_
+
+### Contract changes per file
+
+#### `client/blob.ts` (added)
+- skipped: working tree: binary (a null byte in the first 4 KB)
+
+#### `events/archive.ts` (added)
+- + symbol `archived` (L6): `async archived(id: string) {`
+- + produces topic `user-archived` (L6) in `archived`
+- + import `kafkajs` (L3)
+
+#### `lib/format.ts` (modified)
+- ~ symbol `formatUser` (L1): `function formatUser(id: string): string {` → `function formatUser(id: string, upper: boolean): string {`
+
+#### `proto/user.proto` (modified)
+- - RPC `UserService.DeleteUser` (base L6): `rpc DeleteUser(DeleteUserRequest) returns (Empty);`
+
+*No contract-level change (body edits only): `events/consumer.ts`*
 ```
 
 ---

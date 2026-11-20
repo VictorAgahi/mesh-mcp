@@ -185,15 +185,25 @@ impl AstGuard {
         content: &[u8],
         max_bytes: u64,
     ) -> Result<(), GuardRejection> {
-        if metadata.len() > max_bytes {
+        Self::check_sized(metadata.len(), content, max_bytes)
+    }
+
+    /// [`Self::check_path`] for content that is not on disk (a blob read from
+    /// Git, for instance): the size checked is the length of `content`.
+    pub fn check_content(path: &std::path::Path, content: &[u8]) -> Result<(), GuardRejection> {
+        Self::check_sized(content.len() as u64, content, Self::size_budget(path))
+    }
+
+    fn check_sized(size: u64, content: &[u8], max_bytes: u64) -> Result<(), GuardRejection> {
+        if size > max_bytes {
             tracing::debug!(
                 target: "mesh::parser",
                 "Rejected file exceeding budget (size: {} bytes, budget: {} bytes)",
-                metadata.len(),
+                size,
                 max_bytes
             );
             return Err(GuardRejection::Oversized {
-                size: metadata.len(),
+                size,
                 budget: max_bytes,
             });
         }

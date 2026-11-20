@@ -1,5 +1,8 @@
 use crate::indexer::{WorkspaceIndexer, SCAN_DEPTH};
-use mesh_core::{expand_roots, AuditLogger, Config, PersistentIndexCache, PropertyRegistry};
+use mesh_core::{
+    expand_roots, AuditLogger, CacheDirId, Config, PersistentIndexCache, PropertyRegistry,
+    RepoFamily,
+};
 use mesh_parsers::AstGuard;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use notify::Watcher;
@@ -759,9 +762,11 @@ impl DoctorCommand {
         Ok(())
     }
 
-    /// The workspace's own daemon socket, if this run has a resolvable config
-    /// (skipped entirely otherwise — there is no workspace to look one up
-    /// for). Shared by the socket-permission and version checks below.
+    /// The workspace's canonical directory and the id of the daemon that serves
+    /// it (8.0.0: the repository's family id inside Git, the per-workspace id
+    /// outside), if this run has a resolvable config (skipped entirely otherwise —
+    /// there is no workspace to look one up for). Shared by the socket-permission
+    /// and version checks below.
     fn resolved_workspace(config_path: Option<&Path>) -> Option<(PathBuf, String)> {
         // A config that does not parse still pins the workspace (its directory):
         // the daemon serving it must stay visible to the daemon checks.
@@ -772,7 +777,7 @@ impl DoctorCommand {
                 .to_path_buf(),
         };
         let canonical = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
-        let id = mesh_core::workspace_id(&canonical);
+        let id = WorkspaceIndexer::identity_for(&canonical, config_path).daemon_id();
         Some((canonical, id))
     }
 
@@ -782,12 +787,21 @@ impl DoctorCommand {
 
         Self::check_socket(&workspace, fix, &mut checks);
         Self::check_daemon_version(&workspace, fix, &mut checks);
+        Self::check_daemon_views(&workspace, &mut checks);
         Self::check_daemon_config(config_path, &workspace, fix, &mut checks);
         Self::check_daemon_sandbox(&workspace, &mut checks);
+        // The directory this workspace's parse cache lives in: its repository's shared one
+        // inside Git (8.0.0), else its own.
+        let cache_dir = workspace.as_ref().map(|(base_dir, _)| {
+            PersistentIndexCache::cache_dir_id(
+                base_dir,
+                WorkspaceIndexer::locate_config(config_path).as_deref(),
+            )
+        });
         Self::check_legacy_global_cache(fix, &mut checks);
-        Self::check_workspace_cache(&workspace, fix, &mut checks);
+        Self::check_workspace_cache(&cache_dir, fix, &mut checks);
         Self::check_audit_db(&mut checks);
-        Self::check_orphaned_workspace_dirs(&workspace, fix, &mut checks);
+        Self::check_orphaned_workspace_dirs(&workspace, &cache_dir, fix, &mut checks);
 
         checks
     }
@@ -950,6 +964,51 @@ impl DoctorCommand {
         checks.push(check);
     }
 
+    /// Which views the running `meshd` serves (8.0.0: one daemon per repository,
+    /// one view per worktree and config), from the meta file it rewrites whenever
+    /// a view is built or dropped. Read-only.
+    fn check_daemon_views(workspace: &Option<(PathBuf, String)>, checks: &mut Vec<DoctorCheck>) {
+        const NAME: &str = "Daemon views";
+        let Some((_, daemon_id)) = workspace else {
+            return;
+        };
+        let Some(meta) = mesh_core::socket::read_daemon_meta(daemon_id) else {
+            return;
+        };
+        if !mesh_core::socket::daemon_is_reachable(daemon_id) {
+            return;
+        }
+        let list = meta
+            .views
+            .iter()
+            .map(|v| {
+                let config = v.config.as_deref().and_then(Path::file_name).map_or_else(
+                    || "default config".to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                format!(
+                    "{} ({config}, {} session{})",
+                    v.worktree.display(),
+                    v.clients,
+                    if v.clients == 1 { "" } else { "s" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        checks.push(DoctorCheck::info(
+            NAME,
+            format!(
+                "meshd (pid {}) serves {} view{}{}{} ({} built since start)",
+                meta.pid,
+                meta.views.len(),
+                if meta.views.len() == 1 { "" } else { "s" },
+                if list.is_empty() { "" } else { ": " },
+                list,
+                meta.view_builds
+            ),
+        ));
+    }
+
     /// Whether the running `meshd` serves the config file as it is on disk.
     /// `meshd` follows its config (7.1.7) and records which config hash it was
     /// built from; this warns when the file moved on and the daemon did not follow
@@ -963,10 +1022,13 @@ impl DoctorCommand {
     ) {
         use mesh_core::config_watch::{config_drift, read_daemon_config_status, ConfigDrift};
         const NAME: &str = "Daemon config";
-        let Some((_, workspace_id)) = workspace else {
+        let Some((base_dir, workspace_id)) = workspace else {
             return;
         };
-        let status = read_daemon_config_status(workspace_id);
+        // The config status is per view, keyed by this directory's own
+        // per-workspace id; the daemon (meta, socket) by `workspace_id`.
+        let view_id = WorkspaceIndexer::workspace_id_for(base_dir, config_path);
+        let status = read_daemon_config_status(&view_id);
         // Only a daemon confirmed to serve this workspace's socket right now
         // (a crash leaves the records behind).
         let reachable = mesh_core::socket::daemon_is_reachable(workspace_id);
@@ -1185,14 +1247,14 @@ impl DoctorCommand {
     }
 
     fn check_workspace_cache(
-        workspace: &Option<(PathBuf, String)>,
+        cache_dir: &Option<CacheDirId>,
         fix: bool,
         checks: &mut Vec<DoctorCheck>,
     ) {
-        let Some((_, workspace_id)) = workspace else {
+        let Some(cache_dir) = cache_dir else {
             return;
         };
-        let path = PersistentIndexCache::workspace_db_path(workspace_id);
+        let path = PersistentIndexCache::workspace_db_path(cache_dir.id());
         if !path.exists() {
             return;
         }
@@ -1260,13 +1322,35 @@ impl DoctorCommand {
         }
     }
 
+    /// A directory under `workspaces/` is a leftover of this project when it is not the one
+    /// this workspace's cache lives in and its `workspace_path` marker (written by 7.x, and
+    /// outside Git by 8.x) names this workspace or, inside Git, any worktree of the same
+    /// repository: since 8.0.0 every worktree of a repository uses the shared directory, so
+    /// no live workspace maps to a per-worktree one any more. A shared directory carries no
+    /// `workspace_path` marker, so it is never reported here, whichever worktree runs this.
+    ///
+    /// Only worktrees that still exist are recognised (`RepoFamily::resolve` of the marker):
+    /// a 7.x directory whose worktree was deleted cannot be tied to this repository any
+    /// more and is left alone, like any other project's directory.
     fn check_orphaned_workspace_dirs(
         workspace: &Option<(PathBuf, String)>,
+        cache_dir: &Option<CacheDirId>,
         fix: bool,
         checks: &mut Vec<DoctorCheck>,
     ) {
-        let Some((base_dir, current_id)) = workspace else {
+        let (Some((base_dir, _)), Some(cache_dir)) = (workspace, cache_dir) else {
             return;
+        };
+        let current_id = cache_dir.id();
+        let family_common_dir = match cache_dir {
+            CacheDirId::Family { common_dir, .. } => Some(common_dir.as_path()),
+            CacheDirId::Workspace { .. } => None,
+        };
+        let is_this_project = |marker: &Path| {
+            marker == base_dir.as_path()
+                || family_common_dir.is_some_and(|common| {
+                    RepoFamily::resolve(marker).is_some_and(|f| f.common_dir == common)
+                })
         };
         let workspaces_dir = mesh_core::mesh_cache_dir().join("workspaces");
         let Ok(entries) = std::fs::read_dir(&workspaces_dir) else {
@@ -1280,19 +1364,20 @@ impl DoctorCommand {
                 continue;
             }
             let id = entry.file_name().to_string_lossy().into_owned();
-            if id == *current_id {
+            if id == current_id {
                 continue;
             }
             let Some(marker_path) = PersistentIndexCache::read_workspace_path_marker(&id) else {
                 continue;
             };
-            if marker_path != *base_dir {
+            if !is_this_project(&marker_path) {
                 continue;
             }
             let mut check = DoctorCheck::warn(
                 "Orphaned workspace cache",
                 format!(
-                    "{} is a leftover from a previous mesh-mcp version of this project",
+                    "{} is a leftover from a previous mesh-mcp version of this project \
+                     (or of another worktree of its repository, which now share one cache)",
                     entry.path().display()
                 ),
             );

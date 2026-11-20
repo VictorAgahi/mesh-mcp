@@ -73,7 +73,7 @@ fn child_index_one_workspace() {
 
     let config = config_for(&ws);
     let roots = WorkspaceIndexer::resolve_roots(&config, &ws);
-    let cache = PersistentIndexCache::open_for_workspace(&ws, 2048).expect("open cache");
+    let cache = PersistentIndexCache::open_for_workspace(&ws, None, 2048).expect("open cache");
     // Cold, warm, then a rewrite of every file: three scans, the first and last writing
     // every entry in one transaction each.
     let cold = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
@@ -137,7 +137,7 @@ fn four_processes_indexing_four_workspaces_hit_zero_sqlite_errors() {
     // One database per workspace, named by the same id as the workspace's socket.
     let cache_root = home.join(".cache").join("mesh-mcp");
     for ws in &workspaces {
-        let id = mesh_core::workspace_id(ws);
+        let id = mesh_core::workspace_id(ws, None);
         let db = cache_root
             .join("workspaces")
             .join(&id)
@@ -243,7 +243,7 @@ fn child_index_shared_workspace() {
     let roots = WorkspaceIndexer::resolve_roots(&config, &ws);
     // Opened concurrently by every child on a database that does not exist yet: the schema
     // creation itself races.
-    let cache = PersistentIndexCache::open_for_workspace(&ws, quota_mb).expect("open cache");
+    let cache = PersistentIndexCache::open_for_workspace(&ws, None, quota_mb).expect("open cache");
     let reference = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, None);
     for _ in 0..4 {
         let snap = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
@@ -310,7 +310,7 @@ fn processes_sharing_one_workspace_cache_hit_zero_sqlite_errors() {
             .join(".cache")
             .join("mesh-mcp")
             .join("workspaces")
-            .join(mesh_core::workspace_id(&ws))
+            .join(mesh_core::workspace_id(&ws, None))
             .join("index-cache.db");
         let wal = db.with_file_name("index-cache.db-wal");
         let on_disk = std::fs::metadata(&db).expect("shared db").len()

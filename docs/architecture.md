@@ -231,9 +231,12 @@ entirely on how much of it is function bodies; no general percentage is claimed.
   response is flushed before the process exits.
 - Notifications (no `id`) never receive a reply. Methods: `initialize`, `ping`, `tools/list`,
   `tools/call`; anything else is `-32601`.
-- In proxy mode, `mesh-mcp run` copies bytes between stdio and the daemon socket without adding
-  any. If the daemon dies mid-session the proxy exits with status 1 and logs the daemon log path;
-  if it cannot connect right after a successful liveness check it falls back to standalone mode.
+- In proxy mode, `mesh-mcp run` first sends one hello line naming its view (8.0.0, see 8.1) and
+  waits for the daemon's ack; no client byte is forwarded before it (the client's `initialize`
+  waits in the stdin buffer). After the ack it copies bytes between stdio and the daemon socket
+  without adding any. If the daemon dies mid-session the proxy exits with status 1 and logs the
+  daemon log path; if it cannot connect right after a successful liveness check, or the daemon
+  refuses the hello, it falls back to standalone mode.
 
 ---
 
@@ -280,7 +283,44 @@ against every crawl (7.1.9).
 
 The daemon transport is a Unix domain socket on macOS/Linux and a named pipe on Windows.
 
-### 8.1 One `meshd` per workspace (P0 step 1.8)
+### 8.1 One `meshd` per repository, one view per worktree (8.0.0)
+
+Inside a Git repository the daemon is named by the repository: `meshd-<family_id>.sock`
+(`\\.\pipe\mesh-mcp-<user>-<family_id>` on Windows), where `family_id`
+(`mesh_core::identity::family_id`) hashes the canonical common Git directory and the binary
+version. The spawn lock, the meta file and the auto-spawn log carry the same id
+(`WorkspaceIdentity::daemon_id`). Outside Git the id is the per-workspace one described below,
+so nothing changes there. `MESH_SOCKET_PATH` still overrides the path.
+
+One daemon serves every worktree and config file of its repository as separate **views**
+(`crates/mesh-daemon/src/views.rs`). Each view is a `WorkspaceHost` with its own state, file
+watcher and config follower; RAM holds one graph per active view. All views share the watcher
+pool, the config-reload pool, the audit logger and the repository's parse cache (8.2).
+
+- **Hello** (`crates/mesh-server/src/hello.rs`, shared by the socket and the pipe): the first
+  line of every connection is `{"meshd_hello":1,"worktree":"<canonical dir>","config":...}`.
+  The daemon reads it under 8 KiB and 5 s and answers `{"meshd_hello_ok":1}` or
+  `{"meshd_hello_error":"<reason>"}`. Anything else, a raw JSON-RPC frame included, gets the
+  error line and the connection is closed. The proxy reads the ack one byte at a time so it
+  consumes nothing after it.
+- **Validation**: the hello's directory and the directory of its config must both resolve
+  (`RepoFamily::resolve`) to the daemon's repository; outside Git they must give exactly the
+  daemon's own per-workspace id. The config must load and the workspace-root guard must accept
+  it. A refused session falls back to standalone mode.
+- **Routing**: views are keyed by `ViewKey` (worktree top, config) plus the directory the state
+  is built from, so without a config each session directory is its own view. The first hello
+  for a key builds it once (one `tokio::sync::OnceCell` per key; the map lock is never held
+  across the build); its scan runs in the background and `tools/call` answers "still indexing"
+  until its first snapshot. The connection then holds that one view for its whole life: no
+  request is ever routed after the hello, so a session can only receive its own view's data.
+- **Lifecycle**: each view counts its sessions. A view with none for `idle_timeout_minutes` is
+  dropped (watcher and config poller cancelled, state freed) and rebuilt on the next hello. The
+  daemon exits once it has no view and no client. The startup view (the one the daemon was
+  spawned for) is built at start so its scan begins before the spawning session connects.
+- **doctor** reads the views (worktree, config, sessions, builds since start) from the meta
+  file, which the daemon rewrites atomically whenever a view is built or dropped.
+
+### 8.1b One `meshd` per workspace outside Git (P0 step 1.8)
 
 Before P0 step 1.8, every `meshd` on a machine bound the same one-per-user socket
 (`~/.cache/mesh/meshd.sock`) regardless of which workspace it was indexing — two unrelated
@@ -304,20 +344,21 @@ simply never found again rather than serving newer clients against an outdated s
 socket accepts connections (and `initialize`/`ping` succeed) immediately, while the initial
 ingestion runs in the background. A `tools/call` made before that first scan installs its
 snapshot gets an explicit "still indexing" error instead of an answer computed against the
-still-empty default snapshot — and `mesh-mcp`'s own 500ms wait for the socket to appear is no
+still-empty default snapshot — and `mesh-mcp`'s own wait for the socket to appear (`SOCKET_WAIT`, 5 s, `spawn_lock.rs`) is no
 longer a race against a large repo's indexing time, since the socket now exists independently of
 how long that indexing takes.
 
 ### 8.1a The daemon follows its config (7.1.7, 7.1.9)
 
 `meshd` does not hold a fixed `AppState`: it serves a `WorkspaceHost`
-(`crates/mesh-daemon/src/host.rs`). On a request, at most every 250 ms, it reads and hashes the
+(`crates/mesh-daemon/src/host.rs`). On a request (at most every 250 ms) and on an idle poll every 2 s, it reads and hashes the
 config file it was started from (`mesh_core::config_watch`; mtime and length are not trusted). A
 different hash builds a new state on a blocking thread while the previous one keeps serving; an
 `ArcSwap` store swaps it in once the new state has its first snapshot, and the old watcher is
 cancelled. A config that fails to parse or whose roots do not resolve is refused and recorded for
-`doctor`; refused bytes are not retried until the file changes. There is no timer: an edit made
-while no client talks to the daemon is applied by the next request.
+`doctor`; refused bytes are not retried until the file changes. The 2 s idle poll
+(`WorkspaceHost::spawn_idle_poller`) means an edit made while no client talks to the daemon is
+already applied when the next request comes.
 
 How much work the swap does depends on the edit (`mesh_core::reload_kind`): display-only keys swap
 the config over the running index, a changed `[[engines.contracts.patterns]]` re-extracts only the
@@ -328,11 +369,25 @@ A workspace that resolves to `/`, a drive root or the user's home with no config
 before any daemon is spawned (`mesh_core::guard_workspace_root`, `crates/mesh-core/src/root_guard.rs`):
 the session stays up and answers every `tools/call` with an error naming the directory.
 
-### 8.2 One parse cache per workspace, under a quota (plan 4 step 4.4)
+### 8.2 One parse cache per repository, under a quota (plan 4 step 4.4, 8.0.0)
 
 The persistent parse cache (`PersistentIndexCache`, `crates/mesh-core/src/index_cache.rs`) is
-scoped the same way as the socket: `~/.cache/mesh-mcp/workspaces/<workspace_id>/index-cache.db`
-(SQLite, WAL, mode `0600`, `auto_vacuum = INCREMENTAL`). It is opened once per process by
+one database per Git repository: `~/.cache/mesh-mcp/workspaces/<cache_family_id>/index-cache.db`
+(`mesh_core::identity::cache_family_id`, a hash of the canonical common Git directory), shared by
+every worktree, config file and process of that repository. Outside Git it is
+`workspaces/<workspace_id>/` as before. SQLite, WAL, mode `0600`, `auto_vacuum = INCREMENTAL`.
+Keys hold the binary version (records are shared within one version; an older version's rows
+age out through LRU eviction), the file's root-relative path, content hash, `RepoId` and the
+extraction-config fingerprint, which also folds in everything extraction reads from the absolute
+path (`mesh_parsers::PathContext`: parent directory name of an `index.*` file, path substring
+tests) and the governing `tsconfig` / `package.json` aliases written root-relative. A record that
+uses the package inferred from directories (a manifest-less checkout gets its directory name) is
+stored under a second key that also folds that package, and the first key holds a pointer to it,
+so files that declare their package still share across differently named worktrees.
+Records store root-relative node paths and are re-anchored on the reading checkout's root, so
+two checkouts of one commit read the same entries and fingerprint the same. The shared
+directory carries a `family_common_dir` marker, never a `workspace_path` one, so `doctor` never
+takes it for an orphan. It is opened once per process by
 `AppState::open_index_cache` and shared by the boot scan and every incremental reload, so a
 branch switch back to already-seen content is a lookup instead of a re-parse.
 
@@ -354,8 +409,8 @@ The cache key of a file folds in its content hash, its `RepoId`, the extraction-
 and, for a JavaScript / TypeScript file, the `tsconfig` / `jsconfig` `paths` and `package.json`
 `imports` aliases that govern it, so editing an alias config re-extracts exactly the files under it.
 The fingerprint does not depend on the workspace roots (adding a root does not invalidate the
-cache). The record schema is versioned (`SCHEMA_VERSION` in `index_cache.rs`, 11 at 7.1.11) and the
-workspace id folds in the binary version.
+cache). The record schema is versioned (`SCHEMA_VERSION` in `index_cache.rs`, 12 at 8.0.0) and the
+daemon id folds in the binary version.
 
 ### 8.3 Kernel network sandbox of `meshd` (Linux, plan 4 step 4.10)
 

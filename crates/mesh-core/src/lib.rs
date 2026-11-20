@@ -8,6 +8,7 @@ pub mod crawler;
 pub mod docs;
 pub mod governance;
 pub mod health;
+pub mod identity;
 pub mod index_cache;
 pub mod paths;
 pub mod properties;
@@ -38,14 +39,16 @@ pub use config::{
 pub use contracts::{
     fold_rpc_name, normalize_topic_key, service_from_client_field_name, ContractGraph,
     DependentsMatch, GrpcTrace, ImpactFlow, ImpactMatrix, ImpactRole, ImpactRow, ImpactScope,
-    CLIENT_FIELD_BINDING_PREFIX, CONST_VALUE_PREFIX, HANDLER_REF_PREFIX, RPC_EXACT_METHOD_PREFIX,
-    RPC_INFERRED_METHOD_PREFIX, RPC_INHERITED_METHOD_PREFIX,
+    ReconcileMode, RecordedCaller, CLIENT_FIELD_BINDING_PREFIX, CONST_VALUE_PREFIX,
+    HANDLER_REF_PREFIX, RPC_EXACT_METHOD_PREFIX, RPC_INFERRED_METHOD_PREFIX,
+    RPC_INHERITED_METHOD_PREFIX,
 };
 pub use crawler::{ExcludeMatcher, FilesystemCrawler, WatchPlan};
 pub use docs::{DocIndex, DocSection};
 pub use governance::{GovernanceEngine, RsahResponse};
 pub use health::{IndexHealth, RejectReason, RejectedFile};
-pub use index_cache::{sha256, CacheEntry, IndexCacheError, PersistentIndexCache};
+pub use identity::{cache_family_id, family_id, RepoFamily, ViewKey, WorkspaceIdentity};
+pub use index_cache::{sha256, CacheDirId, CacheEntry, IndexCacheError, PersistentIndexCache};
 pub use paths::mesh_cache_dir;
 pub use properties::{PropertyRegistry, PropertySourceMatcher};
 pub use rescan::BackgroundRescanEngine;

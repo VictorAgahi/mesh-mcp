@@ -16,14 +16,39 @@
 use std::path::{Path, PathBuf};
 
 /// Derives a short, stable identifier for one workspace: the first 16 hex
-/// characters of SHA-256(canonical `base_dir` + this binary's version).
+/// characters of SHA-256(canonical `base_dir` + canonical `config_file` when
+/// one is used + this binary's version). This is the single source of truth
+/// for the daemon identity (socket, lock, log, parse cache, doctor checks).
+///
+/// The config file is part of the identity because a directory can hold
+/// several config files (`a.toml`, `b.toml` passed with `--config`), each
+/// describing a different graph: sharing one daemon between them would answer
+/// a session with the other config's graph (idempotence invariant I7).
+/// `None` (no config file, built-in default) hashes the directory alone.
+///
 /// Two different workspaces get distinct sockets, and so does the same
 /// workspace indexed by two different `mesh-mcp` versions — an old, stale
 /// daemon from before an upgrade is simply never found again rather than
 /// silently serving newer clients from an outdated snapshot format.
-pub fn workspace_id(base_dir: &Path) -> String {
+pub fn workspace_id(base_dir: &Path, config_file: Option<&Path>) -> String {
     let canonical = dunce::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
-    let key = format!("{}\u{0}{}", canonical.display(), env!("CARGO_PKG_VERSION"));
+    let key = match config_file {
+        Some(file) => {
+            let file = dunce::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+            format!(
+                "{}\u{0}{}\u{0}{}",
+                canonical.display(),
+                file.display(),
+                env!("CARGO_PKG_VERSION")
+            )
+        }
+        None => format!("{}\u{0}{}", canonical.display(), env!("CARGO_PKG_VERSION")),
+    };
+    hash_id16(&key)
+}
+
+/// The one id scheme shared by every identity: SHA-256 of `key`, first 16 hex chars.
+pub(crate) fn hash_id16(key: &str) -> String {
     let digest = crate::audit::AuditLogger::compute_sha256(key.as_bytes());
     digest[..16].to_string()
 }
@@ -117,6 +142,26 @@ fn user_session_identifier() -> String {
 pub struct DaemonMeta {
     pub pid: u32,
     pub version: String,
+    /// The views this daemon serves right now (8.0.0: one `meshd` per repository serves one
+    /// view per worktree and config). Empty for a daemon that predates views.
+    #[serde(default)]
+    pub views: Vec<ViewMeta>,
+    /// How many views this daemon has built since it started (a view dropped after idling out
+    /// and built again counts twice).
+    #[serde(default)]
+    pub view_builds: u64,
+}
+
+/// One view of a running daemon, as `doctor` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ViewMeta {
+    /// Canonical worktree top (the canonical base directory outside Git).
+    pub worktree: PathBuf,
+    /// Canonical config file, `None` for the built-in default.
+    pub config: Option<PathBuf>,
+    /// Sessions connected to this view right now.
+    #[serde(default)]
+    pub clients: usize,
 }
 
 /// Path for one workspace's [`DaemonMeta`], keyed by `workspace_id` rather
@@ -134,11 +179,22 @@ pub fn daemon_meta_path(workspace_id: &str) -> PathBuf {
 /// failure only means `doctor` cannot compare versions or offer `--fix` for
 /// this daemon, never that the daemon itself should not start.
 pub fn write_daemon_meta(workspace_id: &str, version: &str) {
-    let meta = DaemonMeta {
-        pid: std::process::id(),
-        version: version.to_string(),
-    };
-    let Ok(json) = serde_json::to_string(&meta) else {
+    write_daemon_meta_record(
+        workspace_id,
+        &DaemonMeta {
+            pid: std::process::id(),
+            version: version.to_string(),
+            views: Vec::new(),
+            view_builds: 0,
+        },
+    );
+}
+
+/// Writes `meta` for `workspace_id` (same best-effort policy as [`write_daemon_meta`]). The
+/// file is replaced atomically (written next to it, then renamed), so a `doctor` reading it
+/// while the daemon rewrites its view list never sees half a record.
+pub fn write_daemon_meta_record(workspace_id: &str, meta: &DaemonMeta) {
+    let Ok(json) = serde_json::to_string(meta) else {
         return;
     };
     let path = daemon_meta_path(workspace_id);
@@ -149,12 +205,17 @@ pub fn write_daemon_meta(workspace_id: &str, version: &str) {
         return;
     }
     chmod_owner_only(parent);
-    if std::fs::write(&path, json).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
+    let tmp = path.with_extension(format!("meta.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, json).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 

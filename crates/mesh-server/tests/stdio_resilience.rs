@@ -13,11 +13,11 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// The `mesh-mcp` binary Cargo built for this integration test (see
+/// `doctor_repairable_health.rs`: `current_exe()`-relative paths broke when Cargo
+/// moved test executables to a separate build directory).
 fn mesh_mcp_bin() -> PathBuf {
-    let mut path = std::env::current_exe().expect("test exe");
-    path.pop(); // deps/
-    path.pop(); // release/ or debug/
-    path.join("mesh-mcp")
+    PathBuf::from(env!("CARGO_BIN_EXE_mesh-mcp"))
 }
 
 #[test]
@@ -36,13 +36,23 @@ fn daemon_dying_mid_session_ends_with_a_logged_eof_not_a_hang() {
     let listener = UnixListener::bind(&sock).expect("bind fake daemon");
 
     // Fake daemon: the first connection is `ensure_daemon_running`'s liveness
-    // probe; the second is the proxy. It reads one request, then "crashes".
+    // probe; the second is the proxy. It accepts the proxy's hello (8.0.0),
+    // reads one request, then "crashes".
     let daemon = std::thread::spawn(move || {
         let (probe, _) = listener.accept().expect("probe");
         drop(probe);
-        let (conn, _) = listener.accept().expect("proxy");
+        let (mut conn, _) = listener.accept().expect("proxy");
+        let mut reader = BufReader::new(conn.try_clone().expect("clone"));
+        let mut hello = String::new();
+        reader.read_line(&mut hello).expect("hello");
+        assert!(
+            hello.starts_with("{\"meshd_hello\":1,"),
+            "hello first: {hello}"
+        );
+        conn.write_all(b"{\"meshd_hello_ok\":1}\n").expect("ack");
         let mut line = String::new();
-        BufReader::new(&conn).read_line(&mut line).expect("request");
+        reader.read_line(&mut line).expect("request");
+        drop(reader);
         drop(conn);
         drop(listener);
         line

@@ -195,15 +195,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return mesh_server::run_refusing_server(message, CancellationToken::new()).await;
             }
             let canonical_base = dunce::canonicalize(&base_dir).unwrap_or(base_dir);
-            let workspace_id = mesh_core::workspace_id(&canonical_base);
+            // The daemon this session talks to (8.0.0): inside Git one `meshd` per
+            // repository, named by its family id, serves every worktree and config
+            // as a separate view; outside Git the config file stays part of the
+            // identity, so two configs in one directory are two daemons (see
+            // `mesh_core::WorkspaceIdentity::daemon_id`).
+            let workspace_id =
+                WorkspaceIndexer::identity_for(&canonical_base, cli.config.as_deref()).daemon_id();
+            // The config file this session resolved (absolute, whether given with
+            // `--config` or discovered). Passed to the daemon as `--config` so the
+            // daemon hashes exactly this file, never a second discovery of its own.
+            let located_config = WorkspaceIndexer::locate_config(cli.config.as_deref());
+            // The view this session asks for, sent before any client byte.
+            #[cfg(any(unix, windows))]
+            let hello = mesh_server::hello::Hello::new(&canonical_base, located_config.as_deref());
 
             #[cfg(unix)]
             if !standalone {
                 // ── UDS Proxy Mode ────────────────────────────────────────────
                 let sock_path = mesh_core::socket_path_for(&workspace_id);
-                let ensured =
-                    ensure_daemon_running(&sock_path, &canonical_base, cli.config.as_deref()).await;
-                if try_proxy_unix(ensured, &sock_path, &workspace_id).await? == ProxyAttempt::Served
+                let ensured = ensure_daemon_running(
+                    &sock_path,
+                    &workspace_id,
+                    &canonical_base,
+                    located_config.as_deref(),
+                )
+                .await;
+                if try_proxy_unix(ensured, &sock_path, &workspace_id, &hello).await?
+                    == ProxyAttempt::Served
                 {
                     return Ok(());
                 }
@@ -215,11 +234,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pipe_name = mesh_core::pipe_name_for(&workspace_id);
                 let ensured = ensure_daemon_running_windows(
                     &pipe_name,
+                    &workspace_id,
                     &canonical_base,
-                    cli.config.as_deref(),
+                    located_config.as_deref(),
                 )
                 .await;
-                if try_proxy_windows(ensured, &pipe_name, &workspace_id).await?
+                if try_proxy_windows(ensured, &pipe_name, &workspace_id, &hello).await?
                     == ProxyAttempt::Served
                 {
                     return Ok(());
@@ -397,63 +417,84 @@ fn daemon_output_stdio(workspace_id: &str) -> (std::process::Stdio, std::process
 /// `--config` when the caller passed an explicit one) so the daemon binds
 /// exactly the socket this proxy is about to connect to and indexes exactly
 /// this workspace, never whichever config its own cwd-based discovery might
-/// otherwise land on — then waits up to 500ms for it to bind.
+/// otherwise land on — then waits for it to bind.
 ///
-/// That 500ms budget used to race a real risk: `meshd` indexed its whole
-/// workspace *before* opening its socket, so on a large repo this would
-/// reliably time out and fall back to standalone mode — spinning up a
-/// second, redundant in-process index right as the daemon it gave up on
-/// finished its own. Since P0 step 1.8, `meshd` opens its socket first and
-/// ingests in the background, so binding it back is now independent of
-/// workspace size and this budget is comfortably generous rather than a race.
+/// The whole "check, spawn, wait" runs under an exclusive lock next to the
+/// socket (`mesh_server::spawn_lock`), so N sessions starting at once on one
+/// workspace spawn one daemon: the others wait for the lock, then find that
+/// daemon alive. Both waits are bounded; on timeout the caller falls back to
+/// standalone mode with a warning. `meshd` opens its socket first and ingests
+/// in the background (P0 step 1.8), so binding is independent of workspace size.
 #[cfg(unix)]
 async fn ensure_daemon_running(
     sock_path: &Path,
+    workspace_id: &str,
     base_dir: &Path,
-    explicit_config: Option<&Path>,
+    located_config: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if tokio::net::UnixStream::connect(sock_path).await.is_ok() {
-        warn_on_daemon_version_mismatch(&mesh_core::workspace_id(base_dir));
-        return Ok(());
+    let probe = || async { tokio::net::UnixStream::connect(sock_path).await.is_ok() };
+    let spawn = || spawn_meshd(sock_path, workspace_id, base_dir, located_config);
+    let lock_path = mesh_server::spawn_lock::lock_path_for(sock_path);
+    let ensured = mesh_server::spawn_lock::ensure_with_lock(
+        &lock_path,
+        mesh_server::spawn_lock::LOCK_WAIT,
+        mesh_server::spawn_lock::SOCKET_WAIT,
+        probe,
+        spawn,
+    )
+    .await?;
+    match ensured {
+        mesh_server::spawn_lock::Ensured::AlreadyRunning => {
+            warn_on_daemon_version_mismatch(workspace_id);
+        }
+        mesh_server::spawn_lock::Ensured::Spawned => {
+            tracing::info!(target: "mesh::proxy", "meshd started successfully.");
+        }
     }
+    Ok(())
+}
 
+/// Spawns `meshd` for this workspace at `endpoint`. Called only by the session
+/// that holds the spawn lock and found no daemon.
+#[cfg(any(unix, windows))]
+fn spawn_meshd(
+    endpoint: impl AsRef<std::ffi::OsStr>,
+    workspace_id: &str,
+    base_dir: &Path,
+    located_config: Option<&Path>,
+) -> Result<(), String> {
     tracing::info!(target: "mesh::proxy", "meshd not found for this workspace. Attempting auto-spawn…");
 
-    let meshd_path = std::env::current_exe()?
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let meshd_name = if cfg!(windows) { "meshd.exe" } else { "meshd" };
+    let meshd_path = exe
         .parent()
         .ok_or("Cannot determine exe dir")?
-        .join("meshd");
+        .join(meshd_name);
 
     if !meshd_path.exists() {
-        return Err(format!("meshd binary not found at {}", meshd_path.display()).into());
+        return Err(format!(
+            "meshd binary not found at {}",
+            meshd_path.display()
+        ));
     }
-    check_sibling_meshd_version(&meshd_path)?;
+    check_sibling_meshd_version(&meshd_path).map_err(|e| e.to_string())?;
 
-    let (stdout_io, stderr_io) = daemon_output_stdio(&mesh_core::workspace_id(base_dir));
+    let (stdout_io, stderr_io) = daemon_output_stdio(workspace_id);
     let mut cmd = std::process::Command::new(&meshd_path);
     cmd.current_dir(base_dir)
         .arg("--socket")
-        .arg(sock_path)
+        .arg(endpoint)
         .stdin(std::process::Stdio::null())
         .stdout(stdout_io)
         .stderr(stderr_io);
-    if let Some(config) = explicit_config {
+    if let Some(config) = located_config {
         let canonical_config = dunce::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
         cmd.arg("--config").arg(canonical_config);
     }
     cmd.spawn()
-        .map_err(|e| format!("Failed to spawn meshd: {e}"))?;
-
-    // Poll up to 500ms for socket to appear
-    for _ in 0..10 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if tokio::net::UnixStream::connect(sock_path).await.is_ok() {
-            tracing::info!(target: "mesh::proxy", "meshd started successfully.");
-            return Ok(());
-        }
-    }
-
-    Err("meshd did not bind socket within 500ms".into())
+        .map(|_child| ())
+        .map_err(|e| format!("Failed to spawn meshd: {e}"))
 }
 
 /// Whether this session was served through `meshd` or must fall back to the
@@ -519,6 +560,7 @@ async fn try_proxy_unix(
     ensured: Result<(), Box<dyn std::error::Error + Send + Sync>>,
     sock_path: &Path,
     workspace_id: &str,
+    hello: &mesh_server::hello::Hello,
 ) -> Result<ProxyAttempt, Box<dyn std::error::Error>> {
     if let Err(e) = ensured {
         tracing::warn!(
@@ -545,7 +587,17 @@ async fn try_proxy_unix(
         sock_path.display(),
         workspace_id
     );
-    let (daemon_reader, daemon_writer) = stream.into_split();
+    let (mut daemon_reader, mut daemon_writer) = stream.into_split();
+    if !handshake(
+        &mut daemon_reader,
+        &mut daemon_writer,
+        hello,
+        &sock_path.display().to_string(),
+    )
+    .await
+    {
+        return Ok(ProxyAttempt::Fallback);
+    }
     let end = bridge(
         daemon_reader,
         daemon_writer,
@@ -555,6 +607,41 @@ async fn try_proxy_unix(
     .await;
     finish_proxy_session(&end, &sock_path.display().to_string(), workspace_id);
     Ok(ProxyAttempt::Served)
+}
+
+/// Sends this session's hello and waits for the daemon's ack (8.0.0), before any
+/// client byte is forwarded: the client's `initialize` waits in the stdin buffer
+/// meanwhile. A refusal (another repository's daemon, a config the daemon cannot
+/// load, a version that does not speak the hello) is logged and the session falls
+/// back to standalone mode, as when the daemon cannot be reached at all.
+#[cfg(any(unix, windows))]
+async fn handshake<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    hello: &mesh_server::hello::Hello,
+    endpoint: &str,
+) -> bool
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match mesh_server::hello::client_handshake(
+        reader,
+        writer,
+        hello,
+        mesh_server::hello::ACK_TIMEOUT,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                target: "mesh::proxy",
+                "meshd at {endpoint} did not accept this session ({e}). Falling back to standalone mode."
+            );
+            false
+        }
+    }
 }
 
 /// Ultra-lightweight proxy: bridges the client's stdin/stdout and the daemon's
@@ -617,59 +704,38 @@ where
 // daemon over a named pipe instead, mirroring the UDS proxy helpers above.
 
 /// Checks if this workspace's meshd is alive at `pipe_name`. If not, spawns
-/// it scoped to this workspace — mirroring the Unix `ensure_daemon_running`
-/// above (see its doc for why `--socket`/`.current_dir` matter and why the
-/// 500ms budget is no longer a race since P0 step 1.8).
+/// it scoped to this workspace, under the same spawn lock as the Unix
+/// `ensure_daemon_running` (see its doc and `mesh_server::spawn_lock`).
 #[cfg(windows)]
 async fn ensure_daemon_running_windows(
     pipe_name: &str,
+    workspace_id: &str,
     base_dir: &Path,
-    explicit_config: Option<&Path>,
+    located_config: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
-    if ClientOptions::new().open(pipe_name).is_ok() {
-        warn_on_daemon_version_mismatch(&mesh_core::workspace_id(base_dir));
-        return Ok(());
-    }
-
-    tracing::info!(target: "mesh::proxy", "meshd not found for this workspace. Attempting auto-spawn…");
-
-    let meshd_path = std::env::current_exe()?
-        .parent()
-        .ok_or("Cannot determine exe dir")?
-        .join("meshd.exe");
-
-    if !meshd_path.exists() {
-        return Err(format!("meshd binary not found at {}", meshd_path.display()).into());
-    }
-    check_sibling_meshd_version(&meshd_path)?;
-
-    let (stdout_io, stderr_io) = daemon_output_stdio(&mesh_core::workspace_id(base_dir));
-    let mut cmd = std::process::Command::new(&meshd_path);
-    cmd.current_dir(base_dir)
-        .arg("--socket")
-        .arg(pipe_name)
-        .stdin(std::process::Stdio::null())
-        .stdout(stdout_io)
-        .stderr(stderr_io);
-    if let Some(config) = explicit_config {
-        let canonical_config = dunce::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
-        cmd.arg("--config").arg(canonical_config);
-    }
-    cmd.spawn()
-        .map_err(|e| format!("Failed to spawn meshd: {e}"))?;
-
-    // Poll up to 500ms for the pipe to appear
-    for _ in 0..10 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if ClientOptions::new().open(pipe_name).is_ok() {
+    let probe = || async { ClientOptions::new().open(pipe_name).is_ok() };
+    let spawn = || spawn_meshd(pipe_name, workspace_id, base_dir, located_config);
+    let lock_path =
+        mesh_server::spawn_lock::lock_path_for(&mesh_core::socket_path_for(workspace_id));
+    let ensured = mesh_server::spawn_lock::ensure_with_lock(
+        &lock_path,
+        mesh_server::spawn_lock::LOCK_WAIT,
+        mesh_server::spawn_lock::SOCKET_WAIT,
+        probe,
+        spawn,
+    )
+    .await?;
+    match ensured {
+        mesh_server::spawn_lock::Ensured::AlreadyRunning => {
+            warn_on_daemon_version_mismatch(workspace_id);
+        }
+        mesh_server::spawn_lock::Ensured::Spawned => {
             tracing::info!(target: "mesh::proxy", "meshd started successfully.");
-            return Ok(());
         }
     }
-
-    Err("meshd did not bind its named pipe within 500ms".into())
+    Ok(())
 }
 
 /// Windows mirror of [`try_proxy_unix`] over this workspace's named pipe.
@@ -678,6 +744,7 @@ async fn try_proxy_windows(
     ensured: Result<(), Box<dyn std::error::Error + Send + Sync>>,
     pipe_name: &str,
     workspace_id: &str,
+    hello: &mesh_server::hello::Hello,
 ) -> Result<ProxyAttempt, Box<dyn std::error::Error>> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
@@ -705,7 +772,10 @@ async fn try_proxy_windows(
         pipe_name,
         workspace_id
     );
-    let (daemon_reader, daemon_writer) = tokio::io::split(client);
+    let (mut daemon_reader, mut daemon_writer) = tokio::io::split(client);
+    if !handshake(&mut daemon_reader, &mut daemon_writer, hello, pipe_name).await {
+        return Ok(ProxyAttempt::Fallback);
+    }
     let end = bridge(
         daemon_reader,
         daemon_writer,
@@ -730,7 +800,10 @@ async fn run_standalone(config_path: Option<&Path>) -> Result<(), Box<dyn std::e
     // Persistent, content-hash-keyed cache of tree-sitter `FileIndex` fragments (P2 step 3.2),
     // one database per workspace under its quota (plan 4 step 4.4); see
     // `AppState::open_index_cache` for why a failure to open it does not fail the boot.
-    let index_cache = state.open_index_cache(&base_dir);
+    let index_cache = state.open_index_cache(
+        &base_dir,
+        WorkspaceIndexer::locate_config(config_path).as_deref(),
+    );
 
     // Single parallel scan over all roots, one reconcile, one atomic install.
     let snapshot = {
@@ -881,8 +954,46 @@ mod proxy_tests {
         drop(listener);
         std::fs::remove_file(&sock).expect("rm socket");
 
-        let attempt = try_proxy_unix(Ok(()), &sock, "ws").await.expect("no error");
+        let hello = mesh_server::hello::Hello::new(dir.path(), None);
+        let attempt = try_proxy_unix(Ok(()), &sock, "ws", &hello)
+            .await
+            .expect("no error");
         assert_eq!(attempt, ProxyAttempt::Fallback);
+    }
+
+    /// 8.0.0: a daemon that refuses the hello (here: another repository's)
+    /// sends the session to standalone mode, and no client byte reached it.
+    #[tokio::test]
+    async fn a_refused_hello_falls_back_to_standalone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("r.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (r, mut w) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(r);
+            let hello = mesh_server::hello::read_hello(
+                &mut reader,
+                mesh_server::hello::MAX_HELLO_BYTES,
+                mesh_server::hello::HELLO_TIMEOUT,
+            )
+            .await
+            .expect("hello");
+            w.write_all(mesh_server::hello::error_line("other repository").as_bytes())
+                .await
+                .expect("refuse");
+            let mut rest = Vec::new();
+            let _ = reader.read_to_end(&mut rest).await;
+            (hello, rest)
+        });
+        let hello = mesh_server::hello::Hello::new(dir.path(), None);
+        let attempt = try_proxy_unix(Ok(()), &sock, "ws", &hello)
+            .await
+            .expect("no error");
+        assert_eq!(attempt, ProxyAttempt::Fallback);
+        let (seen, rest) = daemon.await.expect("daemon");
+        assert_eq!(seen, hello);
+        assert!(rest.is_empty(), "no client byte after a refused hello");
     }
 
     /// A daemon closing its end first is reported as such (the caller logs it).

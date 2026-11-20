@@ -1,13 +1,17 @@
 //! IPC multiplexing server for meshd.
 //!
 //! Accepts N simultaneous IDE client connections over a Unix Domain Socket
-//! (Unix) or a named pipe (Windows). Each connection relays JSON-RPC frames
-//! to the shared AppState tool handlers without allocating any additional
-//! graph, watcher, or crawler.
+//! (Unix) or a named pipe (Windows). Every connection starts with a hello
+//! (`mesh_server::hello`) that names its view; the connection is then bound to
+//! that one view for its whole life and relays JSON-RPC frames to its state's
+//! tool handlers.
 
+#[cfg(test)]
 use crate::host::StateHandle;
 use crate::idle::ClientCounter;
+use crate::views::{Session, ViewRegistry};
 use mesh_core::AppState;
+use mesh_server::hello::{self, HelloError};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -37,24 +41,143 @@ async fn dispatch(line: &str, state: &Arc<AppState>, session_id: &str) -> Option
     serde_json::to_string(&response).ok()
 }
 
+// ── Routing: which state answers a connection ────────────────────────────────
+
+/// What the IPC server routes connections with.
+#[derive(Clone)]
+pub enum Router {
+    /// One view per (worktree, config), chosen by each connection's hello.
+    Views(Arc<ViewRegistry>),
+    /// Tests: one fixed state that accepts any well-formed hello.
+    #[cfg(test)]
+    Fixed(StateHandle),
+}
+
+impl From<Arc<ViewRegistry>> for Router {
+    fn from(registry: Arc<ViewRegistry>) -> Self {
+        Self::Views(registry)
+    }
+}
+
+#[cfg(test)]
+impl From<Arc<AppState>> for Router {
+    fn from(state: Arc<AppState>) -> Self {
+        Self::Fixed(state.into())
+    }
+}
+
+impl Router {
+    async fn open(&self, hello: hello::Hello) -> Result<Bound, String> {
+        match self {
+            Self::Views(registry) => registry.open(hello).await.map(Bound::View),
+            #[cfg(test)]
+            Self::Fixed(handle) => {
+                let _ = hello;
+                Ok(Bound::Fixed(handle.clone()))
+            }
+        }
+    }
+
+    /// The socket is bound: record the daemon (and its views) for `doctor`.
+    fn on_bound(&self, daemon_id: &str, version: &str) {
+        match self {
+            Self::Views(registry) => registry.on_bound(daemon_id, version),
+            #[cfg(test)]
+            Self::Fixed(handle) => {
+                mesh_core::socket::write_daemon_meta(daemon_id, version);
+                handle.publish_status();
+            }
+        }
+    }
+
+    fn on_shutdown(&self, daemon_id: &str) {
+        match self {
+            Self::Views(registry) => registry.on_shutdown(daemon_id),
+            #[cfg(test)]
+            Self::Fixed(_) => mesh_core::socket::remove_daemon_meta(daemon_id),
+        }
+    }
+}
+
+/// The state one connection is bound to after its hello.
+enum Bound {
+    View(Session),
+    #[cfg(test)]
+    Fixed(StateHandle),
+}
+
+impl Bound {
+    /// Resolved per request, not per connection: a config edit reaches clients that are
+    /// already connected. Always the state of this connection's own view.
+    fn current(&self) -> Arc<AppState> {
+        match self {
+            Self::View(session) => session.host().current(),
+            #[cfg(test)]
+            Self::Fixed(handle) => handle.current(),
+        }
+    }
+}
+
 // ── Per-client handler (generic over any duplex IPC stream) ─────────────────
 
-/// Drives one client connection to completion: reads newline-delimited
-/// JSON-RPC requests, dispatches them against the shared `AppState`, and
-/// writes back newline-delimited responses. Generic over the underlying
-/// transport so the same logic serves Unix Domain Sockets and Windows named
-/// pipes without duplication.
+/// Decrements the connection counter however the handler ends.
+struct Counted(ClientCounter);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.decrement();
+    }
+}
+
+/// Writes the refusal line for `reason` and closes the write side.
+async fn refuse<W: AsyncWrite + Unpin>(writer: &mut W, reason: &str) {
+    tracing::warn!(target: "meshd::server", "Refused a connection: {reason}");
+    let _ = writer.write_all(hello::error_line(reason).as_bytes()).await;
+    let _ = writer.shutdown().await;
+}
+
+/// Drives one client connection to completion: reads the hello and binds the
+/// connection to its view, then reads newline-delimited JSON-RPC requests,
+/// dispatches them against that view's state, and writes back newline-delimited
+/// responses. Generic over the underlying transport so the same logic serves
+/// Unix Domain Sockets and Windows named pipes without duplication.
 async fn handle_client<S>(
     stream: S,
-    host: StateHandle,
-
+    router: Router,
     cancel_token: CancellationToken,
     counter: ClientCounter,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let _counted = Counted(counter);
     let (reader_half, mut writer_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader_half);
+
+    // The hello comes first, always: a connection whose first line is anything
+    // else (a raw JSON-RPC frame included) gets an error line and is closed, so
+    // no frame is ever answered from a view nobody named.
+    let hello = tokio::select! {
+        _ = cancel_token.cancelled() => return,
+        h = hello::read_hello(&mut reader, hello::MAX_HELLO_BYTES, hello::HELLO_TIMEOUT) => h,
+    };
+    let hello = match hello {
+        Ok(h) => h,
+        // A liveness probe (`mesh-mcp`'s spawn check) connects and closes.
+        Err(HelloError::Closed) => return,
+        Err(e) => return refuse(&mut writer_half, &e.to_string()).await,
+    };
+    let bound = match router.open(hello).await {
+        Ok(b) => b,
+        Err(reason) => return refuse(&mut writer_half, &reason).await,
+    };
+    if writer_half
+        .write_all(hello::ok_line().as_bytes())
+        .await
+        .is_err()
+    {
+        return;
+    }
+
     // One audit session per client connection: each `mesh-mcp run` proxy (one
     // agent session) opens exactly one.
     let session_id = mesh_server::new_session_id();
@@ -72,9 +195,7 @@ async fn handle_client<S>(
                         if trimmed.is_empty() {
                             continue;
                         }
-                        // Resolved per request, not per connection: a config edit
-                        // reaches clients that are already connected.
-                        let state = host.current();
+                        let state = bound.current();
                         if let Some(resp) = dispatch(trimmed, &state, &session_id).await {
                             let mut out = resp;
                             out.push('\n');
@@ -91,8 +212,6 @@ async fn handle_client<S>(
             }
         }
     }
-
-    counter.decrement();
 }
 
 // ── Unix Domain Socket transport ─────────────────────────────────────────────
@@ -102,7 +221,7 @@ pub use unix_impl::run_uds_server_then;
 
 #[cfg(unix)]
 mod unix_impl {
-    use super::{handle_client, ClientCounter, StateHandle};
+    use super::{handle_client, ClientCounter, Router};
     #[cfg(test)]
     use mesh_core::AppState;
     #[cfg(test)]
@@ -151,14 +270,14 @@ mod unix_impl {
     #[allow(clippy::too_many_arguments)]
     pub async fn run_uds_server_then(
         socket_path: &std::path::Path,
-        state: impl Into<StateHandle>,
+        router: impl Into<Router>,
         cancel_token: CancellationToken,
         counter: ClientCounter,
         workspace_id: &str,
         version: &str,
         after_bind: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let state: StateHandle = state.into();
+        let router: Router = router.into();
         if let Some(parent) = socket_path.parent() {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
@@ -176,8 +295,7 @@ mod unix_impl {
             let _ = std::fs::remove_file(socket_path);
             return Err(e.into());
         }
-        mesh_core::socket::write_daemon_meta(workspace_id, version);
-        state.publish_status();
+        router.on_bound(workspace_id, version);
         tracing::info!(
             target: "meshd::server",
             "meshd listening on {}",
@@ -193,12 +311,12 @@ mod unix_impl {
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((stream, _addr)) => {
-                            let state = state.clone();
+                            let router = router.clone();
                             let cancel = cancel_token.clone();
                             let counter = counter.clone();
                             counter.increment();
                             tokio::spawn(async move {
-                                handle_client(stream, state, cancel, counter).await;
+                                handle_client(stream, router, cancel, counter).await;
                             });
                         }
                         Err(e) => {
@@ -209,7 +327,7 @@ mod unix_impl {
             }
         }
 
-        mesh_core::socket::remove_daemon_meta(workspace_id);
+        router.on_shutdown(workspace_id);
         Ok(())
     }
 }
@@ -227,7 +345,7 @@ pub use windows_impl::run_named_pipe_server;
 
 #[cfg(windows)]
 mod windows_impl {
-    use super::{handle_client, ClientCounter, StateHandle};
+    use super::{handle_client, ClientCounter, Router};
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     use tokio_util::sync::CancellationToken;
 
@@ -246,16 +364,15 @@ mod windows_impl {
     #[allow(clippy::too_many_arguments)]
     pub async fn run_named_pipe_server(
         pipe_name: &str,
-        state: impl Into<StateHandle>,
+        router: impl Into<Router>,
         cancel_token: CancellationToken,
         counter: ClientCounter,
         workspace_id: &str,
         version: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let state: StateHandle = state.into();
+        let router: Router = router.into();
         let mut server = create_instance(pipe_name, true)?;
-        mesh_core::socket::write_daemon_meta(workspace_id, version);
-        state.publish_status();
+        router.on_bound(workspace_id, version);
         tracing::info!(
             target: "meshd::server",
             "meshd listening on named pipe {}",
@@ -276,12 +393,12 @@ mod windows_impl {
 
                     match connect_res {
                         Ok(()) => {
-                            let state = state.clone();
+                            let router = router.clone();
                             let cancel = cancel_token.clone();
                             let counter_cloned = counter.clone();
                             counter.increment();
                             tokio::spawn(async move {
-                                handle_client(connected, state, cancel, counter_cloned).await;
+                                handle_client(connected, router, cancel, counter_cloned).await;
                             });
                         }
                         Err(e) => {
@@ -292,7 +409,7 @@ mod windows_impl {
             }
         }
 
-        mesh_core::socket::remove_daemon_meta(workspace_id);
+        router.on_shutdown(workspace_id);
         Ok(())
     }
 }
@@ -336,6 +453,22 @@ mod unix_tests {
         // these tests exercise post-ready behavior, so mark it ready up front.
         state.install_snapshot(mesh_core::MeshSnapshot::default());
         state
+    }
+
+    /// Connects and completes the hello every connection starts with (8.0.0).
+    async fn connect(path: &std::path::Path) -> UnixStream {
+        let mut stream = UnixStream::connect(path).await.unwrap();
+        let hello = mesh_server::hello::Hello::new(&std::env::temp_dir(), None);
+        let (mut r, mut w) = stream.split();
+        mesh_server::hello::client_handshake(
+            &mut r,
+            &mut w,
+            &hello,
+            mesh_server::hello::ACK_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        stream
     }
 
     #[tokio::test]
@@ -449,7 +582,7 @@ mod unix_tests {
         for _ in 0..20 {
             let path = sock_path.clone();
             handles.push(tokio::spawn(async move {
-                let mut stream = UnixStream::connect(&path).await.unwrap();
+                let mut stream = connect(&path).await;
                 let ping = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
                 stream.write_all(ping.as_bytes()).await.unwrap();
                 let mut buf = vec![0u8; 256];
@@ -498,7 +631,7 @@ mod unix_tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let mut stream = UnixStream::connect(&sock_path).await.unwrap();
+        let mut stream = connect(&sock_path).await;
         let ping = "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\"}\n";
         stream.write_all(ping.as_bytes()).await.unwrap();
 
@@ -509,6 +642,47 @@ mod unix_tests {
         assert_eq!(resp["id"], 42);
         assert!(resp["result"].is_object());
 
+        token.cancel();
+    }
+
+    /// 8.0.0: a connection that sends a JSON-RPC frame before its hello gets
+    /// one error line and is closed; the frame is never dispatched.
+    #[tokio::test]
+    async fn a_frame_before_the_hello_is_refused_and_never_answered() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("no-hello.sock");
+        let token = CancellationToken::new();
+        let (srv_path, srv_token) = (sock_path.clone(), token.clone());
+        tokio::spawn(async move {
+            run_uds_server(
+                &srv_path,
+                make_state(),
+                srv_token,
+                ClientCounter::new(),
+                "test-ws",
+                "0.0.0",
+            )
+            .await
+            .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut stream = UnixStream::connect(&sock_path).await.unwrap();
+        stream
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+            .await
+            .unwrap();
+        let mut all = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_string(&mut all),
+        )
+        .await
+        .expect("closed promptly")
+        .unwrap();
+        assert!(all.starts_with("{\"meshd_hello_error\":"), "{all}");
+        assert_eq!(all.lines().count(), 1, "one error line, then EOF: {all}");
+        assert!(!all.contains("\"result\""), "{all}");
         token.cancel();
     }
 
@@ -554,7 +728,7 @@ mod unix_tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let stream = UnixStream::connect(&sock_path).await.unwrap();
+        let stream = connect(&sock_path).await;
         let (read_half, mut stream) = stream.into_split();
         // One JSON-RPC frame per line: the `initialize` reply carries the
         // routing `instructions` (7.0.15), well over a fixed 1 KiB read.
@@ -606,8 +780,8 @@ mod unix_tests {
     async fn test_two_workspace_scoped_daemons_never_cross_talk() {
         let dir_a = tempdir().unwrap();
         let dir_b = tempdir().unwrap();
-        let sock_a = mesh_core::socket_path_for(&mesh_core::workspace_id(dir_a.path()));
-        let sock_b = mesh_core::socket_path_for(&mesh_core::workspace_id(dir_b.path()));
+        let sock_a = mesh_core::socket_path_for(&mesh_core::workspace_id(dir_a.path(), None));
+        let sock_b = mesh_core::socket_path_for(&mesh_core::workspace_id(dir_b.path(), None));
         assert_ne!(
             sock_a, sock_b,
             "two different workspaces must resolve to different sockets"
@@ -643,7 +817,7 @@ mod unix_tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let query = |sock_path: PathBuf| async move {
-            let mut stream = UnixStream::connect(&sock_path).await.unwrap();
+            let mut stream = connect(&sock_path).await;
             let req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"visualize_mesh\",\"arguments\":{\"format\":\"json\"}}}\n";
             stream.write_all(req.as_bytes()).await.unwrap();
             let mut buf = vec![0u8; 8192];
@@ -663,6 +837,84 @@ mod unix_tests {
             "workspace B's socket must only ever answer with workspace B's data, got: {resp_b}"
         );
 
+        token.cancel();
+    }
+
+    /// Two config files in ONE directory (`--config a.toml` / `--config b.toml`)
+    /// are two workspaces: distinct ids, distinct sockets, and each daemon
+    /// answers with its own config's graph only (idempotence invariant I7).
+    #[tokio::test]
+    async fn test_two_configs_in_one_directory_get_two_daemons_and_two_graphs() {
+        let dir = tempdir().unwrap();
+        let config_for = |name: &str| {
+            let path = dir.path().join(format!("{name}.toml"));
+            std::fs::write(
+                &path,
+                format!("[workspace]\nname = \"{name}\"\nversion = \"2.9.0\"\nroots = [\".\"]\n"),
+            )
+            .unwrap();
+            path
+        };
+        let cfg_a = config_for("k8s-wt1");
+        let cfg_b = config_for("k8s-wt2");
+
+        // 8.0.0: outside Git (a tempdir) the daemon id is still the per-config
+        // workspace id, so the two configs keep two daemons. Inside Git they are
+        // two views of one daemon instead (`tests/multi_view.rs`).
+        std::fs::write(dir.path().join(".git"), "gitdir: ./nowhere\n").unwrap();
+        let ident_a = mesh_core::WorkspaceIdentity::resolve(dir.path(), Some(&cfg_a));
+        let ident_b = mesh_core::WorkspaceIdentity::resolve(dir.path(), Some(&cfg_b));
+        assert!(ident_a.family.is_none());
+        assert_eq!(ident_a.daemon_id(), ident_a.legacy_id);
+        assert_ne!(ident_a.daemon_id(), ident_b.daemon_id());
+        let id_a = mesh_core::workspace_id(dir.path(), Some(&cfg_a));
+        let id_b = mesh_core::workspace_id(dir.path(), Some(&cfg_b));
+        assert_ne!(id_a, id_b, "two configs in one directory share no identity");
+        assert_ne!(id_a, mesh_core::workspace_id(dir.path(), None));
+        assert_ne!(
+            mesh_core::socket_path_for(&id_a),
+            mesh_core::socket_path_for(&id_b)
+        );
+
+        // Bound in the test's own directory: a short name, never the user's cache.
+        let sock_a = dir.path().join(format!("m-{id_a}.sock"));
+        let sock_b = dir.path().join(format!("m-{id_b}.sock"));
+
+        let token = CancellationToken::new();
+        let counter = ClientCounter::new();
+        for (sock, cfg) in [(&sock_a, &cfg_a), (&sock_b, &cfg_b)] {
+            let config = Config::load_from_str(&std::fs::read_to_string(cfg).unwrap()).unwrap();
+            let audit = Arc::new(AuditLogger::new_in_memory().unwrap());
+            let rescan = Arc::new(BackgroundRescanEngine::new().unwrap());
+            let state = Arc::new(AppState::new(config, vec![], audit, rescan));
+            state.install_snapshot(mesh_core::MeshSnapshot::default());
+            let (sock, token, counter) = (sock.clone(), token.clone(), counter.clone());
+            tokio::spawn(async move {
+                run_uds_server(&sock, state, token, counter, "test-two-cfg", "0.0.0")
+                    .await
+                    .unwrap();
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let query = |sock_path: PathBuf| async move {
+            let mut stream = connect(&sock_path).await;
+            let req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"visualize_mesh\",\"arguments\":{\"format\":\"json\"}}}\n";
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        };
+        let resp_a = query(sock_a).await;
+        let resp_b = query(sock_b).await;
+        assert!(
+            resp_a.contains("k8s-wt1") && !resp_a.contains("k8s-wt2"),
+            "config a's daemon must answer with config a's graph, got: {resp_a}"
+        );
+        assert!(
+            resp_b.contains("k8s-wt2") && !resp_b.contains("k8s-wt1"),
+            "config b's daemon must answer with config b's graph, got: {resp_b}"
+        );
         token.cancel();
     }
 
@@ -706,7 +958,7 @@ mod unix_tests {
         let path_a = sock_path.clone();
         let slow_start = std::time::Instant::now();
         let slow_handle = tokio::spawn(async move {
-            let mut stream = UnixStream::connect(&path_a).await.unwrap();
+            let mut stream = connect(&path_a).await;
             let req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\
                         \"params\":{\"name\":\"test_slow_op\",\"arguments\":{\"sleep_ms\":800}}}\n";
             stream.write_all(req.as_bytes()).await.unwrap();
@@ -720,7 +972,7 @@ mod unix_tests {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         // Client B: ping, issued while A's slow call is still running.
-        let mut stream_b = UnixStream::connect(&sock_path).await.unwrap();
+        let mut stream_b = connect(&sock_path).await;
         let ping = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n";
         let ping_start = std::time::Instant::now();
         stream_b.write_all(ping.as_bytes()).await.unwrap();
@@ -926,7 +1178,7 @@ mod unix_tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let mut stream = UnixStream::connect(&sock_path).await.unwrap();
+        let mut stream = connect(&sock_path).await;
         let req = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\
                     \"params\":{\"name\":\"test_slow_op\",\"arguments\":{\"sleep_ms\":300}}}\n";
         stream.write_all(req.as_bytes()).await.unwrap();
@@ -1004,6 +1256,18 @@ mod windows_tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let mut client = ClientOptions::new().open(&pipe_name).unwrap();
+        {
+            let hello = mesh_server::hello::Hello::new(&std::env::temp_dir(), None);
+            let (mut r, mut w) = tokio::io::split(&mut client);
+            mesh_server::hello::client_handshake(
+                &mut r,
+                &mut w,
+                &hello,
+                mesh_server::hello::ACK_TIMEOUT,
+            )
+            .await
+            .unwrap();
+        }
         let ping = "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"ping\"}\n";
         client.write_all(ping.as_bytes()).await.unwrap();
 

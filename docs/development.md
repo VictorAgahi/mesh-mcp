@@ -219,8 +219,8 @@ What it actually checks:
 ### The daemon follows its config (7.1.7)
 
 `meshd` serves a `WorkspaceHost` (`crates/mesh-daemon/src/host.rs`) instead of a fixed `AppState`
-(`config` and `allowed_roots` are immutable, only the snapshot hot-swaps). Per request, at most
-every 250 ms, it reads and hashes the config file it was started from
+(`config` and `allowed_roots` are immutable, only the snapshot hot-swaps). Per request (at most
+every 250 ms) and every 2 s when idle, it reads and hashes the config file it was started from
 (`WorkspaceIndexer::locate_config`, absolute; `mesh_core::config_watch`; mtime and length are not
 trusted), and a different hash builds a new `AppState` (parse, expand roots, ingest, file watcher) on a blocking
 thread. The previous state keeps serving until the new one has its first snapshot, then an

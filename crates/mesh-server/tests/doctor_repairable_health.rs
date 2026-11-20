@@ -12,15 +12,11 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The `mesh-mcp` binary Cargo built for this integration test. Deriving it from
+/// `current_exe()` assumed `target/<profile>/deps/` and broke when Cargo moved
+/// test executables to a separate build directory.
 fn mesh_mcp_bin() -> PathBuf {
-    let mut path = std::env::current_exe().expect("test exe");
-    path.pop(); // deps/
-    path.pop(); // release/ or debug/
-    path.join(if cfg!(windows) {
-        "mesh-mcp.exe"
-    } else {
-        "mesh-mcp"
-    })
+    PathBuf::from(env!("CARGO_BIN_EXE_mesh-mcp"))
 }
 
 fn write_config(dir: &Path) -> PathBuf {
@@ -102,7 +98,7 @@ fn corrupt_workspace_cache_is_reported_then_removed_by_fix() {
     let config = write_config(project.path());
     let canonical_project = dunce::canonicalize(project.path()).expect("canon");
 
-    let workspace_id = mesh_core::workspace_id(&canonical_project);
+    let workspace_id = mesh_core::workspace_id(&canonical_project, Some(&config));
     let db_path = home
         .path()
         .join(".cache")
@@ -204,7 +200,7 @@ fn daemon_version_mismatch_is_reported_and_fix_stops_the_live_daemon() {
     let project = tempfile::tempdir().expect("project");
     let config = write_config(project.path());
     let canonical_project = dunce::canonicalize(project.path()).expect("canon");
-    let workspace_id = mesh_core::workspace_id(&canonical_project);
+    let workspace_id = mesh_core::workspace_id(&canonical_project, Some(&config));
 
     // A real, harmless, long-lived process standing in for an old meshd: proves
     // `--fix` actually terminates the recorded PID, not just marks it fixed.
@@ -220,6 +216,8 @@ fn daemon_version_mismatch_is_reported_and_fix_stops_the_live_daemon() {
     let meta = mesh_core::socket::DaemonMeta {
         pid: child.id(),
         version: "0.0.1-old".to_string(),
+        views: Vec::new(),
+        view_builds: 0,
     };
     // `daemon_meta_path` reads `$HOME` at call time, which in this *test harness*
     // process is the real machine's home, not `home` (that override only takes
@@ -281,7 +279,7 @@ fn daemon_version_mismatch_with_a_dead_pid_is_fixed_by_removing_the_stale_record
     let project = tempfile::tempdir().expect("project");
     let config = write_config(project.path());
     let canonical_project = dunce::canonicalize(project.path()).expect("canon");
-    let workspace_id = mesh_core::workspace_id(&canonical_project);
+    let workspace_id = mesh_core::workspace_id(&canonical_project, Some(&config));
 
     let mut child = Command::new(if cfg!(windows) { "cmd" } else { "true" })
         .args(if cfg!(windows) {
@@ -300,6 +298,8 @@ fn daemon_version_mismatch_with_a_dead_pid_is_fixed_by_removing_the_stale_record
     let meta = mesh_core::socket::DaemonMeta {
         pid: dead_pid,
         version: "0.0.1-old".to_string(),
+        views: Vec::new(),
+        view_builds: 0,
     };
     let meta_path = home
         .path()
@@ -330,11 +330,13 @@ fn daemon_version_match_is_ok_and_offers_no_fix() {
     let project = tempfile::tempdir().expect("project");
     let config = write_config(project.path());
     let canonical_project = dunce::canonicalize(project.path()).expect("canon");
-    let workspace_id = mesh_core::workspace_id(&canonical_project);
+    let workspace_id = mesh_core::workspace_id(&canonical_project, Some(&config));
 
     let meta = mesh_core::socket::DaemonMeta {
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        views: Vec::new(),
+        view_builds: 0,
     };
     let meta_path = home
         .path()
@@ -363,7 +365,7 @@ fn socket_permissions_are_reported_then_repaired_by_fix() {
     let project = tempfile::tempdir().expect("project");
     let config = write_config(project.path());
     let canonical_project = dunce::canonicalize(project.path()).expect("canon");
-    let workspace_id = mesh_core::workspace_id(&canonical_project);
+    let workspace_id = mesh_core::workspace_id(&canonical_project, Some(&config));
 
     let sock_dir = home.path().join(".cache").join("mesh");
     std::fs::create_dir_all(&sock_dir).expect("mkdir");
@@ -404,7 +406,7 @@ fn orphaned_socket_is_reported_and_removed_by_fix() {
     let project = tempfile::tempdir().expect("project");
     let config = write_config(project.path());
     let canonical_project = dunce::canonicalize(project.path()).expect("canon");
-    let workspace_id = mesh_core::workspace_id(&canonical_project);
+    let workspace_id = mesh_core::workspace_id(&canonical_project, Some(&config));
 
     let sock_dir = home.path().join(".cache").join("mesh");
     std::fs::create_dir_all(&sock_dir).expect("mkdir");
@@ -475,7 +477,7 @@ fn corrupt_cache_and_stale_version_live_daemon_together_are_all_fixed_at_once() 
     let project = tempfile::tempdir().expect("project");
     let config = write_config(project.path());
     let canonical_project = dunce::canonicalize(project.path()).expect("canon");
-    let workspace_id = mesh_core::workspace_id(&canonical_project);
+    let workspace_id = mesh_core::workspace_id(&canonical_project, Some(&config));
 
     // Corrupt workspace cache.
     let db_path = home
@@ -498,6 +500,8 @@ fn corrupt_cache_and_stale_version_live_daemon_together_are_all_fixed_at_once() 
     let meta = mesh_core::socket::DaemonMeta {
         pid: child.id(),
         version: "0.0.1-old".to_string(),
+        views: Vec::new(),
+        view_builds: 0,
     };
     let meta_path = home
         .path()
@@ -551,7 +555,7 @@ fn invalid_config_reports_the_daemon_still_serving_its_previous_config() {
     let project = tempfile::tempdir().expect("project");
     let config = write_config(project.path());
     let canonical_project = dunce::canonicalize(project.path()).expect("canon");
-    let workspace_id = mesh_core::workspace_id(&canonical_project);
+    let workspace_id = mesh_core::workspace_id(&canonical_project, Some(&config));
     let served_sha = mesh_core::config_watch::config_sha256(&std::fs::read(&config).unwrap());
 
     let cache = home.path().join(".cache").join("mesh-mcp").join("meshd");
@@ -559,6 +563,8 @@ fn invalid_config_reports_the_daemon_still_serving_its_previous_config() {
     let meta = mesh_core::socket::DaemonMeta {
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        views: Vec::new(),
+        view_builds: 0,
     };
     std::fs::write(
         cache.join(format!("{workspace_id}.meta")),
@@ -573,6 +579,7 @@ fn invalid_config_reports_the_daemon_still_serving_its_previous_config() {
         rejected_sha256: None,
         loaded_ms: Some(1_000),
         last_reload: None,
+        owner: None,
     };
     std::fs::write(
         cache.join(format!("{workspace_id}.config.json")),

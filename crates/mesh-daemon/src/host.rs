@@ -12,8 +12,10 @@
 //! to; anything else re-indexes the workspace, reusing the per-file parse cache.
 //! The rebuild runs on a blocking thread while the old state keeps serving, and
 //! the swap happens once the new state is ready. The check runs when a request
-//! arrives (there is no timer), so an edit made while no client is talking to the
-//! daemon is applied by the next request. A config that does not parse, or whose
+//! arrives, and also on a periodic task ([`WorkspaceHost::spawn_idle_poller`],
+//! every [`IDLE_POLL_INTERVAL`]), so an edit made while no client is talking to
+//! the daemon is already applied when the next request comes. A config that does
+//! not parse, or whose
 //! roots do not resolve, is refused: the old state keeps serving, the reason is
 //! logged to stderr and recorded for `mesh-mcp doctor`.
 
@@ -34,6 +36,10 @@ use tokio_util::sync::CancellationToken;
 
 /// Minimum time between two `stat`s of the config file.
 pub const CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often the daemon checks its config file with no request in flight (see
+/// [`WorkspaceHost::spawn_idle_poller`]).
+pub const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// What one [`WorkspaceHost::reload_if_changed`] pass did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +88,12 @@ pub struct WorkspaceHost {
     /// Where the status record and the index caches of rebuilt states go;
     /// `None` is the user's real cache directory. Tests point it at a tempdir.
     cache_dir: Option<PathBuf>,
+    /// This host instance, written into every status record it publishes: a view
+    /// that idles out removes the record only while it is still its own (8.0.0).
+    owner: u64,
+    /// Set once the view is dropped: a retired host never publishes again, even
+    /// from a reload that was still running.
+    retired: AtomicBool,
     /// Test hook: make the next reload panic.
     #[cfg(test)]
     panic_next: AtomicBool,
@@ -112,6 +124,18 @@ pub fn seed_index_cache(state: &AppState, cache_dir: &Path, tag: u64) {
     }
 }
 
+/// Serializes every status publish and removal of this process: views of one daemon share
+/// the record directory, and two views of one directory (one retiring, one new) share a
+/// record path.
+static STATUS_LOCK: Mutex<()> = Mutex::new(());
+
+/// A process-unique host instance id (pid in the high bits, so a record left by an earlier
+/// daemon never carries the id of a live host).
+fn next_owner() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    (u64::from(std::process::id()) << 32) | (NEXT.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff)
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -120,12 +144,12 @@ fn now_ms() -> u128 {
 
 /// Indexes `state`'s workspace into its first snapshot, under `reload_lock` like
 /// every later reload (idempotence invariant I2). Blocking.
-pub fn ingest_blocking(state: &Arc<AppState>, base_dir: &Path) {
+pub fn ingest_blocking(state: &Arc<AppState>, base_dir: &Path, config_file: Option<&Path>) {
     let _guard = state.reload_lock.lock().unwrap_or_else(|p| p.into_inner());
     tracing::info!(target: "meshd", "Starting initial workspace ingestion...");
     // Per-workspace cache under its quota (plan 4 step 4.4); a failure to open it
     // degrades to "parse everything" (see `AppState::open_index_cache`).
-    let index_cache = state.open_index_cache(base_dir);
+    let index_cache = state.open_index_cache(base_dir, config_file);
     let snapshot = {
         let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
         WorkspaceIndexer::build_snapshot(
@@ -208,7 +232,7 @@ fn close_reload_gap(
 impl WorkspaceHost {
     /// The intermediate-priority pool of the config-driven reload; should it not
     /// build, the watcher's own (lower priority) pool serves instead.
-    fn reload_pool_for(fallback: &Arc<BackgroundRescanEngine>) -> Arc<BackgroundRescanEngine> {
+    pub fn reload_pool_for(fallback: &Arc<BackgroundRescanEngine>) -> Arc<BackgroundRescanEngine> {
         match BackgroundRescanEngine::with_priority(mesh_core::rescan::RescanPriority::Utility) {
             Ok(pool) => Arc::new(pool),
             Err(e) => {
@@ -224,32 +248,10 @@ impl WorkspaceHost {
     /// `WorkspaceIndexer::discover_config_stamped`), never a later re-read of the
     /// file, which could describe newer content than the state serves.
     /// `watcher_cancel` stops the watcher already running on `state`; it must be
-    /// a child of `shutdown`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        state: Arc<AppState>,
-        config_path: Option<PathBuf>,
-        serving_sha: Option<String>,
-        workspace_id: &str,
-        audit: Arc<AuditLogger>,
-        rescan: Arc<BackgroundRescanEngine>,
-        shutdown: CancellationToken,
-        watcher_cancel: CancellationToken,
-    ) -> Arc<Self> {
-        Self::new_in(
-            state,
-            config_path,
-            serving_sha,
-            workspace_id,
-            audit,
-            rescan,
-            shutdown,
-            watcher_cancel,
-            None,
-        )
-    }
-
-    /// [`Self::new`] with the cache directory given (`None`: the real one).
+    /// a child of `shutdown`. `cache_dir` is where status records and the index
+    /// caches of rebuilt states go (`None`: the real cache). Tests only; `meshd`
+    /// builds its hosts with [`Self::new_view`].
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn new_in(
         state: Arc<AppState>,
@@ -262,12 +264,42 @@ impl WorkspaceHost {
         watcher_cancel: CancellationToken,
         cache_dir: Option<PathBuf>,
     ) -> Arc<Self> {
+        let reload_pool = Self::reload_pool_for(&rescan);
+        Self::new_view(
+            state,
+            config_path,
+            serving_sha,
+            workspace_id,
+            audit,
+            rescan,
+            reload_pool,
+            shutdown,
+            watcher_cancel,
+            cache_dir,
+        )
+    }
+
+    /// [`Self::new_in`] with the config-reload pool given: every view of a multi-view daemon
+    /// shares one, as it shares the watcher pool `rescan` and the audit logger.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_view(
+        state: Arc<AppState>,
+        config_path: Option<PathBuf>,
+        serving_sha: Option<String>,
+        workspace_id: &str,
+        audit: Arc<AuditLogger>,
+        rescan: Arc<BackgroundRescanEngine>,
+        reload_pool: Arc<BackgroundRescanEngine>,
+        shutdown: CancellationToken,
+        watcher_cancel: CancellationToken,
+        cache_dir: Option<PathBuf>,
+    ) -> Arc<Self> {
         let host = Arc::new(Self {
             current: ArcSwap::from(state),
             config_path,
             workspace_id: workspace_id.to_string(),
             audit,
-            reload_pool: Self::reload_pool_for(&rescan),
+            reload_pool,
             rescan,
             shutdown,
             started_ms: now_ms(),
@@ -284,6 +316,8 @@ impl WorkspaceHost {
                 last_reload: None,
             }),
             cache_dir,
+            owner: next_owner(),
+            retired: AtomicBool::new(false),
             #[cfg(test)]
             panic_next: AtomicBool::new(false),
             #[cfg(test)]
@@ -295,7 +329,8 @@ impl WorkspaceHost {
         host
     }
 
-    /// A host that never reloads: tests and embedders with a fixed state.
+    /// A host that never reloads: tests with a fixed state.
+    #[cfg(test)]
     pub fn fixed(state: Arc<AppState>) -> Arc<Self> {
         let audit = Arc::clone(&state.audit);
         let rescan = Arc::clone(&state.rescan);
@@ -323,6 +358,8 @@ impl WorkspaceHost {
                 last_reload: None,
             }),
             cache_dir: None,
+            owner: next_owner(),
+            retired: AtomicBool::new(false),
             #[cfg(test)]
             panic_next: AtomicBool::new(false),
             #[cfg(test)]
@@ -344,6 +381,26 @@ impl WorkspaceHost {
         self.current.load_full()
     }
 
+    /// Checks the config file every `interval` until the daemon shuts down, so an
+    /// edit made while the daemon is idle is applied before the next request
+    /// instead of being answered with the old state first. Each tick is the same
+    /// cheap check a request does (read and hash a few hundred bytes, reload only
+    /// on a different hash); nothing is held across an await.
+    pub fn spawn_idle_poller(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let host = Arc::clone(self);
+        let cancel = self.shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = ticker.tick() => host.check_for_change(),
+                }
+            }
+        })
+    }
+
     fn check_for_change(self: &Arc<Self>) {
         let Some(path) = self.config_path.as_deref() else {
             return;
@@ -357,7 +414,7 @@ impl WorkspaceHost {
         self.last_check_ms.store(elapsed.max(1), Ordering::Relaxed);
         // Read and hash every time the throttle window passes: the file is tiny
         // and `(mtime, len)` cannot see a same-length edit within one mtime tick.
-        let moved = match std::fs::read(path) {
+        let moved = match mesh_core::config_watch::read_config_bounded(path) {
             Ok(bytes) => self.observe(&config_sha256(&bytes)),
             Err(_) => false,
         };
@@ -412,7 +469,7 @@ impl WorkspaceHost {
                 let sha = self
                     .config_path
                     .as_deref()
-                    .and_then(|p| std::fs::read(p).ok())
+                    .and_then(|p| mesh_core::config_watch::read_config_bounded(p).ok())
                     .map(|b| config_sha256(&b));
                 self.reject(
                     sha,
@@ -424,16 +481,47 @@ impl WorkspaceHost {
         }
     }
 
+    /// Retires this host (its view was dropped): it never publishes again, and the status
+    /// record goes only if it is still this host's own. A newer view of the same directory
+    /// may already have published its record at that path; that one stays.
+    pub fn retire_status(&self) {
+        self.retired.store(true, Ordering::SeqCst);
+        if self.config_path.is_none() || self.workspace_id.is_empty() {
+            return;
+        }
+        let _serial = STATUS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let path = mesh_core::config_watch::daemon_config_status_path_in(
+            &self.status_dir(),
+            &self.workspace_id,
+        );
+        let ours = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<DaemonConfigStatus>(&text).ok())
+            .is_some_and(|status| status.owner == Some(self.owner));
+        if ours {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    fn status_dir(&self) -> PathBuf {
+        self.cache_dir
+            .clone()
+            .unwrap_or_else(mesh_core::paths::mesh_cache_dir)
+    }
+
     /// Records which config this daemon serves, for `mesh-mcp doctor`.
     pub fn publish_status(&self) {
         let Some(path) = self.config_path.clone() else {
             return;
         };
+        let _serial = STATUS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Checked under the lock `retire_status` takes after setting the flag: once a host
+        // is retired, no publish of it can land after its removal.
+        if self.retired.load(Ordering::SeqCst) {
+            return;
+        }
         let book = self.book.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = self
-            .cache_dir
-            .clone()
-            .unwrap_or_else(mesh_core::paths::mesh_cache_dir);
+        let dir = self.status_dir();
         write_daemon_config_status_in(
             &dir,
             &self.workspace_id,
@@ -445,6 +533,7 @@ impl WorkspaceHost {
                 rejected_sha256: book.rejected_sha.clone(),
                 loaded_ms: Some(book.loaded_ms),
                 last_reload: book.last_reload.clone(),
+                owner: Some(self.owner),
             },
         );
     }
@@ -477,7 +566,7 @@ impl WorkspaceHost {
         };
         // One read: these bytes are hashed, parsed and, if they win, recorded as
         // the served content, so the recorded hash always describes the state.
-        let bytes = match std::fs::read(path) {
+        let bytes = match mesh_core::config_watch::read_config_bounded(path) {
             Ok(b) => b,
             // Vanished (an editor's atomic save, or deleted): keep serving.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReloadOutcome::Unchanged,
@@ -550,13 +639,13 @@ impl WorkspaceHost {
         let watcher_cancel = self.shutdown.child_token();
         match kind {
             ReloadKind::Full => {
-                ingest_blocking(&state, &base_dir);
+                ingest_blocking(&state, &base_dir, self.config_path.as_deref());
             }
             ReloadKind::DisplayOnly | ReloadKind::Partial => {
                 // The index stays valid: carry it over instead of reading the
                 // workspace again. Only the query-time docs settings follow the
                 // new config.
-                state.open_index_cache(&base_dir);
+                state.open_index_cache(&base_dir, self.config_path.as_deref());
                 let settings = WorkspaceIndexer::doc_index_for(&state.config);
                 state.adopt_index_of(&old, |snapshot| {
                     snapshot.doc_index.adopt_query_settings(&settings);
@@ -602,11 +691,12 @@ impl WorkspaceHost {
     }
 }
 
-/// What the IPC server hands each connection: a [`WorkspaceHost`], or a fixed
-/// `AppState` (tests) wrapped in one that never reloads.
+/// A fixed `AppState` wrapped in a host that never reloads (the server's test router).
+#[cfg(test)]
 #[derive(Clone)]
 pub struct StateHandle(pub Arc<WorkspaceHost>);
 
+#[cfg(test)]
 impl StateHandle {
     pub fn current(&self) -> Arc<AppState> {
         self.0.current()
@@ -617,12 +707,14 @@ impl StateHandle {
     }
 }
 
+#[cfg(test)]
 impl From<Arc<AppState>> for StateHandle {
     fn from(state: Arc<AppState>) -> Self {
         Self(WorkspaceHost::fixed(state))
     }
 }
 
+#[cfg(test)]
 impl From<Arc<WorkspaceHost>> for StateHandle {
     fn from(host: Arc<WorkspaceHost>) -> Self {
         Self(host)
@@ -682,7 +774,7 @@ mod tests {
         // in this test's own tempdir.
         let cache = root.join(".test-cache");
         seed_index_cache(&state, &cache, 0);
-        ingest_blocking(&state, &base);
+        ingest_blocking(&state, &base, Some(&config));
         let shutdown = CancellationToken::new();
         let host = WorkspaceHost::new_in(
             state,
@@ -818,6 +910,29 @@ mod tests {
         }
         assert!(served_new, "the rebuilt state never started serving");
         fx.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn an_idle_edit_is_picked_up_by_the_timer_without_any_request() {
+        let fx = fixture(&["a"]);
+        let poller = fx.host.spawn_idle_poller(Duration::from_millis(50));
+        write_config(&fx.config, &["a", "b"]);
+        // No `current()` call: only `peek()`, which never checks the file.
+        let mut served_new = false;
+        for _ in 0..200 {
+            if knows(&fx.host.peek(), "OnlyB") {
+                served_new = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(served_new, "the timer never applied the idle edit");
+        fx.shutdown.cancel();
+        // Cancelled by the daemon's token: the task ends.
+        tokio::time::timeout(Duration::from_secs(5), poller)
+            .await
+            .expect("poller stops on shutdown")
+            .expect("poller join");
     }
 
     fn set_mtime(path: &Path, secs: u64) {
@@ -1113,6 +1228,55 @@ mod tests {
             mesh_core::config_watch::daemon_config_status_path_in(&fx.cache, "test-ws-host");
         assert!(status.exists(), "{}", status.display());
         assert!(fx.cache.join("index").exists());
+        fx.shutdown.cancel();
+    }
+
+    /// 8.0.0 review M3: a view that idles out while a newer view of the same
+    /// directory has already published must not delete the newer record, and a
+    /// retired host (a reload still finishing) never publishes again.
+    #[test]
+    fn a_retired_host_removes_only_its_own_status_and_never_publishes_again() {
+        let fx = fixture(&["a"]);
+        let status =
+            mesh_core::config_watch::daemon_config_status_path_in(&fx.cache, "test-ws-host");
+        let owner_of = || -> Option<u64> {
+            let text = std::fs::read_to_string(&status).ok()?;
+            serde_json::from_str::<DaemonConfigStatus>(&text)
+                .ok()?
+                .owner
+        };
+        fx.host.publish_status();
+        assert_eq!(owner_of(), Some(fx.host.owner));
+
+        // A newer host for the same directory and config publishes over it.
+        let newer = WorkspaceHost::new_in(
+            fx.host.peek(),
+            Some(fx.config.clone()),
+            None,
+            "test-ws-host",
+            Arc::new(AuditLogger::new_in_memory().expect("audit")),
+            Arc::new(BackgroundRescanEngine::new().expect("rescan")),
+            fx.shutdown.clone(),
+            fx.shutdown.child_token(),
+            Some(fx.cache.clone()),
+        );
+        newer.publish_status();
+        assert_eq!(owner_of(), Some(newer.owner));
+
+        // The old one retires: the newer record stays, and the old one cannot
+        // write over it any more.
+        fx.host.retire_status();
+        assert_eq!(owner_of(), Some(newer.owner), "the newer record survives");
+        fx.host.publish_status();
+        assert_eq!(
+            owner_of(),
+            Some(newer.owner),
+            "a retired host never publishes"
+        );
+
+        // The newer one retiring removes its own record.
+        newer.retire_status();
+        assert!(!status.exists());
         fx.shutdown.cancel();
     }
 }
