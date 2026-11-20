@@ -94,6 +94,7 @@ pub fn declaration_label(node: &ContractNode) -> Option<&'static str> {
         NodeKind::PostProcessor => Some("post-processor"),
         NodeKind::Saga => Some("saga"),
         NodeKind::Module => Some("module"),
+        NodeKind::Callable => Some("callable"),
         NodeKind::Interface => match keyword {
             "type" => type_kind(),
             _ => Some("interface"),

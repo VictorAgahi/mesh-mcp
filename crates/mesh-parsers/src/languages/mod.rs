@@ -13,6 +13,7 @@ pub mod scala;
 mod sfc;
 mod spec_shape;
 pub mod swift;
+mod ts_calls;
 pub mod ts_config;
 pub mod typescript;
 
@@ -21,8 +22,8 @@ pub use ts_config::TsAliasIndex;
 use crate::decapitate::LanguageKind;
 use crate::guard::{AstGuard, ParseOutcome};
 use mesh_core::{
-    CompactStr, ContractGraph, ContractNode, ContractsConfig, CustomPatternConfig, FilePath,
-    NodeKind, PatternKind, RepoId,
+    CallFacts, CompactStr, ContractGraph, ContractNode, ContractsConfig, CustomPatternConfig,
+    FilePath, NodeKind, PatternKind, RepoId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -193,6 +194,11 @@ pub struct FileIndex {
     /// and on an incremental reload keeps its last known-good facts and retries on the
     /// next change, rather than wiping them (idempotence invariant I6).
     pub parse_failed: bool,
+    /// Call facts (9.0 calls layer): callables, call sites, injections, imports and
+    /// type heritage, language-agnostic (`mesh_core::CallFacts`). Empty for a
+    /// language without a call extractor.
+    #[serde(default)]
+    pub calls: CallFacts,
 }
 
 impl FileIndex {
@@ -216,10 +222,23 @@ impl FileIndex {
         self.heuristic_topic_nodes
             .extend(other.heuristic_topic_nodes.into_iter().map(|i| i + offset));
         self.parse_failed |= other.parse_failed;
+        self.calls.merge(other.calls);
     }
 
     /// Inserts the extracted nodes and relations into `graph`.
     pub fn apply(self, graph: &mut ContractGraph) {
+        // Call facts are keyed by the file their nodes live in: a file with call
+        // facts always has the declaration nodes they were read from.
+        if let Some(first) = self.nodes.first() {
+            if !self.calls.is_empty() {
+                graph.add_call_facts(
+                    first.file_path.clone(),
+                    first.repo_id,
+                    first.package.clone(),
+                    self.calls,
+                );
+            }
+        }
         let ids: Vec<_> = self.nodes.into_iter().map(|n| graph.add_node(n)).collect();
         for (i, target) in self.dependencies {
             graph.add_dependency(ids[i], &target);
@@ -482,10 +501,19 @@ impl PolyglotIndexer {
     /// as producers or consumers (so `analyze_impact` could not link them):
     /// - a method decorated `@EventPattern` / `@MessagePattern` (a `KafkaTopic`
     ///   node named after its pattern) consumes that pattern;
-    /// - a call-site node (`consumer.subscribe`, `producer.send`, NestJS
-    ///   `client.emit` / `client.send`, BullMQ `new Queue` / `new Worker`)
-    ///   is attributed to the smallest declaration enclosing it — the method
-    ///   that publishes or subscribes — or to itself at module level.
+    /// - a call-site producer (`producer.send`, NestJS `client.emit` / `client.send`,
+    ///   BullMQ `new Queue`, `redis.publish`) is the call-site node itself, at the line
+    ///   of the call. Up to 8.0.1 it was attributed to the smallest declaration
+    ///   enclosing it, so it reported the method's declaration line, or the class's
+    ///   when the method was itself an `@EventPattern` handler (8.0.1 defects N2 /
+    ///   N9). The enclosing method is now found by line containment in the calls
+    ///   layer (`ContractGraph::enclosing_callable`);
+    /// - a call-site consumer (`consumer.subscribe`, `new Worker`) is still attributed
+    ///   to the smallest declaration enclosing it: the handler a subscription runs is
+    ///   what a consumer row names, and a topic-named node would say nothing more;
+    /// - a decorator fact (`@Processor('q')`, `@RabbitSubscribe`) spans the
+    ///   declaration it decorates and stays on it, as does a producer call that a
+    ///   one-line declaration spans exactly (same lines, the declaration's name).
     fn wire_ts_events(nodes: &[ContractNode], out: &mut FileIndex) {
         for (i, node) in nodes.iter().enumerate() {
             let signature = node.signature.as_deref().unwrap_or("");
@@ -506,6 +534,8 @@ impl PolyglotIndexer {
                     *j != i
                         && n.line_start <= node.line_start
                         && n.line_end >= node.line_end
+                        && (!produces
+                            || (n.line_start, n.line_end) == (node.line_start, node.line_end))
                         && !matches!(
                             n.kind,
                             NodeKind::KafkaTopic | NodeKind::Queue | NodeKind::EventStream
@@ -804,7 +834,24 @@ impl PolyglotIndexer {
                                 tree,
                             ));
                         }
-                        Some((nodes, imports, rpc_calls))
+                        // Test files carry no call facts: a chain entered from a spec is
+                        // not an architecture flow, and they only cost memory.
+                        // Judged below the workspace root: a checkout under `~/tests/` is
+                        // not test code.
+                        let in_test = match Self::routing_path(cfg, file_path) {
+                            Some(rel) => mesh_core::is_test_path(&rel),
+                            None => file_path
+                                .file_name()
+                                .is_some_and(|n| mesh_core::is_test_path(Path::new(n))),
+                        };
+                        let calls = if in_test {
+                            CallFacts::default()
+                        } else {
+                            ts_calls::extract(tree, content.as_bytes(), &|module| {
+                                cfg.ts_aliases.rewrite(file_path, module)
+                            })
+                        };
+                        Some((nodes, imports, rpc_calls, calls))
                     })
                 };
                 // Plain JavaScript is parsed by its own grammar. A `.js` file
@@ -822,7 +869,7 @@ impl PolyglotIndexer {
                         other => other,
                     };
                 }
-                let (nodes, mut imports, rpc_calls) = match outcome {
+                let (nodes, mut imports, rpc_calls, calls) = match outcome {
                     ParseOutcome::Parsed(Some(extracted)) => extracted,
                     ParseOutcome::Parsed(None) | ParseOutcome::NoGrammar => Default::default(),
                     ParseOutcome::ParseFailed => {
@@ -840,6 +887,7 @@ impl PolyglotIndexer {
                     }
                 }
                 out.rpc_calls = rpc_calls;
+                out.calls = calls;
                 Self::wire_ts_events(&nodes, &mut out);
                 let mut nodes = nodes;
                 // A file with imports and no declaration (a barrel of
@@ -1402,6 +1450,7 @@ mod tests {
             rpc_calls: vec![(0, CompactStr::new("Billing.Charge"))],
             heuristic_topic_nodes: vec![1],
             parse_failed: false,
+            calls: CallFacts::default(),
         };
         let before = format!("{index:?}");
         let anchored = index.relativize(&root_a).expect("all under root");
@@ -1602,23 +1651,24 @@ export class BillingController {
             &mut graph,
         );
         graph.reconcile_edges();
-        for (topic, producer, consumer) in [
-            ("order.placed", "place", "order.placed"),
-            ("order.shipped", "publish", "start"),
-        ] {
+        // 9.0: a call-site producer / consumer is the call itself (its line), not the
+        // method enclosing it; an `@EventPattern` handler is still the method.
+        for (topic, producer_line, consumer_line) in
+            [("order.placed", 4, 4), ("order.shipped", 5, 5)]
+        {
             let flow = graph.analyze_impact(topic);
-            let producers: Vec<&str> = flow
+            let producers: Vec<usize> = flow
                 .upstream_producers
                 .iter()
-                .map(|n| n.name.as_str())
+                .map(|n| n.line_start)
                 .collect();
-            let consumers: Vec<&str> = flow
+            let consumers: Vec<usize> = flow
                 .downstream_consumers
                 .iter()
-                .map(|n| n.name.as_str())
+                .map(|n| n.line_start)
                 .collect();
-            assert!(producers.contains(&producer), "{topic}: {producers:?}");
-            assert!(consumers.contains(&consumer), "{topic}: {consumers:?}");
+            assert_eq!(producers, vec![producer_line], "{topic}");
+            assert_eq!(consumers, vec![consumer_line], "{topic}");
         }
     }
 

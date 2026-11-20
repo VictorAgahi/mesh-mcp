@@ -66,7 +66,10 @@ impl GraphRenderer {
         // reorder itself whenever the hashing scheme changes even though the
         // workspace didn't (idempotence invariant I5 — same query, same
         // snapshot, byte-identical output).
-        let mut sorted_nodes: Vec<_> = graph.all_nodes().collect();
+        let mut sorted_nodes: Vec<_> = graph
+            .all_nodes()
+            .chain(graph.callable_nodes().iter())
+            .collect();
         sorted_nodes.sort_by(|a, b| {
             a.file_path
                 .cmp(&b.file_path)
@@ -96,6 +99,7 @@ impl GraphRenderer {
         let edges: Vec<WebEdge> = graph
             .all_edges()
             .iter()
+            .chain(graph.call_edges())
             .map(|e| WebEdge {
                 from: e.from,
                 to: e.to,
@@ -216,6 +220,7 @@ impl GraphRenderer {
                     EdgeKind::Implements => "Implements",
                     EdgeKind::Imports => "Imports",
                     EdgeKind::DispatchesTo => "Dispatches",
+                    EdgeKind::Calls => "Calls",
                 };
                 // Only flag `Heuristic`/`Ambiguous` edges — marking every edge
                 // (including the structural `Exact` majority) would make the
@@ -228,7 +233,9 @@ impl GraphRenderer {
                 let arrow = match edge.kind {
                     EdgeKind::Produces => format!("== {label} ==> "),
                     EdgeKind::Consumes => format!("-. {label} .-> "),
-                    EdgeKind::CallsRpc | EdgeKind::Implements => format!("-- {label} --> "),
+                    EdgeKind::CallsRpc | EdgeKind::Implements | EdgeKind::Calls => {
+                        format!("-- {label} --> ")
+                    }
                     EdgeKind::Imports => {
                         if label == "Imports" {
                             "--> ".to_string()

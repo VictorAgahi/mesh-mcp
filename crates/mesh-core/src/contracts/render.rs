@@ -19,7 +19,7 @@ impl ContractGraph {
     /// in two directories gives the same lines (plan 4.12f).
     pub fn canonical_lines_rooted(&self, roots: &[std::path::PathBuf]) -> Vec<String> {
         let key_of = |id: NodeId| -> String {
-            self.nodes.get(&id).map_or_else(
+            self.get_node(id).map_or_else(
                 || String::from("<missing>"),
                 |n| Self::canonical_node_key(n, roots),
             )
@@ -56,6 +56,34 @@ impl ContractGraph {
                     ));
                 }
             }
+        }
+        for node in self.callable_nodes() {
+            lines.push(format!("node {}", Self::canonical_node_key(node, roots)));
+        }
+        for edge in self.call_edges() {
+            let line = serde_json::json!([
+                edge.kind,
+                key_of(edge.from),
+                key_of(edge.to),
+                edge.metadata,
+                edge.confidence
+            ]);
+            lines.push(format!("edge {line}"));
+        }
+        // One digest per file, not the facts themselves: the full JSON of every
+        // file's facts made `graph --format fingerprint` hold several times their
+        // size at once (vscode: +170 MB peak).
+        for (path, facts) in &self.call_facts {
+            let digest = serde_json::to_vec(&facts.facts)
+                .map(|bytes| crate::audit::AuditLogger::compute_sha256(&bytes))
+                .unwrap_or_default();
+            lines.push(format!(
+                "call_facts {}",
+                serde_json::json!([
+                    crate::state::root_relative_path(path, roots, Some(facts.repo_id)),
+                    digest
+                ])
+            ));
         }
         for (caller, target) in &self.rpc_calls {
             lines.push(format!(

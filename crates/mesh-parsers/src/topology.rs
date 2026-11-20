@@ -134,6 +134,7 @@ fn kind_label(kind: NodeKind) -> &'static str {
         NodeKind::ProtoMessage => "message",
         NodeKind::Interface => "interface",
         NodeKind::Module => "module",
+        NodeKind::Callable => "callable",
         NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue => "topic",
         NodeKind::Saga => "saga",
         NodeKind::PostProcessor => "post-processor",
@@ -149,6 +150,7 @@ fn edge_label(kind: EdgeKind) -> &'static str {
         EdgeKind::Implements => "Implements",
         EdgeKind::Imports => "Imports",
         EdgeKind::DispatchesTo => "Dispatches",
+        EdgeKind::Calls => "Calls",
     }
 }
 

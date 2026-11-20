@@ -762,12 +762,32 @@ fn facts_of(
                     .map(|(raw, _, _)| (*i, Fact::CallsUnresolved(raw.to_string()))),
             }
         }));
+    let topic_kind = |k: NodeKind| {
+        matches!(
+            k,
+            NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue
+        )
+    };
+    // Declarations only, once per file: a file of thousands of sends is not
+    // rescanned per send.
+    let decls: Vec<&ContractNode> = index.nodes.iter().filter(|d| !topic_kind(d.kind)).collect();
     for (i, fact) in relations {
         let n = node(i);
         // An import is the file's, not the declaration's that carries it.
         let owner = match fact {
             Fact::Import(_) => None,
-            _ => n.map(|n| n.name.as_str()),
+            // A call-site producer / consumer (9.0) is named after its topic: its
+            // owner is the smallest declaration around the call.
+            _ => n.map(|n| {
+                if !topic_kind(n.kind) {
+                    return n.name.as_str();
+                }
+                decls
+                    .iter()
+                    .filter(|d| d.line_start <= n.line_start && n.line_end <= d.line_end)
+                    .min_by_key(|d| (d.line_end - d.line_start, d.line_start))
+                    .map_or(n.name.as_str(), |d| d.name.as_str())
+            }),
         };
         add_fact(&mut facts, fact, n.map(|n| n.line_start), None, owner);
     }
@@ -2237,7 +2257,7 @@ export class ArchiveEvents {
         // The new producer on a new topic (untracked file).
         assert!(text.contains("#### `events/archive.ts` (added)"), "{text}");
         assert!(
-            text.contains("+ produces topic `user-archived` (L6) in `archived`"),
+            text.contains("+ produces topic `user-archived` (L7) in `archived`"),
             "{text}"
         );
         // The binary file is skipped with the guard's reason; the body-only edit

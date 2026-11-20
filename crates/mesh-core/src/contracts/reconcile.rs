@@ -120,6 +120,9 @@ impl ContractGraph {
         // 5. Reconcile RPC Client Calls (CallsRpc).
         let rpc_edges = self.calls_rpc_full(&proto_methods);
         self.edges.extend(rpc_edges);
+
+        // 6. The calls layer, always in full over the pruned facts (see `calls`).
+        self.derive_calls();
     }
 
     /// The `Imports` edges of `facts` (sorted by importer, then target): every

@@ -551,6 +551,8 @@ impl ContractGraph {
         edges.extend(implements);
         edges.extend(rpc);
         self.edges = edges;
+        // The calls layer is not journaled: rebuilt in full, as `reconcile_edges` does.
+        self.derive_calls();
         ReconcileMode::Delta {
             grpc_full,
             calls_full,

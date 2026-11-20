@@ -133,7 +133,7 @@ struct FileFragment {
 /// package, and the first key holds `NeedsPackage` to send the lookup there.
 #[derive(serde::Deserialize)]
 enum CachedRecord {
-    Index(RootRelativeIndex),
+    Index(Box<RootRelativeIndex>),
     NeedsPackage,
 }
 
@@ -508,6 +508,8 @@ impl WorkspaceIndexer {
             snapshot.property_registry.resolve_all_placeholders();
         }
         snapshot.contract_graph.reconcile_edges();
+        let call_stats = snapshot.contract_graph.call_stats();
+        snapshot.health.set_call_stats(&call_stats);
 
         tracing::info!(
             target: "mesh::indexer",
@@ -646,6 +648,15 @@ impl WorkspaceIndexer {
             }
         }
 
+        for frag in &fragments {
+            if frag.code.calls.capped {
+                tracing::warn!(
+                    target: "mesh::indexer",
+                    "{}: call facts capped (calls layer), a call path through it may be cut",
+                    frag.path.display()
+                );
+            }
+        }
         if let Some(cache) = scan_cfg.cache {
             let writes: Vec<CacheEntry> = fragments
                 .iter_mut()
@@ -1165,6 +1176,8 @@ impl WorkspaceIndexer {
             snapshot.contract_graph.reconcile_edges();
             ReconcileMode::Full("forced re-extraction (alias config or custom pattern change)")
         };
+        let call_stats = snapshot.contract_graph.call_stats();
+        snapshot.health.set_call_stats(&call_stats);
         let t_reconciled = std::time::Instant::now();
         let node_count = snapshot.contract_graph.node_count();
         let edge_count = snapshot.contract_graph.edge_count();
@@ -1697,6 +1710,47 @@ mod tests {
         let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
         let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
         Arc::new(AppState::new(cfg, vec![root.to_path_buf()], audit, rescan))
+    }
+
+    /// 9.0 calls layer: a file over the per-file callables cap and one over the
+    /// per-file call-site cap are each counted in `IndexHealth` and named by the
+    /// summary `doctor` prints, never dropped silently.
+    #[test]
+    fn per_file_call_fact_caps_reach_index_health_and_the_summary() {
+        for (file, code) in [
+            ("many_methods.ts", {
+                let mut c = String::from("export class Big {\n");
+                for k in 0..4100 {
+                    c.push_str(&format!("  m{k}() {{}}\n"));
+                }
+                c + "}\n"
+            }),
+            ("many_calls.ts", {
+                let mut c = String::from("export class Calls {\n  run() {\n");
+                for k in 0..8100 {
+                    c.push_str(&format!("    this.m{k}();\n"));
+                }
+                c + "  }\n}\n"
+            }),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = dunce::canonicalize(tmp.path()).expect("canon");
+            std::fs::write(root.join(file), code).expect("write");
+            let state = make_state(&root);
+            let snap = WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(snap.health.files_call_facts_capped, 1, "{file}");
+            let summary = snap.health.render_summary(10);
+            assert!(
+                summary.contains("1 file(s) with call facts capped"),
+                "{file}: {summary}"
+            );
+        }
     }
 
     /// Regression (step 4.12d review): two roots sharing a directory name
