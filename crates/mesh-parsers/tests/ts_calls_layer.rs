@@ -127,9 +127,12 @@ fn layered_ts_resolves_every_golden_hop() {
 
 #[test]
 fn layered_ts_is_deterministic() {
-    let a = index_dir(&fixture_dir("layered-ts")).fingerprint();
-    let b = index_dir(&fixture_dir("layered-ts")).fingerprint();
-    assert_eq!(a, b);
+    let a = index_dir(&fixture_dir("layered-ts"));
+    let b = index_dir(&fixture_dir("layered-ts"));
+    // Not vacuous: both runs hold the 13 golden hops before they are compared.
+    assert_eq!(a.call_edges().len(), 13);
+    assert_eq!(calls(&a), calls(&b));
+    assert_eq!(a.fingerprint(), b.fingerprint());
 }
 
 #[test]

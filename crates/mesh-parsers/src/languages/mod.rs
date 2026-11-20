@@ -834,9 +834,23 @@ impl PolyglotIndexer {
                                 tree,
                             ));
                         }
-                        let calls = ts_calls::extract(tree, content.as_bytes(), &|module| {
-                            cfg.ts_aliases.rewrite(file_path, module)
-                        });
+                        // Test files carry no call facts: a chain entered from a spec is
+                        // not an architecture flow, and they only cost memory.
+                        // Judged below the workspace root: a checkout under `~/tests/` is
+                        // not test code.
+                        let in_test = match Self::routing_path(cfg, file_path) {
+                            Some(rel) => mesh_core::is_test_path(&rel),
+                            None => file_path
+                                .file_name()
+                                .is_some_and(|n| mesh_core::is_test_path(Path::new(n))),
+                        };
+                        let calls = if in_test {
+                            CallFacts::default()
+                        } else {
+                            ts_calls::extract(tree, content.as_bytes(), &|module| {
+                                cfg.ts_aliases.rewrite(file_path, module)
+                            })
+                        };
                         Some((nodes, imports, rpc_calls, calls))
                     })
                 };

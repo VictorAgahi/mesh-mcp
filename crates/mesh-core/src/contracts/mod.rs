@@ -449,6 +449,8 @@ pub struct ContractGraph {
     /// Set by every change the calls layer reads (`call_facts`, a producer or consumer
     /// registered on a node of a file with call facts); cleared by `derive_calls`.
     calls_dirty: bool,
+    /// Test override of [`MAX_DERIVED_CALL_SITES`] (0: the constant).
+    call_site_budget: usize,
 
     next_node_id: u32,
 }

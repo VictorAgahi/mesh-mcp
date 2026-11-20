@@ -389,6 +389,51 @@ fn output_is_independent_of_insertion_order_and_stable_across_reloads() {
 }
 
 #[test]
+fn the_whole_graph_site_cap_is_counted_and_reaches_index_health() {
+    let mut g = ContractGraph::new();
+    g.call_site_budget = 2;
+    for f in layered() {
+        g.add_call_facts(path(f.path), 0, CompactStr::new("app"), f.facts.clone());
+        g.add_node(node("decl", NodeKind::ServiceClass, f.path, 1));
+        for (line, topic) in &f.consumers {
+            let id = g.add_node(node(topic, NodeKind::KafkaTopic, f.path, *line));
+            g.add_consumer(id, topic);
+        }
+        for (line, topic) in &f.producers {
+            let id = g.add_node(node(topic, NodeKind::KafkaTopic, f.path, *line));
+            g.add_producer(id, topic);
+        }
+    }
+    g.reconcile_edges();
+    let stats = g.call_stats();
+    // 3 sites in the candidate files, 2 resolved.
+    assert_eq!((stats.sites_resolved, stats.sites_skipped), (2, 1));
+    let mut health = crate::health::IndexHealth::default();
+    health.set_call_stats(&stats);
+    assert_eq!(health.call_sites_skipped, 1);
+    assert!(health.calls_truncated());
+    let summary = health.render_summary(10);
+    assert!(
+        summary.contains("1 call site(s) not resolved past the calls layer's limit"),
+        "{summary}"
+    );
+}
+
+#[test]
+fn a_capped_file_is_counted_from_the_stored_facts() {
+    let mut files = layered();
+    files[1].facts.capped = true;
+    let g = build(&files);
+    let mut health = crate::health::IndexHealth::default();
+    health.set_call_stats(&g.call_stats());
+    assert_eq!(health.files_call_facts_capped, 1);
+    assert!(health
+        .render_summary(10)
+        .contains("1 file(s) with call facts capped"));
+    assert!(g.call_stats().facts_bytes > 0);
+}
+
+#[test]
 fn deep_call_chain_is_walked_without_recursion_on_a_2mb_stack() {
     const DEPTH: u32 = 50_000;
     let handle = std::thread::Builder::new()
@@ -424,4 +469,117 @@ fn deep_call_chain_is_walked_without_recursion_on_a_2mb_stack() {
     let (nodes, edges) = handle.join().expect("no stack overflow");
     assert_eq!(nodes, DEPTH as usize);
     assert_eq!(edges, DEPTH as usize - 1);
+}
+
+/// Intentional and language-agnostic: a producer row whose node is a call site
+/// (named after its topic) names the declaration that publishes in `via`, for
+/// a Java saga as for TypeScript (polyglot-shop `BillingSaga.java:16`).
+#[test]
+fn a_call_site_producer_row_names_its_declaration_in_any_language() {
+    let mut g = ContractGraph::new();
+    let mut class = node(
+        "BillingSaga",
+        NodeKind::ServiceClass,
+        "/w/BillingSaga.java",
+        5,
+    );
+    class.line_end = 30;
+    g.add_node(class);
+    let id = g.add_node(node(
+        "billing.done",
+        NodeKind::KafkaTopic,
+        "/w/BillingSaga.java",
+        16,
+    ));
+    g.add_producer(id, "billing.done");
+    // A declaration-level producer keeps no `via`.
+    let svc = g.add_node(node(
+        "OrderService",
+        NodeKind::ServiceClass,
+        "/w/Order.java",
+        3,
+    ));
+    g.add_producer(svc, "billing.done");
+    g.reconcile_edges();
+    let m = g.impact_matrix("billing.done", 1);
+    let via: Vec<(String, Option<String>)> = m
+        .rows
+        .iter()
+        .filter(|r| r.role == ImpactRole::Producer)
+        .map(|r| (r.node.name.to_string(), r.via.map(|v| v.name.to_string())))
+        .collect();
+    assert!(
+        via.contains(&("billing.done".into(), Some("BillingSaga".into()))),
+        "{via:?}"
+    );
+    assert!(via.contains(&("OrderService".into(), None)), "{via:?}");
+}
+
+/// Staleness: patch_files + re-fold + delta reconcile ends with the same calls as
+/// a fresh build, for a deleted implementation file, a renamed implementation
+/// method and a renamed implementation file.
+#[test]
+fn live_reloads_of_an_implementation_file_match_a_fresh_build() {
+    fn refold(g: &mut ContractGraph, f: &FileSpec) {
+        g.add_call_facts(path(f.path), 0, CompactStr::new("app"), f.facts.clone());
+        g.add_node(node("decl", NodeKind::ServiceClass, f.path, 1));
+        for (line, topic) in &f.producers {
+            let id = g.add_node(node(topic, NodeKind::KafkaTopic, f.path, *line));
+            g.add_producer(id, topic);
+        }
+    }
+    // Two impls in two files: the second is the one changed.
+    let base = || {
+        let mut files = layered();
+        let sms = FileSpec {
+            path: "/w/src/sms.ts",
+            facts: CallFacts {
+                callables: vec![callable(Some("Sms"), "send", 10, 12)],
+                imports: vec![import("Notifier", "./notifiers")],
+                types: vec![class("Sms", TypeFactKind::Class, &["Notifier"])],
+                ..CallFacts::default()
+            },
+            consumers: vec![],
+            producers: vec![(11, "sms.queued")],
+        };
+        files[2].facts.types.pop();
+        files[2].facts.callables.pop();
+        files[2].producers.pop();
+        files.push(sms);
+        files
+    };
+    let initial = build(&base());
+    assert!(calls(&initial).iter().any(|c| c.1 == "Sms.send"));
+
+    // 1. Delete the implementation file.
+    let mut live = build(&base());
+    live.patch_files([Path::new("/w/src/sms.ts")]);
+    live.reconcile_delta();
+    let mut fresh = base();
+    fresh.pop();
+    assert_eq!(calls(&live), calls(&build(&fresh)));
+    assert!(calls(&live).iter().all(|c| c.1 != "Sms.send"));
+
+    // 2. Rename the implementation method.
+    let mut live = build(&base());
+    let mut changed = base();
+    changed[3].facts.callables[0].name = CompactStr::new("deliver");
+    live.patch_files([Path::new("/w/src/sms.ts")]);
+    refold(&mut live, &changed[3]);
+    live.reconcile_delta();
+    assert_eq!(calls(&live), calls(&build(&changed)));
+    assert!(calls(&live).iter().all(|c| c.1 != "Sms.send"));
+
+    // 3. Rename the implementation file.
+    let mut live = build(&base());
+    let mut moved = base();
+    moved[3].path = "/w/src/sms2.ts";
+    live.patch_files([Path::new("/w/src/sms.ts")]);
+    refold(&mut live, &moved[3]);
+    live.reconcile_delta();
+    assert_eq!(calls(&live), calls(&build(&moved)));
+    assert!(live
+        .callable_nodes()
+        .iter()
+        .any(|n| n.file_path.as_ref() == Path::new("/w/src/sms2.ts")));
 }

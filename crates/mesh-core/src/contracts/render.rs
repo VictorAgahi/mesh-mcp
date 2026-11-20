@@ -70,12 +70,18 @@ impl ContractGraph {
             ]);
             lines.push(format!("edge {line}"));
         }
+        // One digest per file, not the facts themselves: the full JSON of every
+        // file's facts made `graph --format fingerprint` hold several times their
+        // size at once (vscode: +170 MB peak).
         for (path, facts) in &self.call_facts {
+            let digest = serde_json::to_vec(&facts.facts)
+                .map(|bytes| crate::audit::AuditLogger::compute_sha256(&bytes))
+                .unwrap_or_default();
             lines.push(format!(
                 "call_facts {}",
                 serde_json::json!([
                     crate::state::root_relative_path(path, roots, Some(facts.repo_id)),
-                    facts.facts
+                    digest
                 ])
             ));
         }

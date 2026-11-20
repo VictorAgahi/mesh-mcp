@@ -138,8 +138,13 @@ pub struct IndexHealth {
     pub files_skipped_non_source: usize,
     /// Files whose call facts (9.0 calls layer) hit a per-file cap: some callables
     /// or call sites of the file were dropped, so a call path through it may be cut.
+    /// The current graph's count (set after every reconcile, not accumulated).
     #[serde(default)]
     pub files_call_facts_capped: usize,
+    /// Call sites the last calls derive did not resolve, past its whole-graph cap
+    /// (`MAX_DERIVED_CALL_SITES`). Set after every reconcile.
+    #[serde(default)]
+    pub call_sites_skipped: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -219,9 +224,16 @@ impl IndexHealth {
         self.files_parse_failed += 1;
     }
 
+    /// Takes the calls-layer counters of the graph just reconciled.
+    pub fn set_call_stats(&mut self, stats: &crate::contracts::CallStats) {
+        self.files_call_facts_capped = stats.files_capped;
+        self.call_sites_skipped = stats.sites_skipped;
+    }
+
+    /// Whether the calls layer dropped facts (a cap was hit): a call path may be cut.
     #[inline]
-    pub fn record_call_facts_capped(&mut self) {
-        self.files_call_facts_capped += 1;
+    pub fn calls_truncated(&self) -> bool {
+        self.files_call_facts_capped > 0 || self.call_sites_skipped > 0
     }
 
     #[inline]
@@ -364,6 +376,22 @@ impl IndexHealth {
                 let _ = writeln!(out, "    {}: {n}", reason.label());
             }
         }
+        if self.files_call_facts_capped > 0 {
+            let _ = writeln!(
+                out,
+                "    {} file(s) with call facts capped (calls layer: some methods or call sites \
+                 dropped, a call path through them may be cut)",
+                self.files_call_facts_capped
+            );
+        }
+        if self.call_sites_skipped > 0 {
+            let _ = writeln!(
+                out,
+                "    {} call site(s) not resolved past the calls layer's limit of {} per graph",
+                self.call_sites_skipped,
+                crate::contracts::MAX_DERIVED_CALL_SITES
+            );
+        }
         if self.rejected_overflow > 0 {
             // The breakdown above only covers the capped `rejected` list (step 4.1
             // review): say so here, or it reads as a per-reason total that silently
@@ -394,7 +422,7 @@ impl IndexHealth {
         self.files_read_error += other.files_read_error;
         self.files_parse_failed += other.files_parse_failed;
         self.files_skipped_non_source += other.files_skipped_non_source;
-        self.files_call_facts_capped += other.files_call_facts_capped;
+        // The calls-layer counters are the graph's, set after the reconcile.
     }
 
     #[inline]

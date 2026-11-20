@@ -422,6 +422,7 @@ pub fn extract(tree: &Tree, source: &[u8], rewrite: &dyn Fn(&str) -> Option<Stri
     b.prune_injections();
     b.call_sites(root, source);
     b.prune_imports();
+    b.facts.shrink_to_fit();
     b.facts
 }
 
@@ -567,7 +568,7 @@ impl Builder {
             .filter(|c| c.owner.is_none())
             .map(|c| c.name.as_str())
             .collect();
-        let mut seen: HashSet<(u32, String, CallReceiver)> = HashSet::new();
+        let mut seen: HashSet<(u32, CompactStr, CallReceiver)> = HashSet::new();
         let mut sites: Vec<CallFact> = Vec::new();
         let mut capped = false;
         // Enclosing callable tracked on the way down (end byte, index): asking each
@@ -654,7 +655,7 @@ impl Builder {
             let Some((callee, receiver)) = site else {
                 return;
             };
-            if !seen.insert((caller, callee.to_string(), receiver.clone())) {
+            if !seen.insert((caller, CompactStr::new(callee), receiver.clone())) {
                 return;
             }
             if sites.len() >= MAX_CALL_SITES_PER_FILE {

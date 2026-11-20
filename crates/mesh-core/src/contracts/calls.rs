@@ -6,7 +6,12 @@
 //! [`ContractGraph::add_call_facts`] and dropped with their file by `patch_files`.
 //! After every reconcile, full or delta, [`ContractGraph::derive_calls`] rebuilds
 //! the whole layer from the current facts: it is never journaled, so it cannot
-//! drift from a full rebuild, and its cost is proportional to the candidate files.
+//! drift from a full rebuild. Its index pass is linear in ALL files with facts
+//! (resolution only in the candidate files), and it is skipped when no re-folded
+//! file has call facts or no file holds both kinds of endpoint. The raw facts of
+//! every non-test TS file stay in memory: pruning happens at derive time, not at
+//! fold time (design note 6.5 asked for fold-time pruning; a file off every path
+//! today can be on one after another file changes, and its facts are then needed).
 //!
 //! Derivation, in order:
 //! 1. File-level pruning: a file takes part only when it lies on an import path
@@ -151,6 +156,20 @@ impl CallFacts {
         self.callables.is_empty() && self.imports.is_empty() && self.types.is_empty()
     }
 
+    /// Releases spare capacity: the facts of every file stay in memory for the
+    /// lifetime of the graph.
+    pub fn shrink_to_fit(&mut self) {
+        self.callables.shrink_to_fit();
+        self.call_sites.shrink_to_fit();
+        self.injections.shrink_to_fit();
+        self.imports.shrink_to_fit();
+        self.types.shrink_to_fit();
+        for t in &mut self.types {
+            t.extends.shrink_to_fit();
+            t.implements.shrink_to_fit();
+        }
+    }
+
     /// Appends `other`, shifting its callable indices.
     pub fn merge(&mut self, other: CallFacts) {
         let offset = self.callables.len() as u32;
@@ -190,6 +209,11 @@ pub struct CallStats {
     pub resolved_pairs: usize,
     pub callables: usize,
     pub calls: usize,
+    /// Files whose stored call facts hit a per-file cap (`CallFacts::capped`).
+    pub files_capped: usize,
+    /// Approximate bytes of the stored raw facts (vector lengths times element
+    /// sizes; strings over 24 bytes, rare in identifiers, are not counted).
+    pub facts_bytes: usize,
 }
 
 /// The derived layer.
@@ -254,6 +278,48 @@ impl ContractGraph {
             .min_by_key(|c| (c.line_end - c.line_start, c.line_start, c.id))
     }
 
+    /// (files whose facts were capped, approximate bytes of all stored facts).
+    fn raw_fact_totals(&self) -> (usize, usize) {
+        use std::mem::size_of;
+        let mut capped = 0;
+        let mut bytes = 0;
+        for f in self.call_facts.values() {
+            let c = &f.facts;
+            capped += usize::from(c.capped);
+            bytes += c.callables.len() * size_of::<CallableFact>()
+                + c.call_sites.len() * size_of::<CallFact>()
+                + c.injections.len() * size_of::<InjectionFact>()
+                + c.imports.len() * size_of::<ImportFact>()
+                + c.types.len() * size_of::<TypeFact>()
+                + c.types
+                    .iter()
+                    .map(|t| (t.extends.len() + t.implements.len()) * size_of::<CompactStr>())
+                    .sum::<usize>();
+        }
+        (capped, bytes)
+    }
+
+    /// Whether some file with call facts holds an entry (consumer, route, gRPC
+    /// handler) and some file holds a producer.
+    fn has_entry_and_producer(&self) -> bool {
+        let producers: HashSet<NodeId> = self.topic_producers.values().flatten().copied().collect();
+        let consumers: HashSet<NodeId> = self.topic_consumers.values().flatten().copied().collect();
+        let (mut entry, mut producer) = (false, false);
+        for path in self.call_facts.keys() {
+            for id in self.get_nodes_for_file(path) {
+                producer |= producers.contains(id);
+                entry |= consumers.contains(id)
+                    || self.nodes.get(id).is_some_and(|n| {
+                        matches!(n.kind, NodeKind::HttpEndpoint | NodeKind::GrpcMethod)
+                    });
+                if entry && producer {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Marks the layer stale when node `id` lives in a file with call facts.
     pub(super) fn touch_calls_node(&mut self, id: NodeId) {
         if !self.calls_dirty {
@@ -298,17 +364,30 @@ impl ContractGraph {
         }
         self.calls_dirty = false;
         let started = std::time::Instant::now();
-        let deriver = Deriver::new(self);
-        let indexed = started.elapsed();
-        self.derived_calls = deriver.run();
+        let (files_capped, facts_bytes) = self.raw_fact_totals();
+        // No path can exist without both an entry and a producer among the files
+        // with facts: skip the index (a whole workspace without events).
+        let indexed;
+        if self.has_entry_and_producer() {
+            let deriver = Deriver::new(self);
+            indexed = started.elapsed();
+            self.derived_calls = deriver.run();
+        } else {
+            indexed = started.elapsed();
+            self.derived_calls = DerivedCalls::default();
+            self.derived_calls.stats.files_with_facts = self.call_facts.len();
+        }
+        self.derived_calls.stats.files_capped = files_capped;
+        self.derived_calls.stats.facts_bytes = facts_bytes;
         let s = self.derived_calls.stats;
         tracing::debug!(
             target: "mesh::calls",
-            "calls derive: {:.1} ms (index {:.1} ms), {} files with facts, {} candidates, {} sites resolved \
+            "calls derive: {:.1} ms (index {:.1} ms), {} files with facts ({} KiB), {} candidates, {} sites resolved \
              ({} skipped), {} pairs, {} callables, {} calls",
             started.elapsed().as_secs_f64() * 1000.0,
             indexed.as_secs_f64() * 1000.0,
             s.files_with_facts,
+            s.facts_bytes / 1024,
             s.candidate_files,
             s.sites_resolved,
             s.sites_skipped,
@@ -465,7 +544,8 @@ struct Deriver<'g> {
     imports: Vec<FastMap<&'g str, Binding<'g>>>,
     star_exports: Vec<Vec<usize>>,
     types: FastMap<TypeKey<'g>, &'g TypeFact>,
-    /// (package, name, is_type) -> non-test files declaring it, sorted.
+    /// (package, name, is_type) -> files declaring it, sorted (test files carry no
+    /// call facts, see the TypeScript extractor).
     package_decls: FastMap<(&'g str, &'g str, bool), Vec<usize>>,
     /// (file, class) -> resolved base classes.
     bases: FastMap<TypeKey<'g>, Vec<TypeKey<'g>>>,
@@ -475,6 +555,9 @@ struct Deriver<'g> {
     methods: FastMap<(usize, &'g str, &'g str), usize>,
     /// (file, class, field) -> declared type.
     injections: FastMap<(usize, &'g str, &'g str), &'g str>,
+    /// `dispatch` results: an interface with thousands of implementations is
+    /// walked once per method name, not once per call site.
+    dispatched: std::cell::RefCell<FastMap<(TypeKey<'g>, CompactStr), Vec<usize>>>,
 }
 
 impl<'g> Deriver<'g> {
@@ -498,6 +581,7 @@ impl<'g> Deriver<'g> {
             subtypes: FastMap::default(),
             methods: FastMap::default(),
             injections: FastMap::default(),
+            dispatched: std::cell::RefCell::default(),
         };
         d.index();
         d
@@ -537,7 +621,7 @@ impl<'g> Deriver<'g> {
                 .copied()
                 .or_else(|| strip_script_ext_str(&joined).and_then(|s| by_module.get(s).copied()))
         };
-        for (i, (path, f)) in self.files.iter().enumerate() {
+        for (i, (_, f)) in self.files.iter().enumerate() {
             let mut map = FastMap::default();
             let mut stars = Vec::new();
             for imp in &f.facts.imports {
@@ -560,22 +644,19 @@ impl<'g> Deriver<'g> {
             stars.dedup();
             self.imports.push(map);
             self.star_exports.push(stars);
-            let in_test = crate::test_paths::is_test_path(path);
             for t in &f.facts.types {
                 self.types.entry((i, t.name.as_str())).or_insert(t);
-                if !in_test {
-                    self.package_decls
-                        .entry((f.package.as_str(), t.name.as_str(), true))
-                        .or_default()
-                        .push(i);
-                }
+                self.package_decls
+                    .entry((f.package.as_str(), t.name.as_str(), true))
+                    .or_default()
+                    .push(i);
             }
             for (k, c) in f.facts.callables.iter().enumerate() {
                 let owner = c.owner.as_deref().unwrap_or("");
                 self.methods
                     .entry((i, owner, c.name.as_str()))
                     .or_insert(self.offsets[i] + k);
-                if owner.is_empty() && !in_test {
+                if owner.is_empty() {
                     self.package_decls
                         .entry((f.package.as_str(), c.name.as_str(), false))
                         .or_default()
@@ -732,6 +813,16 @@ impl<'g> Deriver<'g> {
     /// Callables `m` a call on a value of type `t` can reach: the class's own
     /// method, or for an interface / abstract class every implementation's.
     fn dispatch(&self, t: TypeKey<'g>, m: &str) -> Vec<usize> {
+        let key = (t, CompactStr::new(m));
+        if let Some(hit) = self.dispatched.borrow().get(&key) {
+            return hit.clone();
+        }
+        let out = self.dispatch_uncached(t, m);
+        self.dispatched.borrow_mut().insert(key, out.clone());
+        out
+    }
+
+    fn dispatch_uncached(&self, t: TypeKey<'g>, m: &str) -> Vec<usize> {
         let kind = self.types.get(&t).map(|f| f.kind);
         if kind == Some(TypeFactKind::Class) {
             return self.find_method(t, m).into_iter().collect();
@@ -913,7 +1004,10 @@ impl<'g> Deriver<'g> {
         // 2. Resolution of the candidate files' call sites.
         let mut pairs: BTreeMap<(usize, usize), (u32, EdgeConfidence, &'static str)> =
             BTreeMap::new();
-        let mut budget = MAX_DERIVED_CALL_SITES;
+        let mut budget = match self.graph.call_site_budget {
+            0 => MAX_DERIVED_CALL_SITES,
+            n => n,
+        };
         for (i, (_, f)) in self.files.iter().enumerate() {
             if !candidate[i] {
                 continue;
