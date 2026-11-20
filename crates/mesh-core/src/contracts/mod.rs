@@ -183,9 +183,10 @@ pub enum RecordedCaller {
     /// `NewXClient`, a Python stub): it may call the method.
     ServiceClient,
     /// A class that binds a client field to the method's service
-    /// (`#field=Service`) while neither it nor a subclass calling through the
-    /// field has a resolved call of the method: it holds a client, no call of
-    /// the method was found.
+    /// (`#field=Service`) while neither it nor a direct subclass calling
+    /// through the field has a resolved call of the method: it holds a client,
+    /// no call of the method was found (a subclass two levels down is not
+    /// seen: its record names only its own parent).
     BoundClient,
 }
 
@@ -213,6 +214,8 @@ pub struct RpcRecordResolver<'g> {
     class_fields: reconcile::ClassFields<'g>,
     /// (folded bare service, folded method) -> declared `Service.Method`s.
     declared: HashMap<(String, String), Vec<CompactStr>>,
+    /// Every `$` string constant: path -> (repository, value).
+    consts: HashMap<&'g str, Vec<(RepoId, &'g str)>>,
 }
 
 /// How [`ContractGraph::find_dependents_matched`] found its result.

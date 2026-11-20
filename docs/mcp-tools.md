@@ -745,11 +745,13 @@ repositories), the working tree is compared with a base revision at the **contra
   consumed; imports; RPC calls. RPC calls are resolved the way the graph resolves them, so a call
   through a client field inherited from a base class in another file (`^Base#field.method`)
   counts like a direct one; each is shown as the declared `Service.Method` when the graph declares
-  it, else as the call names it, and a call through an inherited field no binding resolves is
-  listed raw, marked unresolved. A body-only edit changes no signature: such files are counted
-  and named in one line, never listed as changes. A `.proto` whose wire check is not clean (a
-  field renumbered changes no declaration) is a contract change, never body-only: its file section
-  carries the wire result.
+  it, else as the call names it. An inherited field is a client only when a base class binds it
+  or its name is a client's (the service then marked as inferred from the name); a field bound to
+  more than one service is listed raw, marked unresolved; `this.logger.log()` is not a call. A
+  body-only edit changes no signature: such files are counted and named in one line, never listed
+  as changes. A `.proto` whose wire check breaks or cannot parse a version (a field renumbered
+  changes no declaration) is a contract change, never body-only: its file section carries the
+  wire result.
 - **Impact** (live graph): for every removed or changed declaration, its dependents
   (`find_dependents` matching); for every removed or changed RPC, its recorded call sites, plus,
   for a changed one, the `analyze_grpc` callers and server handlers; for a removed producer or
@@ -760,13 +762,16 @@ repositories), the working tree is compared with a base revision at the **contra
   with its proto package (`demo.v1.UserService.DeleteUser`, matched against the `.proto`'s own
   `package`: same package keeps the record's confidence, no package known is `heuristic`, another
   package `ambiguous`). A class that binds a client field to the service while neither it nor a
-  subclass calling through that field calls the RPC is listed once as "holds a `UserService`
-  client, no call to `GetPublicUser` found", `heuristic`; a base class whose subclass makes the
-  call is not listed. A client built for the service with no method-level call and no field
+  direct subclass calling through that field calls the RPC is listed once as "holds a
+  `UserService` client; no call to `GetPublicUser` found in it or its direct subclasses",
+  `heuristic`; a base class whose direct subclass makes the call is not listed. Limit: a call
+  through a client inherited across more than one level (A extends B extends Base) is not
+  resolved, since the extractor records only the immediate parent. A client built for the service with no method-level call and no field
   binding in its file (Go `NewUserServiceClient`, a Python stub, a Java `newBlockingStub`) is
   listed as a "service-level client, may call", `heuristic`. The server handlers of a removed RPC
   (`@GrpcMethod` arguments resolved through string constants, as the graph resolves them) are
-  listed as "orphaned handler: implements a removed RPC". Each row gives
+  listed as "orphaned handler: implements a removed RPC" (heuristic and "service not resolved"
+  when the service argument does not reduce to a literal). Each row gives
   `path:line` and its match (`exact`, `heuristic`, `ambiguous`). Generic names (`constructor`,
   `main`, ...) are not looked up; routes and gRPC services are not looked up either, and one line
   says so (HTTP callers are not linked in the graph; a service's callers are listed under its RPCs).

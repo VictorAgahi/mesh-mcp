@@ -18,21 +18,35 @@ roots).
   (`this.userService.getPublicUser(...)` in a subclass) is now listed at its own method, `exact`
   through the base class's binding; 8.0.0 missed it and listed the base class's `onModuleInit`
   instead. A class that binds a client of the service but never calls the RPC (nor does any
-  subclass through that field) is listed once as "holds a `UserService` client, no call to
-  `GetPublicUser` found", `heuristic`, instead of "service-level client, may call"; a base class
-  whose subclass makes the call is not listed. On the benchmark copy: 1 real caller found (was 0),
-  3 bind-only classes correctly labelled (were 3 "may call" rows plus the base class).
+  direct subclass through that field) is listed once as "holds a `UserService` client; no call to
+  `GetPublicUser` found in it or its direct subclasses", `heuristic`, instead of "service-level
+  client, may call"; a base class whose direct subclass makes the call is not listed. On the
+  benchmark copy: 1 real caller found (was 0), 3 bind-only classes labelled as such (were 3 "may
+  call" rows plus the base class).
 - **RPC calls per file.** Calls through inherited and bound fields are counted and listed, under
-  the declared `Service.Method` when the graph declares it; a call through an inherited field that
-  no binding resolves is listed raw, marked unresolved. 8.0.0 counted only direct calls (`RPC
-  calls +0` on a branch adding an inherited call).
+  the declared `Service.Method` when the graph declares it. An inherited field counts as a client
+  only when a base class binds it or its name is a client's (`userClient`, `userService`; the
+  service is then marked as inferred from the name); `this.logger.log()` in a subclass is not an
+  RPC call. A field bound to more than one service is listed raw, marked unresolved. 8.0.0 counted
+  only direct calls (`RPC calls +0` on a branch adding an inherited call).
 - **Orphaned handlers.** For a removed RPC, the server handlers whose `@GrpcMethod(...)`
-  arguments name it (constants resolved, as the graph resolves them) are listed as "orphaned
-  handler: implements a removed RPC".
-- **Wire labels.** A `.proto` whose wire check is not clean is a contract change, never listed
-  under "body edits only"; its file section carries the wire result. A field kept under its name
-  with a new number is reported as "field `pagination` renumbered 2 -> 5" (still breaking, same
-  rule and classification as before, `analyze_grpc` included).
+  arguments name it (constants resolved, as the graph resolves them; the service compared by
+  equality once folded and its package stripped) are listed as "orphaned handler: implements a
+  removed RPC". A handler whose service argument cannot be resolved is listed as heuristic,
+  "service not resolved".
+- **Wire labels.** A `.proto` whose wire check breaks or cannot parse a version is a contract
+  change, never listed under "body edits only"; its file section carries the wire result (a
+  `.proto` merely not checked keeps what its declarations say). A field kept under its name with a
+  new number is reported as "field `pagination` renumbered 2 -> 5" (still breaking, same rule and
+  classification as before, `analyze_grpc` included); its `(L<n>)` now points at the new field's
+  line instead of the old one's.
+
+### Known limits
+
+- A call through a client inherited across more than one level of classes (A extends B extends
+  Base, the client bound in Base) is not resolved: the extractor records only the immediate
+  parent. Such a call is not listed as a caller, and Base may show "no call found in it or its
+  direct subclasses".
 
 ## [8.0.0] - 2026-11-20
 

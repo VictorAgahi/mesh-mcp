@@ -349,6 +349,7 @@ impl ContractGraph {
         RpcRecordResolver {
             class_fields: self.class_fields(),
             declared,
+            consts: self.const_values(),
         }
     }
 
@@ -378,12 +379,15 @@ impl ContractGraph {
     ///   answers for it).
     ///
     /// Names compare with [`fold_rpc_name`]. Sorted by location, each node once.
-    pub fn recorded_rpc_callers(
-        &self,
+    /// `resolver` is this graph's [`Self::rpc_record_resolver`], built once by
+    /// a caller asking about several RPCs.
+    pub fn recorded_rpc_callers<'g>(
+        &'g self,
+        resolver: &RpcRecordResolver<'g>,
         service: &str,
         method: &str,
         package: Option<&str>,
-    ) -> Vec<(&ContractNode, EdgeConfidence, RecordedCaller)> {
+    ) -> Vec<(&'g ContractNode, EdgeConfidence, RecordedCaller)> {
         let (want_service, want_method) = (fold_rpc_name(service), fold_rpc_name(method));
         // Splits `[pkg.]Service`, comparing the service; the package decides
         // the confidence.
@@ -419,12 +423,14 @@ impl ContractGraph {
                 None => list.push(row),
             }
         }
-        let resolver = self.rpc_record_resolver();
         let mut methods: Vec<Row<'_>> = Vec::new();
         let mut clients: Vec<Row<'_>> = Vec::new();
         let mut bound: Vec<Row<'_>> = Vec::new();
-        // Base classes a `^Base#field.method` record calls the method through.
-        let mut called_bases: HashSet<&str> = HashSet::new();
+        // Base classes a `^Base#field.method` record calls the method through,
+        // by (repository, class name): the repositories whose binding of the
+        // field the resolution used (the caller's own first, as
+        // `resolve_inherited_call` does), else the caller's.
+        let mut called_bases: HashSet<(RepoId, &str)> = HashSet::new();
         // Files binding a client field to the service.
         let mut binding_files: HashSet<&FilePath> = HashSet::new();
         for (caller_id, recorded) in &self.rpc_calls {
@@ -460,12 +466,21 @@ impl ContractGraph {
                 let Some(confidence) = service_confidence(s, resolved.confidence) else {
                     continue;
                 };
-                if let Some(base) = recorded
+                if let Some((base, field)) = recorded
                     .strip_prefix(RPC_INHERITED_METHOD_PREFIX)
                     .and_then(|r| r.split_once('#'))
-                    .map(|(base, _)| base)
+                    .and_then(|(base, rest)| rest.split_once('.').map(|(f, _)| (base, f)))
                 {
-                    called_bases.insert(base);
+                    let repos: Vec<RepoId> = resolver
+                        .class_fields
+                        .get(&(base, field))
+                        .map(|b| b.iter().map(|(r, _)| *r).collect())
+                        .unwrap_or_default();
+                    if repos.is_empty() || repos.contains(&node.repo_id) {
+                        called_bases.insert((node.repo_id, base));
+                    } else {
+                        called_bases.extend(repos.into_iter().map(|r| (r, base)));
+                    }
                 }
                 keep_strongest(&mut methods, (node, confidence, RecordedCaller::Method));
             } else if resolved
@@ -500,7 +515,7 @@ impl ContractGraph {
         let bound: Vec<Row<'_>> = bound
             .into_iter()
             .filter(|(class, _, _)| {
-                !called_bases.contains(class.name.as_str())
+                !called_bases.contains(&(class.repo_id, class.name.as_str()))
                     && !calls_inside(class)
                     && seen.insert(class.id)
             })
@@ -528,17 +543,18 @@ impl ContractGraph {
     /// declared: the handlers a removed RPC leaves orphaned. A handler that
     /// resolved to a declared RPC (`Service.Method` still declared somewhere)
     /// is not one. Exact when both arguments reduce to literals naming the
-    /// RPC (a package qualifier must equal `package` when both are known);
-    /// heuristic when the method does but the service argument does not reduce
-    /// to a literal and its text contains the service name
-    /// (`USER_SERVICE_NAME` of an unindexed package), or was not written.
-    /// Sorted by location.
-    pub fn handlers_naming_rpc(
-        &self,
+    /// RPC (the folded service equal once its package qualifier is stripped;
+    /// a qualifier must equal `package` when both are known). When the method
+    /// does but the service argument is empty or does not reduce to a literal
+    /// (a constant of an unindexed package), the row is heuristic and its
+    /// third element is `false` (service not resolved). Sorted by location.
+    pub fn handlers_naming_rpc<'g>(
+        &'g self,
+        resolver: &RpcRecordResolver<'g>,
         service: &str,
         method: &str,
         package: Option<&str>,
-    ) -> Vec<(&ContractNode, EdgeConfidence)> {
+    ) -> Vec<(&'g ContractNode, EdgeConfidence, bool)> {
         let (want_service, want_method) = (fold_rpc_name(service), fold_rpc_name(method));
         let refs: Vec<(NodeId, &str)> = self
             .rpc_calls
@@ -551,47 +567,42 @@ impl ContractGraph {
         if refs.is_empty() {
             return Vec::new();
         }
-        let consts = self.const_values();
-        let mut out: Vec<(&ContractNode, EdgeConfidence)> = Vec::new();
+        let consts = &resolver.consts;
+        let mut out: Vec<(&ContractNode, EdgeConfidence, bool)> = Vec::new();
         for (id, reference) in refs {
             let (Some(node), Some(parsed)) =
                 (self.nodes.get(&id), Self::parse_handler_ref(reference))
             else {
                 continue;
             };
-            let Some(m) = Self::resolve_literal_expr(parsed.method, node.repo_id, &consts) else {
+            let Some(m) = Self::resolve_literal_expr(parsed.method, node.repo_id, consts) else {
                 continue;
             };
             if fold_rpc_name(m.rsplit('.').next().unwrap_or(m)) != want_method {
                 continue;
             }
-            let confidence = match Self::resolve_literal_expr(parsed.service, node.repo_id, &consts)
-            {
-                Some(s) => {
-                    let (qualifier, bare) = match s.rsplit_once('.') {
-                        Some((q, b)) => (Some(q), b),
-                        None => (None, s),
-                    };
-                    if fold_rpc_name(bare) != want_service {
-                        continue;
+            let (confidence, resolved) =
+                match Self::resolve_literal_expr(parsed.service, node.repo_id, consts) {
+                    Some(s) => {
+                        let (qualifier, bare) = match s.rsplit_once('.') {
+                            Some((q, b)) => (Some(q), b),
+                            None => (None, s),
+                        };
+                        if fold_rpc_name(bare) != want_service {
+                            continue;
+                        }
+                        match (qualifier, package) {
+                            (Some(q), Some(p)) if q != p => continue,
+                            _ => (EdgeConfidence::Exact, true),
+                        }
                     }
-                    match (qualifier, package) {
-                        (Some(q), Some(p)) if q != p => continue,
-                        _ => EdgeConfidence::Exact,
-                    }
-                }
-                None if parsed.service.trim().is_empty()
-                    || fold_rpc_name(parsed.service).contains(&want_service) =>
-                {
-                    EdgeConfidence::Heuristic
-                }
-                None => continue,
-            };
-            if !out.iter().any(|(n, _)| n.id == node.id) {
-                out.push((node, confidence));
+                    None => (EdgeConfidence::Heuristic, false),
+                };
+            if !out.iter().any(|(n, _, _)| n.id == node.id) {
+                out.push((node, confidence, resolved));
             }
         }
-        out.sort_by(|(a, _), (b, _)| {
+        out.sort_by(|(a, _, _), (b, _, _)| {
             (&a.file_path, a.line_start, a.id).cmp(&(&b.file_path, b.line_start, b.id))
         });
         out
@@ -1369,6 +1380,16 @@ impl ContractGraph {
 }
 
 impl RpcRecordResolver<'_> {
+    /// Whether some class named `base` binds `field` to a gRPC service
+    /// (`#field=Service`, the service written): the inherited field of a
+    /// `^base#field.method` record is a client even when the resolution
+    /// cannot tell which one.
+    pub fn base_binds_client_field(&self, base: &str, field: &str) -> bool {
+        self.class_fields
+            .get(&(base, field))
+            .is_some_and(|b| b.iter().any(|(_, service)| !service.is_empty()))
+    }
+
     /// One `rpc_calls` record of a caller in `caller_repo`, resolved as
     /// `reconcile_edges` resolves it (`ContractGraph::rpc_call_target`): `None`
     /// for a record that is not a call (a binding, a constant, a handler
