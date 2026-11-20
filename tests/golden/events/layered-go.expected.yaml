@@ -1,0 +1,97 @@
+# Hand-annotated from the source of examples/eda/layered-go. Never generated from tool output.
+# A kafka-go producer or consumer is placed on the line that carries the topic literal
+# (the kafka.Writer / kafka.ReaderConfig literal), not on the WriteMessages / ReadMessage call.
+# OrderService.pub is a Publisher with two implementations (main.go picks one at startup, so a
+# static reader sees both candidates); OrderService.pricer is a Pricer with a single implementation.
+corpus: layered-go
+root: examples/eda/layered-go
+config: mesh-mcp.toml
+languages: [go]
+
+producers:
+  - {id: p1, topic: orders.priced, file: publisher.go, line: 19, language: go, tags: [kafka_basic]}
+  - {id: p2, topic: orders.audit, file: publisher.go, line: 31, language: go, tags: [kafka_basic]}
+  - {id: p3, topic: invoices.issued, file: billing.go, line: 14, language: go, tags: [kafka_basic]}
+
+consumers:
+  - {id: c1, topic: orders.placed, file: consumer.go, line: 15, language: go, tags: [kafka_basic]}
+  - {id: c2, topic: orders.priced, file: billing.go, line: 39, language: go, tags: [kafka_basic]}
+
+hops:
+  - id: h1
+    from: {symbol: OrderConsumer.Run, file: consumer.go, line: 25}
+    to: {symbol: OrderService.Handle, file: service.go, line: 14}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h2
+    from: {symbol: OrderService.Handle, file: service.go, line: 15}
+    to: {symbol: DefaultPricer.Price, file: pricer.go, line: 12}
+    via: interface_impl
+    tags: [layered_calls]
+  - id: h3
+    from: {symbol: OrderService.Handle, file: service.go, line: 16}
+    to: {symbol: KafkaPublisher.Publish, file: publisher.go, line: 22}
+    via: interface_impl
+    tags: [layered_calls]
+  - id: h4
+    from: {symbol: OrderService.Handle, file: service.go, line: 16}
+    to: {symbol: AuditPublisher.Publish, file: publisher.go, line: 34}
+    via: interface_impl
+    tags: [layered_calls]
+  - id: h5
+    from: {symbol: BillingConsumer.Run, file: billing.go, line: 49}
+    to: {symbol: BillingService.Invoice, file: billing.go, line: 29}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h6
+    from: {symbol: BillingService.Invoice, file: billing.go, line: 30}
+    to: {symbol: InvoiceWriter.Write, file: billing.go, line: 17}
+    via: injected_field
+    tags: [layered_calls]
+
+chains:
+  - id: ch1
+    entry: {kind: topic, value: orders.placed}
+    direction: forward
+    steps:
+      - {kind: consume, file: consumer.go, line: 15, topic: orders.placed}
+      - {kind: call, file: service.go, line: 14}
+      - {kind: call, file: publisher.go, line: 22}
+      - {kind: produce, file: publisher.go, line: 19, topic: orders.priced}
+    tags: [layered_calls]
+    min_hops: 2
+  - id: ch2
+    entry: {kind: topic, value: orders.placed}
+    direction: forward
+    steps:
+      - {kind: consume, file: consumer.go, line: 15, topic: orders.placed}
+      - {kind: call, file: service.go, line: 14}
+      - {kind: call, file: publisher.go, line: 34}
+      - {kind: produce, file: publisher.go, line: 31, topic: orders.audit}
+    tags: [layered_calls]
+    min_hops: 2
+  - id: ch3
+    entry: {kind: topic, value: orders.priced}
+    direction: forward
+    steps:
+      - {kind: consume, file: billing.go, line: 39, topic: orders.priced}
+      - {kind: call, file: billing.go, line: 29}
+      - {kind: call, file: billing.go, line: 17}
+      - {kind: produce, file: billing.go, line: 14, topic: invoices.issued}
+    tags: [layered_calls]
+    min_hops: 2
+  # Two services, one flow: orders.placed -> orders.priced -> invoices.issued.
+  - id: ch4
+    entry: {kind: topic, value: orders.placed}
+    direction: forward
+    steps:
+      - {kind: consume, file: consumer.go, line: 15, topic: orders.placed}
+      - {kind: call, file: service.go, line: 14}
+      - {kind: call, file: publisher.go, line: 22}
+      - {kind: produce, file: publisher.go, line: 19, topic: orders.priced}
+      - {kind: consume, file: billing.go, line: 39, topic: orders.priced}
+      - {kind: call, file: billing.go, line: 29}
+      - {kind: call, file: billing.go, line: 17}
+      - {kind: produce, file: billing.go, line: 14, topic: invoices.issued}
+    tags: [layered_calls]
+    min_hops: 4

@@ -11,12 +11,13 @@ config: mesh-mcp.toml              # optional, relative to root; default: a gene
 languages: [ts]                    # informational; every item also carries its own language
 
 producers:
-  - id: p1                         # unique within the file
+  - id: p1                         # unique within the file, across all categories
     topic: order.created           # topic key as an agent would name it (lower-case, see normalize_topic_key)
     file: src/order.publisher.ts   # relative to root
     line: 14                       # 1-based line of the publish call expression
     language: ts                   # ts | js | java | go | python | csharp | rust | sql
     tags: [kafka_basic]            # feature tags, see below; used for per-ticket score slices
+    optional: false                # default false; true (needs tag declared_pattern): ignored both ways
 consumers:
   - id: c1
     topic: order.created
@@ -42,7 +43,7 @@ chains:                            # end-to-end flows; "full chain" score
       - {kind: call,    file: src/invoice.service.ts, line: 8}
       - {kind: produce, file: src/invoice.publisher.ts, line: 12, topic: invoice.issued}
     tags: [layered_calls]
-    min_hops: 3                    # number of call steps (for the ">= 3 hops" metric)
+    min_hops: 2                    # number of `call` steps in the chain (for the ">= 3 hops" metric)
 
 # Things that look like a flow but are NOT one (precision traps). Optional.
 negatives:
@@ -62,10 +63,30 @@ negatives:
   columns: "ambiguous counted" and "ambiguous excluded". `heuristic` counts as emitted.
 - `negatives` found in the output are false positives.
 
+## Annotation conventions
+
+- `min_hops` is the number of `call` steps in the chain. A route, cron or handler entry that is the
+  first step counts as one call step (it is a `call` step on the entry handler).
+- A `call` step points at the callee declaration line. A hop's `from.line` is the call site and its
+  `to.line` is the callee declaration, so every non-entry `call` step equals some hop's `to`.
+- A producer or consumer whose topic is bound where the client is built (a Go `kafka.Writer` or
+  `kafka.ReaderConfig` literal) sits on that construction line, not on the later `WriteMessages` or
+  `ReadMessage` call.
+- CQRS and Spring in-process keys are the command or event class name as written in the source;
+  the scorer lower-cases it.
+- `optional: true` marks a site the scorer ignores both ways: not a false negative when missing and
+  not a false positive when found. It is used with the tag `declared_pattern` for sites that exist
+  only because a fixture's own custom pattern declares them, while the source makes no broker call.
+  `optional` is allowed only on producers, consumers and hops, and only together with
+  `declared_pattern` (each requires the other). It is never allowed on a chain, a chain step or a
+  negative, and a chain step must not point at an optional item.
+- Ids (`p1`, `c1`, `h1`, `ch1`, ...) are unique within a file across all categories.
+
 ## Tags (feature slices, one per later ticket)
 
 `kafka_basic`, `layered_calls` (T2/T3), `inproc_bus` (T4), `cqrs` (T4), `cron` (T4), `sql` (T5),
-`config_topic` (T6), `broker_key` (T7), `jvm_broker`, `go_broker`, `py_broker`, `cs_broker` (T8).
+`config_topic` (T6), `broker_key` (T7), `jvm_broker`, `go_broker`, `py_broker`, `cs_broker` (T8),
+`declared_pattern` (site declared by a custom pattern only; always `optional: true`).
 A tag whose feature is not implemented yet is EXPECTED to score 0 on 8.0.1: that is the baseline.
 
 ## Report shape

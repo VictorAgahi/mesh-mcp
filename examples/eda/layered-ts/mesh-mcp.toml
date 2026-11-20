@@ -1,0 +1,12 @@
+# Fixture: layered NestJS Kafka services (consumer -> service -> service -> publisher).
+[workspace]
+name = "layered-ts"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/node_modules/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true
