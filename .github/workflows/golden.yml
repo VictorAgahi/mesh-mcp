@@ -23,6 +23,11 @@ jobs:
       - name: "Checkout repository"
         uses: actions/checkout@v4
 
+      - name: "Event scorer self-tests"
+        run: |
+          python3 -I scripts/golden/test_score_events.py
+          python3 -I scripts/bench/agent-ab/test_run.py
+
       - name: "Install Rust stable"
         uses: dtolnay/rust-toolchain@stable
 
