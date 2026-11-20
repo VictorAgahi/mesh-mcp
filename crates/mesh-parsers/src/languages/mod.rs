@@ -501,17 +501,19 @@ impl PolyglotIndexer {
     /// as producers or consumers (so `analyze_impact` could not link them):
     /// - a method decorated `@EventPattern` / `@MessagePattern` (a `KafkaTopic`
     ///   node named after its pattern) consumes that pattern;
-    /// - a call-site node (`consumer.subscribe`, `producer.send`, NestJS
-    ///   `client.emit` / `client.send`, BullMQ `new Queue` / `new Worker`) is the
-    ///   producer or consumer itself, at the line of the call. Up to 8.0.1 it was
-    ///   attributed to the smallest declaration enclosing it, so the site reported
-    ///   the method's declaration line, or the class's when the method was itself
-    ///   an `@EventPattern` handler (8.0.1 defects N2 / N9). The enclosing method is
-    ///   now found by line containment in the calls layer
-    ///   (`ContractGraph::enclosing_callable`);
+    /// - a call-site producer (`producer.send`, NestJS `client.emit` / `client.send`,
+    ///   BullMQ `new Queue`, `redis.publish`) is the call-site node itself, at the line
+    ///   of the call. Up to 8.0.1 it was attributed to the smallest declaration
+    ///   enclosing it, so it reported the method's declaration line, or the class's
+    ///   when the method was itself an `@EventPattern` handler (8.0.1 defects N2 /
+    ///   N9). The enclosing method is now found by line containment in the calls
+    ///   layer (`ContractGraph::enclosing_callable`);
+    /// - a call-site consumer (`consumer.subscribe`, `new Worker`) is still attributed
+    ///   to the smallest declaration enclosing it: the handler a subscription runs is
+    ///   what a consumer row names, and a topic-named node would say nothing more;
     /// - a decorator fact (`@Processor('q')`, `@RabbitSubscribe`) spans the
-    ///   declaration it decorates: that declaration keeps it, as before, since it
-    ///   sits on exactly the same lines and carries the class or method name.
+    ///   declaration it decorates and stays on it, as does a producer call that a
+    ///   one-line declaration spans exactly (same lines, the declaration's name).
     fn wire_ts_events(nodes: &[ContractNode], out: &mut FileIndex) {
         for (i, node) in nodes.iter().enumerate() {
             let signature = node.signature.as_deref().unwrap_or("");
@@ -528,14 +530,18 @@ impl PolyglotIndexer {
             let owner = nodes
                 .iter()
                 .enumerate()
-                .find(|(j, n)| {
+                .filter(|(j, n)| {
                     *j != i
-                        && (n.line_start, n.line_end) == (node.line_start, node.line_end)
+                        && n.line_start <= node.line_start
+                        && n.line_end >= node.line_end
+                        && (!produces
+                            || (n.line_start, n.line_end) == (node.line_start, node.line_end))
                         && !matches!(
                             n.kind,
                             NodeKind::KafkaTopic | NodeKind::Queue | NodeKind::EventStream
                         )
                 })
+                .min_by_key(|(_, n)| n.line_end - n.line_start)
                 .map_or(i, |(j, _)| j);
             if produces {
                 out.producers.push((owner, node.name.clone()));

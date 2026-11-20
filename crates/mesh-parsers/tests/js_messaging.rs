@@ -491,7 +491,7 @@ fn nestjs_clients_need_a_client_shaped_receiver() {
 // ---- wiring ---------------------------------------------------------------------------
 
 #[test]
-fn an_interaction_is_the_call_site_itself() {
+fn a_publish_is_the_call_site_and_a_subscribe_its_declaration() {
     let fi = index(
         "svc/owner.ts",
         "import Redis from 'ioredis';\n\
@@ -500,8 +500,8 @@ fn an_interaction_is_the_call_site_itself() {
            async listen() { this.sub.subscribe('other'); }\n\
          }\n",
     );
-    // 9.0: the call-site node, at the line of the call (8.0.1 N2 / N9); the method
-    // that makes it is found by line containment in the calls layer.
+    // 9.0: a publish is the call-site node, at the line of the call (8.0.1 N2 / N9);
+    // a subscribe stays on the declaration that makes it.
     let name_of = |i: usize| format!("{}@{}", fi.nodes[i].name, fi.nodes[i].line_start);
     let produced: Vec<(String, String)> = fi
         .producers

@@ -1168,12 +1168,17 @@ impl ContractGraph {
                 } else {
                     role
                 };
+                // A call-site producer (9.0) is named after its topic: the row
+                // names the declaration that publishes through `via`.
+                let via = (role == ImpactRole::Producer)
+                    .then(|| self.enclosing_declaration(node))
+                    .flatten();
                 rows.push(ImpactRow {
                     node,
                     role,
                     scope: Self::scope_of(node, &async_owners),
                     confidence: self.async_match_confidence(node, &target_lc),
-                    via: None,
+                    via,
                 });
             }
         }

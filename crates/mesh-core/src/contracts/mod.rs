@@ -361,8 +361,9 @@ pub struct ImpactRow<'g> {
     /// the topic match (async rows).
     pub confidence: EdgeConfidence,
     /// Contract node the row is linked through: the proto method it
-    /// implements/calls, or its service for a service-level client. `None` for
-    /// a direct name match with no edge and for async rows.
+    /// implements/calls, or its service for a service-level client; for a
+    /// call-site producer row (9.0), the declaration that makes the call. `None`
+    /// for a direct name match with no edge and for other async rows.
     pub via: Option<&'g ContractNode>,
 }
 

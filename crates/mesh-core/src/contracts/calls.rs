@@ -263,6 +263,31 @@ impl ContractGraph {
         }
     }
 
+    /// The smallest declaration (not a topic / stream / queue node) of `node`'s file
+    /// whose lines contain `node`, for a call-site producer or consumer node; `None`
+    /// for any other node or at module level.
+    pub fn enclosing_declaration(&self, node: &ContractNode) -> Option<&ContractNode> {
+        let topic_kind = |k: NodeKind| {
+            matches!(
+                k,
+                NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue
+            )
+        };
+        if !topic_kind(node.kind) {
+            return None;
+        }
+        self.get_nodes_for_file(&node.file_path)
+            .iter()
+            .filter_map(|id| self.nodes.get(id))
+            .filter(|d| {
+                d.id != node.id
+                    && !topic_kind(d.kind)
+                    && d.line_start <= node.line_start
+                    && node.line_end <= d.line_end
+            })
+            .min_by_key(|d| (d.line_end - d.line_start, d.line_start, d.id))
+    }
+
     /// Rebuilds the calls layer from the stored facts (see the module doc), or keeps
     /// it when nothing it reads changed since the last derive: everything it reads is
     /// a file's call facts and the nodes of files with call facts, and a file's nodes
