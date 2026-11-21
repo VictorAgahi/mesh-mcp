@@ -309,14 +309,28 @@ Fixture and ground truth: `examples/eda/sql-outbox` and `tests/golden/events/sql
   that is not statically knowable (a parameter, a call result, a variable holding the message) is
   not recorded and nothing is guessed. A class-level CQRS handler is anchored on its `execute` /
   `handle` method, so the chain continues into the calls it makes.
-- Schedules are entries, like an HTTP route: `trace_flow` with `entry_kind = cron` starts at the
-  `Schedule` node named `Class.method` (a name no schedule carries still resolves as a handler),
-  and a reverse trace from a publish ends at the schedule that reaches it.
+- Schedules are entries, like an HTTP route: `trace_flow` with `entry_kind = cron` (or `auto`, which
+  reads a scheduled `Class.method` as a cron entry) starts at the `Schedule` node named
+  `Class.method` (a name no schedule carries still resolves as a handler). A reverse trace from a
+  publish ends at the schedule when the scheduled method calls a method that publishes; a publish
+  made inside the scheduled method itself is not reached (the same limit as a Kafka handler that
+  publishes in its own body, a residual of the chain engine).
+- In-process and broker sites never meet. Besides the separate `inproc:` channels, the legacy
+  same-file fallback of `trace_flow` (offered when no call path reaches a publish) does not link a
+  site known to be in-process with a site known to talk to another broker; a site whose broker is
+  unknown (a NestJS `client.emit`, a custom pattern) keeps the old behaviour.
+- A class-name key is the name as written, with an import alias resolved to what the module
+  exports (`import { OrderCreated as Created }` is `OrderCreated`). It is not qualified by module:
+  two unrelated classes of the same name in two packages are one key and are linked.
 - Not covered: Node `events.EventEmitter`, wildcard event names (`order.*`), `AggregateRoot.apply`,
   Spring `@Async` ordering and `ApplicationEvent` subclasses published through a variable,
   Spring Modulith `@DomainEvents`, `SchedulerRegistry` / `cron.schedule(...)` calls, Quartz, a
   schedule read from configuration (`@Scheduled(cron = "${...}")` is kept as written in the
-  signature, the method is still an entry), Kotlin and Scala Spring code.
+  signature, the method is still an entry), Kotlin and Scala Spring code. Also: a class whose name
+  is all capitals (`new OC()`) is not read as a class; a `@Cron` on an abstract member and a
+  `@Scheduled` on an interface method are entries of a body-less method (nothing follows them);
+  `diff_mesh` does not report a `Schedule` entry (a added or removed schedule is not a contract
+  change it lists); homonymous classes across packages are linked (see above).
 - Bounds: at most 2,000 in-process sites and schedules per file (`MAX_INPROC_SITES_PER_FILE`);
   the sites past it are not registered, and the file is counted in
   `IndexHealth::files_inproc_capped`, listed by `mesh-mcp doctor` (a warning).

@@ -367,7 +367,7 @@ fn inproc_event_names(s: &Site) -> Vec<String> {
         let object = a.child_by_field_name("object")?;
         let property = a.child_by_field_name("property")?;
         (a.kind() == "member_expression" && property.utf8_text(s.source) == Ok("name"))
-            .then(|| class_of(object, s.source, false))
+            .then(|| class_of(object, s.source, false, &s.fx.bindings))
             .flatten()
     });
     match class_name {
@@ -386,7 +386,12 @@ fn is_class_name(text: &str) -> bool {
 }
 
 /// The class a node stands for: `Foo` (a reference) or `new Foo(...)` (an instance).
-pub(super) fn class_of(node: Node, source: &[u8], instance: bool) -> Option<String> {
+pub(super) fn class_of(
+    node: Node,
+    source: &[u8],
+    instance: bool,
+    bindings: &super::ModuleBindings,
+) -> Option<String> {
     let node = super::super::typescript::TypeScriptExtractor::peel_wrappers(node);
     let ident = match (node.kind(), instance) {
         ("identifier", false) => node,
@@ -394,14 +399,23 @@ pub(super) fn class_of(node: Node, source: &[u8], instance: bool) -> Option<Stri
         _ => return None,
     };
     let text = ident.utf8_text(source).ok()?;
-    (ident.kind() == "identifier" && is_class_name(text)).then(|| text.to_string())
+    if ident.kind() != "identifier" || !is_class_name(text) {
+        return None;
+    }
+    // `import { OrderCreated as Created }`: the class is named by what it is exported as, the
+    // spelling the other side of the bus uses.
+    let exported = bindings
+        .value_binding(text)
+        .map(|b| b.imported.as_str())
+        .filter(|name| is_class_name(name));
+    Some(exported.unwrap_or(text).to_string())
 }
 
 /// Every class named by an argument: `@CommandHandler(Foo)`, `@EventsHandler(A, B)`.
 fn class_args(s: &Site) -> Vec<String> {
     s.args
         .iter()
-        .filter_map(|a| class_of(*a, s.source, false))
+        .filter_map(|a| class_of(*a, s.source, false, &s.fx.bindings))
         .collect()
 }
 
@@ -414,10 +428,10 @@ fn new_class_args(s: &Site) -> Vec<String> {
         if a.kind() == "array" {
             out.extend(
                 a.named_children(&mut a.walk())
-                    .filter_map(|e| class_of(e, s.source, true)),
+                    .filter_map(|e| class_of(e, s.source, true, &s.fx.bindings)),
             );
         } else {
-            out.extend(class_of(a, s.source, true));
+            out.extend(class_of(a, s.source, true, &s.fx.bindings));
         }
     }
     out

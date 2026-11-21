@@ -32,23 +32,31 @@ fn text<'s>(node: Node, source: &'s [u8]) -> &'s str {
     node.utf8_text(source).unwrap_or("")
 }
 
-/// The simple class name a type node stands for.
+/// The simple class name a type node stands for. Iterative: a hostile file may nest
+/// `PayloadApplicationEvent<PayloadApplicationEvent<...>>` or a qualified name as deep as
+/// the lexical guard lets short lines go, and no recursion depth is tied to that.
 fn simple_type(node: Node, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "type_identifier" => Some(text(node, source).to_string()),
-        "scoped_type_identifier" => node
-            .named_child(node.named_child_count().checked_sub(1)?)
-            .and_then(|last| simple_type(last, source)),
-        "generic_type" => {
-            let base = node.named_child(0).and_then(|b| simple_type(b, source))?;
-            if base == "PayloadApplicationEvent" {
-                // `PayloadApplicationEvent<OrderPlaced>` is an `OrderPlaced` payload.
-                let args = node.named_child(1)?;
-                return args.named_child(0).and_then(|a| simple_type(a, source));
+    let mut node = node;
+    loop {
+        match node.kind() {
+            "type_identifier" => return Some(text(node, source).to_string()),
+            // `a.b.C`: the last segment.
+            "scoped_type_identifier" => {
+                node = node.named_child(node.named_child_count().checked_sub(1)?)?;
             }
-            Some(base)
+            "generic_type" => {
+                let base = node.named_child(0)?;
+                let is_payload = base.kind() == "type_identifier"
+                    && text(base, source) == "PayloadApplicationEvent";
+                if !is_payload {
+                    node = base;
+                    continue;
+                }
+                // `PayloadApplicationEvent<OrderPlaced>` is an `OrderPlaced` payload.
+                node = node.named_child(1)?.named_child(0)?;
+            }
+            _ => return None,
         }
-        _ => None,
     }
 }
 

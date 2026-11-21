@@ -510,3 +510,187 @@ fn a_reverse_trace_ends_at_the_schedule_that_starts_the_flow() {
         .collect();
     assert_eq!(produced, vec!["report.done".to_string()]);
 }
+
+// ---- fix round 1 ------------------------------------------------------------------------
+
+const MIXED: &str = "import { Kafka } from 'kafkajs';\n\
+import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';\n\
+const consumer = new Kafka({ brokers: [] }).consumer({ groupId: 'g' });\n\
+const producer = new Kafka({ brokers: [] }).producer();\n\
+export class Mixed {\n\
+  constructor(private readonly bus: EventEmitter2) {}\n\
+  async run() { await consumer.subscribe({ topic: 'orders' }); }\n\
+  async send() {\n\
+    await producer.send({ topic: 'orders', messages: [] });\n\
+    this.bus.emit('orders', {});\n\
+  }\n\
+  @OnEvent('orders')\n\
+  onOrders() {}\n\
+}\n";
+
+/// Lines of the produce / consume steps of every hop of a trace.
+fn step_lines(graph: &ContractGraph, target: &str, direction: FlowDirection) -> Vec<usize> {
+    let trace = graph.trace_flow(
+        FlowEntry::Topic(target),
+        direction,
+        FlowBounds::default(),
+        &|_| false,
+    );
+    let mut lines: Vec<usize> = trace
+        .hops
+        .iter()
+        .flat_map(|h| h.steps.iter())
+        .filter(|st| matches!(st.kind, FlowStepKind::Produce | FlowStepKind::Consume))
+        .map(|st| st.node.line_start)
+        .collect();
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
+#[test]
+fn the_same_file_fallback_never_crosses_the_in_process_boundary() {
+    // Kafka consumer l.7, Kafka producer l.9, emit l.10, @OnEvent l.13 (method l.13).
+    let graph = graph_of(&[("src/mixed.ts", MIXED)]);
+    // In-process consumer, forward: the emit may follow (same file, same broker), the Kafka
+    // send at l.9 may not.
+    let forward = step_lines(&graph, "inproc:orders", FlowDirection::Forward);
+    assert!(
+        forward.contains(&10) && !forward.contains(&9),
+        "{forward:?}"
+    );
+    // In-process producer, reverse: the Kafka consumer at l.7 may not be offered.
+    let reverse = step_lines(&graph, "inproc:orders", FlowDirection::Reverse);
+    assert!(
+        reverse.contains(&13) && !reverse.contains(&7),
+        "{reverse:?}"
+    );
+    // And the other way round: a Kafka consumer never leads to the in-process emit.
+    let kafka_forward = step_lines(&graph, "kafka:orders", FlowDirection::Forward);
+    assert!(
+        kafka_forward.contains(&9) && !kafka_forward.contains(&10),
+        "{kafka_forward:?}"
+    );
+    let kafka_reverse = step_lines(&graph, "kafka:orders", FlowDirection::Reverse);
+    assert!(
+        kafka_reverse.contains(&7) && !kafka_reverse.contains(&13),
+        "{kafka_reverse:?}"
+    );
+}
+
+#[test]
+fn an_unknown_broker_site_keeps_the_legacy_same_file_fallback() {
+    // No broker is known for a custom-pattern-like site: a plain `NestJS client.emit` joins.
+    let graph = graph_of(&[(
+        "src/svc.ts",
+        "import { OnEvent, EventEmitter2 } from '@nestjs/event-emitter';\n\
+         import { ClientProxy } from '@nestjs/microservices';\n\
+         export class S {\n\
+           constructor(private readonly bus: EventEmitter2, private readonly client: ClientProxy) {}\n\
+           @OnEvent('a')\n\
+           onA() { this.client.emit('b', {}); }\n\
+         }\n",
+    )]);
+    let forward = step_lines(&graph, "a", FlowDirection::Forward);
+    assert!(forward.contains(&6), "{forward:?}");
+}
+
+#[test]
+fn an_import_alias_is_the_class_the_other_side_names() {
+    let handlers = extract(
+        "src/h.ts",
+        "import { CommandHandler, EventsHandler } from '@nestjs/cqrs';\n\
+         import { OrderCreated as Created, Ship as Go } from './m';\n\
+         @EventsHandler(Created)\n\
+         export class H { handle() {} }\n\
+         @CommandHandler(Go)\n\
+         export class G { execute() {} }\n",
+    );
+    assert_eq!(
+        sites(&handlers),
+        vec![s('C', "OrderCreated"), s('C', "Ship")]
+    );
+    let caller = extract(
+        "src/c.ts",
+        "import { EventBus, ofType, Saga } from '@nestjs/cqrs';\n\
+         import { OrderCreated as Created, Ship as Go } from './m';\n\
+         export class C {\n\
+           constructor(private readonly bus: EventBus) {}\n\
+           go() { this.bus.publish(new Created()); }\n\
+           @Saga()\n\
+           s = (e$: any) => e$.pipe(ofType(Created), map(() => new Go()));\n\
+         }\n",
+    );
+    assert_eq!(
+        sites(&caller),
+        vec![
+            s('C', "OrderCreated"),
+            s('P', "OrderCreated"),
+            s('P', "Ship")
+        ]
+    );
+}
+
+#[test]
+fn a_scheduled_name_in_auto_mode_is_a_cron_entry() {
+    let graph = graph_of(&[(
+        "src/j.ts",
+        "import { Cron } from '@nestjs/schedule';\n\
+         import { EventEmitter2 } from '@nestjs/event-emitter';\n\
+         export class Sched {\n\
+           constructor(private readonly bus: EventEmitter2) {}\n\
+           @Cron('0 * * * *')\n\
+           hourly() { this.bus.emit('tick'); }\n\
+         }\n",
+    )]);
+    let trace = graph.trace_flow(
+        FlowEntry::Auto("Sched.hourly"),
+        FlowDirection::Forward,
+        FlowBounds::default(),
+        &|_| false,
+    );
+    assert_eq!(trace.entry_kind, "cron");
+}
+
+#[test]
+fn a_hostile_nested_type_is_read_without_recursion() {
+    // 3,000 nested generics, one level per short line: the guard's line-length rule passes
+    // it, and a test thread has a 2 MiB stack.
+    let depth = 3_000;
+    let mut java = String::from(
+        "package p;\nimport org.springframework.context.event.EventListener;\npublic class L {\n  @EventListener\n  void on(\n",
+    );
+    for _ in 0..depth {
+        java.push_str("PayloadApplicationEvent<\n");
+    }
+    java.push_str("Deep");
+    for _ in 0..depth {
+        java.push_str(">\n");
+    }
+    java.push_str(" e) {}\n}\n");
+    let fi = PolyglotIndexer::extract(Path::new("src/main/java/p/L.java"), &java, 0);
+    // A parse that gives up is a counted parse failure, never a crash; when it parses, the
+    // payload class is the innermost one.
+    if !fi.parse_failed {
+        assert!(
+            sites(&fi).iter().all(|(_, t)| t == "Deep"),
+            "{:?}",
+            sites(&fi)
+        );
+    }
+    let mut ts = String::from(
+        "import { EventsHandler } from '@nestjs/cqrs';\n@EventsHandler(Deep)\nexport class H {\n  handle(e: ",
+    );
+    for _ in 0..depth {
+        ts.push_str("Box<\n");
+    }
+    ts.push_str("Deep");
+    for _ in 0..depth {
+        ts.push_str(">\n");
+    }
+    ts.push_str(") {}\n}\n");
+    let fi = PolyglotIndexer::extract(Path::new("src/h.ts"), &ts, 0);
+    if !fi.parse_failed {
+        assert_eq!(sites(&fi), vec![s('C', "Deep")]);
+    }
+}

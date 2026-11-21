@@ -942,7 +942,7 @@ id, so two runs on the same index give byte-identical answers.
 `entry_kind`: `auto` (default: a `VERB /path` is a route, else an indexed event, else a handler),
 `topic`, `route`, `handler`, `cron` (a scheduled method: the `Class.method` of a NestJS `@Cron` /
 `@Interval` / `@Timeout` or a Spring `@Scheduled` when one carries the name, else resolved like a
-handler; a reverse trace ends at the schedule that reaches a publish). In-process events (NestJS
+handler; a reverse trace ends at the schedule whose method calls a method that publishes). In-process events (NestJS
 EventEmitter2 / CQRS, Spring application events) are topics like any other, keyed by the event name
 or the event class name. A handler is found among the callables of resolved entry -> publish
 paths, then by exact declaration name.

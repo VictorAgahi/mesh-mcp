@@ -588,7 +588,7 @@ pub(crate) fn detect_saga(
         match n.kind() {
             "call_expression" if local_of(n).is_some_and(|l| cqrs(&l, "ofType")) => {
                 for arg in arguments(n) {
-                    if let Some(name) = messaging::class_of(arg, source, false) {
+                    if let Some(name) = messaging::class_of(arg, source, false, &built.bindings) {
                         out.push((
                             lines(n),
                             EventFact {
@@ -602,8 +602,12 @@ pub(crate) fn detect_saga(
                 }
             }
             "new_expression" => {
-                if let Some(name) = messaging::class_of(n, source, true) {
-                    let from_library = built.bindings.value_binding(&name).map(|b| &b.module);
+                if let Some(name) = messaging::class_of(n, source, true, &built.bindings) {
+                    let local = n
+                        .child_by_field_name("constructor")
+                        .and_then(|c| c.utf8_text(source).ok())
+                        .unwrap_or(&name);
+                    let from_library = built.bindings.value_binding(local).map(|b| &b.module);
                     let message = match from_library {
                         Some(module) => !ModuleBindings::module_in(module, &["rxjs", "@nestjs"]),
                         None => ["Command", "Event", "Query"]
