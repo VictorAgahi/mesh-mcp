@@ -111,7 +111,10 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v17: SQL producers and consumers (9.0 T5, on top of T7's 16): `.sql` files and the SQL string
 /// literals of TypeScript / JavaScript, Go, Java and Python files register `EventStream` nodes;
 /// `FileIndex::sql_unresolved` / `sql_capped`.
-const SCHEMA_VERSION: u8 = 17;
+/// v18: in-process buses and schedules (9.0 T4): `NodeKind::Schedule`, `Broker::InProc`,
+/// `EventStream` nodes for NestJS EventEmitter2 / CQRS and Spring application events,
+/// `FileIndex::inproc_capped`.
+const SCHEMA_VERSION: u8 = 18;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

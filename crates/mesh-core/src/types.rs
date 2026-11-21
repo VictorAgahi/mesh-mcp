@@ -89,6 +89,21 @@ pub enum NodeKind {
     /// reconcile (see `contracts::calls`). Like `Module`, never a `smart_search`
     /// result, and never in the graph's name / file indices.
     Callable,
+    /// A scheduled method (`@Cron`, `@Interval`, `@Timeout`, `@Scheduled`): a chain entry
+    /// the way an HTTP route is (9.0 ticket T4). Named `Class.method`, spanning the method;
+    /// the schedule expression is the signature.
+    Schedule,
+}
+
+impl NodeKind {
+    /// Whether a node of this kind starts a flow by itself, without a topic: an HTTP route,
+    /// an inbound gRPC handler or a scheduled method.
+    pub const fn is_entry_site(self) -> bool {
+        matches!(
+            self,
+            NodeKind::HttpEndpoint | NodeKind::GrpcMethod | NodeKind::Schedule
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

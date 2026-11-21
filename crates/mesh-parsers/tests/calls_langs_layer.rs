@@ -142,43 +142,13 @@ fn layered_py_with_annotated_parameters_resolves_every_golden_hop() {
 }
 
 #[test]
-fn spring_monolith_resolves_the_golden_hops_once_entries_and_producers_exist() {
-    // In-process Spring events and `@Scheduled` entries are not read by this tree
-    // (later tickets), so the unmodified fixture has no entry -> producer path. The
-    // variant swaps its `@EventListener` / `publishEvent` pairs for the Kafka
-    // listener / template shapes the extractors do read, and nothing else.
-    let g = index("spring-monolith", &|name, c| match name {
-        "BillingListener.java" => c
-            .replace(
-                "import org.springframework.context.event.EventListener;",
-                "import org.springframework.kafka.annotation.KafkaListener;",
-            )
-            .replace(
-                "@EventListener",
-                "@KafkaListener(topics = \"order.placed\")",
-            ),
-        "ShipmentListener.java" => c.replace(
-            "@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)",
-            "@KafkaListener(topics = \"fulfilment.started\")",
-        ),
-        "OrderEventPublisher.java" => kafka_publisher(
-            c,
-            "events.publishEvent(new OrderPlacedEvent(orderId, total));",
-            "order.placed",
-        ),
-        "FulfilmentService.java" => kafka_publisher(
-            c,
-            "events.publishEvent(new FulfilmentStartedEvent(orderId));",
-            "fulfilment.started",
-        ),
-        _ => c,
-    });
-    // Golden h1-h6 (h7 and h8 start from a cron entry, a later ticket).
+fn spring_monolith_resolves_the_golden_hops_through_events_and_schedules() {
+    // Spring application events and `@Scheduled` entries are read since T4: the unmodified
+    // fixture resolves the eight golden hops (h7 and h8 start from the cron entry).
+    let g = index("spring-monolith", &|_, c| c);
     assert_eq!(
         calls(&g),
         edges(&[
-            ("OrderController.create", "OrderService.place", X),
-            ("OrderService.place", "OrderEventPublisher.announce", X),
             ("BillingListener.onOrderPlaced", "BillingService.charge", X),
             (
                 "BillingService.charge",
@@ -186,10 +156,18 @@ fn spring_monolith_resolves_the_golden_hops_once_entries_and_producers_exist() {
                 X
             ),
             (
+                "BillingService.reconcile",
+                "PaymentPublisher.publishReconciled",
+                X
+            ),
+            ("OrderController.create", "OrderService.place", X),
+            ("OrderService.place", "OrderEventPublisher.announce", X),
+            (
                 "PaymentsKafkaListener.onCharged",
                 "FulfilmentService.start",
                 X
             ),
+            ("ReconcileJob.hourly", "BillingService.reconcile", X),
             (
                 "ShipmentListener.onFulfilmentStarted",
                 "ShipmentService.dispatch",
@@ -197,23 +175,4 @@ fn spring_monolith_resolves_the_golden_hops_once_entries_and_producers_exist() {
             ),
         ])
     );
-}
-
-fn kafka_publisher(c: String, publish: &str, topic: &str) -> String {
-    c.replace(
-        "import org.springframework.context.ApplicationEventPublisher;",
-        "import org.springframework.kafka.core.KafkaTemplate;",
-    )
-    .replace(
-        "ApplicationEventPublisher events",
-        "KafkaTemplate<String, String> kafkaTemplate",
-    )
-    .replace(
-        "this.events = events;",
-        "this.kafkaTemplate = kafkaTemplate;",
-    )
-    .replace(
-        publish,
-        &format!("kafkaTemplate.send(\"{topic}\", orderId);"),
-    )
 }

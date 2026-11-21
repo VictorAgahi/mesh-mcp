@@ -57,8 +57,9 @@ pub enum FlowEntry<'a> {
     Route(Vec<NodeId>),
     /// A handler symbol (`OrderService.place`, `place`).
     Handler(&'a str),
-    /// A scheduled method (`ReportScheduler.hourly`). Schedules are not indexed
-    /// yet: the method is resolved like a handler.
+    /// A scheduled method (`ReportScheduler.hourly`): an indexed schedule (`@Cron`,
+    /// `@Interval`, `@Timeout`, `@Scheduled`) when one carries the name, else the method
+    /// resolved like a handler.
     Cron(&'a str),
 }
 
@@ -369,7 +370,7 @@ impl ContractGraph {
                 (FlowEntry::Cron(name), _) => (
                     name.to_string(),
                     "cron",
-                    self.resolve_handler(name),
+                    self.resolve_schedule(name),
                     HashSet::new(),
                     None,
                 ),
@@ -399,6 +400,28 @@ impl ContractGraph {
         trace.target = CompactStr::new(target);
         trace.entry_kind = kind;
         trace
+    }
+
+    /// The scheduled methods named `name` (`Owner.method` or a bare method); a name no
+    /// schedule carries falls back to [`Self::resolve_handler`], so a method scheduled by
+    /// something the indexer does not see (a runtime registry) still traces as a handler.
+    /// Sorted.
+    fn resolve_schedule(&self, name: &str) -> Vec<&ContractNode> {
+        let name = name.trim();
+        let mut out: Vec<&ContractNode> = self
+            .nodes
+            .values()
+            .filter(|n| {
+                n.kind == NodeKind::Schedule
+                    && (n.name == name
+                        || (!name.contains('.') && n.name.rsplit('.').next() == Some(name)))
+            })
+            .collect();
+        if out.is_empty() {
+            return self.resolve_handler(name);
+        }
+        sort_nodes(&mut out);
+        out
     }
 
     /// Callables named `name` (`Owner.method` or a bare method), else declarations
@@ -470,8 +493,7 @@ impl ContractGraph {
                     continue;
                 };
                 let is_producer = produces.contains_key(id);
-                let is_entry = consumer_ids.contains(id)
-                    || matches!(node.kind, NodeKind::HttpEndpoint | NodeKind::GrpcMethod);
+                let is_entry = consumer_ids.contains(id) || node.kind.is_entry_site();
                 if !(is_producer || is_entry) {
                     continue;
                 }
@@ -839,6 +861,8 @@ impl ContractGraph {
                 )
             } else if e.kind == NodeKind::HttpEndpoint {
                 (FlowStepKind::Route, None)
+            } else if e.kind == NodeKind::Schedule {
+                (FlowStepKind::Cron, None)
             } else {
                 (FlowStepKind::Handler, None)
             };

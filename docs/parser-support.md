@@ -41,6 +41,7 @@ type checker behind any of them.
 | OpenAPI, AsyncAPI, Spring properties | contract source | [3.2](#32-openapi-asyncapi-spring-properties) |
 | Markdown | docs | [3.3](#33-markdown) |
 | SQL (`.sql`, and the SQL strings of TypeScript / JavaScript, Go, Java, Python) | events only: outbox inserts, `NOTIFY` / `pg_notify`, `LISTEN` | [3.4](#34-sql) |
+| In-process buses and schedules (NestJS EventEmitter2 / CQRS / `@nestjs/schedule`, Spring application events / `@Scheduled`) | events and chain entries | [3.5](#35-in-process-buses-and-schedules) |
 
 ---
 
@@ -76,8 +77,9 @@ blocks, with the original line numbers.
 > configuration-driven; the label "level 4" describes the extractor, not the recall on your code.
 
 Not recognised at all (non-exhaustive; absence from the table above means invisible): Socket.IO /
-NestJS WebSocket gateways, EventEmitter2 / `@OnEvent`, Temporal, NestJS CQRS buses and sagas, `@Cron`
-schedulers, server-sent events, ORMs (Prisma, TypeORM). The BullMQ decorators `@Processor` /
+NestJS WebSocket gateways, Temporal, server-sent events, ORMs (Prisma, TypeORM). EventEmitter2 /
+`@OnEvent`, NestJS CQRS buses and sagas and `@Cron` schedulers are in-process buses since 9.0
+([3.5](#35-in-process-buses-and-schedules)). The BullMQ decorators `@Processor` /
 `@InjectQueue`, `@nestjs/bull(mq)`, `@RabbitSubscribe` / `@RabbitRPC` and `@SqsMessageHandler` are
 recognised.
 
@@ -112,6 +114,7 @@ a convention, and a convention the table lacks is invisible.
 | Imports | `import` statements, for `find_dependents` |
 | gRPC | `*ImplBase` servers, `@GrpcService`, `newBlockingStub` / `newStub` / `newFutureStub` clients |
 | Events | `@KafkaListener` (consumers), `KafkaTemplate` (producers); topic names resolved through Spring `application*.yml` / `.properties` placeholders when `[engines.contracts.spring] resolve_placeholders` is on |
+| In-process events | `@EventListener`, `@TransactionalEventListener`, `ApplicationListener<E>`, `publishEvent(new E(...))`, `@Scheduled`: [3.5](#35-in-process-buses-and-schedules) |
 | HTTP | Spring MVC mappings, JAX-RS annotations |
 
 **You will not get:** JMS, RabbitMQ, Spring Cloud Stream, Kafka Streams or SQS; Feign / RestTemplate /
@@ -281,6 +284,45 @@ over the string literals of TypeScript / JavaScript, Go, Java and Python files. 
   the cut are kept.
 
 Fixture and ground truth: `examples/eda/sql-outbox` and `tests/golden/events/sql-outbox.expected.yaml`.
+
+### 3.5 In-process buses and schedules
+
+9.0 (ticket T4) makes the application's own buses and schedulers visible to the event graph, so
+`trace_flow` chains through them like it does through a broker. They are recorded under the broker
+`inproc`: an in-process event named like a Kafka topic is a different channel, never linked to it
+(`inproc:orders` and `kafka:orders` when both exist, [architecture 3.4](architecture.md#34-broker-qualified-topic-keys)).
+
+| Idiom | Role | Key |
+| :--- | :--- | :--- |
+| NestJS `@OnEvent('a.b')`, `@OnEvent(['a', 'b'])` | consumer | the event name |
+| EventEmitter2 `emitter.emit('a.b')`, `emitAsync`, `.on` / `.once` | producer / consumer | the event name (`Event.name` reads as `Event`) |
+| NestJS CQRS `@CommandHandler(C)`, `@EventsHandler(A, B)`, `@QueryHandler(Q)` | consumer | the class name as written (`C`, `A`, `B`, `Q`) |
+| `commandBus.execute(new C())`, `queryBus.execute(new Q())`, `eventBus.publish(new E())`, `publishAll([new E()])` | producer | the class name |
+| `@Saga()` member: `ofType(E)` and each `new C()` it builds | consumer / producer | `E` / `C`, on the line of each |
+| Spring `@EventListener`, `@TransactionalEventListener`, `onApplicationEvent` of an `ApplicationListener<E>` | consumer | the class of the first parameter, or of `classes = {A.class}`; `PayloadApplicationEvent<T>` reads as `T` |
+| Spring `publishEvent(new E(...))` in a file naming `ApplicationEventPublisher` or `ApplicationContext` | producer | `E`, on the line of the call |
+| NestJS `@Cron`, `@Interval`, `@Timeout` (`@nestjs/schedule`), Spring `@Scheduled` | chain entry (kind `cron`) | a `Schedule` node named `Class.method`, signature the decorator text |
+
+- Gating. A NestJS call needs the receiver typed with a class of the library
+  (`private readonly emitter: EventEmitter2`, `commandBus: CommandBus`), or built from one; a
+  socket's `emit`, a Node `events.EventEmitter` and an untyped parameter are not the bus. A name
+  that is not statically knowable (a parameter, a call result, a variable holding the message) is
+  not recorded and nothing is guessed. A class-level CQRS handler is anchored on its `execute` /
+  `handle` method, so the chain continues into the calls it makes.
+- Schedules are entries, like an HTTP route: `trace_flow` with `entry_kind = cron` starts at the
+  `Schedule` node named `Class.method` (a name no schedule carries still resolves as a handler),
+  and a reverse trace from a publish ends at the schedule that reaches it.
+- Not covered: Node `events.EventEmitter`, wildcard event names (`order.*`), `AggregateRoot.apply`,
+  Spring `@Async` ordering and `ApplicationEvent` subclasses published through a variable,
+  Spring Modulith `@DomainEvents`, `SchedulerRegistry` / `cron.schedule(...)` calls, Quartz, a
+  schedule read from configuration (`@Scheduled(cron = "${...}")` is kept as written in the
+  signature, the method is still an entry), Kotlin and Scala Spring code.
+- Bounds: at most 2,000 in-process sites and schedules per file (`MAX_INPROC_SITES_PER_FILE`);
+  the sites past it are not registered, and the file is counted in
+  `IndexHealth::files_inproc_capped`, listed by `mesh-mcp doctor` (a warning).
+
+Fixtures and ground truth: `examples/eda/nestjs-monolith-bus` and `examples/eda/spring-monolith`
+with `tests/golden/events/nestjs-monolith-bus.expected.yaml` and `spring-monolith.expected.yaml`.
 
 ---
 

@@ -545,9 +545,7 @@ impl ContractGraph {
             for id in self.get_nodes_for_file(path) {
                 producer |= producers.contains(id);
                 entry |= consumers.contains(id)
-                    || self.nodes.get(id).is_some_and(|n| {
-                        matches!(n.kind, NodeKind::HttpEndpoint | NodeKind::GrpcMethod)
-                    });
+                    || self.nodes.get(id).is_some_and(|n| n.kind.is_entry_site());
                 if entry && producer {
                     return true;
                 }
@@ -1844,6 +1842,25 @@ impl<'g> Deriver<'g> {
         Vec::new()
     }
 
+    /// The `execute` / `handle` methods declared inside the lines `start..=end` of `file`: the
+    /// entry callables of a handler declared on its class (NestJS CQRS `@CommandHandler`,
+    /// `@EventsHandler`, `@QueryHandler`), whose decorator lies on no method.
+    fn handler_methods(&self, file: usize, start: usize, end: usize) -> Vec<usize> {
+        let (_, f) = self.files[file];
+        f.facts
+            .callables
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.owner.is_some()
+                    && (c.name == "execute" || c.name == "handle")
+                    && start <= c.line_start as usize
+                    && c.line_end as usize <= end
+            })
+            .map(|(k, _)| self.offsets[file] + k)
+            .collect()
+    }
+
     /// Whether the callable makes a call through a field of its type.
     fn uses_fields(&self, global: usize) -> bool {
         self.field_users.contains(&global)
@@ -1887,10 +1904,8 @@ impl<'g> Deriver<'g> {
                 if producer_ids.contains(id) {
                     producer_lines[i].push((node.line_start, *id));
                 }
-                // Entries: consumers, HTTP routes and inbound gRPC handlers.
-                if consumer_ids.contains(id)
-                    || matches!(node.kind, NodeKind::HttpEndpoint | NodeKind::GrpcMethod)
-                {
+                // Entries: consumers, HTTP routes, inbound gRPC handlers and scheduled methods.
+                if consumer_ids.contains(id) || node.kind.is_entry_site() {
                     entry_lines[i].push((node.line_start, *id));
                 }
             }
@@ -2028,6 +2043,11 @@ impl<'g> Deriver<'g> {
                         let methods = constructed
                             .entry(c)
                             .or_insert_with(|| self.constructed_methods(i, c));
+                        set.extend(methods.iter().copied());
+                        site_methods.extend(methods.iter().map(|&m| (site, m)));
+                    } else if let Some(end) = self.graph.nodes.get(&site).map(|n| n.line_end) {
+                        // A class-level handler (`@CommandHandler(X) class H { execute() {} }`).
+                        let methods = self.handler_methods(i, l, end);
                         set.extend(methods.iter().copied());
                         site_methods.extend(methods.iter().map(|&m| (site, m)));
                     }

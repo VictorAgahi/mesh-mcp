@@ -3,6 +3,7 @@ pub mod cpp;
 pub mod csharp;
 pub mod go;
 mod go_calls;
+mod inproc_java;
 pub mod java;
 mod java_calls;
 mod js_frameworks;
@@ -230,6 +231,10 @@ pub struct FileIndex {
     /// counted in `IndexHealth::files_sql_capped`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sql_capped: bool,
+    /// The per-file cap on in-process bus sites and schedules (`MAX_INPROC_SITES_PER_FILE`) cut
+    /// events of this file: counted in `IndexHealth::files_inproc_capped`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inproc_capped: bool,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -276,6 +281,7 @@ impl FileIndex {
         self.calls_skipped_path |= other.calls_skipped_path;
         self.sql_unresolved = self.sql_unresolved.saturating_add(other.sql_unresolved);
         self.sql_capped |= other.sql_capped;
+        self.inproc_capped |= other.inproc_capped;
     }
 
     /// Inserts the extracted nodes and relations into `graph`.
@@ -572,6 +578,11 @@ impl CompiledPattern {
     }
 }
 
+/// Most in-process bus sites (NestJS EventEmitter2 and CQRS, Spring application events) and
+/// schedules one file registers; the rest are dropped and the file is counted in
+/// `IndexHealth::files_inproc_capped` (never silent).
+pub const MAX_INPROC_SITES_PER_FILE: usize = 2_000;
+
 pub struct PolyglotIndexer;
 
 impl PolyglotIndexer {
@@ -605,22 +616,29 @@ impl PolyglotIndexer {
                 }
                 None => continue,
             };
-            let owner = nodes
-                .iter()
-                .enumerate()
-                .filter(|(j, n)| {
-                    *j != i
-                        && n.line_start <= node.line_start
-                        && n.line_end >= node.line_end
-                        && (!produces
-                            || (n.line_start, n.line_end) == (node.line_start, node.line_end))
-                        && !matches!(
-                            n.kind,
-                            NodeKind::KafkaTopic | NodeKind::Queue | NodeKind::EventStream
-                        )
-                })
-                .min_by_key(|(_, n)| n.line_end - n.line_start)
-                .map_or(i, |(j, _)| j);
+            // A saga's `ofType(Event)` is its own consumer: the field it sits in holds no
+            // declaration of its own to attribute it to, and the class would say line 7 for a
+            // site on line 11.
+            let owner = if signature == js_frameworks::SAGA_CONSUME_SIGNATURE {
+                i
+            } else {
+                nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, n)| {
+                        *j != i
+                            && n.line_start <= node.line_start
+                            && n.line_end >= node.line_end
+                            && (!produces
+                                || (n.line_start, n.line_end) == (node.line_start, node.line_end))
+                            && !matches!(
+                                n.kind,
+                                NodeKind::KafkaTopic | NodeKind::Queue | NodeKind::EventStream
+                            )
+                    })
+                    .min_by_key(|(_, n)| n.line_end - n.line_start)
+                    .map_or(i, |(j, _)| j)
+            };
             let broker = js_frameworks::signature_broker(signature);
             if let Some(b) = broker {
                 out.node_brokers.push((i, b));
@@ -637,6 +655,29 @@ impl PolyglotIndexer {
                 out.consumers.push((owner, node.name.clone()));
             }
         }
+    }
+
+    /// Drops the in-process bus sites and schedules of a file past
+    /// [`MAX_INPROC_SITES_PER_FILE`], in node order (the order of the source), so a hostile
+    /// file of thousands of listeners costs a bounded wiring pass. `true` when any was
+    /// dropped: the file is then counted in `IndexHealth::files_inproc_capped`.
+    pub(crate) fn cap_inproc_nodes(nodes: &mut Vec<ContractNode>) -> bool {
+        let is_inproc = |n: &ContractNode| {
+            n.kind == NodeKind::Schedule
+                || n.signature.as_deref().is_some_and(|s| {
+                    s.starts_with("nestjs-event-emitter") || s.starts_with("nestjs-cqrs")
+                })
+        };
+        let mut seen = 0usize;
+        let before = nodes.len();
+        nodes.retain(|n| {
+            if !is_inproc(n) {
+                return true;
+            }
+            seen += 1;
+            seen <= MAX_INPROC_SITES_PER_FILE
+        });
+        nodes.len() != before
     }
 
     /// Whether `nodes[i]` sits inside no other node of the same file (a class,
@@ -881,17 +922,20 @@ impl PolyglotIndexer {
             LanguageKind::Java => {
                 let with_calls = Self::wants_call_facts(cfg, file_path);
                 out.calls_skipped_path = !with_calls;
-                if let Some(((nodes, dependencies, producers, rpc_calls), calls)) =
+                if let Some((((nodes, dependencies, producers, rpc_calls), calls), inproc)) =
                     parsed!(|tree| {
                         (
-                            java::JavaExtractor::extract_relations(
-                                file_path, content, repo_id, tree,
+                            (
+                                java::JavaExtractor::extract_relations(
+                                    file_path, content, repo_id, tree,
+                                ),
+                                if with_calls {
+                                    java_calls::extract(tree, content.as_bytes())
+                                } else {
+                                    CallFacts::default()
+                                },
                             ),
-                            if with_calls {
-                                java_calls::extract(tree, content.as_bytes())
-                            } else {
-                                CallFacts::default()
-                            },
+                            inproc_java::scan(tree, content),
                         )
                     })
                 {
@@ -905,7 +949,10 @@ impl PolyglotIndexer {
                     out.dependencies = dependencies;
                     out.producers = producers;
                     out.rpc_calls = rpc_calls;
-                    // Spring Kafka and `kafka-clients` are the only brokers detected.
+                    // Spring application events and schedules, tagged `InProc` before the
+                    // Kafka default below reaches them.
+                    inproc_java::apply(inproc, &mut out);
+                    // Spring Kafka and `kafka-clients` are the only other brokers detected.
                     out.tag_brokers(Broker::Kafka);
                 }
             }
@@ -1039,8 +1086,9 @@ impl PolyglotIndexer {
                 }
                 out.rpc_calls = rpc_calls;
                 out.calls = calls;
-                Self::wire_ts_events(&nodes, &mut out);
                 let mut nodes = nodes;
+                out.inproc_capped = Self::cap_inproc_nodes(&mut nodes);
+                Self::wire_ts_events(&nodes, &mut out);
                 // A file with imports and no declaration (a barrel of
                 // `export * from …`, a spec of `describe` calls) had nothing
                 // to attach them to, so `find_dependents` never listed it:
@@ -1627,6 +1675,7 @@ mod tests {
             calls_skipped_path: false,
             sql_unresolved: 0,
             sql_capped: false,
+            inproc_capped: false,
         };
         let before = format!("{index:?}");
         let anchored = index.relativize(&root_a).expect("all under root");

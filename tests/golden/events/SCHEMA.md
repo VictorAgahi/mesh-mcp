@@ -77,7 +77,7 @@ negatives:
 - Broker-qualified keys (T7, tag `broker_key`): a name used on two or more brokers of the corpus is
   several channels and is written `<broker>:<name>` (`kafka:orders`, `rabbitmq:orders`; the
   broker slugs are `kafka rabbitmq redis nats mqtt sqs sns kinesis eventbridge pubsub pulsar
-  servicebus eventhubs stomp bull beequeue`), on producers, consumers, chain entries and
+  servicebus eventhubs stomp bull beequeue inproc`), on producers, consumers, chain entries and
   consume / produce steps alike. That is the topic hub's name in the graph, so the scorer's strict
   key equality needs no change. A name used on one broker keeps its plain spelling. The qualifier
   is not in the source: `check_golden.py` strips it before looking for the name on the line, and

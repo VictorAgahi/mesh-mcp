@@ -36,7 +36,7 @@ pub struct TraceFlowArgs {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
-        description = "What `target` names: auto (default: a 'VERB /path' is a route, else an indexed event, else a handler), topic, route, handler, cron (a scheduled method, resolved like a handler: schedules themselves are not indexed yet)."
+        description = "What `target` names: auto (default: a 'VERB /path' is a route, else an indexed event, else a handler), topic, route, handler, cron (a scheduled method: a NestJS @Cron / @Interval / @Timeout or Spring @Scheduled schedule when one carries the name, else resolved like a handler)."
     )]
     pub entry_kind: Option<EntryKind>,
 
