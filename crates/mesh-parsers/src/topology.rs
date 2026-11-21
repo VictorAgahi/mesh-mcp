@@ -135,6 +135,7 @@ fn kind_label(kind: NodeKind) -> &'static str {
         NodeKind::Interface => "interface",
         NodeKind::Module => "module",
         NodeKind::Callable => "callable",
+        NodeKind::Schedule => "schedule",
         NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue => "topic",
         NodeKind::Saga => "saga",
         NodeKind::PostProcessor => "post-processor",

@@ -204,6 +204,11 @@ pub struct IndexHealth {
     /// only the lines that held them are lost. Counted like `files_scanned`.
     #[serde(default)]
     pub files_config_lossy: usize,
+    /// Files where the per-file cap on in-process bus sites and schedules (NestJS EventEmitter2
+    /// and CQRS, Spring application events, `@Cron` / `@Scheduled`) dropped sites: the sites
+    /// past the cap are not registered. Counted like `files_scanned`.
+    #[serde(default)]
+    pub files_inproc_capped: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -336,6 +341,18 @@ impl IndexHealth {
     #[inline]
     pub fn config_truncated(&self) -> bool {
         self.files_config_capped > 0 || self.config_entries_dropped > 0
+    }
+
+    /// One file's in-process bus cap (`FileIndex::inproc_capped`).
+    #[inline]
+    pub fn record_inproc(&mut self, capped: bool) {
+        self.files_inproc_capped += usize::from(capped);
+    }
+
+    /// Whether the in-process site cap dropped events: some bus sites or schedules are missing.
+    #[inline]
+    pub fn inproc_truncated(&self) -> bool {
+        self.files_inproc_capped > 0
     }
 
     /// Whether a SQL scan cap dropped events: some outbox / NOTIFY / LISTEN sites are missing.
@@ -572,6 +589,15 @@ impl IndexHealth {
                 self.files_sql_capped
             );
         }
+        if self.files_inproc_capped > 0 {
+            let _ = writeln!(
+                out,
+                "    {} file(s) cut by the in-process bus site cap (NestJS EventEmitter2 / CQRS, Spring \
+                 events, schedules; docs/parser-support.md, section 3.5): the sites past the cap are \
+                 not registered",
+                self.files_inproc_capped
+            );
+        }
         if self.sql_sites_unresolved > 0 {
             let _ = writeln!(
                 out,
@@ -660,6 +686,7 @@ impl IndexHealth {
         self.files_config_capped += other.files_config_capped;
         self.files_config_parse_failed += other.files_config_parse_failed;
         self.files_config_lossy += other.files_config_lossy;
+        self.files_inproc_capped += other.files_inproc_capped;
         self.files_skipped_non_source += other.files_skipped_non_source;
         // The calls-layer counters are the graph's, set after the reconcile.
     }

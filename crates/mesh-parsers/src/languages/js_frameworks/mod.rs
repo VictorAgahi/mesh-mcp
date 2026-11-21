@@ -514,6 +514,175 @@ pub(crate) fn detect_decorator(
     out
 }
 
+/// Signatures of the facts a `@Saga()` member states (see [`detect_saga`]). They are not rows
+/// of a rule table: the site is a call inside the member, not the decorator.
+pub(crate) const SAGA_CONSUME_SIGNATURE: &str = "nestjs-cqrs @Saga ofType";
+pub(crate) const SAGA_PRODUCE_SIGNATURE: &str = "nestjs-cqrs @Saga new";
+
+/// The class member (method or field) a decorator decorates: the next named sibling that is
+/// not another decorator or a comment.
+pub(crate) fn decorated_member(decorator: Node) -> Option<Node> {
+    // A field's decorators are part of the field; a method's precede it.
+    if let Some(parent) = decorator.parent().filter(|p| {
+        matches!(
+            p.kind(),
+            "method_definition" | "public_field_definition" | "field_definition"
+        )
+    }) {
+        return Some(parent);
+    }
+    let mut next = decorator.next_named_sibling();
+    while let Some(n) = next {
+        match n.kind() {
+            "decorator" | "comment" => next = n.next_named_sibling(),
+            "method_definition" | "public_field_definition" | "field_definition" => return Some(n),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The call-site facts of a `@Saga()` member, as `(lines, fact)`: `ofType(A, B)` consumes the
+/// events `A` and `B` and each `new C(...)` the member builds is a command it produces
+/// (`events$.pipe(ofType(A), map(() => new C()))`). A class imported from `rxjs` or
+/// `@nestjs/*` is not a message; a class this file declares is one only when it is named like
+/// one (`...Command`, `...Event`, `...Query`).
+pub(crate) fn detect_saga(
+    decorator: Node,
+    source: &[u8],
+    fx: &FrameworkCtx,
+) -> Vec<((usize, usize), EventFact)> {
+    let Some(call) = decorator
+        .named_child(0)
+        .filter(|c| c.kind() == "call_expression")
+    else {
+        return Vec::new();
+    };
+    let is_saga = call
+        .child_by_field_name("function")
+        .filter(|f| f.kind() == "identifier")
+        .and_then(|f| f.utf8_text(source).ok())
+        .is_some_and(|local| local.ends_with("Saga"));
+    if !is_saga || !fx.relevant() {
+        return Vec::new();
+    }
+    let built = fx.built();
+    let cqrs = |local: &str, imported: &str| {
+        built.bindings.value_binding(local).is_some_and(|b| {
+            b.imported == imported && ModuleBindings::module_in(&b.module, &["@nestjs/cqrs"])
+        })
+    };
+    let local_of = |n: Node| {
+        call_of_identifier(n)
+            .and_then(|f| f.utf8_text(source).ok())
+            .map(str::to_string)
+    };
+    if !local_of(call).is_some_and(|l| cqrs(&l, "Saga")) {
+        return Vec::new();
+    }
+    let Some(member) = decorated_member(decorator) else {
+        return Vec::new();
+    };
+    let lines = |n: Node| (n.start_position().row + 1, n.end_position().row + 1);
+    let mut out = Vec::new();
+    let mut cursor = member.walk();
+    loop {
+        let n = cursor.node();
+        match n.kind() {
+            "call_expression" if local_of(n).is_some_and(|l| cqrs(&l, "ofType")) => {
+                for arg in arguments(n) {
+                    if let Some(name) = messaging::class_of(arg, source, false, &built.bindings) {
+                        out.push((
+                            lines(n),
+                            EventFact {
+                                name,
+                                kind: NodeKind::EventStream,
+                                signature: SAGA_CONSUME_SIGNATURE,
+                                role: Role::Consume,
+                            },
+                        ));
+                    }
+                }
+            }
+            "new_expression" => {
+                if let Some(name) = messaging::class_of(n, source, true, &built.bindings) {
+                    let local = n
+                        .child_by_field_name("constructor")
+                        .and_then(|c| c.utf8_text(source).ok())
+                        .unwrap_or(&name);
+                    let from_library = built.bindings.value_binding(local).map(|b| &b.module);
+                    let message = match from_library {
+                        Some(module) => !ModuleBindings::module_in(module, &["rxjs", "@nestjs"]),
+                        None => ["Command", "Event", "Query"]
+                            .iter()
+                            .any(|suffix| name.ends_with(suffix)),
+                    };
+                    if message {
+                        out.push((
+                            lines(n),
+                            EventFact {
+                                name,
+                                kind: NodeKind::EventStream,
+                                signature: SAGA_PRODUCE_SIGNATURE,
+                                role: Role::Produce,
+                            },
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.node() == member {
+                return out;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return out;
+            }
+        }
+    }
+}
+
+/// The function of a call (`ofType` of `ofType(A)`) when it is a plain identifier.
+fn call_of_identifier(call: Node) -> Option<Node> {
+    call.child_by_field_name("function")
+        .filter(|f| f.kind() == "identifier")
+}
+
+/// The schedule a `@Cron(...)` / `@Interval(...)` / `@Timeout(...)` decorator of
+/// `@nestjs/schedule` declares, as the text of the decorator (`@Cron('0 * * * *')`, at most
+/// 96 bytes); `None` for any other decorator. The decorated member is the scheduled method.
+pub(crate) fn detect_schedule(decorator: Node, source: &[u8], fx: &FrameworkCtx) -> Option<String> {
+    let call = decorator
+        .named_child(0)
+        .filter(|c| c.kind() == "call_expression")?;
+    let local = call_of_identifier(call)?.utf8_text(source).ok()?;
+    if !["Cron", "Interval", "Timeout"]
+        .iter()
+        .any(|n| local.ends_with(n))
+    {
+        return None;
+    }
+    let binding = fx.built().bindings.value_binding(local)?;
+    if !ModuleBindings::module_in(&binding.module, &["@nestjs/schedule"])
+        || !["Cron", "Interval", "Timeout"].contains(&binding.imported.as_str())
+    {
+        return None;
+    }
+    let text = decorator.utf8_text(source).ok()?;
+    let mut end = text.len().min(96);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(text[..end].replace(['\n', '\r'], " "))
+}
+
 /// The [`Role`] of the interaction a node's `signature` was recorded under.
 pub(crate) fn signature_role(signature: &str) -> Option<Role> {
     messaging::CALL_RULES
@@ -525,6 +694,10 @@ pub(crate) fn signature_role(signature: &str) -> Option<Role> {
                 .iter()
                 .map(|r| (r.signature, r.role)),
         )
+        .chain([
+            (SAGA_CONSUME_SIGNATURE, Role::Consume),
+            (SAGA_PRODUCE_SIGNATURE, Role::Produce),
+        ])
         .find(|(s, _)| *s == signature)
         .map(|(_, role)| role)
 }

@@ -111,11 +111,15 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v17: SQL producers and consumers (9.0 T5, on top of T7's 16): `.sql` files and the SQL string
 /// literals of TypeScript / JavaScript, Go, Java and Python files register `EventStream` nodes;
 /// `FileIndex::sql_unresolved` / `sql_capped`.
-/// v18: config-driven topics (9.0 T6): a producer / consumer topic read from configuration is
-/// recorded as a `${key}` / `${key:default}` placeholder (TypeScript `process.env` /
-/// `ConfigService`, Go `os.Getenv` / viper, Python `os.environ`, Java `@Value`), resolved when
-/// the index is folded; the extractors no longer record the env key itself as a Go / Python topic.
-const SCHEMA_VERSION: u8 = 18;
+/// v18: in-process buses and schedules (9.0 T4): `NodeKind::Schedule`, `Broker::InProc`,
+/// `EventStream` nodes for NestJS EventEmitter2 / CQRS and Spring application events,
+/// `FileIndex::inproc_capped`.
+/// v19: config-driven topics (9.0 T6, on top of T4's 18): a producer / consumer topic read from
+/// configuration is recorded as a `${key}` / `${key:default}` placeholder (TypeScript
+/// `process.env` / `ConfigService`, Go `os.Getenv` / viper, Python `os.environ`, Java `@Value`),
+/// resolved when the index is folded; the extractors no longer record the env key itself as a
+/// Go / Python topic.
+const SCHEMA_VERSION: u8 = 19;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

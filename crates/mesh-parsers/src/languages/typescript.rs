@@ -973,6 +973,29 @@ impl TypeScriptExtractor {
                 for fact in js_frameworks::detect_decorator(node, source, &ctx.frameworks) {
                     nodes.push(Self::event_node(ctx, Self::decorated_lines(node), fact));
                 }
+                // `@Saga()`: the `ofType(...)` and `new Command(...)` inside the member.
+                for (lines, fact) in js_frameworks::detect_saga(node, source, &ctx.frameworks) {
+                    nodes.push(Self::event_node(ctx, lines, fact));
+                }
+                // `@Cron('0 * * * *')` on `Class.method`: a chain entry.
+                if let Some(schedule) =
+                    js_frameworks::detect_schedule(node, source, &ctx.frameworks)
+                {
+                    if let Some(name) = Self::scheduled_name(node, source) {
+                        let mut entry = Self::event_node(
+                            ctx,
+                            Self::decorated_lines(node),
+                            js_frameworks::EventFact {
+                                name,
+                                kind: NodeKind::Schedule,
+                                signature: "",
+                                role: js_frameworks::Role::Consume,
+                            },
+                        );
+                        entry.signature = Some(CompactStr::new(schedule));
+                        nodes.push(entry);
+                    }
+                }
             }
             _ => {}
         }
@@ -1236,6 +1259,16 @@ impl TypeScriptExtractor {
             return None;
         }
         Self::module_call_specifier(node, source)
+    }
+
+    /// `Class.method` of the member a schedule decorator decorates: the class is the one
+    /// the member sits in, and a member of an anonymous class is not named.
+    fn scheduled_name(decorator: Node, source: &[u8]) -> Option<String> {
+        let member = js_frameworks::decorated_member(decorator)?;
+        let method = member.child_by_field_name("name")?.utf8_text(source).ok()?;
+        let class = member.parent()?.parent()?;
+        let class = class.child_by_field_name("name")?.utf8_text(source).ok()?;
+        Some(format!("{class}.{method}"))
     }
 
     /// The 1-based line span of what a decorator decorates: the declaration it

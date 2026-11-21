@@ -359,10 +359,110 @@ fn stomp_destination(s: &Site) -> Vec<String> {
     object_keys(s, 0, &["destination"])
 }
 
+// ---- in-process buses (9.0 ticket T4) -------------------------------------------------
+
+/// A name read off an in-process event argument: `Event.name` is the class `Event` (the key
+/// the CQRS side of the same event uses), anything else is read as any topic name is.
+fn inproc_event_names(s: &Site) -> Vec<String> {
+    let class_name = s.args.first().and_then(|a| {
+        let a = super::super::typescript::TypeScriptExtractor::peel_wrappers(*a);
+        let object = a.child_by_field_name("object")?;
+        let property = a.child_by_field_name("property")?;
+        (a.kind() == "member_expression" && property.utf8_text(s.source) == Ok("name"))
+            .then(|| class_of(object, s.source, false, &s.fx.bindings))
+            .flatten()
+    });
+    match class_name {
+        Some(class) => vec![class],
+        None => first_arg(s),
+    }
+}
+
+/// `Foo`, not `foo`, `Foo.Bar` or `FOO_BAR`: the spelling of a class reference.
+fn is_class_name(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_ascii_uppercase())
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        && text.chars().any(|c| c.is_ascii_lowercase())
+}
+
+/// The class a node stands for: `Foo` (a reference) or `new Foo(...)` (an instance).
+pub(super) fn class_of(
+    node: Node,
+    source: &[u8],
+    instance: bool,
+    bindings: &super::ModuleBindings,
+) -> Option<String> {
+    let node = super::super::typescript::TypeScriptExtractor::peel_wrappers(node);
+    let ident = match (node.kind(), instance) {
+        ("identifier", false) => node,
+        ("new_expression", _) => node.child_by_field_name("constructor")?,
+        _ => return None,
+    };
+    let text = ident.utf8_text(source).ok()?;
+    if ident.kind() != "identifier" || !is_class_name(text) {
+        return None;
+    }
+    // `import { OrderCreated as Created }`: the class is named by what it is exported as, the
+    // spelling the other side of the bus uses.
+    let exported = bindings
+        .value_binding(text)
+        .map(|b| b.imported.as_str())
+        .filter(|name| is_class_name(name));
+    Some(exported.unwrap_or(text).to_string())
+}
+
+/// Every class named by an argument: `@CommandHandler(Foo)`, `@EventsHandler(A, B)`.
+fn class_args(s: &Site) -> Vec<String> {
+    s.args
+        .iter()
+        .filter_map(|a| class_of(*a, s.source, false, &s.fx.bindings))
+        .collect()
+}
+
+/// The class of each `new Foo(...)` argument, or of each element of an array of them
+/// (`bus.publishAll([new A(), new B()])`): a variable holding the message names no class.
+fn new_class_args(s: &Site) -> Vec<String> {
+    let mut out = Vec::new();
+    for a in &s.args {
+        let a = super::super::typescript::TypeScriptExtractor::peel_wrappers(*a);
+        if a.kind() == "array" {
+            out.extend(
+                a.named_children(&mut a.walk())
+                    .filter_map(|e| class_of(e, s.source, true, &s.fx.bindings)),
+            );
+        } else {
+            out.extend(class_of(a, s.source, true, &s.fx.bindings));
+        }
+    }
+    out
+}
+
+/// The receiver is a property or parameter typed with a class of `family`
+/// (`private readonly emitter: EventEmitter2`) or built from one; an untyped `emitter`
+/// (a socket, a Node `EventEmitter`) is not the application bus.
+fn typed_receiver(s: &Site, family: &str) -> bool {
+    s.receiver_key()
+        .is_some_and(|k| s.fx.receivers.is_client(family, &k) == Some(true))
+}
+
+fn event_emitter_receiver(s: &Site) -> bool {
+    typed_receiver(s, EVENT_EMITTER[0])
+}
+
+fn cqrs_receiver(s: &Site) -> bool {
+    typed_receiver(s, CQRS[0])
+}
+
 // ---- libraries --------------------------------------------------------------------
 
 const KAFKAJS: &[&str] = &["kafkajs", "@confluentinc/kafka-javascript"];
 const NEST: &[&str] = &["@nestjs/microservices"];
+/// In-process buses (9.0 ticket T4): NestJS EventEmitter2 and CQRS. Neither is a broker; both
+/// are recorded under [`mesh_core::Broker::InProc`].
+const EVENT_EMITTER: &[&str] = &["@nestjs/event-emitter", "eventemitter2"];
+const CQRS: &[&str] = &["@nestjs/cqrs"];
 const KAFKA_ANY: &[&str] = &[
     "kafkajs",
     "@confluentinc/kafka-javascript",
@@ -427,6 +527,8 @@ pub(super) const FAMILIES: &[&[&str]] = &[
     SERVICE_BUS,
     STOMP,
     NEST,
+    EVENT_EMITTER,
+    CQRS,
 ];
 
 macro_rules! call {
@@ -957,6 +1059,72 @@ pub(super) const CALL_RULES: &[CallRule] = &[
         "stomp subscribe",
         first_arg
     ),
+    // In-process buses (9.0 ticket T4): NestJS EventEmitter2 and CQRS. The receiver must be
+    // typed with a class of the library, so a socket's `emit` or a Node `EventEmitter` is not one.
+    CallRule {
+        libs: EVENT_EMITTER,
+        method: "emit",
+        role: Role::Produce,
+        kind: NodeKind::EventStream,
+        signature: "nestjs-event-emitter emit",
+        extract: inproc_event_names,
+        when: Some(event_emitter_receiver),
+    },
+    CallRule {
+        libs: EVENT_EMITTER,
+        method: "emitAsync",
+        role: Role::Produce,
+        kind: NodeKind::EventStream,
+        signature: "nestjs-event-emitter emitAsync",
+        extract: inproc_event_names,
+        when: Some(event_emitter_receiver),
+    },
+    CallRule {
+        libs: EVENT_EMITTER,
+        method: "on",
+        role: Role::Consume,
+        kind: NodeKind::EventStream,
+        signature: "nestjs-event-emitter on",
+        extract: inproc_event_names,
+        when: Some(event_emitter_receiver),
+    },
+    CallRule {
+        libs: EVENT_EMITTER,
+        method: "once",
+        role: Role::Consume,
+        kind: NodeKind::EventStream,
+        signature: "nestjs-event-emitter once",
+        extract: inproc_event_names,
+        when: Some(event_emitter_receiver),
+    },
+    CallRule {
+        libs: CQRS,
+        method: "publish",
+        role: Role::Produce,
+        kind: NodeKind::EventStream,
+        signature: "nestjs-cqrs eventBus.publish",
+        extract: new_class_args,
+        when: Some(cqrs_receiver),
+    },
+    CallRule {
+        libs: CQRS,
+        method: "publishAll",
+        role: Role::Produce,
+        kind: NodeKind::EventStream,
+        signature: "nestjs-cqrs eventBus.publishAll",
+        extract: new_class_args,
+        when: Some(cqrs_receiver),
+    },
+    // `commandBus.execute(new X())` and `queryBus.execute(new X())`.
+    CallRule {
+        libs: CQRS,
+        method: "execute",
+        role: Role::Produce,
+        kind: NodeKind::EventStream,
+        signature: "nestjs-cqrs bus.execute",
+        extract: new_class_args,
+        when: Some(cqrs_receiver),
+    },
 ];
 
 /// Pulsar `{ topic | topics }` of the options object.
@@ -1170,6 +1338,39 @@ pub(super) const DECORATOR_RULES: &[DecoratorRule] = &[
         signature: "sqs @SqsMessageHandler",
         extract: first_arg,
     },
+    // In-process buses (9.0 ticket T4).
+    DecoratorRule {
+        libs: EVENT_EMITTER,
+        name: "OnEvent",
+        role: Role::Consume,
+        kind: NodeKind::EventStream,
+        signature: "nestjs-event-emitter @OnEvent",
+        extract: inproc_event_names,
+    },
+    DecoratorRule {
+        libs: CQRS,
+        name: "EventsHandler",
+        role: Role::Consume,
+        kind: NodeKind::EventStream,
+        signature: "nestjs-cqrs @EventsHandler",
+        extract: class_args,
+    },
+    DecoratorRule {
+        libs: CQRS,
+        name: "CommandHandler",
+        role: Role::Consume,
+        kind: NodeKind::EventStream,
+        signature: "nestjs-cqrs @CommandHandler",
+        extract: class_args,
+    },
+    DecoratorRule {
+        libs: CQRS,
+        name: "QueryHandler",
+        role: Role::Consume,
+        kind: NodeKind::EventStream,
+        signature: "nestjs-cqrs @QueryHandler",
+        extract: class_args,
+    },
 ];
 
 /// The broker a rule's `signature` (`kafkajs producer.send`, `aws-sdk sns.publish`) speaks to:
@@ -1200,6 +1401,7 @@ pub(super) fn broker_of_signature(signature: &str) -> Option<Broker> {
         "servicebus" => Broker::ServiceBus,
         "eventhubs" => Broker::EventHubs,
         "stomp" => Broker::Stomp,
+        "nestjs-event-emitter" | "nestjs-cqrs" => Broker::InProc,
         "bull" | "bullmq" | "nestjs-bull" => Broker::Bull,
         "bee-queue" => Broker::BeeQueue,
         _ => return None,

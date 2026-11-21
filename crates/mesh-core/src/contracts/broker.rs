@@ -42,11 +42,15 @@ pub enum Broker {
     Stomp,
     Bull,
     BeeQueue,
+    /// In-process buses (NestJS EventEmitter2 and CQRS, Spring application events): the
+    /// "broker" is the application itself, so an in-process event named like a Kafka topic is
+    /// never the same channel (9.0 ticket T4).
+    InProc,
 }
 
 impl Broker {
     /// Every broker, in declaration order.
-    pub const ALL: [Broker; 16] = [
+    pub const ALL: [Broker; 17] = [
         Broker::Kafka,
         Broker::RabbitMq,
         Broker::Redis,
@@ -63,6 +67,7 @@ impl Broker {
         Broker::Stomp,
         Broker::Bull,
         Broker::BeeQueue,
+        Broker::InProc,
     ];
 
     /// The lower-case qualifier written in a hub name and accepted in a query target.
@@ -84,6 +89,7 @@ impl Broker {
             Broker::Stomp => "stomp",
             Broker::Bull => "bull",
             Broker::BeeQueue => "beequeue",
+            Broker::InProc => "inproc",
         }
     }
 

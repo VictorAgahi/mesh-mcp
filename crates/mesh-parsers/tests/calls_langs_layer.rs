@@ -142,11 +142,46 @@ fn layered_py_with_annotated_parameters_resolves_every_golden_hop() {
 }
 
 #[test]
-fn spring_monolith_resolves_the_golden_hops_once_entries_and_producers_exist() {
-    // In-process Spring events and `@Scheduled` entries are not read by this tree
-    // (later tickets), so the unmodified fixture has no entry -> producer path. The
-    // variant swaps its `@EventListener` / `publishEvent` pairs for the Kafka
-    // listener / template shapes the extractors do read, and nothing else.
+fn spring_monolith_resolves_the_golden_hops_through_events_and_schedules() {
+    // Spring application events and `@Scheduled` entries are read since T4: the unmodified
+    // fixture resolves the eight golden hops (h7 and h8 start from the cron entry).
+    let g = index("spring-monolith", &|_, c| c);
+    assert_eq!(
+        calls(&g),
+        edges(&[
+            ("BillingListener.onOrderPlaced", "BillingService.charge", X),
+            (
+                "BillingService.charge",
+                "PaymentPublisher.publishCharged",
+                X
+            ),
+            (
+                "BillingService.reconcile",
+                "PaymentPublisher.publishReconciled",
+                X
+            ),
+            ("OrderController.create", "OrderService.place", X),
+            ("OrderService.place", "OrderEventPublisher.announce", X),
+            (
+                "PaymentsKafkaListener.onCharged",
+                "FulfilmentService.start",
+                X
+            ),
+            ("ReconcileJob.hourly", "BillingService.reconcile", X),
+            (
+                "ShipmentListener.onFulfilmentStarted",
+                "ShipmentService.dispatch",
+                X
+            ),
+        ])
+    );
+}
+
+/// The Kafka shapes the Java extractor read before in-process events existed
+/// (`@KafkaListener`, `KafkaTemplate.send`) still produce the golden hops through the calls
+/// layer: the variant swaps the fixture's `@EventListener` / `publishEvent` pairs for them.
+#[test]
+fn spring_monolith_kafka_variant_resolves_the_same_hops() {
     let g = index("spring-monolith", &|name, c| match name {
         "BillingListener.java" => c
             .replace(
@@ -173,30 +208,42 @@ fn spring_monolith_resolves_the_golden_hops_once_entries_and_producers_exist() {
         ),
         _ => c,
     });
-    // Golden h1-h6 (h7 and h8 start from a cron entry, a later ticket).
-    assert_eq!(
-        calls(&g),
-        edges(&[
-            ("OrderController.create", "OrderService.place", X),
-            ("OrderService.place", "OrderEventPublisher.announce", X),
-            ("BillingListener.onOrderPlaced", "BillingService.charge", X),
-            (
-                "BillingService.charge",
-                "PaymentPublisher.publishCharged",
-                X
-            ),
-            (
-                "PaymentsKafkaListener.onCharged",
-                "FulfilmentService.start",
-                X
-            ),
-            (
-                "ShipmentListener.onFulfilmentStarted",
-                "ShipmentService.dispatch",
-                X
-            ),
-        ])
+    let got = calls(&g);
+    for (from, to) in [
+        ("OrderController.create", "OrderService.place"),
+        ("OrderService.place", "OrderEventPublisher.announce"),
+        ("BillingListener.onOrderPlaced", "BillingService.charge"),
+        ("BillingService.charge", "PaymentPublisher.publishCharged"),
+        ("PaymentsKafkaListener.onCharged", "FulfilmentService.start"),
+        (
+            "ShipmentListener.onFulfilmentStarted",
+            "ShipmentService.dispatch",
+        ),
+        ("ReconcileJob.hourly", "BillingService.reconcile"),
+    ] {
+        assert!(
+            got.iter().any(|(f, t, c)| f == from && t == to && *c == X),
+            "{from} -> {to} in {got:?}"
+        );
+    }
+    // The Kafka producers are Kafka, not in-process: the variant has no `InProc` site left on
+    // the two swapped publishers.
+    let path =
+        fixture_dir("spring-monolith").join("src/main/java/com/shop/OrderEventPublisher.java");
+    let fi = PolyglotIndexer::extract(
+        &path,
+        &kafka_publisher(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .replace("\r\n", "\n"),
+            "events.publishEvent(new OrderPlacedEvent(orderId, total));",
+            "order.placed",
+        ),
+        0,
     );
+    assert_eq!(fi.producers.len(), 1);
+    assert_eq!(fi.producers[0].1, "order.placed");
+    assert_eq!(fi.producer_brokers, vec![(0, mesh_core::Broker::Kafka)]);
 }
 
 fn kafka_publisher(c: String, publish: &str, topic: &str) -> String {
