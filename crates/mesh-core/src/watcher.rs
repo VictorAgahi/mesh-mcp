@@ -674,6 +674,7 @@ impl FileWatcherService {
                     | "scala"
                     | "sc"
                     | "proto"
+                    | "sql"
                     | "yaml"
                     | "yml"
                     | "properties"

@@ -16,6 +16,7 @@ pub mod rust_lang;
 pub mod scala;
 mod sfc;
 mod spec_shape;
+pub mod sql;
 pub mod swift;
 mod ts_calls;
 pub mod ts_config;
@@ -696,6 +697,10 @@ impl PolyglotIndexer {
         if sfc::is_sfc(file_path) {
             return Self::extract_component(file_path, content, repo_id, cfg, timeout_micros);
         }
+        // `.sql`: outbox inserts, NOTIFY and LISTEN (no grammar, a bounded scanner).
+        if sql::is_sql_path(file_path) {
+            return sql::extract_file(file_path, content, repo_id);
+        }
         let lang_kind = LanguageKind::from_path(&file_path.to_string_lossy());
         Self::extract_as(file_path, content, repo_id, cfg, lang_kind, timeout_micros)
     }
@@ -1165,6 +1170,20 @@ impl PolyglotIndexer {
                 Self::extract_yaml_contracts(file_path, content, repo_id, &mut out, cfg);
             }
             LanguageKind::Unknown => {}
+        }
+
+        // SQL held in string literals (outbox inserts, NOTIFY, LISTEN) of the host languages.
+        let host = match lang_kind {
+            LanguageKind::TypeScript | LanguageKind::Tsx | LanguageKind::JavaScript => {
+                Some(sql::Host::Ts)
+            }
+            LanguageKind::Go => Some(sql::Host::Go),
+            LanguageKind::Java => Some(sql::Host::Java),
+            LanguageKind::Python => Some(sql::Host::Python),
+            _ => None,
+        };
+        if let Some(host) = host.filter(|_| !out.parse_failed) {
+            sql::add_embedded(&mut out, file_path, content, repo_id, host);
         }
 
         out

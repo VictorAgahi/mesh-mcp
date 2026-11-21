@@ -1,0 +1,64 @@
+# Hand-annotated from the source of examples/eda/sql-outbox (T5). Never generated from tool output.
+# Events produced from SQL, not from a broker client call: outbox inserts, pg_notify / NOTIFY, LISTEN.
+# A producer or consumer sits on the line that carries the topic or channel literal (for the multi-line
+# outbox insert in order.shipped that is the VALUES line). Channels are keyed the way Postgres reads them:
+# an unquoted name is folded to lower case (listen Invoice_Ready listens on invoice_ready), a quoted one
+# is kept as written (the scorer lower-cases every key anyway).
+# Not resolved on purpose, so not annotated as sites: the insert whose topic is TG_TABLE_NAME || '.changed'
+# and the insert whose topic is the bind parameter $1. They are listed as negatives (a key made up for them
+# would be a false positive), together with the comment and string-literal mentions.
+corpus: sql-outbox
+root: examples/eda/sql-outbox
+config: mesh-mcp.toml
+languages: [sql, ts, go, java, python]
+
+producers:
+  - {id: p1, topic: order.created, file: db/migrations/001_order_outbox.sql, line: 13, language: sql, tags: [sql]}
+  - {id: p2, topic: stock_changed, file: db/migrations/001_order_outbox.sql, line: 33, language: sql, tags: [sql]}
+  - {id: p3, topic: invoice_ready, file: db/migrations/002_channels.sql, line: 2, language: sql, tags: [sql]}
+  - {id: p4, topic: Refund.Requested, file: db/migrations/002_channels.sql, line: 3, language: sql, tags: [sql]}
+  - {id: p5, topic: invoice_ready, file: db/migrations/002_channels.sql, line: 4, language: sql, tags: [sql]}
+  - {id: p6, topic: order.shipped, file: src/shipping.repo.ts, line: 10, language: ts, tags: [sql]}
+  - {id: p7, topic: stock_changed, file: go/stock.go, line: 11, language: go, tags: [sql]}
+  - {id: p8, topic: invoice.issued, file: java/InvoiceOutbox.java, line: 13, language: java, tags: [sql]}
+
+consumers:
+  - {id: c1, topic: invoice_ready, file: db/migrations/002_channels.sql, line: 5, language: sql, tags: [sql]}
+  - {id: c2, topic: stock_changed, file: src/notifier.py, line: 6, language: python, tags: [sql]}
+  - {id: c3, topic: order.created, file: src/order.relay.ts, line: 6, language: ts, tags: [kafka_basic]}
+  - {id: c4, topic: shipment.requested, file: src/shipment.consumer.ts, line: 9, language: ts, tags: [kafka_basic]}
+
+hops:
+  - id: h1
+    from: {symbol: ShipmentConsumer.handle, file: src/shipment.consumer.ts, line: 11}
+    to: {symbol: ShipmentService.ship, file: src/shipment.service.ts, line: 8}
+    via: injected_field
+    tags: [layered_calls]
+  - id: h2
+    from: {symbol: ShipmentService.ship, file: src/shipment.service.ts, line: 9}
+    to: {symbol: ShippingRepo.markShipped, file: src/shipping.repo.ts, line: 6}
+    via: injected_field
+    tags: [layered_calls]
+
+# The one chain: a Kafka consumer, two injected calls, then the outbox insert of ShippingRepo.markShipped.
+chains:
+  - id: ch1
+    entry: {kind: topic, value: shipment.requested}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/shipment.consumer.ts, line: 9, topic: shipment.requested}
+      - {kind: call, file: src/shipment.service.ts, line: 8}
+      - {kind: call, file: src/shipping.repo.ts, line: 6}
+      - {kind: produce, file: src/shipping.repo.ts, line: 10, topic: order.shipped}
+    tags: [sql, layered_calls]
+    min_hops: 2
+
+negatives:
+  - {kind: producer, file: db/migrations/001_order_outbox.sql, line: 2, note: "INSERT INTO mentioned in a comment"}
+  - {kind: producer, file: db/migrations/001_order_outbox.sql, line: 26, note: "outbox insert whose topic is TG_TABLE_NAME || '.changed': not statically resolved"}
+  - {kind: producer, file: db/migrations/001_order_outbox.sql, line: 43, note: "audit_log is not an outbox, and the INSERT text is inside a string literal"}
+  - {kind: producer, file: src/shipping.repo.ts, line: 7, note: "INSERT INTO outbox in a comment"}
+  - {kind: producer, file: src/shipping.repo.ts, line: 16, note: "outbox insert with the topic as bind parameter $1: not statically resolved"}
+  - {kind: producer, file: src/shipping.repo.ts, line: 20, note: "audit_log is not an outbox"}
+  - {kind: producer, file: src/shipping.repo.ts, line: 24, note: "prose string that mentions INSERT INTO outbox"}
+  - {kind: consumer, file: src/notifier.py, line: 5, note: "LISTEN in a comment"}
