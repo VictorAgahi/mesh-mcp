@@ -6,6 +6,7 @@ pub mod search_docs;
 pub mod smart_search;
 #[cfg(feature = "test-util")]
 pub mod test_slow_op;
+pub mod trace_flow;
 pub mod visualize_mesh;
 
 use crate::protocol::RequestMeta;
@@ -23,6 +24,7 @@ use smart_search::SmartSearchTool;
 use std::sync::{Arc, LazyLock};
 #[cfg(feature = "test-util")]
 use test_slow_op::TestSlowOpTool;
+use trace_flow::TraceFlowTool;
 use visualize_mesh::VisualizeMeshTool;
 
 /// JSON-RPC error tuple used throughout tool dispatch.
@@ -109,6 +111,7 @@ impl ToolRegistry {
                 ToolRegistry::describe::<SearchDocsTool>(),
                 ToolRegistry::describe::<VisualizeMeshTool>(),
                 ToolRegistry::describe::<DiffMeshTool>(),
+                ToolRegistry::describe::<TraceFlowTool>(),
             ])
         });
         TOOLS.clone()
@@ -136,6 +139,7 @@ impl ToolRegistry {
                 | SearchDocsTool::NAME
                 | VisualizeMeshTool::NAME
                 | DiffMeshTool::NAME
+                | TraceFlowTool::NAME
         ) || {
             #[cfg(feature = "test-util")]
             {
@@ -199,6 +203,7 @@ impl ToolRegistry {
                 Self::invoke::<VisualizeMeshTool>(arguments, state, session).await?
             }
             DiffMeshTool::NAME => Self::invoke::<DiffMeshTool>(arguments, state, session).await?,
+            TraceFlowTool::NAME => Self::invoke::<TraceFlowTool>(arguments, state, session).await?,
             #[cfg(feature = "test-util")]
             TestSlowOpTool::NAME => {
                 Self::invoke::<TestSlowOpTool>(arguments, state, session).await?
@@ -1029,7 +1034,7 @@ roots = ["."]
     fn test_list_tools_contains_all_tools() {
         let tools = ToolRegistry::list_tools();
         let arr = tools.as_array().expect("tools array");
-        assert_eq!(arr.len(), 7);
+        assert_eq!(arr.len(), 8);
         let names: Vec<_> = arr.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"smart_search"));
         assert!(names.contains(&"find_dependents"));
@@ -1038,6 +1043,7 @@ roots = ["."]
         assert!(names.contains(&"search_docs"));
         assert!(names.contains(&"visualize_mesh"));
         assert!(names.contains(&"diff_mesh"));
+        assert!(names.contains(&"trace_flow"));
     }
 
     /// Regression test for Issue 3: assert generated JSON schemas match real tool structs

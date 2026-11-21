@@ -1,5 +1,7 @@
 use mesh_core::{
-    ContractNode, DocSection, GrpcTrace, ImpactFlow, ImpactMatrix, ImpactScope, RepoId,
+    ContractNode, DocSection, EdgeConfidence, FlowDirection, FlowEnd, FlowHop, FlowLimit,
+    FlowOutcome, FlowSite, FlowStepKind, FlowTrace, GrpcTrace, ImpactFlow, ImpactMatrix,
+    ImpactScope, RepoId,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -773,6 +775,11 @@ impl MarkdownFormatter {
             }
         ));
 
+        if matrix.call_linked_hops {
+            header.push_str(
+                "*Past the first hop, the walk follows resolved calls (`Calls` edges) from each consumer to the publishes they reach, the chain engine of `trace_flow` (which shows each hop's call path, line by line).*\n",
+            );
+        }
         if matrix.file_linked_hops {
             header.push_str(
                 "*Past the first hop, the walk follows producers declared in the same file as a consumer (a handler that re-emits): those rows are `heuristic`.*\n",
@@ -903,6 +910,348 @@ impl MarkdownFormatter {
             ));
         }
         header
+    }
+
+    /// Renders one page of a [`FlowTrace`] (`trace_flow`, 9.0): the header and
+    /// notes, then hops from `offset` in depth-first order, as many as fit the
+    /// 48 KB budget (at least one, so a page always makes progress). Every step
+    /// is one numbered line with its `path:line`; a `call` line gives the callee
+    /// declaration first, then the call site.
+    pub fn format_flow_trace(trace: &FlowTrace, roots: &[PathBuf], offset: usize) -> String {
+        let forward = trace.direction == FlowDirection::Forward;
+        let dir = if forward { "forward" } else { "reverse" };
+        let total = trace.hops.len();
+        let weakest = trace
+            .hops
+            .iter()
+            .map(|h| h.chain_confidence)
+            .max_by_key(|c| match c {
+                EdgeConfidence::Exact => 0,
+                EdgeConfidence::Heuristic => 1,
+                EdgeConfidence::Ambiguous => 2,
+            })
+            .map_or("none", |c| c.label());
+        let mut out = format!(
+            "## Flow trace for `{}` ({dir})\n",
+            Self::clamp_chars(&trace.target.replace('`', "'"), Self::NOTE_NAME_CHARS)
+        );
+        out.push_str(&format!(
+            "*Entry: {} `{}`, {} entry site(s). Bounds: event_depth {}, call_depth {}, fan_out {}. Hops: {total}; weakest chain confidence: {weakest}.*\n",
+            trace.entry_kind,
+            Self::clamp_chars(&trace.target.replace('`', "'"), Self::NOTE_NAME_CHARS),
+            trace.entries.len(),
+            trace.bounds.event_depth,
+            trace.bounds.call_depth,
+            trace.bounds.fan_out,
+        ));
+        if forward {
+            out.push_str("*A hop runs from an entry site (consumer, route, handler) through the resolved calls to a publish. A `call` line gives the callee declaration, then the call site. Hop 1.2 continues hop 1 through a topic it publishes. Confidence per step: exact / heuristic / ambiguous; a hop is as strong as its weakest step, a chain as its weakest hop.*\n");
+        } else {
+            out.push_str("*A hop runs from a publish back through its callers to the entry site (consumer, route, handler) that reaches it. A `called by` line gives the caller declaration, then the call site. Hop 1.2 continues hop 1 through a topic its consumer listens to, back to that topic's producers. Confidence per step: exact / heuristic / ambiguous; a chain is as strong as its weakest hop.*\n");
+        }
+        if trace.entries.is_empty() {
+            out.push_str(&format!(
+                "\n*No entry matched `{}` across {} indexed workspace roots (0 matches). Pass an event or topic name, a route written `VERB /path`, or a handler as `Class.method`; a handler is found only on a resolved entry -> publish call path or by its exact declaration name.*\n",
+                Self::clamp_chars(&trace.target.replace('`', "'"), Self::NOTE_NAME_CHARS),
+                roots.len()
+            ));
+            return out;
+        }
+        if offset == 0 {
+            out.push_str(&Self::flow_notes(trace, roots));
+        } else {
+            out.push_str(
+                "*Notes (depth limits, chain ends, caps) are on the first page (`offset: 0`).*\n",
+            );
+        }
+        if offset >= total {
+            out.push_str(&format!(
+                "\n*No hops at `offset: {offset}`: the trace has {total} hop(s); request an offset below {total}.*\n"
+            ));
+            return out;
+        }
+        const FOOTER_UPPER_BOUND: usize = 160;
+        let budget = (MAX_OUTPUT_BYTES - NON_RESULT_RESERVE_BYTES)
+            .saturating_sub(out.len() + 128 + FOOTER_UPPER_BOUND);
+        let mut body = String::new();
+        let mut end = offset;
+        for hop in trace.hops.iter().skip(offset) {
+            let block = Self::flow_hop(trace, hop, roots);
+            if end > offset && body.len() + block.len() > budget {
+                break;
+            }
+            body.push_str(&block);
+            end += 1;
+        }
+        if offset > 0 || end < total {
+            out.push_str(&format!(
+                "*Showing hops {}-{end} of {total}.*\n",
+                offset + 1
+            ));
+        }
+        out.push_str(&body);
+        if end < total {
+            out.push_str(&format!(
+                "\n*More hops: repeat the same call with `offset: {end}` for the next page.*\n"
+            ));
+        }
+        out
+    }
+
+    /// `` `name` `` with backticks neutralised and a bounded length.
+    fn flow_name(name: &str) -> String {
+        format!(
+            "`{}`",
+            Self::clamp_chars(&name.replace(['`', '\n', '\r'], "'"), Self::NOTE_NAME_CHARS)
+        )
+    }
+
+    /// `path:line` of `file` at `line`, root-relative for `repo`.
+    fn flow_place(file: &Path, line: usize, repo: RepoId, roots: &[PathBuf]) -> String {
+        match roots
+            .get(repo as usize)
+            .and_then(|root| file.strip_prefix(root).ok())
+        {
+            Some(rel) => format!("{}:{line}", Self::slash_path(rel)),
+            None => format!("{}:{line}", file.display()),
+        }
+    }
+
+    fn flow_hop(trace: &FlowTrace, hop: &FlowHop, roots: &[PathBuf]) -> String {
+        let forward = trace.direction == FlowDirection::Forward;
+        let mut out = format!(
+            "\n### Hop {} (level {}, {}; chain {}){}\n",
+            hop.id,
+            hop.level,
+            hop.confidence.label(),
+            hop.chain_confidence.label(),
+            if hop.fallback {
+                " - same file, no call path (legacy rule, heuristic)"
+            } else {
+                ""
+            }
+        );
+        for (i, step) in hop.steps.iter().enumerate() {
+            let at = format!("`{}`", Self::location(step.node, roots));
+            let topic = step
+                .topic
+                .as_deref()
+                .map(|t| format!(" {}", Self::flow_name(t)))
+                .unwrap_or_default();
+            let line = match step.kind {
+                FlowStepKind::Call => {
+                    let site = match (step.call_file, step.call_line) {
+                        (Some(f), Some(l)) => {
+                            format!(" at `{}`", Self::flow_place(f, l, step.node.repo_id, roots))
+                        }
+                        _ => String::new(),
+                    };
+                    let via = step
+                        .via
+                        .as_deref()
+                        .map(|v| format!("{v}, "))
+                        .unwrap_or_default();
+                    format!(
+                        "{} {} ({at}){site} [{via}{}]",
+                        if forward { "call" } else { "called by" },
+                        Self::flow_name(&step.node.name),
+                        step.confidence.label()
+                    )
+                }
+                kind => {
+                    let verb = match kind {
+                        FlowStepKind::Consume => "consume",
+                        FlowStepKind::Produce => "produce",
+                        FlowStepKind::Route => "route",
+                        FlowStepKind::Cron => "cron",
+                        _ => "handler",
+                    };
+                    let label = match kind {
+                        FlowStepKind::Consume | FlowStepKind::Produce => topic,
+                        // shortcut: the route is shown without the root's configured
+                        // HTTP prefix (`[http] prefixes`); pass it in when a user asks.
+                        FlowStepKind::Route => format!(
+                            " {}",
+                            Self::flow_name(
+                                &mesh_core::routes::display_route(step.node, None)
+                                    .unwrap_or_else(|| step.node.name.to_string())
+                            )
+                        ),
+                        _ => format!(" {}", Self::flow_name(&step.node.name)),
+                    };
+                    let within = step
+                        .within
+                        .map(|c| {
+                            format!(
+                                ", in {} (`{}`)",
+                                Self::flow_name(&c.name),
+                                Self::location(c, roots)
+                            )
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "{verb}{label} at {at}{within} [{}]",
+                        step.confidence.label()
+                    )
+                }
+            };
+            out.push_str(&format!("{}. {line}\n", i + 1));
+        }
+        let (counterpart, raise) = if forward {
+            ("consumer", "publish")
+        } else {
+            ("producer", "entry")
+        };
+        match hop.end {
+            Some(FlowEnd::ChainEnd) => out.push_str(&format!(
+                "-> **Chain end**: no statically resolved {raise} {} (within call_depth {}). If one is resolved at runtime (registry, config, template string), the chain continues there.\n",
+                if forward { "is reached from here" } else { "reaches this publish" },
+                trace.bounds.call_depth
+            )),
+            Some(FlowEnd::Origin) => out.push_str("-> Chain starts here.\n"),
+            None => {}
+        }
+        for nx in &hop.next {
+            let what = match &nx.outcome {
+                FlowOutcome::Followed(ids) => {
+                    let names: Vec<&str> = ids
+                        .iter()
+                        .filter_map(|&i| trace.hops.get(i))
+                        .map(|h| h.id.as_str())
+                        .collect();
+                    format!("continues in hop {}", names.join(", "))
+                }
+                FlowOutcome::NoCounterpart => {
+                    format!("no {counterpart} statically resolved (chain end)")
+                }
+                FlowOutcome::DepthLimit(n) => {
+                    format!(
+                    "**Depth limit reached**: {n} {counterpart}(s) not expanded (event_depth {}{})",
+                    trace.bounds.event_depth,
+                    if trace.bounds.event_depth >= mesh_core::MAX_EVENT_DEPTH {
+                        ", the maximum".to_string()
+                    } else {
+                        format!("; repeat with `event_depth: {}`", trace.bounds.event_depth + 1)
+                    }
+                )
+                }
+                FlowOutcome::AlreadyTraced => {
+                    "already traced in this answer (cycle or join), not expanded again".to_string()
+                }
+            };
+            let more = if nx.more > 0 {
+                format!(
+                    ", +{} more {counterpart}(s) not followed (fan_out {})",
+                    nx.more, trace.bounds.fan_out
+                )
+            } else {
+                String::new()
+            };
+            out.push_str(&format!(
+                "-> {}: {what}{more}\n",
+                Self::flow_name(&nx.topic)
+            ));
+        }
+        out
+    }
+
+    /// Notes of the first page: depth limits, chain ends, bounds hit.
+    fn flow_notes(trace: &FlowTrace, roots: &[PathBuf]) -> String {
+        let mut out = String::new();
+        let counterpart = if trace.direction == FlowDirection::Forward {
+            "consumer"
+        } else {
+            "producer"
+        };
+        if !trace.unexpanded.is_empty() {
+            out.push_str(&format!(
+                "\n**Depth limit reached** (event_depth {}): {} {counterpart}(s) were not expanded: {}.\n",
+                trace.bounds.event_depth,
+                trace.unexpanded.len(),
+                Self::node_labels(&trace.unexpanded, roots)
+            ));
+        }
+        if !trace.chain_end.is_empty() {
+            out.push_str(&format!(
+                "\n**Chain ends** at {} site(s) with no statically resolved onward {}: {}.\n",
+                trace.chain_end.len(),
+                if trace.direction == FlowDirection::Forward {
+                    "publish"
+                } else {
+                    "entry"
+                },
+                Self::node_labels(&trace.chain_end, roots)
+            ));
+        }
+        let call_depth: Vec<&FlowLimit> = trace
+            .limits
+            .iter()
+            .filter(|l| matches!(l, FlowLimit::CallDepth(_)))
+            .collect();
+        let fan_out: Vec<&FlowLimit> = trace
+            .limits
+            .iter()
+            .filter(|l| matches!(l, FlowLimit::FanOut(..)))
+            .collect();
+        let label = |s: &FlowSite| -> String {
+            format!(
+                "{} (`{}`)",
+                Self::flow_name(&s.name),
+                Self::flow_place(&s.file, s.line, s.repo_id, roots)
+            )
+        };
+        if !call_depth.is_empty() {
+            let mut shown: Vec<String> = call_depth
+                .iter()
+                .take(Self::NOTE_LABELS)
+                .filter_map(|l| match l {
+                    FlowLimit::CallDepth(s) => Some(label(s)),
+                    _ => None,
+                })
+                .collect();
+            if call_depth.len() > Self::NOTE_LABELS {
+                shown.push(format!("+{} more", call_depth.len() - Self::NOTE_LABELS));
+            }
+            out.push_str(&format!(
+                "\n**Call depth limit reached** (call_depth {}) at {} callable(s) with further calls: {}. Raise `call_depth` (max {}).\n",
+                trace.bounds.call_depth,
+                call_depth.len(),
+                shown.join(", "),
+                mesh_core::MAX_CALL_DEPTH
+            ));
+        }
+        if !fan_out.is_empty() {
+            let mut shown: Vec<String> = fan_out
+                .iter()
+                .take(Self::NOTE_LABELS)
+                .filter_map(|l| match l {
+                    FlowLimit::FanOut(s, _, more) => Some(format!("{} +{more} more", label(s))),
+                    _ => None,
+                })
+                .collect();
+            if fan_out.len() > Self::NOTE_LABELS {
+                shown.push(format!("+{} more", fan_out.len() - Self::NOTE_LABELS));
+            }
+            out.push_str(&format!(
+                "\n**Fan-out limit reached** (fan_out {}): {}. Raise `fan_out` (max {}).\n",
+                trace.bounds.fan_out,
+                shown.join(", "),
+                mesh_core::MAX_FAN_OUT
+            ));
+        }
+        if trace.capped {
+            out.push_str(&format!(
+                "\n**Hop limit reached**: the trace stopped at {} hops. Narrow the entry or lower `event_depth`.\n",
+                mesh_core::MAX_FLOW_HOPS
+            ));
+        }
+        if trace.hidden > 0 {
+            out.push_str(&format!(
+                "\n*{} site(s) in test files left out (`include_tests: true` to follow them).*\n",
+                trace.hidden
+            ));
+        }
+        out
     }
 
     /// Most handlers [`Self::format_route_impact`] lists.
@@ -1186,6 +1535,7 @@ mod tests {
             no_producer_resolved: false,
             no_consumer_resolved: false,
             file_linked_hops: false,
+            call_linked_hops: false,
             depth: 1,
             unexpanded: Vec::new(),
             chain_end: Vec::new(),
@@ -1520,6 +1870,7 @@ mod tests {
             downstream_producers: Vec::new(),
             unexpanded: Vec::new(),
             chain_end: Vec::new(),
+            call_linked_producers: Vec::new(),
             files_scanned: 1248,
         };
         let out = MarkdownFormatter::format_impact_flow(&empty_flow);
@@ -1537,5 +1888,133 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    /// A consumer whose handler calls `n` imported publishers, each publishing
+    /// `per` topics, with long paths: far more hops than one 48 KB page holds.
+    fn wide_flow_graph(n: usize, per: usize) -> mesh_core::ContractGraph {
+        use mesh_core::{
+            CallFact, CallFacts, CallReceiver, CallableFact, CompactStr, ImportFact, NodeKind,
+        };
+        let dir = format!("/w/{}", "deeply_nested_directory_name/".repeat(4));
+        let node = |name: &str, file: &str, line: usize| ContractNode {
+            id: 0,
+            name: CompactStr::new(name),
+            kind: NodeKind::KafkaTopic,
+            file_path: std::sync::Arc::from(Path::new(file)),
+            line_start: line,
+            line_end: line,
+            package: CompactStr::new("app"),
+            repo_id: 0,
+            signature: None,
+            docstring: None,
+        };
+        let callable = |name: &str| CallableFact {
+            name: CompactStr::new(name),
+            owner: None,
+            line_start: 1,
+            line_end: 400,
+        };
+        let mut g = mesh_core::ContractGraph::new();
+        let hub = format!("{dir}hub.ts");
+        let callees: Vec<String> = (0..n)
+            .map(|k| format!("publisher_function_{k:03}"))
+            .collect();
+        g.add_call_facts(
+            std::sync::Arc::from(Path::new(&hub)),
+            0,
+            CompactStr::new("app"),
+            CallFacts {
+                callables: vec![callable("hub")],
+                call_sites: callees
+                    .iter()
+                    .map(|c| CallFact {
+                        caller: 0,
+                        callee: CompactStr::new(c),
+                        receiver: CallReceiver::ImportedSymbol,
+                        line: 3,
+                    })
+                    .collect(),
+                imports: callees
+                    .iter()
+                    .map(|c| ImportFact {
+                        local: CompactStr::new(c),
+                        exported: CompactStr::new(c),
+                        module: CompactStr::new(format!("./{c}")),
+                    })
+                    .collect(),
+                ..CallFacts::default()
+            },
+        );
+        let c = g.add_node(node("in", &hub, 2));
+        g.add_consumer(c, "in");
+        for (k, callee) in callees.iter().enumerate() {
+            let file = format!("{dir}{callee}.ts");
+            g.add_call_facts(
+                std::sync::Arc::from(Path::new(&file)),
+                0,
+                CompactStr::new("app"),
+                CallFacts {
+                    callables: vec![callable(callee)],
+                    ..CallFacts::default()
+                },
+            );
+            for t in 0..per {
+                let topic = format!("topic.{k:03}.{t:02}");
+                let id = g.add_node(node(&topic, &file, 10 + t));
+                g.add_producer(id, &topic);
+            }
+        }
+        g.reconcile_edges();
+        g
+    }
+
+    #[test]
+    fn flow_trace_pages_by_hop_under_the_payload_cap() {
+        use mesh_core::{FlowBounds, FlowDirection, FlowEntry};
+        let g = wide_flow_graph(50, 10);
+        let trace = g.trace_flow(
+            FlowEntry::Topic("in"),
+            FlowDirection::Forward,
+            FlowBounds::clamped(None, Some(1), Some(50)),
+            &|_| false,
+        );
+        assert_eq!(trace.hops.len(), 500);
+        let roots = vec![PathBuf::from("/w")];
+        let mut offset = 0;
+        let mut seen: Vec<String> = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = MarkdownFormatter::format_flow_trace(&trace, &roots, offset);
+            assert!(
+                page.len() <= MAX_OUTPUT_BYTES - NON_RESULT_RESERVE_BYTES,
+                "{}",
+                page.len()
+            );
+            seen.extend(
+                page.lines()
+                    .filter_map(|l| l.strip_prefix("### Hop "))
+                    .map(|l| l.split(' ').next().unwrap_or("").to_string()),
+            );
+            pages += 1;
+            let next = page
+                .split("More hops: repeat the same call with `offset: ")
+                .nth(1)
+                .and_then(|rest| rest.split('`').next())
+                .and_then(|n| n.parse::<usize>().ok());
+            match next {
+                Some(n) => {
+                    assert!(n > offset, "page must make progress");
+                    offset = n;
+                }
+                None => break,
+            }
+        }
+        assert!(pages > 1, "500 hops must not fit one page");
+        let expected: Vec<String> = trace.hops.iter().map(|h| h.id.clone()).collect();
+        assert_eq!(seen, expected, "every hop exactly once, in order");
+        // Past the end: a clear note, no hop.
+        let past = MarkdownFormatter::format_flow_trace(&trace, &roots, 10_000);
+        assert!(past.contains("No hops at `offset: 10000`"), "{past}");
     }
 }

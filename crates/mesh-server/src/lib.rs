@@ -151,6 +151,7 @@ WHEN TO USE IT: for a question that spans several repositories, start from the g
 3. gRPC (server handlers, \"who calls this RPC\" client call sites, .proto wire-format checks): `analyze_grpc`; `find_dependents` is for imports and symbol usage, not RPC callers.
 4. Symbol declarations across roots: `smart_search`.
 5. What does my branch change in the mesh / what will this change break (contract-level diff against a Git base, with callers, dependents and the .proto wire check): `diff_mesh`.
+6. An event flow end to end (what does handling an event, route or handler trigger; what ends up publishing an event), hop by hop with each call's path:line: `trace_flow`.
 For an exact identifier (an enum value, a class name), plain grep is fine.
 
 LOADING: in clients that defer MCP tool schemas (such as Claude Code), load them with:

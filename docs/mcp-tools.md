@@ -1,6 +1,6 @@
 # MeshMCP MCP Tools Reference
 
-This document specifies the seven Model Context Protocol (MCP) tools exposed by MeshMCP: their arguments, output formats and error handling. The JSON schemas below are checked against the code by `test_mcp_tools_md_schema_drift_check` (`crates/mesh-server/src/tools/mod.rs`).
+This document specifies the eight Model Context Protocol (MCP) tools exposed by MeshMCP: their arguments, output formats and error handling. The JSON schemas below are checked against the code by `test_mcp_tools_md_schema_drift_check` (`crates/mesh-server/src/tools/mod.rs`).
 
 ---
 
@@ -34,6 +34,7 @@ graph LR
     T -->|search_docs| TDO[Sanitized Architecture Docs]
     T -->|visualize_mesh| TV[Mermaid / HTML Topology]
     T -->|diff_mesh| TDM[Branch Contract Diff & Impact]
+    T -->|trace_flow| TF[End-to-End Event Chains, Hop by Hop]
 ```
 
 ---
@@ -535,11 +536,18 @@ written, it is tried once more with `.`, `:`, `-`, `/` turned into `_`, so the v
 counted unless `include_tests: true`.
 
 #### Depth
-Each hop past the first follows the `Produces` edges of the consumers reached on the previous hop
-**and of the producers declared in the same file as one of them** — a handler usually re-emits
-from a separate call site (a `produce:` pattern, a `client.emit` in another method), not from the
-node that consumes. Those rows are `heuristic` (linked by file, not by a call edge), and the output
-says the walk used them.
+Since 9.0, each hop past the first comes from the chain engine that `trace_flow` renders
+(`crates/mesh-core/src/contracts/flow.rs`): from each consumer reached on the previous hop, the
+resolved intra-repository calls (`Calls` edges) to every publish they reach, then that topic's
+consumers. `depth: N` here follows `N - 1` event levels, the same set of producers, topics and
+consumers as `trace_flow` with `event_depth: N - 1` and no fan-out cap (a shared test checks it on
+the fixtures). The matrix lists those elements as rows; `trace_flow` shows the call path of each hop.
+
+Where no call path reaches a publish (a language without call extraction yet, a call the resolver
+could not follow), the 8.x rule is the fallback: the producers declared in the same file as the
+consumer (a handler that re-emits from a `produce:` pattern or another method). That fallback is
+labelled: those rows are `heuristic`, and the output says the walk used them. A consumer whose own
+node carries a `Produces` edge is followed through that edge as before.
 
 #### Gaps said explicitly
 When an event matches but no producer outside tests was resolved, the output says so (**No
@@ -876,6 +884,99 @@ shortened:
 - - RPC `UserService.DeleteUser` (base L6): `rpc DeleteUser(DeleteUserRequest) returns (Empty);`
 
 *No contract-level change (body edits only): `events/consumer.ts`*
+```
+
+---
+
+### Tool 8: `trace_flow`
+
+#### Description
+End-to-end event flow chains, hop by hop (9.0). The entry is an event / topic, an HTTP route
+(`VERB /path`), a handler or a scheduled method (`Class.method`). A **hop** runs from an entry site
+(a consumer, a route, a handler) through every resolved intra-repository call to each publish it
+reaches; the topic published continues the chain at its consumers, one **event level** further.
+`direction: reverse` runs the same walk backwards: from a publish, through its callers, to the entry
+sites that reach it, then to the producers of the topics those entries consume.
+
+Each step is one numbered line with a `path:line`:
+- `consume` / `produce`: the site, with the topic, and on the first step the callable enclosing it.
+- `call` (forward): the callee declaration line, then the call site in the caller (`at path:line`),
+  the resolution rule (`this`, `injected_field`, `imported_function`, `same_module`) and the
+  confidence. `called by` (reverse): the caller declaration, then the call site.
+
+Confidence per step is `exact`, `heuristic` or `ambiguous` (an interface call with several
+implementations is followed into each, `ambiguous`). A hop is as strong as its weakest step and a
+chain as its weakest hop; both are printed. Hop ids nest: hop `1.2` continues hop `1` through a
+topic it publishes. After the steps, one line per topic says what follows: the next hops, "no
+consumer statically resolved" (chain end), **Depth limit reached**, or "already traced" (a cycle or
+a join: each topic is expanded once per answer).
+
+Calls are resolved without a type checker, from the calls layer (`Callable` nodes and `Calls`
+edges, `contracts/calls.rs`): today TypeScript / NestJS / Angular; Java/Spring, Go and Python when
+their call extraction lands. A hop with no resolved call path falls back on the producers declared
+in the entry's own file, marked `same file, no call path (legacy rule, heuristic)`.
+
+Bounds, each a parameter with a cap: `event_depth` (default 3, max 5), `call_depth` per hop
+(default 6, max 12), `fan_out` per node (default 20, max 50, the rest reported as `+K more`). A bound
+that cut the walk is named in the notes (**Call depth limit reached**, **Fan-out limit reached**,
+**Depth limit reached**); **Chain ends** lists the entries with no statically resolved onward
+publish. At most 2,000 hops per trace (**Hop limit reached**). Every list is sorted by path, line,
+name and id, so two runs on the same index give byte-identical answers.
+
+`entry_kind`: `auto` (default: a `VERB /path` is a route, else an indexed event, else a handler),
+`topic`, `route`, `handler`, `cron` (a scheduled method, resolved like a handler: schedules
+themselves are not indexed yet). A handler is found among the callables of resolved entry -> publish
+paths, then by exact declaration name.
+
+> **Negative constraints:** DO NOT USE for the flat list of every producer and consumer of an
+> event or for a gRPC impact (use `analyze_impact`), for "who calls this gRPC method" (use
+> `analyze_grpc`) or for imports (use `find_dependents`). It does NOT follow HTTP client calls across
+> repositories, dynamic dispatch through reflection or runtime registries, or calls through local
+> variables. "Chain end" is the end of the statically resolved chain, never proof that nothing follows.
+
+#### Pagination and truncation
+Paged by hop: a page holds as many hops as fit the 48 KB payload budget (at least one), in
+depth-first order; the footer `More hops: repeat the same call with offset: N` gives the next
+page. The notes are on the first page.
+
+#### JSON Schema
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["target"],
+  "properties": {
+    "target": { "type": "string" },
+    "entry_kind": { "enum": ["auto", "topic", "route", "handler", "cron"] },
+    "direction": { "enum": ["forward", "reverse"] },
+    "event_depth": { "type": "integer", "minimum": 0, "maximum": 255 },
+    "call_depth": { "type": "integer", "minimum": 0, "maximum": 255 },
+    "fan_out": { "type": "integer", "minimum": 0, "maximum": 255 },
+    "offset": { "type": "integer", "minimum": 0 },
+    "include_tests": { "type": "boolean" }
+  }
+}
+```
+
+#### Sample Response (`examples/eda/layered-ts`, `POST /orders`, first two hops)
+```markdown
+## Flow trace for `POST /orders` (forward)
+*Entry: route `POST /orders`, 1 entry site(s). Bounds: event_depth 3, call_depth 6, fan_out 20. Hops: 4; weakest chain confidence: ambiguous.*
+
+### Hop 1 (level 1, exact; chain exact)
+1. route `POST /orders` at `src/order.controller.ts:9`, in `OrderController.create` (`src/order.controller.ts:9`) [exact]
+2. call `OrderService.place` (`src/order.service.ts:8`) at `src/order.controller.ts:10` [injected_field, exact]
+3. call `InventoryService.reserve` (`src/inventory.service.ts:8`) at `src/order.service.ts:10` [injected_field, exact]
+4. call `StockPublisher.publishReserved` (`src/stock.publisher.ts:8`) at `src/inventory.service.ts:10` [injected_field, exact]
+5. produce `stock.reserved` at `src/stock.publisher.ts:9` [exact]
+-> `stock.reserved`: continues in hop 1.1
+
+### Hop 1.1 (level 2, exact; chain exact)
+1. consume `stock.reserved` at `src/shipping.consumer.ts:10`, in `ShippingConsumer.onStockReserved` (`src/shipping.consumer.ts:10`) [exact]
+2. call `ShippingService.schedule` (`src/shipping.service.ts:8`) at `src/shipping.consumer.ts:11` [injected_field, exact]
+3. call `ShipmentPublisher.publishScheduled` (`src/shipment.publisher.ts:8`) at `src/shipping.service.ts:10` [injected_field, exact]
+4. produce `shipment.scheduled` at `src/shipment.publisher.ts:9` [exact]
+-> `shipment.scheduled`: continues in hop 1.1.1, 1.1.2
 ```
 
 ---

@@ -721,6 +721,7 @@ impl ContractGraph {
             downstream_producers: Vec::new(),
             unexpanded: Vec::new(),
             chain_end: Vec::new(),
+            call_linked_producers: Vec::new(),
             files_scanned: self.file_to_nodes.len(),
         }
     }
@@ -767,142 +768,70 @@ impl ContractGraph {
             flow.unexpanded = unexpanded;
             return flow;
         }
-        let mut expanded: Vec<NodeId> = Vec::new();
-
-        let mut visited_topics: HashSet<NodeId> = flow.topics.iter().map(|n| n.id).collect();
-        let mut visited_nodes: HashSet<NodeId> = flow
+        // Hops past the first come from the chain engine (`flow`), the same one
+        // `trace_flow` renders: from each consumer, the resolved calls to every
+        // publish they reach; producers declared in the consumer's own file only
+        // when no call path reaches a publish (the 8.x same-file rule, heuristic).
+        // `depth` counts the direct hop, so the engine follows `depth - 1` levels.
+        // No fan-out cap: the matrix lists every row and pages them.
+        let starts: Vec<&ContractNode> = flow
+            .downstream_consumers
+            .iter()
+            .chain(flow.related_sagas.iter())
+            .copied()
+            .collect();
+        let seen_topics: HashSet<NodeId> = flow.topics.iter().map(|n| n.id).collect();
+        let trace = self.trace_from(
+            starts,
+            super::flow::FlowStepKind::Consume,
+            Some(flow.key.clone()),
+            seen_topics,
+            super::flow::FlowDirection::Forward,
+            super::flow::FlowBounds {
+                call_depth: super::flow::DEFAULT_CALL_DEPTH,
+                event_depth: depth - 1,
+                fan_out: usize::MAX,
+            },
+            &|_| false,
+        );
+        let mut seen_nodes: HashSet<NodeId> = flow
             .downstream_consumers
             .iter()
             .chain(flow.related_sagas.iter())
             .map(|n| n.id)
             .collect();
-        let mut frontier: HashSet<NodeId> = visited_nodes.clone();
-        let mut visited_producers: HashSet<NodeId> =
-            flow.upstream_producers.iter().map(|n| n.id).collect();
-
-        for _hop in 2..=depth {
-            if frontier.is_empty() {
-                break;
-            }
-            // A consumer rarely carries the `Produces` edge itself: the
-            // re-emission is a separate producer node (a `produce:` pattern
-            // call site, a `client.emit` in another method) in the same file.
-            // 7.0.6 walked only the consumer's own edges, so `depth: 2` gave
-            // the depth-1 answer on Volontariapp's post-processors, silently.
-            expanded.extend(frontier.iter().copied());
-            let frontier_files: HashSet<&FilePath> = frontier
-                .iter()
-                .filter_map(|id| self.nodes.get(id))
-                .map(|n| &n.file_path)
-                .collect();
-
-            // Every topic a node in the current frontier produces onto, in
-            // stable edge-insertion order (not `HashSet` order) so the result
-            // stays deterministic across runs (I5). A single pass over
-            // `self.edges` — not one pass per frontier node — keeps one hop
-            // O(|edges|) regardless of how wide the frontier is.
-            let mut new_topics: Vec<NodeId> = Vec::new();
-            let mut new_topics_set: HashSet<NodeId> = HashSet::new();
-            for edge in &self.edges {
-                if edge.kind != EdgeKind::Produces {
-                    continue;
-                }
-                let own = frontier.contains(&edge.from);
-                let same_file = !own
-                    && self
-                        .nodes
-                        .get(&edge.from)
-                        .is_some_and(|p| frontier_files.contains(&p.file_path));
-                if !(own || same_file) {
-                    continue;
-                }
-                if same_file && visited_producers.insert(edge.from) {
-                    if let Some(producer) = self.nodes.get(&edge.from) {
-                        flow.downstream_producers.push(producer);
-                    }
-                }
-                if visited_topics.insert(edge.to) {
-                    new_topics.push(edge.to);
-                    new_topics_set.insert(edge.to);
-                }
-            }
-            for topic_id in &new_topics {
-                if let Some(topic_node) = self.nodes.get(topic_id) {
-                    flow.topics.push(topic_node);
-                }
-            }
-
-            // Consumers of *any* newly-discovered topic, again in one pass
-            // over `self.edges` rather than one pass per topic — keeps this
-            // hop O(|edges|) too instead of O(new_topics × |edges|).
-            //
-            // `reconcile_edges` emits `Consumes` as topic -> consumer (the
-            // direction events flow, also what the graph renderers draw), while
-            // `add_edge` indexes it as consumer -> topic. The walk used to
-            // accept only the latter, so on an indexed workspace no hop past
-            // the first ever reached a consumer. The topic end is whichever end
-            // was just discovered; the consumer is the other one.
-            let mut next_frontier: HashSet<NodeId> = HashSet::new();
-            for edge in &self.edges {
-                if edge.kind != EdgeKind::Consumes {
-                    continue;
-                }
-                let consumer_id = if new_topics_set.contains(&edge.from) {
-                    edge.to
-                } else if new_topics_set.contains(&edge.to) {
-                    edge.from
-                } else {
-                    continue;
-                };
-                if !visited_nodes.insert(consumer_id) {
-                    continue;
-                }
-                let Some(consumer) = self.nodes.get(&consumer_id) else {
-                    continue;
-                };
-                next_frontier.insert(consumer_id);
+        for consumer in &trace.reached {
+            if seen_nodes.insert(consumer.id) {
                 match consumer.kind {
                     NodeKind::Saga => flow.related_sagas.push(consumer),
                     _ => flow.downstream_consumers.push(consumer),
                 }
             }
-            frontier = next_frontier;
         }
-
-        // Left in `frontier` when the hops ran out: reached, not expanded.
-        let mut unexpanded: Vec<&ContractNode> = frontier
-            .iter()
-            .filter_map(|id| self.nodes.get(id))
-            .collect();
-        by_location(&mut unexpanded);
-        flow.unexpanded = unexpanded;
-
-        // Expanded consumers with no resolved onward publish (a `Produces` edge
-        // of their own or of any node in their file, the file-linked rule the
-        // walk uses). The edge scan runs only when there is something to judge.
-        if !expanded.is_empty() {
-            let mut producing_nodes: HashSet<NodeId> = HashSet::new();
-            let mut producing_files: HashSet<&FilePath> = HashSet::new();
-            for edge in &self.edges {
-                if edge.kind != EdgeKind::Produces {
-                    continue;
-                }
-                producing_nodes.insert(edge.from);
-                if let Some(p) = self.nodes.get(&edge.from) {
-                    producing_files.insert(&p.file_path);
-                }
+        flow.topics.extend(trace.topics.iter().copied());
+        let mut visited_producers: HashSet<NodeId> =
+            flow.upstream_producers.iter().map(|n| n.id).collect();
+        let mut call_linked: Vec<NodeId> = Vec::new();
+        for hop in &trace.hops {
+            let (Some(first), Some(last)) = (hop.steps.first(), hop.steps.last()) else {
+                continue;
+            };
+            // A consumer that publishes itself is not listed again as a producer.
+            if last.kind != super::flow::FlowStepKind::Produce || last.node.id == first.node.id {
+                continue;
             }
-            let mut chain_end: Vec<&ContractNode> = expanded
-                .iter()
-                .filter_map(|id| self.nodes.get(id))
-                .filter(|n| {
-                    !producing_nodes.contains(&n.id) && !producing_files.contains(&n.file_path)
-                })
-                .collect();
-            by_location(&mut chain_end);
-            flow.chain_end = chain_end;
+            if visited_producers.insert(last.node.id) {
+                flow.downstream_producers.push(last.node);
+            }
+            if !hop.fallback {
+                call_linked.push(last.node.id);
+            }
         }
-
+        call_linked.sort_unstable();
+        call_linked.dedup();
+        flow.call_linked_producers = call_linked;
+        flow.unexpanded = trace.unexpanded;
+        flow.chain_end = trace.chain_end;
         flow
     }
 
@@ -1106,7 +1035,11 @@ impl ContractGraph {
         // ── Async: producers / topics / consumers / sagas ──
         let flow = self.analyze_impact_with_depth(norm_target, depth);
         let target_lc = flow.key.to_lowercase();
-        let file_linked_hops = !flow.downstream_producers.is_empty();
+        let file_linked_hops = flow
+            .downstream_producers
+            .iter()
+            .any(|p| flow.call_linked_producers.binary_search(&p.id).is_err());
+        let call_linked_hops = !flow.call_linked_producers.is_empty();
         let event_matched = !flow.topics.is_empty()
             || !flow.upstream_producers.is_empty()
             || !flow.downstream_consumers.is_empty();
@@ -1227,6 +1160,7 @@ impl ContractGraph {
             no_producer_resolved,
             no_consumer_resolved,
             file_linked_hops,
+            call_linked_hops,
             depth: depth.clamp(1, Self::MAX_IMPACT_DEPTH),
             unexpanded: flow
                 .unexpanded

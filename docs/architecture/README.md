@@ -9,7 +9,7 @@ before it.
 | 1 | [The big picture](01-big-picture.md) | What problem it solves, the pieces, the life of one question | none |
 | 2 | [From files to facts](02-from-files-to-facts.md) | How source code becomes a list of small facts | none |
 | 3 | [The graph](03-the-graph.md) | How facts from different repositories get connected, and what "confidence" means | none |
-| 4 | [Answering a question](04-answering-a-question.md) | The protocol, the seven tools, output limits, the audit log | a little |
+| 4 | [Answering a question](04-answering-a-question.md) | The protocol, the eight tools, output limits, the audit log | a little |
 | 5 | [Processes and time](05-processes-and-time.md) | The daemon, snapshots, file watching, config reload, the cache | a little |
 | 6 | [Safety and limits](06-safety-and-limits.md) | What is protected, how, and what is not guaranteed | a little |
 | 7 | [Rust for readers of this code](07-rust-for-readers.md) | The dozen Rust ideas this code relies on, explained from scratch | this is the lesson |

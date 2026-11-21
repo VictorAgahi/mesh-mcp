@@ -789,11 +789,13 @@ def _impact_args(chain, include_tests):
 
 
 def _trace_flow_args(chain, include_tests):
-    # Extension point: the trace_flow argument shape arrives with the 9.x tool.
+    # trace_flow (9.x): event_depth at the same cap as analyze_impact's depth, the
+    # golden entry kind passed through (a cron or handler entry is a method name).
     # Arguments the tool's inputSchema does not declare are dropped by
     # _filter_args, so this stays valid when the schema grows or shrinks.
-    return {"target": chain["entry"]["value"], "depth": CHAIN_DEPTH, "direction": chain.get("direction", "forward"),
-            "include_tests": include_tests}
+    return {"target": chain["entry"]["value"], "event_depth": CHAIN_DEPTH,
+            "entry_kind": chain["entry"].get("kind", "topic"),
+            "direction": chain.get("direction", "forward"), "include_tests": include_tests}
 
 
 TOOL_ADAPTERS = {"analyze_impact": _impact_args, "trace_flow": _trace_flow_args}
@@ -813,7 +815,8 @@ def trace_chain(session, tool_name, chain, include_tests):
     for _ in range(10):
         pages.append(session.call(tool_name, dict(args, offset=offset) if offset and paged else args))
         # Footer: "More rows: repeat the same call with `offset: N` for the next page."
-        m = re.search(r"More rows:.*?offset:\s*(\d+)", pages[-1])
+        # (trace_flow pages by hop: "More hops: ...").
+        m = re.search(r"More (?:rows|hops):.*?offset:\s*(\d+)", pages[-1])
         if not m or int(m.group(1)) <= offset:
             break
         offset = int(m.group(1))

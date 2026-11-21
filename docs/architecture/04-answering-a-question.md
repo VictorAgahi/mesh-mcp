@@ -27,7 +27,7 @@ the reply is a normal success response whose result has `isError: true` and the 
 agent sees the message and can correct its next call. Only protocol faults (unparseable JSON, unknown
 method) are JSON-RPC errors.
 
-## The seven tools
+## The eight tools
 
 | Tool | Reads | Answers |
 | :--- | :--- | :--- |
@@ -38,6 +38,7 @@ method) are JSON-RPC errors.
 | `search_docs` | the Markdown section index | what the team's docs say about a term |
 | `visualize_mesh` | the whole graph, aggregated per service | a bounded topology map as Mermaid, JSON or HTML |
 | `diff_mesh` | Git base and working tree, extracted like the index; the live graph for impact | what a branch changes at the contract level and who depends on it |
+| `trace_flow` | produce/consume edges and the calls layer (`Callable` nodes, `Calls` edges) | the end-to-end chain of an event, route or handler, hop by hop with each call's `path:line`, forward or reverse |
 
 Each tool is a Rust type that implements the `McpTool` trait: a name, a description, an argument
 type, and a `run` function that takes the arguments and the shared state and returns text.
