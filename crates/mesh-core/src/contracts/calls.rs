@@ -8,11 +8,21 @@
 //! the whole layer from the current facts: it is never journaled, so it cannot
 //! drift from a full rebuild. Its index pass is linear in ALL files with facts
 //! (resolution only in the candidate files), and it is skipped when no re-folded
-//! file has call facts or no file holds both kinds of endpoint. The raw facts of
-//! every non-test TS, Java, Go and Python file stay in memory: pruning happens at
-//! derive time, not at fold time (design note 6.5 asked for fold-time pruning; a
-//! file off every path today can be on one after another file changes, and its
-//! facts are then needed).
+//! file has call facts or no file holds both kinds of endpoint.
+//!
+//! What stays in memory, and when. Every non-test, non-generated file with facts is
+//! folded whole: a full build holds all of them until its one derive, because a file is
+//! on a path or not only once every entry and producer is known (design note 6.5 asked
+//! for fold-time pruning; that is impossible in one pass). TypeScript files keep their
+//! facts for good. For Java, Go and Python files, the derive that follows a fold drops
+//! the CALL SITES of every file off all entry -> producer paths (the bulk of a file's
+//! facts; only a candidate file's are ever resolved) and keeps its callables, imports,
+//! injections and types, which decide which files lie on a path. A file that a later
+//! edit brings onto a path is reported by [`ContractGraph::call_files_missing_sites`]
+//! and the indexer re-extracts it in one restoring pass; until then its calls resolve
+//! to nothing (counted in `IndexHealth`, never silent). A fresh build prunes exactly
+//! the files a live graph does, so the two give the same layer. The previous layer is
+//! freed before a derive builds the next one.
 //!
 //! Languages (by file extension, [`Lang`]): TypeScript resolves relative module
 //! specifiers; Java types resolve through a qualified import (matched against the
@@ -49,6 +59,7 @@
 use super::*;
 use serde::Deserialize;
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// First id of the derived `Callable` nodes. Real nodes are numbered from 0 by
@@ -60,12 +71,17 @@ pub const CALLABLE_ID_BASE: NodeId = 1 << 31;
 pub const MAX_DERIVED_CALL_SITES: usize = 2_000_000;
 
 /// Longest chain of base classes / re-exports followed for one lookup.
-const MAX_TYPE_HOPS: usize = 16;
+pub const MAX_TYPE_HOPS: usize = 16;
 
 /// Most struct types a Go interface may resolve to, matched structurally (the
 /// methods of the interface are a subset of the struct's). Past it the interface
 /// resolves to nothing and is counted in [`CallStats::dispatch_overflow`].
 pub const MAX_STRUCTURAL_IMPLS: usize = 64;
+
+/// Most (interface, candidate struct) pairs one repository's Go interface matching
+/// tests per derive. Past it the remaining interfaces of that repository get no
+/// implementation and are counted in [`CallStats::pairs_capped`], never silently.
+pub const MAX_STRUCTURAL_PAIRS: usize = 1_000_000;
 
 /// Extensions a relative module specifier may omit.
 const SCRIPT_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
@@ -117,6 +133,9 @@ pub enum CallReceiver {
     This,
     /// `this.field.m()`: the field's declared type is in [`CallFacts::injections`].
     InjectedField(CompactStr),
+    /// `field.m()` on a bare identifier the extractor only guessed to be a field a base
+    /// class declares (Java, no `this.`): resolved like an injected field, never `exact`.
+    InheritedField(CompactStr),
     /// `f()` where `f` is an imported binding (the callee is the local name).
     ImportedSymbol,
     /// `f()` where `f` is a free function of the same file (Go: of the same package).
@@ -149,6 +168,7 @@ impl From<CallFact> for CallFactRepr {
             CallReceiver::ImportedSymbol => (2, CompactStr::default()),
             CallReceiver::SameModule => (3, CompactStr::default()),
             CallReceiver::Namespace(n) => (4, n),
+            CallReceiver::InheritedField(f) => (5, f),
         };
         Self(c.caller, c.callee, kind, name, c.line)
     }
@@ -164,6 +184,7 @@ impl TryFrom<CallFactRepr> for CallFact {
             2 => CallReceiver::ImportedSymbol,
             3 => CallReceiver::SameModule,
             4 => CallReceiver::Namespace(r.3),
+            5 => CallReceiver::InheritedField(r.3),
             other => return Err(format!("unknown call receiver kind {other}")),
         };
         Ok(Self {
@@ -323,6 +344,9 @@ pub(super) struct FileCallFacts {
     /// Shared: a reload clones the whole graph to patch it, and the facts of the files
     /// it did not touch are by far the largest part of the layer.
     pub(super) facts: Arc<CallFacts>,
+    /// The call sites were dropped after a derive found the file on no entry -> producer
+    /// path (Java, Go, Python; see the module doc). Cleared when the file is re-folded.
+    pub(super) sites_pruned: bool,
 }
 
 /// Counters of the last derive.
@@ -349,6 +373,17 @@ pub struct CallStats {
     /// Approximate bytes of the stored raw facts (vector lengths times element
     /// sizes; strings over 24 bytes, rare in identifiers, are not counted).
     pub facts_bytes: usize,
+    /// Lookups (base-class, embedding and re-export walks) cut at [`MAX_TYPE_HOPS`]: a
+    /// call path through a chain that deep is cut (counted in `IndexHealth`).
+    pub hops_capped: usize,
+    /// Go interfaces not matched against struct types because their repository hit
+    /// [`MAX_STRUCTURAL_PAIRS`] (counted in `IndexHealth`).
+    pub pairs_capped: usize,
+    /// Files whose call sites are not retained (off every entry -> producer path).
+    pub files_pruned: usize,
+    /// Files on an entry -> producer path whose call sites were pruned earlier and not
+    /// restored yet: the indexer re-extracts them (`call_files_missing_sites`).
+    pub missing_sites: usize,
 }
 
 /// The derived layer.
@@ -361,6 +396,8 @@ pub(super) struct DerivedCalls {
     /// Per file, indices into `callables` (sorted by line).
     pub(super) by_file: HashMap<FilePath, Vec<u32>>,
     pub(super) stats: CallStats,
+    /// Candidate files holding no call sites (pruned by an earlier derive), sorted.
+    pub(super) missing_sites: Vec<FilePath>,
 }
 
 impl ContractGraph {
@@ -383,8 +420,17 @@ impl ContractGraph {
                 repo_id,
                 package,
                 facts: Arc::new(facts),
+                sites_pruned: false,
             },
         );
+    }
+
+    /// Files (Java, Go, Python) that lie on an entry -> producer path but whose call
+    /// sites an earlier derive pruned, when the file was not on a path: the caller
+    /// re-extracts them and stores the full facts with [`Self::add_call_facts`]. Empty
+    /// after a fresh build (nothing is pruned before the first derive).
+    pub fn call_files_missing_sites(&self) -> &[FilePath] {
+        &self.derived_calls.missing_sites
     }
 
     /// The derived `Callable` nodes, sorted by (path, line, name).
@@ -413,14 +459,17 @@ impl ContractGraph {
             .min_by_key(|c| (c.line_end - c.line_start, c.line_start, c.id))
     }
 
-    /// (files whose facts were capped, approximate bytes of all stored facts).
-    fn raw_fact_totals(&self) -> (usize, usize) {
+    /// (files whose facts were capped, approximate bytes of all stored facts, files
+    /// whose call sites are pruned).
+    fn raw_fact_totals(&self) -> (usize, usize, usize) {
         use std::mem::size_of;
         let mut capped = 0;
         let mut bytes = 0;
+        let mut pruned = 0;
         for f in self.call_facts.values() {
             let c = &f.facts;
             capped += usize::from(c.capped);
+            pruned += usize::from(f.sites_pruned);
             bytes += c.callables.len() * size_of::<CallableFact>()
                 + c.call_sites.len() * size_of::<CallFact>()
                 + c.injections.len() * size_of::<InjectionFact>()
@@ -434,7 +483,34 @@ impl ContractGraph {
                     })
                     .sum::<usize>();
         }
-        (capped, bytes)
+        (capped, bytes, pruned)
+    }
+
+    /// Drops the call sites of `paths` (files off every entry -> producer path): the
+    /// callables, imports, injections and types stay, they decide which files lie on a
+    /// path and how a call from a candidate file resolves. Sites are the bulk of a
+    /// file's facts and only a candidate file's are ever resolved.
+    fn prune_call_sites(&mut self, paths: &[FilePath]) {
+        for path in paths {
+            let Some(f) = self.call_facts.get_mut(path) else {
+                continue;
+            };
+            if f.sites_pruned || f.facts.call_sites.is_empty() {
+                continue;
+            }
+            // Unique right after a fold; shared with the previous snapshot after a graph
+            // clone, in which case the file gets a slimmed copy and the old one is freed
+            // with that snapshot.
+            match Arc::get_mut(&mut f.facts) {
+                Some(facts) => facts.call_sites = Vec::new(),
+                None => {
+                    let mut slim = (*f.facts).clone();
+                    slim.call_sites = Vec::new();
+                    f.facts = Arc::new(slim);
+                }
+            }
+            f.sites_pruned = true;
+        }
     }
 
     /// Whether some file with call facts holds an entry (consumer, route, gRPC
@@ -502,25 +578,38 @@ impl ContractGraph {
         }
         self.calls_dirty = false;
         let started = std::time::Instant::now();
-        let (files_capped, facts_bytes) = self.raw_fact_totals();
+        // Nothing reads the previous layer: free it before the new one is built (the graph
+        // of a reload is a clone of the live one, and the live snapshot keeps its own
+        // copy). `run` cannot fail; only a panic would leave the layer empty, and that
+        // unwinds the whole reload.
+        self.derived_calls = DerivedCalls::default();
         // No path can exist without both an entry and a producer among the files
         // with facts: skip the index (a whole workspace without events).
         let indexed;
-        if self.has_entry_and_producer() {
+        let prune: Vec<FilePath> = if self.has_entry_and_producer() {
             let deriver = Deriver::new(self);
             indexed = started.elapsed();
-            self.derived_calls = deriver.run();
+            let (derived, off_path) = deriver.run();
+            self.derived_calls = derived;
+            off_path
         } else {
             indexed = started.elapsed();
-            self.derived_calls = DerivedCalls::default();
             self.derived_calls.stats.files_with_facts = self.call_facts.len();
-        }
+            self.call_facts
+                .keys()
+                .filter(|p| lang_of(&p.to_string_lossy()) != Lang::Script)
+                .cloned()
+                .collect()
+        };
+        self.prune_call_sites(&prune);
+        let (files_capped, facts_bytes, files_pruned) = self.raw_fact_totals();
         self.derived_calls.stats.files_capped = files_capped;
         self.derived_calls.stats.facts_bytes = facts_bytes;
+        self.derived_calls.stats.files_pruned = files_pruned;
         let s = self.derived_calls.stats;
         if tracing::enabled!(target: "mesh::calls", tracing::Level::DEBUG) {
             let mut n = [0usize; 5];
-            let mut by_receiver = [0usize; 5];
+            let mut by_receiver = [0usize; 6];
             for f in self.call_facts.values() {
                 let c = &f.facts;
                 for site in &c.call_sites {
@@ -530,6 +619,7 @@ impl ContractGraph {
                         CallReceiver::ImportedSymbol => 2,
                         CallReceiver::SameModule => 3,
                         CallReceiver::Namespace(_) => 4,
+                        CallReceiver::InheritedField(_) => 5,
                     }] += 1;
                 }
                 for (slot, len) in n.iter_mut().zip([
@@ -549,18 +639,21 @@ impl ContractGraph {
             );
             tracing::debug!(
                 target: "mesh::calls",
-                "call sites by receiver: {} this, {} injected field, {} imported symbol, {} same module, {} namespace",
-                by_receiver[0], by_receiver[1], by_receiver[2], by_receiver[3], by_receiver[4]
+                "call sites by receiver: {} this, {} injected field, {} imported symbol, {} same module, \
+                 {} namespace, {} inherited field",
+                by_receiver[0], by_receiver[1], by_receiver[2], by_receiver[3], by_receiver[4],
+                by_receiver[5]
             );
         }
         tracing::debug!(
             target: "mesh::calls",
-            "calls derive: {:.1} ms (index {:.1} ms), {} files with facts ({} KiB), {} candidates, {} sites resolved \
-             ({} skipped), {} pairs, {} callables, {} calls",
+            "calls derive: {:.1} ms (index {:.1} ms), {} files with facts ({} KiB retained, {} without call \
+             sites), {} candidates, {} sites resolved ({} skipped), {} pairs, {} callables, {} calls",
             started.elapsed().as_secs_f64() * 1000.0,
             indexed.as_secs_f64() * 1000.0,
             s.files_with_facts,
             s.facts_bytes / 1024,
+            s.files_pruned,
             s.candidate_files,
             s.sites_resolved,
             s.sites_skipped,
@@ -568,6 +661,13 @@ impl ContractGraph {
             s.callables,
             s.calls
         );
+        if s.hops_capped > 0 || s.pairs_capped > 0 {
+            tracing::warn!(
+                target: "mesh::calls",
+                "calls layer: {} lookups cut at {MAX_TYPE_HOPS} hops, {} Go interfaces unmatched past the pair cap",
+                s.hops_capped, s.pairs_capped
+            );
+        }
         if s.sites_skipped > 0 {
             tracing::warn!(
                 target: "mesh::calls",
@@ -810,6 +910,12 @@ struct Deriver<'g> {
     dispatched: std::cell::RefCell<FastMap<(TypeKey<'g>, CompactStr), Vec<usize>>>,
     /// Go interfaces dropped past [`MAX_STRUCTURAL_IMPLS`].
     dispatch_overflow: usize,
+    /// Go interfaces not matched past [`MAX_STRUCTURAL_PAIRS`] of their repository.
+    pairs_capped: usize,
+    /// Lookups cut at [`MAX_TYPE_HOPS`].
+    hops_capped: std::cell::Cell<usize>,
+    /// Go: global indices of the callables that call through a field of their type.
+    field_users: FastSet<usize>,
 }
 
 /// The one candidate closest to `importer` (most leading path segments shared); `None`
@@ -864,6 +970,9 @@ impl<'g> Deriver<'g> {
             injections: FastMap::default(),
             dispatched: std::cell::RefCell::default(),
             dispatch_overflow: 0,
+            pairs_capped: 0,
+            hops_capped: std::cell::Cell::new(0),
+            field_users: FastSet::default(),
         };
         d.index();
         d
@@ -1145,6 +1254,19 @@ impl<'g> Deriver<'g> {
             v.sort_unstable();
             v.dedup();
         }
+        // Go: the callables that call through a field of their type, found once per
+        // file (`constructed_methods` asks per method of a type).
+        for (i, (_, f)) in self.files.iter().enumerate() {
+            if self.lang[i] != Lang::Go {
+                continue;
+            }
+            for site in &f.facts.call_sites {
+                if matches!(site.receiver, CallReceiver::InjectedField(_)) {
+                    self.field_users
+                        .insert(self.offsets[i] + site.caller as usize);
+                }
+            }
+        }
 
         let mut bases: FastMap<TypeKey<'g>, Vec<TypeKey<'g>>> = FastMap::default();
         let mut subtypes: FastMap<TypeKey<'g>, Vec<TypeKey<'g>>> = FastMap::default();
@@ -1214,8 +1336,15 @@ impl<'g> Deriver<'g> {
             v.sort_unstable();
             v.dedup();
         }
-        let mut sets: FastMap<TypeKey<'g>, BTreeSet<&'g str>> = FastMap::default();
+        let mut sets: FastMap<TypeKey<'g>, Rc<BTreeSet<&'g str>>> = FastMap::default();
         let mut dropped = 0;
+        let mut capped = 0;
+        // (interface, candidate struct) pairs tested so far, per repository.
+        let mut spent: BTreeMap<RepoId, usize> = BTreeMap::new();
+        let cap = match self.graph.structural_pair_budget {
+            0 => MAX_STRUCTURAL_PAIRS,
+            n => n,
+        };
         for iface in ifaces {
             let want = self.method_set(iface, &mut sets);
             let Some(rarest) = want
@@ -1224,10 +1353,15 @@ impl<'g> Deriver<'g> {
             else {
                 continue;
             };
-            let candidates: Vec<TypeKey<'g>> =
-                method_types.get(rarest).cloned().unwrap_or_default();
+            let candidates = method_types.get(rarest).map_or(&[][..], Vec::as_slice);
+            let used = spent.entry(self.files[iface.0].1.repo_id).or_default();
+            if *used + candidates.len() > cap {
+                capped += 1;
+                continue;
+            }
+            *used += candidates.len();
             let mut found = Vec::new();
-            for t in candidates {
+            for &t in candidates {
                 let have = self.method_set(t, &mut sets);
                 if want.iter().all(|m| have.contains(m)) {
                     found.push(t);
@@ -1240,23 +1374,29 @@ impl<'g> Deriver<'g> {
             subtypes.entry(iface).or_default().extend(found);
         }
         self.dispatch_overflow = dropped;
+        self.pairs_capped = capped;
     }
 
     /// Method names of `t`: an interface's declared ones and a struct's own, plus those
-    /// of its embedded types (`bases`), bounded by [`MAX_TYPE_HOPS`].
+    /// of its embedded types (`bases`), bounded by [`MAX_TYPE_HOPS`] (counted).
     fn method_set(
         &self,
         t: TypeKey<'g>,
-        cache: &mut FastMap<TypeKey<'g>, BTreeSet<&'g str>>,
-    ) -> BTreeSet<&'g str> {
+        cache: &mut FastMap<TypeKey<'g>, Rc<BTreeSet<&'g str>>>,
+    ) -> Rc<BTreeSet<&'g str>> {
         if let Some(hit) = cache.get(&t) {
-            return hit.clone();
+            return Rc::clone(hit);
         }
         let mut out = BTreeSet::new();
         let mut stack = vec![t];
         let mut seen = FastSet::default();
+        let mut truncated = false;
         while let Some(c) = stack.pop() {
-            if seen.len() > MAX_TYPE_HOPS || !seen.insert(c) {
+            if seen.len() > MAX_TYPE_HOPS {
+                truncated |= !seen.contains(&c);
+                continue;
+            }
+            if !seen.insert(c) {
                 continue;
             }
             if let Some(fact) = self.types.get(&c) {
@@ -1269,7 +1409,9 @@ impl<'g> Deriver<'g> {
                 stack.extend(bs.iter().copied());
             }
         }
-        cache.insert(t, out.clone());
+        self.note_hops(truncated);
+        let out = Rc::new(out);
+        cache.insert(t, Rc::clone(&out));
         out
     }
 
@@ -1382,8 +1524,13 @@ impl<'g> Deriver<'g> {
     fn follow(&self, start: TypeKey<'g>, is_type: bool) -> Vec<(TypeKey<'g>, EdgeConfidence)> {
         let mut queue = VecDeque::from([start]);
         let mut seen: FastSet<TypeKey<'g>> = FastSet::default();
+        let mut truncated = false;
         while let Some((f, n)) = queue.pop_front() {
-            if seen.len() > MAX_TYPE_HOPS || !seen.insert((f, n)) {
+            if seen.len() > MAX_TYPE_HOPS {
+                truncated |= !seen.contains(&(f, n));
+                continue;
+            }
+            if !seen.insert((f, n)) {
                 continue;
             }
             if self.declared(f, n, is_type) {
@@ -1402,6 +1549,7 @@ impl<'g> Deriver<'g> {
                 queue.push_back((g, n));
             }
         }
+        self.note_hops(truncated);
         Vec::new()
     }
 
@@ -1436,12 +1584,24 @@ impl<'g> Deriver<'g> {
         self.resolve_export(file, name, true)
     }
 
+    /// Counts one lookup cut at [`MAX_TYPE_HOPS`] (`CallStats::hops_capped`).
+    fn note_hops(&self, truncated: bool) {
+        if truncated {
+            self.hops_capped.set(self.hops_capped.get() + 1);
+        }
+    }
+
     /// Method `m` of class `class` or of its nearest base class declaring it.
     fn find_method(&self, class: TypeKey<'g>, m: &str) -> Option<usize> {
         let mut stack = vec![class];
         let mut seen = FastSet::default();
+        let mut truncated = false;
         while let Some(c) = stack.pop() {
-            if seen.len() > MAX_TYPE_HOPS || !seen.insert(c) {
+            if seen.len() > MAX_TYPE_HOPS {
+                truncated |= !seen.contains(&c);
+                continue;
+            }
+            if !seen.insert(c) {
                 continue;
             }
             if let Some(&idx) = self.methods.get(&(c.0, c.1, m)) {
@@ -1452,6 +1612,7 @@ impl<'g> Deriver<'g> {
                 stack.extend(bs.iter().rev().copied());
             }
         }
+        self.note_hops(truncated);
         None
     }
 
@@ -1459,8 +1620,13 @@ impl<'g> Deriver<'g> {
     fn field_type(&self, class: TypeKey<'g>, field: &str) -> Option<(usize, &'g str)> {
         let mut stack = vec![class];
         let mut seen = FastSet::default();
+        let mut truncated = false;
         while let Some(c) = stack.pop() {
-            if seen.len() > MAX_TYPE_HOPS || !seen.insert(c) {
+            if seen.len() > MAX_TYPE_HOPS {
+                truncated |= !seen.contains(&c);
+                continue;
+            }
+            if !seen.insert(c) {
                 continue;
             }
             if let Some(&t) = self.injections.get(&(c.0, c.1, field)) {
@@ -1470,6 +1636,7 @@ impl<'g> Deriver<'g> {
                 stack.extend(bs.iter().rev().copied());
             }
         }
+        self.note_hops(truncated);
         None
     }
 
@@ -1530,13 +1697,17 @@ impl<'g> Deriver<'g> {
                 }
                 "this"
             }
-            CallReceiver::InjectedField(field) => {
+            CallReceiver::InjectedField(field) | CallReceiver::InheritedField(field) => {
+                let guessed = matches!(site.receiver, CallReceiver::InheritedField(_));
                 let class = owner.map(|o| (self.owner_file(file, o), o));
                 if let Some((decl_file, t)) = class.and_then(|c| self.field_type(c, field)) {
                     for (ty, c) in self.resolve_type(decl_file, t) {
                         let impls = self.dispatch(ty, callee);
                         let c = if impls.len() > 1 {
                             EdgeConfidence::Ambiguous
+                        } else if guessed && c == EdgeConfidence::Exact {
+                            // The identifier was only assumed to name the base class's field.
+                            EdgeConfidence::Heuristic
                         } else {
                             c
                         };
@@ -1545,7 +1716,11 @@ impl<'g> Deriver<'g> {
                         }
                     }
                 }
-                "injected_field"
+                if guessed {
+                    "inherited_field"
+                } else {
+                    "injected_field"
+                }
             }
             CallReceiver::ImportedSymbol => {
                 if self.imports[file].contains_key(callee) {
@@ -1649,23 +1824,19 @@ impl<'g> Deriver<'g> {
 
     /// Whether the callable makes a call through a field of its type.
     fn uses_fields(&self, global: usize) -> bool {
-        let (file, _) = self.callable(global);
-        let local = (global - self.offsets[file]) as u32;
-        let (_, f) = self.files[file];
-        f.facts
-            .call_sites
-            .iter()
-            .any(|s| s.caller == local && matches!(s.receiver, CallReceiver::InjectedField(_)))
+        self.field_users.contains(&global)
     }
 
-    fn run(self) -> DerivedCalls {
+    /// The derived layer and the files (Java, Go, Python) off every entry -> producer
+    /// path that still hold call sites, for the caller to prune.
+    fn run(self) -> (DerivedCalls, Vec<FilePath>) {
         let n = self.files.len();
         let mut stats = CallStats {
             files_with_facts: n,
             ..CallStats::default()
         };
         if n == 0 {
-            return DerivedCalls::default();
+            return (DerivedCalls::default(), Vec::new());
         }
 
         // Entry and producer nodes of each file.
@@ -1755,10 +1926,28 @@ impl<'g> Deriver<'g> {
         );
         let candidate: Vec<bool> = (0..n).map(|i| fwd_files[i] && bwd_files[i]).collect();
         stats.candidate_files = candidate.iter().filter(|&&c| c).count();
+        drop((adj, radj, fwd_files, bwd_files));
 
-        // 2. Resolution of the candidate files' call sites.
-        let mut pairs: BTreeMap<(usize, usize), (u32, EdgeConfidence, &'static str)> =
-            BTreeMap::new();
+        // Files to prune after this derive, files whose pruned sites are needed again.
+        let mut off_path: Vec<FilePath> = Vec::new();
+        let mut missing_sites: Vec<FilePath> = Vec::new();
+        for (i, (path, f)) in self.files.iter().enumerate() {
+            if matches!(self.lang[i], Lang::Script | Lang::Other) {
+                continue;
+            }
+            if !candidate[i] {
+                if !f.sites_pruned && !f.facts.call_sites.is_empty() {
+                    off_path.push((*path).clone());
+                }
+            } else if f.sites_pruned {
+                missing_sites.push((*path).clone());
+            }
+        }
+        stats.missing_sites = missing_sites.len();
+
+        // 2. Resolution of the candidate files' call sites. One entry per resolved site in
+        // resolution order; sorted and reduced to one per (caller, callee) below.
+        let mut pairs: Vec<(usize, usize, u32, EdgeConfidence, &'static str)> = Vec::new();
         let mut budget = match self.graph.call_site_budget {
             0 => MAX_DERIVED_CALL_SITES,
             n => n,
@@ -1780,42 +1969,48 @@ impl<'g> Deriver<'g> {
                 let caller = self.offsets[i] + site.caller as usize;
                 let (targets, via) = self.resolve_site(i, caller_fact.owner.as_deref(), site);
                 for (t, confidence) in targets {
-                    let entry = pairs
-                        .entry((caller, t))
-                        .or_insert((site.line, confidence, via));
-                    if (confidence_rank(confidence), site.line)
-                        < (confidence_rank(entry.1), entry.0)
-                    {
-                        *entry = (site.line, confidence, via);
+                    pairs.push((caller, t, site.line, confidence, via));
+                }
+            }
+        }
+        // The best site per (caller, callee): strongest confidence, then lowest line; a
+        // stable sort keeps the first resolved one on a full tie.
+        pairs.sort_by_key(|p| (p.0, p.1, confidence_rank(p.3), p.2));
+        pairs.dedup_by_key(|p| (p.0, p.1));
+        pairs.shrink_to_fit();
+        stats.resolved_pairs = pairs.len();
+
+        // 3. Callable-level pruning: entry -> ... -> producer. `pairs` is sorted by caller:
+        // the callees of a caller are a contiguous slice; the callers of a callee are found
+        // in the same list sorted the other way.
+        let out_edges: Vec<(usize, usize)> = pairs.iter().map(|p| (p.0, p.1)).collect();
+        let mut in_edges: Vec<(usize, usize)> = out_edges.iter().map(|&(a, b)| (b, a)).collect();
+        in_edges.sort_unstable();
+        let mut entries = BTreeSet::new();
+        let mut producers = BTreeSet::new();
+        // `constructed_methods` per anchoring callable, not per line: several sites may
+        // lie in one constructor.
+        let mut constructed: FastMap<usize, Vec<usize>> = FastMap::default();
+        for i in (0..n).filter(|&i| candidate[i]) {
+            for (lines, set) in [
+                (&entry_lines[i], &mut entries),
+                (&producer_lines[i], &mut producers),
+            ] {
+                for &l in lines {
+                    if let Some(c) = self.enclosing(i, l) {
+                        set.insert(c);
+                        set.extend(
+                            constructed
+                                .entry(c)
+                                .or_insert_with(|| self.constructed_methods(i, c))
+                                .iter()
+                                .copied(),
+                        );
                     }
                 }
             }
         }
-        stats.resolved_pairs = pairs.len();
-
-        // 3. Callable-level pruning: entry -> ... -> producer.
-        let mut out_edges: HashMap<usize, Vec<usize>> = HashMap::new();
-        let mut in_edges: HashMap<usize, Vec<usize>> = HashMap::new();
-        for &(a, b) in pairs.keys() {
-            out_edges.entry(a).or_default().push(b);
-            in_edges.entry(b).or_default().push(a);
-        }
-        let mut entries = BTreeSet::new();
-        let mut producers = BTreeSet::new();
-        for i in (0..n).filter(|&i| candidate[i]) {
-            for &l in &entry_lines[i] {
-                if let Some(c) = self.enclosing(i, l) {
-                    entries.insert(c);
-                    entries.extend(self.constructed_methods(i, c));
-                }
-            }
-            for &l in &producer_lines[i] {
-                if let Some(c) = self.enclosing(i, l) {
-                    producers.insert(c);
-                    producers.extend(self.constructed_methods(i, c));
-                }
-            }
-        }
+        drop(constructed);
         let fwd = reach(entries, &out_edges);
         let bwd = reach(producers, &in_edges);
         let kept: BTreeSet<usize> = fwd.intersection(&bwd).copied().collect();
@@ -1863,13 +2058,13 @@ impl<'g> Deriver<'g> {
             });
         }
         let mut edges = Vec::new();
-        for (&(a, b), &(line, confidence, via)) in &pairs {
+        for &(a, b, line, confidence, via) in &pairs {
             if let (Some(&from), Some(&to)) = (id_of.get(&a), id_of.get(&b)) {
                 edges.push(ContractEdge {
                     from,
                     to,
                     kind: EdgeKind::Calls,
-                    metadata: Some(CompactStr::new(format!("{via} L{line}"))),
+                    metadata: Some(compact_str::format_compact!("{via} L{line}")),
                     confidence,
                 });
             }
@@ -1878,12 +2073,18 @@ impl<'g> Deriver<'g> {
         stats.callables = callables.len();
         stats.calls = edges.len();
         stats.dispatch_overflow = self.dispatch_overflow;
-        DerivedCalls {
-            callables,
-            edges,
-            by_file,
-            stats,
-        }
+        stats.pairs_capped = self.pairs_capped;
+        stats.hops_capped = self.hops_capped.get();
+        (
+            DerivedCalls {
+                callables,
+                edges,
+                by_file,
+                stats,
+                missing_sites,
+            },
+            off_path,
+        )
     }
 }
 
@@ -1908,12 +2109,15 @@ fn bfs(starts: impl Iterator<Item = usize>, adj: &[Vec<usize>], n: usize) -> Vec
     seen
 }
 
-/// Callables reachable from `starts` over `adj`, the starts included (iterative).
-fn reach(starts: BTreeSet<usize>, adj: &HashMap<usize, Vec<usize>>) -> BTreeSet<usize> {
+/// Callables reachable from `starts` over `edges` (sorted `(from, to)` pairs), the
+/// starts included (iterative).
+fn reach(starts: BTreeSet<usize>, edges: &[(usize, usize)]) -> BTreeSet<usize> {
     let mut seen = starts.clone();
     let mut stack: Vec<usize> = starts.into_iter().collect();
     while let Some(i) = stack.pop() {
-        for &j in adj.get(&i).map_or(&[][..], Vec::as_slice) {
+        let lo = edges.partition_point(|e| e.0 < i);
+        let hi = edges.partition_point(|e| e.0 <= i);
+        for &(_, j) in &edges[lo..hi] {
             if seen.insert(j) {
                 stack.push(j);
             }

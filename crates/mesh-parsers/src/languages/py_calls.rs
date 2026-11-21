@@ -9,12 +9,15 @@
 //! guess. Recorded on purpose, and nothing else: `self.m()`, `self.dep.m()` on an
 //! annotated dependency, `mod.f()` on an imported module, `f()` of an imported
 //! function and `f()` of a module-level function of the file. Calls on locals and
-//! parameters are dropped.
+//! parameters are dropped: a parameter, assignment, loop, `with` / `except` alias or
+//! walrus target that carries the name of an imported module or function keeps its
+//! call out of the facts (limit: a name bound after the call in document order, or in
+//! a nested function, is judged by the enclosing callable as a whole, see `Shadows`).
 //!
 //! Every walk is iterative, every list is capped per file and a hit cap sets
 //! `CallFacts::capped` (counted in `IndexHealth`).
 
-use super::call_support::{collect_sites, is_ident, prune_unused};
+use super::call_support::{collect_sites, is_ident, prune_unused, Shadows};
 use super::ts_calls::{text, walk, Builder, MAX_DECLS_PER_FILE};
 use mesh_core::{CallFacts, CallReceiver, CompactStr, TypeFact, TypeFactKind};
 use std::collections::{HashMap, HashSet};
@@ -372,8 +375,10 @@ pub fn extract(tree: &Tree, source: &[u8]) -> CallFacts {
         .map(|c| c.name.clone())
         .collect();
 
-    collect_sites(&mut b, root, &mut |node, _, fact| {
+    let mut shadows = Shadows::default();
+    collect_sites(&mut b, root, &mut |node, caller, fact| {
         if node.kind() != "call" {
+            bind_locals(node, source, &mut |name| shadows.bind(caller, name));
             return None;
         }
         let function = node.child_by_field_name("function")?;
@@ -381,7 +386,9 @@ pub fn extract(tree: &Tree, source: &[u8]) -> CallFacts {
         match function.kind() {
             "identifier" => {
                 let name = text(function, source)?;
-                if functions.contains(name) {
+                if shadows.has(caller, name) {
+                    None
+                } else if functions.contains(name) {
                     Some((CompactStr::new(name), CallReceiver::ImportedSymbol))
                 } else if free.contains(name) {
                     Some((CompactStr::new(name), CallReceiver::SameModule))
@@ -398,7 +405,7 @@ pub fn extract(tree: &Tree, source: &[u8]) -> CallFacts {
                         let name = text(object, source)?;
                         if owner.is_some() && matches!(name, "self" | "cls") {
                             Some((callee, CallReceiver::This))
-                        } else if modules.contains(name) {
+                        } else if modules.contains(name) && !shadows.has(caller, name) {
                             Some((callee, CallReceiver::Namespace(CompactStr::new(name))))
                         } else {
                             None
@@ -429,6 +436,53 @@ pub fn extract(tree: &Tree, source: &[u8]) -> CallFacts {
     prune_unused(&mut b);
     b.facts.shrink_to_fit();
     b.facts
+}
+
+/// Calls `bind` with each name `node` binds locally: a parameter, an assignment or loop
+/// target, a `with ... as` / `except ... as` alias, a walrus or a comprehension variable.
+fn bind_locals(node: Node, source: &[u8], bind: &mut dyn FnMut(&str)) {
+    let mut targets: Vec<Node> = Vec::new();
+    let mut cursor = node.walk();
+    match node.kind() {
+        "parameters" | "lambda_parameters" => {
+            for p in node.named_children(&mut cursor) {
+                match p.kind() {
+                    "identifier" => targets.push(p),
+                    "default_parameter" | "typed_default_parameter" => {
+                        targets.extend(p.child_by_field_name("name"));
+                    }
+                    // `x: T`, `*args`, `**kwargs`: the name is the first named child.
+                    _ => targets.extend(p.named_child(0)),
+                }
+            }
+        }
+        "assignment" | "augmented_assignment" => targets.extend(node.child_by_field_name("left")),
+        "for_statement" | "for_in_clause" => targets.extend(node.child_by_field_name("left")),
+        "named_expression" => targets.extend(node.child_by_field_name("name")),
+        "as_pattern" => targets.extend(node.child_by_field_name("alias")),
+        _ => {}
+    }
+    // Tuple and list targets (`a, (b, c) = ...`): only identifiers bind; `self.x = ...`
+    // is an attribute and binds nothing.
+    while let Some(t) = targets.pop() {
+        match t.kind() {
+            "identifier" => {
+                if let Some(n) = text(t, source) {
+                    bind(n);
+                }
+            }
+            "pattern_list"
+            | "tuple_pattern"
+            | "list_pattern"
+            | "list_splat_pattern"
+            | "as_pattern_target"
+            | "parenthesized_expression" => {
+                let mut c = t.walk();
+                targets.extend(t.named_children(&mut c));
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -564,6 +618,56 @@ def local():
         assert_eq!(annotation_type("list[Dep]"), None);
         assert_eq!(annotation_type("str"), None);
         assert_eq!(annotation_type("Callable[[int], str]"), None);
+    }
+
+    #[test]
+    fn locals_and_parameters_shadow_imported_names() {
+        let f = facts(
+            r#"import orders
+from pkg import helper
+
+def by_param(orders):
+    orders.save()
+    helper()
+
+def by_local():
+    orders = make()
+    orders.save()
+
+def by_loop(items):
+    for helper in items:
+        helper()
+
+def by_with():
+    with open_it() as orders:
+        orders.save()
+
+def not_shadowed():
+    orders.save()
+    helper()
+
+def other_param(x):
+    orders.save()
+"#,
+        );
+        let s = sites(&f);
+        let callers = |receiver: CallReceiver| -> Vec<&str> {
+            s.iter()
+                .filter(|c| c.2 == receiver)
+                .map(|c| c.0.as_str())
+                .collect()
+        };
+        // Only the functions that bind no such name keep their call.
+        assert_eq!(
+            callers(CallReceiver::Namespace("orders".into())),
+            vec![".not_shadowed", ".other_param"],
+            "{s:?}"
+        );
+        assert_eq!(
+            callers(CallReceiver::ImportedSymbol),
+            vec![".by_param", ".not_shadowed"],
+            "{s:?}"
+        );
     }
 
     #[test]

@@ -667,3 +667,320 @@ fn call_facts_round_trip_through_compact_json() {
     // A record of an unknown kind is an error, never a silent receiver.
     assert!(serde_json::from_str::<CallFacts>(r#"{"call_sites":[[0,"x",9,"",1]]}"#).is_err());
 }
+
+// ---------------------------------------------------------------- hop and pair caps
+
+/// `depth + 1` classes `C0 .. C<depth>` in one file, each extending the next: `C0.run`
+/// is the entry (it calls `this.post`), `C<depth>.post` publishes. In Java the types
+/// are classes of one package, in Go structs embedding each other in one package.
+fn chain_files(depth: usize, path: &'static str) -> Vec<FileSpec> {
+    let mut callables = vec![
+        callable(Some("C0"), "run", 3, 5),
+        callable(Some(&format!("C{depth}")), "post", 8, 10),
+    ];
+    callables[0].line_start = 3;
+    let types = (0..=depth)
+        .map(|k| TypeFact {
+            extends: if k < depth {
+                vec![CompactStr::new(format!("C{}", k + 1))]
+            } else {
+                Vec::new()
+            },
+            ..class(&format!("C{k}"), TypeFactKind::Class, &[])
+        })
+        .collect();
+    vec![spec(
+        path,
+        CallFacts {
+            callables,
+            call_sites: vec![site(0, "post", CallReceiver::This, 4)],
+            types,
+            ..CallFacts::default()
+        },
+        vec![(3, "in")],
+        vec![(9, "out")],
+    )]
+}
+
+#[test]
+fn a_base_class_or_embedding_chain_deeper_than_the_hop_cap_is_counted() {
+    for path in ["/w/j/Chain.java", "/w/g/chain.go"] {
+        // Within the cap the method is found through every base.
+        let g = build(&chain_files(MAX_TYPE_HOPS - 2, path));
+        assert_eq!(g.call_stats().hops_capped, 0, "{path}");
+        assert_eq!(
+            calls(&g),
+            vec![edge("C0.run", &format!("C{}.post", MAX_TYPE_HOPS - 2), X)]
+        );
+        // Past it the call is cut, counted, and reaches IndexHealth and the doctor summary.
+        let g = build(&chain_files(MAX_TYPE_HOPS + 4, path));
+        assert!(g.call_stats().hops_capped > 0, "{path}");
+        assert!(calls(&g).is_empty(), "{path}");
+        let mut health = crate::health::IndexHealth::default();
+        health.set_call_stats(&g.call_stats());
+        assert!(health.calls_truncated());
+        assert!(
+            health.render_summary(10).contains("cut at 16 hops"),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn go_interface_matching_past_the_pair_cap_is_counted() {
+    let mut g = ContractGraph::new();
+    g.structural_pair_budget = 1;
+    for f in go_files(2) {
+        g.add_call_facts(path(f.path), 0, CompactStr::new("app"), f.facts.clone());
+        g.add_node(node("decl", NodeKind::ServiceClass, f.path, 1));
+        for (line, topic) in &f.consumers {
+            let id = g.add_node(node(topic, NodeKind::KafkaTopic, f.path, *line));
+            g.add_consumer(id, topic);
+        }
+        for (line, topic) in &f.producers {
+            let id = g.add_node(node(topic, NodeKind::KafkaTopic, f.path, *line));
+            g.add_producer(id, topic);
+        }
+    }
+    g.reconcile_edges();
+    // `Publisher` has two candidate structs: over the cap of one pair, left unmatched.
+    assert_eq!(g.call_stats().pairs_capped, 1);
+    assert!(calls(&g).iter().all(|c| !c.1.ends_with(".Publish")));
+    let mut health = crate::health::IndexHealth::default();
+    health.set_call_stats(&g.call_stats());
+    assert!(health.calls_truncated());
+    assert!(health
+        .render_summary(10)
+        .contains("1 Go interface(s) not matched against struct types"));
+    // The default cap does not bind this fixture.
+    assert_eq!(build(&go_files(2)).call_stats().pairs_capped, 0);
+}
+
+// ---------------------------------------------------------------- Go: quadratic probe
+
+/// One Go package: `Consumer.Run` (the entry) calls `T.m0`, which calls `m1`, ... `m2999`
+/// through `this`; the even methods also call through a field; `NewT` holds 50 producer
+/// sites (a client built in the constructor). 8,000 call sites in all.
+fn big_go_package() -> Vec<FileSpec> {
+    const METHODS: u32 = 3_000;
+    let mut callables = vec![callable(None, "NewT", 1, 3)];
+    let mut call_sites = Vec::new();
+    for k in 0..METHODS {
+        let line = 10 + 4 * k;
+        callables.push(callable(Some("T"), &format!("m{k}"), line, line + 3));
+        let me = k + 1;
+        if k + 1 < METHODS {
+            call_sites.push(site(
+                me,
+                &format!("m{}", k + 1),
+                CallReceiver::This,
+                line + 1,
+            ));
+        }
+        if k % 2 == 0 {
+            call_sites.push(site(me, "WriteMessages", field("w"), line + 2));
+        }
+        // Filler: package functions that do not exist.
+        call_sites.push(site(me, "helperA", CallReceiver::SameModule, line + 2));
+        if k % 2 == 1 {
+            call_sites.push(site(me, "helperB", CallReceiver::SameModule, line + 2));
+        }
+    }
+    while call_sites.len() < 8_000 {
+        call_sites.push(site(
+            1,
+            &format!("filler{}", call_sites.len()),
+            CallReceiver::SameModule,
+            12,
+        ));
+    }
+    let producers: Vec<(usize, &'static str)> = (0..50)
+        .map(|k| (2, &*Box::leak(format!("t{k}").into_boxed_str())))
+        .collect();
+    vec![
+        spec(
+            "/w/g/t.go",
+            CallFacts {
+                callables,
+                call_sites,
+                injections: vec![inject("T", "w", "kafka.Writer")],
+                types: vec![class("T", TypeFactKind::Class, &[])],
+                ..CallFacts::default()
+            },
+            vec![],
+            producers,
+        ),
+        spec(
+            "/w/g/consumer.go",
+            CallFacts {
+                callables: vec![callable(Some("Consumer"), "Run", 5, 8)],
+                call_sites: vec![site(0, "m0", field("t"), 6)],
+                injections: vec![inject("Consumer", "t", "T")],
+                types: vec![class("Consumer", TypeFactKind::Class, &[])],
+                ..CallFacts::default()
+            },
+            vec![(6, "in")],
+            vec![],
+        ),
+    ]
+}
+
+#[test]
+fn a_constructor_with_thousands_of_methods_and_many_producer_sites_stays_linear() {
+    let files = big_go_package();
+    assert!(files[0].facts.call_sites.len() >= 8_000);
+    let started = std::time::Instant::now();
+    let g = build(&files);
+    let took = started.elapsed();
+    // Run -> m0 -> m1 -> ... -> m2998 (the last even method publishes): m2999 is a dead end.
+    let edges = calls(&g);
+    assert_eq!(edges.len(), 2_999, "{}", edges.len());
+    assert!(edges.contains(&edge("Consumer.Run", "T.m0", X)));
+    assert!(edges.contains(&edge("T.m2997", "T.m2998", X)));
+    assert!(edges.iter().all(|e| e.1 != "T.m2999"));
+    // The pre-fix scan (50 constructor sites x 3,000 methods x 8,000 call sites) took 830 ms
+    // in release here; the fixed one 10 ms. The bounds leave a loaded CI runner room.
+    let bound = if cfg!(debug_assertions) { 3_000 } else { 250 };
+    assert!(took.as_millis() < bound, "{took:?}");
+}
+
+// ---------------------------------------------------------------- call-site pruning
+
+fn refold_spec(g: &mut ContractGraph, f: &FileSpec) {
+    g.add_call_facts(path(f.path), 0, CompactStr::new("app"), f.facts.clone());
+    g.add_node(node("decl", NodeKind::ServiceClass, f.path, 1));
+    for (line, topic) in &f.consumers {
+        let id = g.add_node(node(topic, NodeKind::KafkaTopic, f.path, *line));
+        g.add_consumer(id, topic);
+    }
+    for (line, topic) in &f.producers {
+        let id = g.add_node(node(topic, NodeKind::KafkaTopic, f.path, *line));
+        g.add_producer(id, topic);
+    }
+}
+
+fn sites_in(g: &ContractGraph, file: &str) -> usize {
+    g.call_facts
+        .get(Path::new(file))
+        .map_or(usize::MAX, |f| f.facts.call_sites.len())
+}
+
+#[test]
+fn files_off_every_path_keep_no_call_sites_and_come_back_when_a_path_reaches_them() {
+    // The consumer imports a module nobody provides: `handler.py` lies on no path.
+    let mut off = py_files(true);
+    off[0].facts.imports = vec![import("Handler", "elsewhere.handler")];
+    let mut g = build(&off);
+    assert!(g.call_edges().is_empty());
+    let handler = "/w/src/pkg/handler.py";
+    assert_eq!(sites_in(&g, handler), 0);
+    assert_eq!(sites_in(&g, "/w/src/pkg/consumer.py"), 0);
+    assert!(g.call_stats().files_pruned >= 2);
+    assert!(g.call_files_missing_sites().is_empty());
+    // Its callables, imports and types stay: they decide which files lie on a path.
+    let kept = &g.call_facts[Path::new(handler)].facts;
+    assert_eq!(kept.callables.len(), 1);
+    assert_eq!(kept.imports.len(), 2);
+
+    // The consumer now imports it: the file is on a path, its sites are asked for.
+    let on = py_files(true);
+    g.patch_files([Path::new(on[0].path)]);
+    refold_spec(&mut g, &on[0]);
+    g.reconcile_delta();
+    assert_eq!(
+        g.call_files_missing_sites(),
+        &[path(handler)],
+        "{:?}",
+        calls(&g)
+    );
+    assert_eq!(g.call_stats().missing_sites, 1);
+    let mut health = crate::health::IndexHealth::default();
+    health.set_call_stats(&g.call_stats());
+    assert!(health.calls_truncated());
+    // The caller re-extracts the file and stores its full facts.
+    g.patch_files([Path::new(handler)]);
+    refold_spec(&mut g, &on[1]);
+    g.reconcile_delta();
+    assert!(g.call_files_missing_sites().is_empty());
+    assert_eq!(calls(&g), calls(&build(&on)));
+    assert_eq!(sites_in(&g, handler), 2);
+    // The candidate files keep their sites.
+    assert_eq!(sites_in(&g, "/w/src/pkg/consumer.py"), 1);
+}
+
+#[test]
+fn a_graph_without_an_entry_or_a_producer_prunes_every_java_go_and_python_file() {
+    let mut files = py_files(true);
+    for f in &mut files {
+        f.consumers.clear();
+    }
+    let g = build(&files);
+    assert!(files.iter().all(|f| sites_in(&g, f.path) == 0));
+    // TypeScript facts are kept whole.
+    let ts = build(&[spec(
+        "/w/src/a.ts",
+        CallFacts {
+            callables: vec![callable(None, "f", 1, 3)],
+            call_sites: vec![site(0, "g", CallReceiver::SameModule, 2)],
+            ..CallFacts::default()
+        },
+        vec![],
+        vec![],
+    )]);
+    assert_eq!(sites_in(&ts, "/w/src/a.ts"), 1);
+}
+
+#[test]
+fn an_inherited_field_guess_is_never_exact() {
+    // `Sub` extends `Base`, which declares `bus`; `Sub.run` calls `bus.send()` bare.
+    let files = vec![
+        spec(
+            "/w/j/Sub.java",
+            CallFacts {
+                callables: vec![callable(Some("Sub"), "run", 3, 6)],
+                call_sites: vec![site(
+                    0,
+                    "send",
+                    CallReceiver::InheritedField("bus".into()),
+                    4,
+                )],
+                types: vec![TypeFact {
+                    extends: vec!["Base".into()],
+                    ..class("Sub", TypeFactKind::Class, &[])
+                }],
+                ..CallFacts::default()
+            },
+            vec![(3, "in")],
+            vec![],
+        ),
+        spec(
+            "/w/j/Base.java",
+            CallFacts {
+                injections: vec![inject("Base", "bus", "Bus")],
+                types: vec![class("Base", TypeFactKind::Class, &[])],
+                ..CallFacts::default()
+            },
+            vec![],
+            vec![],
+        ),
+        spec(
+            "/w/j/Bus.java",
+            CallFacts {
+                callables: vec![callable(Some("Bus"), "send", 2, 5)],
+                types: vec![class("Bus", TypeFactKind::Class, &[])],
+                ..CallFacts::default()
+            },
+            vec![],
+            vec![(3, "out")],
+        ),
+    ];
+    let g = build(&files);
+    assert_eq!(
+        calls(&g),
+        vec![edge("Sub.run", "Bus.send", EdgeConfidence::Heuristic)]
+    );
+    assert!(g.call_edges()[0]
+        .metadata
+        .as_deref()
+        .is_some_and(|m| m.starts_with("inherited_field")));
+}

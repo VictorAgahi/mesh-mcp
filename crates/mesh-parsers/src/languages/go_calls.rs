@@ -7,12 +7,16 @@
 //! Recorded on purpose, and nothing else: `r.m()` on the method receiver `r`,
 //! `r.field.m()` through a struct field, `pkg.F()` on an imported package, and `F()`
 //! of a name that is not a builtin or predeclared type (a function of the same
-//! package, in this file or a sibling). Calls on locals and parameters are dropped.
+//! package, in this file or a sibling). Calls on locals and parameters are dropped: a
+//! parameter, `:=` / `var` name or `range` variable that carries the name of an imported
+//! package or of a package function keeps its call out of the facts (limit: a name bound
+//! after the call in document order, or in a closure, is judged by the enclosing callable
+//! as a whole, see `Shadows`).
 //!
 //! Every walk is iterative, every list is capped per file and a hit cap sets
 //! `CallFacts::capped` (counted in `IndexHealth`).
 
-use super::call_support::{collect_sites, prune_unused};
+use super::call_support::{collect_sites, prune_unused, Shadows};
 use super::ts_calls::{text, walk, Builder, MAX_DECLS_PER_FILE};
 use mesh_core::{CallFacts, CallReceiver, CompactStr, TypeFact, TypeFactKind};
 use std::collections::HashSet;
@@ -362,15 +366,17 @@ pub fn extract(tree: &Tree, source: &[u8]) -> CallFacts {
         .collect();
     let imported: HashSet<CompactStr> = b.facts.imports.iter().map(|i| i.local.clone()).collect();
 
+    let mut shadows = Shadows::default();
     collect_sites(&mut b, root, &mut |node, caller, fact| {
         if node.kind() != "call_expression" {
+            bind_locals(node, source, &mut |name| shadows.bind(caller, name));
             return None;
         }
         let function = node.child_by_field_name("function")?;
         match function.kind() {
             "identifier" => {
                 let name = text(function, source)?;
-                (!PREDECLARED.contains(&name))
+                (!PREDECLARED.contains(&name) && !shadows.has(caller, name))
                     .then(|| (CompactStr::new(name), CallReceiver::SameModule))
             }
             "selector_expression" => {
@@ -383,7 +389,7 @@ pub fn extract(tree: &Tree, source: &[u8]) -> CallFacts {
                         let name = text(operand, source)?;
                         if owner.is_some() && Some(name) == var {
                             Some((callee, CallReceiver::This))
-                        } else if imported.contains(name) {
+                        } else if imported.contains(name) && !shadows.has(caller, name) {
                             Some((callee, CallReceiver::Namespace(CompactStr::new(name))))
                         } else {
                             None
@@ -415,6 +421,37 @@ pub fn extract(tree: &Tree, source: &[u8]) -> CallFacts {
     prune_unused(&mut b);
     b.facts.shrink_to_fit();
     b.facts
+}
+
+/// Calls `bind` with each name `node` declares locally: a parameter (receiver included),
+/// a `:=` or `var` name, a `range` or type-switch variable.
+fn bind_locals(node: Node, source: &[u8], bind: &mut dyn FnMut(&str)) {
+    let mut names: Vec<Node> = Vec::new();
+    let mut cursor = node.walk();
+    match node.kind() {
+        "parameter_declaration" | "variadic_parameter_declaration" | "var_spec" => {
+            names.extend(node.children_by_field_name("name", &mut cursor));
+        }
+        "short_var_declaration" | "range_clause" | "receive_statement" => {
+            names.extend(node.child_by_field_name("left"));
+        }
+        "type_switch_statement" => names.extend(node.child_by_field_name("alias")),
+        _ => {}
+    }
+    while let Some(n) = names.pop() {
+        match n.kind() {
+            "identifier" => {
+                if let Some(t) = text(n, source) {
+                    bind(t);
+                }
+            }
+            "expression_list" => {
+                let mut c = n.walk();
+                names.extend(n.named_children(&mut c));
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -556,6 +593,52 @@ func audit(x float64) {}
                 ("store", "example.com/app/store/v2")
             ]
         );
+    }
+
+    #[test]
+    fn parameters_and_locals_shadow_packages_and_functions() {
+        let f = facts(
+            r#"package p
+
+import "example.com/app/store"
+
+func byParam(store Saver) { store.Save() }
+
+func byLocal() {
+	store := open()
+	store.Save()
+}
+
+func byRange(items []Saver) {
+	for _, store := range items {
+		store.Save()
+	}
+}
+
+func byCallback(audit func()) { audit() }
+
+func plain() {
+	store.Save()
+	audit()
+}
+
+func audit() {}
+"#,
+        );
+        let s = sites(&f);
+        let ns = CallReceiver::Namespace("store".into());
+        let ns_callers: Vec<&str> = s
+            .iter()
+            .filter(|c| c.2 == ns)
+            .map(|c| c.0.as_str())
+            .collect();
+        assert_eq!(ns_callers, vec![".plain"], "{s:?}");
+        let audit_callers: Vec<&str> = s
+            .iter()
+            .filter(|c| c.1 == "audit")
+            .map(|c| c.0.as_str())
+            .collect();
+        assert_eq!(audit_callers, vec![".plain"], "{s:?}");
     }
 
     #[test]

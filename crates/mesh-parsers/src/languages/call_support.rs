@@ -4,7 +4,7 @@
 
 use super::ts_calls::{walk, Builder, MAX_CALL_SITES_PER_FILE};
 use mesh_core::{CallFact, CallReceiver, CallableFact, CompactStr};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
 /// A call site: the callee name and how it is reached.
@@ -72,6 +72,30 @@ pub(super) fn collect_sites<'t>(
     b.facts.capped |= capped;
 }
 
+/// Names a parameter or a local binds inside each recorded callable, in document order
+/// (a call before the binding still reaches the module or package of that name). The
+/// Python and Go extractors use it so that a parameter `orders` does not turn
+/// `orders.save()` into a call on the imported module `orders`.
+///
+/// shortcut: a name bound in a nested function or closure counts for the whole enclosing
+/// callable, and a name bound after the call in document order is not seen; a precise
+/// per-scope analysis would need a full binder, upgrade if a corpus shows false edges.
+#[derive(Default)]
+pub(super) struct Shadows(HashMap<u32, HashSet<CompactStr>>);
+
+impl Shadows {
+    pub(super) fn bind(&mut self, caller: u32, name: &str) {
+        self.0
+            .entry(caller)
+            .or_default()
+            .insert(CompactStr::new(name));
+    }
+
+    pub(super) fn has(&self, caller: u32, name: &str) -> bool {
+        self.0.get(&caller).is_some_and(|s| s.contains(name))
+    }
+}
+
 /// Whether `name` is a plain identifier (letters, digits, `_`, `$`; not starting with a digit).
 pub(super) fn is_ident(name: &str) -> bool {
     name.chars()
@@ -92,7 +116,7 @@ pub(super) fn prune_unused(b: &mut Builder) {
         .call_sites
         .iter()
         .filter_map(|s| match &s.receiver {
-            CallReceiver::InjectedField(f) => Some(f.as_str()),
+            CallReceiver::InjectedField(f) | CallReceiver::InheritedField(f) => Some(f.as_str()),
             _ => None,
         })
         .collect();

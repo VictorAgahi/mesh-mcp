@@ -91,12 +91,18 @@ fn heritage(node: Node, source: &[u8]) -> (Vec<CompactStr>, Vec<CompactStr>) {
     (extends, implements)
 }
 
-fn has_modifier(node: Node, source: &[u8], word: &str) -> bool {
+/// Whether `node` carries the modifier keyword `word` (`abstract`): a keyword child of its
+/// `modifiers` node, not a word inside an annotation's arguments.
+fn has_modifier(node: Node, word: &str) -> bool {
     let mut cursor = node.walk();
-    let found = node.children(&mut cursor).any(|c| {
-        c.kind() == "modifiers"
-            && text(c, source).is_some_and(|t| t.split_whitespace().any(|w| w == word))
-    });
+    let found = node
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "modifiers")
+        .any(|m| {
+            let mut inner = m.walk();
+            let found = m.children(&mut inner).any(|k| k.kind() == word);
+            found
+        });
     found
 }
 
@@ -133,9 +139,7 @@ pub fn extract(tree: &Tree, source: &[u8]) -> CallFacts {
             let (extends, implements) = heritage(node, source);
             let kind = match kind {
                 "interface_declaration" => TypeFactKind::Interface,
-                "class_declaration" if has_modifier(node, source, "abstract") => {
-                    TypeFactKind::Abstract
-                }
+                "class_declaration" if has_modifier(node, "abstract") => TypeFactKind::Abstract,
                 _ => TypeFactKind::Class,
             };
             let fact = TypeFact {
@@ -262,10 +266,15 @@ pub fn extract(tree: &Tree, source: &[u8]) -> CallFacts {
         let callee = CompactStr::new(text(node.child_by_field_name("name")?, source)?);
         let owner = fact.owner.as_deref()?;
         // An inherited field is guessed from the base class only for a lower-case name:
-        // `Util.stat()` is a static call.
+        // `Util.stat()` is a static call. `0`: a field of this class, `1`: a guess.
         let field_of = |name: &str| {
-            fields.contains(&(CompactStr::new(owner), CompactStr::new(name)))
-                || (derived.contains(owner) && name.starts_with(char::is_lowercase))
+            if fields.contains(&(CompactStr::new(owner), CompactStr::new(name))) {
+                Some(false)
+            } else if derived.contains(owner) && name.starts_with(char::is_lowercase) {
+                Some(true)
+            } else {
+                None
+            }
         };
         let receiver = match node.child_by_field_name("object") {
             None => CallReceiver::This,
@@ -276,15 +285,20 @@ pub fn extract(tree: &Tree, source: &[u8]) -> CallFacts {
                     let shadowed = shadows
                         .get(&caller)
                         .is_some_and(|s| s.contains(&CompactStr::new(f)));
-                    if shadowed || !field_of(f) {
+                    if shadowed {
                         return None;
                     }
-                    CallReceiver::InjectedField(CompactStr::new(f))
+                    // A bare name that is no field of this class is only a guess (a field
+                    // the base class may declare): never `exact`.
+                    match field_of(f)? {
+                        false => CallReceiver::InjectedField(CompactStr::new(f)),
+                        true => CallReceiver::InheritedField(CompactStr::new(f)),
+                    }
                 }
                 "field_access" => {
                     let base = o.child_by_field_name("object")?;
                     let f = text(o.child_by_field_name("field")?, source)?;
-                    if base.kind() != "this" || !field_of(f) {
+                    if base.kind() != "this" || field_of(f).is_none() {
                         return None;
                     }
                     CallReceiver::InjectedField(CompactStr::new(f))
@@ -402,8 +416,10 @@ record Pair(Handler first) {
         assert!(s.contains(&(c.clone(), "send".into(), field("kafka"), 23)));
         assert!(s.contains(&(c.clone(), "audit".into(), CallReceiver::This, 24)));
         assert!(s.contains(&(c.clone(), "helper".into(), CallReceiver::This, 25)));
-        // The class extends `Base`: a field the base may declare is kept for the resolver.
-        assert!(s.contains(&(c.clone(), "go".into(), field("inherited"), 26)));
+        // The class extends `Base`: a field the base may declare is kept for the resolver,
+        // as a guess (never `exact`).
+        let guess = CallReceiver::InheritedField("inherited".into());
+        assert!(s.contains(&(c.clone(), "go".into(), guess, 26)));
         // `local`, `Util`, a call chain and an abstract method give nothing; the repeated
         // `billing.charge` (line 30, a chain's inner call is not a site) and `send` are de-duplicated.
         assert_eq!(s.len(), 6 + 1, "{s:?}");
@@ -420,6 +436,24 @@ record Pair(Handler first) {
                 ("*", "com.shop.audit"),
                 // Called through `names.forEach`: kept, the resolver finds nothing.
                 ("List", "java.util")
+            ]
+        );
+    }
+
+    #[test]
+    fn abstract_is_a_modifier_keyword_not_a_word_of_an_annotation_argument() {
+        let f = facts(
+            "@Qualifier(\"an abstract name\")\nclass Plain {}\nabstract class Real {}\n\
+             @Named(\"x\") public abstract class Both {}\n",
+        );
+        let kinds: Vec<(&str, TypeFactKind)> =
+            f.types.iter().map(|t| (t.name.as_str(), t.kind)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("Plain", TypeFactKind::Class),
+                ("Real", TypeFactKind::Abstract),
+                ("Both", TypeFactKind::Abstract)
             ]
         );
     }

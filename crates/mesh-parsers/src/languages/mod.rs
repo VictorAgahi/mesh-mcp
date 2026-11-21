@@ -203,6 +203,11 @@ pub struct FileIndex {
     /// language without a call extractor.
     #[serde(default)]
     pub calls: CallFacts,
+    /// A Java, Go or Python file that carries no call facts because of its path (test code,
+    /// generated code, a `testing/`, `fixtures/` or `gen/` directory): counted in
+    /// `IndexHealth`, so a chain through such a file is not silently absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub calls_skipped_path: bool,
 }
 
 impl FileIndex {
@@ -227,6 +232,7 @@ impl FileIndex {
             .extend(other.heuristic_topic_nodes.into_iter().map(|i| i + offset));
         self.parse_failed |= other.parse_failed;
         self.calls.merge(other.calls);
+        self.calls_skipped_path |= other.calls_skipped_path;
     }
 
     /// Inserts the extracted nodes and relations into `graph`.
@@ -792,6 +798,7 @@ impl PolyglotIndexer {
 
             LanguageKind::Java => {
                 let with_calls = Self::wants_call_facts(cfg, file_path);
+                out.calls_skipped_path = !with_calls;
                 if let Some(((nodes, dependencies, producers, rpc_calls), calls)) =
                     parsed!(|tree| {
                         (
@@ -820,6 +827,7 @@ impl PolyglotIndexer {
             }
             LanguageKind::Go => {
                 let with_calls = Self::wants_call_facts(cfg, file_path);
+                out.calls_skipped_path = !with_calls;
                 if let Some(((nodes, relations), calls)) = parsed!(|tree| {
                     (
                         go::GoExtractor::extract_with_relations(file_path, content, repo_id, tree),
@@ -840,6 +848,7 @@ impl PolyglotIndexer {
             }
             LanguageKind::Python => {
                 let with_calls = Self::wants_call_facts(cfg, file_path);
+                out.calls_skipped_path = !with_calls;
                 if let Some(((nodes, relations), calls)) = parsed!(|tree| {
                     (
                         python::PythonExtractor::extract_with_relations(
@@ -1507,6 +1516,7 @@ mod tests {
             heuristic_topic_nodes: vec![1],
             parse_failed: false,
             calls: CallFacts::default(),
+            calls_skipped_path: false,
         };
         let before = format!("{index:?}");
         let anchored = index.relativize(&root_a).expect("all under root");
