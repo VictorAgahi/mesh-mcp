@@ -395,6 +395,9 @@ pub(super) struct DerivedCalls {
     pub(super) edges: Vec<ContractEdge>,
     /// Per file, indices into `callables` (sorted by line).
     pub(super) by_file: HashMap<FilePath, Vec<u32>>,
+    /// Entry / producer site -> the materialized callables it is anchored on besides
+    /// its enclosing one (Go: the methods of the struct a `NewT` constructor builds).
+    pub(super) site_anchors: HashMap<NodeId, Vec<NodeId>>,
     pub(super) stats: CallStats,
     /// Candidate files holding no call sites (pruned by an earlier derive), sorted.
     pub(super) missing_sites: Vec<FilePath>,
@@ -457,6 +460,25 @@ impl ContractGraph {
             .filter_map(|&k| self.derived_calls.callables.get(k as usize))
             .filter(|c| c.line_start <= node.line_start && node.line_start <= c.line_end)
             .min_by_key(|c| (c.line_end - c.line_start, c.line_start, c.id))
+    }
+
+    /// Every materialized callable `node` (an entry or producer site) is anchored
+    /// on: its [`Self::enclosing_callable`], then the methods of the struct a Go
+    /// constructor builds when the site lies in that constructor. Sorted by id.
+    pub fn site_callables(&self, node: &ContractNode) -> Vec<&ContractNode> {
+        let mut out: Vec<&ContractNode> = self.enclosing_callable(node).into_iter().collect();
+        out.extend(
+            self.derived_calls
+                .site_anchors
+                .get(&node.id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|&id| self.get_node(id)),
+        );
+        out.sort_by_key(|c| c.id);
+        out.dedup_by_key(|c| c.id);
+        out
     }
 
     /// (files whose facts were capped, approximate bytes of all stored facts, files
@@ -1854,21 +1876,22 @@ impl<'g> Deriver<'g> {
             .flatten()
             .copied()
             .collect();
-        let mut entry_lines: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut producer_lines: Vec<Vec<usize>> = vec![Vec::new(); n];
+        // (line, node) of each entry and producer site, per file.
+        let mut entry_lines: Vec<Vec<(usize, NodeId)>> = vec![Vec::new(); n];
+        let mut producer_lines: Vec<Vec<(usize, NodeId)>> = vec![Vec::new(); n];
         for (i, (path, _)) in self.files.iter().enumerate() {
             for id in self.graph.get_nodes_for_file(path) {
                 let Some(node) = self.graph.nodes.get(id) else {
                     continue;
                 };
                 if producer_ids.contains(id) {
-                    producer_lines[i].push(node.line_start);
+                    producer_lines[i].push((node.line_start, *id));
                 }
                 // Entries: consumers, HTTP routes and inbound gRPC handlers.
                 if consumer_ids.contains(id)
                     || matches!(node.kind, NodeKind::HttpEndpoint | NodeKind::GrpcMethod)
                 {
-                    entry_lines[i].push(node.line_start);
+                    entry_lines[i].push((node.line_start, *id));
                 }
             }
         }
@@ -1991,21 +2014,22 @@ impl<'g> Deriver<'g> {
         // `constructed_methods` per anchoring callable, not per line: several sites may
         // lie in one constructor.
         let mut constructed: FastMap<usize, Vec<usize>> = FastMap::default();
+        // Sites anchored on methods other than their enclosing callable (a Go
+        // constructor), for the chain engine: site node -> global callables.
+        let mut site_methods: Vec<(NodeId, usize)> = Vec::new();
         for i in (0..n).filter(|&i| candidate[i]) {
             for (lines, set) in [
                 (&entry_lines[i], &mut entries),
                 (&producer_lines[i], &mut producers),
             ] {
-                for &l in lines {
+                for &(l, site) in lines {
                     if let Some(c) = self.enclosing(i, l) {
                         set.insert(c);
-                        set.extend(
-                            constructed
-                                .entry(c)
-                                .or_insert_with(|| self.constructed_methods(i, c))
-                                .iter()
-                                .copied(),
-                        );
+                        let methods = constructed
+                            .entry(c)
+                            .or_insert_with(|| self.constructed_methods(i, c));
+                        set.extend(methods.iter().copied());
+                        site_methods.extend(methods.iter().map(|&m| (site, m)));
                     }
                 }
             }
@@ -2070,6 +2094,16 @@ impl<'g> Deriver<'g> {
             }
         }
         edges.sort_by_key(|e| (e.from, e.to));
+        let mut site_anchors: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for (site, m) in site_methods {
+            if let Some(&id) = id_of.get(&m) {
+                site_anchors.entry(site).or_default().push(id);
+            }
+        }
+        for v in site_anchors.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
         stats.callables = callables.len();
         stats.calls = edges.len();
         stats.dispatch_overflow = self.dispatch_overflow;
@@ -2080,6 +2114,7 @@ impl<'g> Deriver<'g> {
                 callables,
                 edges,
                 by_file,
+                site_anchors,
                 stats,
                 missing_sites,
             },

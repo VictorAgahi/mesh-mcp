@@ -65,6 +65,9 @@ Behaviour that is easy to get wrong, stated once
   `optional` is allowed only on a producer, consumer or hop that also carries the tag
   `declared_pattern` (and `declared_pattern` requires `optional`); a chain, a chain step or
   a chain that references an optional item is an error. Dropped items are listed by id.
+- Like-for-like slice: "topic entry, forward" keeps the chains every chain tool accepts (analyze_impact
+takes only a topic and has no reverse); "endpoints present" counts a chain whose consume / produce
+steps all appear (any order), the most a flat matrix with no call steps can show.
 - Chain table: chain recall for all chains, for the `min_hops >= 3` slice (min_hops is the
   explicit value, else the number of `call` steps) and per tag, in order and as presence.
 - Chains: tp = traced, fn = not traced; precision is not defined. Precision columns
@@ -613,10 +616,14 @@ def score_corpus(golden, sites, answers, include_tests=False, chain_order="stric
         for ch in golden["chains"]:
             occ = extract_occurrences(answers.get(ch["id"], ""))
             strict, presence = chain_traced(ch["steps"], occ), chain_present(ch["steps"], occ)
+            # Endpoints only (consume / produce steps, any order): the like-for-like
+            # measure for a flat matrix, which cannot list call steps.
+            endpoints = chain_present([st for st in ch["steps"] if st.get("kind") in ("consume", "produce")], occ)
             ok = presence if chain_order == "any" else strict
             rec("chain", "tp" if ok else "fn", lang_of(ch["steps"][0]["file"]), ch.get("tags") or [],
                 strict=strict, presence=presence, min_hops=chain_min_hops(ch),
-                direction=ch.get("direction") or "forward", n_steps=len(ch["steps"]))
+                direction=ch.get("direction") or "forward", n_steps=len(ch["steps"]),
+                entry_kind=(ch.get("entry") or {}).get("kind", "topic"), endpoints=endpoints)
     return recs, negatives_hit, {"ignored_test_sites": ignored, "optional_ignored": len(optional_ids),
                                  "optional_ids": optional_ids}
 
@@ -654,7 +661,9 @@ def summarize(recs, line_tol=LINE_TOL):
 def _chain_row(rs):
     n = len(rs)
     a, b = sum(r["strict"] for r in rs), sum(r["presence"] for r in rs)
-    return {"chains": n, "in_order": a, "presence": b, "recall_in_order": _ratio(a, n), "recall_presence": _ratio(b, n)}
+    e = sum(bool(r.get("endpoints")) for r in rs)
+    return {"chains": n, "in_order": a, "presence": b, "recall_in_order": _ratio(a, n), "recall_presence": _ratio(b, n),
+            "endpoints": e, "recall_endpoints": _ratio(e, n)}
 
 
 def chain_summary(recs):
@@ -671,6 +680,9 @@ def chain_summary(recs):
     return {"all": _chain_row(ch), "min_hops_ge_3": _chain_row([r for r in ch if (r.get("min_hops") or 0) >= 3]),
             "per_direction": {d: _chain_row(v) for d, v in sorted(per_dir.items())},
             "longer_than_cap": _chain_row([r for r in ch if r.get("n_steps", 0) - 1 > CHAIN_DEPTH]),
+            # The only chains analyze_impact can be asked about (a topic, forward).
+            "topic_forward": _chain_row([r for r in ch if r.get("entry_kind", "topic") == "topic"
+                                         and r.get("direction", "forward") == "forward"]),
             "depth_cap": CHAIN_DEPTH,
             "per_tag": {t: _chain_row(v) for t, v in sorted(per_tag.items())}}
 
@@ -789,11 +801,13 @@ def _impact_args(chain, include_tests):
 
 
 def _trace_flow_args(chain, include_tests):
-    # Extension point: the trace_flow argument shape arrives with the 9.x tool.
+    # trace_flow (9.x): event_depth at the same cap as analyze_impact's depth, the
+    # golden entry kind passed through (a cron or handler entry is a method name).
     # Arguments the tool's inputSchema does not declare are dropped by
     # _filter_args, so this stays valid when the schema grows or shrinks.
-    return {"target": chain["entry"]["value"], "depth": CHAIN_DEPTH, "direction": chain.get("direction", "forward"),
-            "include_tests": include_tests}
+    return {"target": chain["entry"]["value"], "event_depth": CHAIN_DEPTH,
+            "entry_kind": chain["entry"].get("kind", "topic"),
+            "direction": chain.get("direction", "forward"), "include_tests": include_tests}
 
 
 TOOL_ADAPTERS = {"analyze_impact": _impact_args, "trace_flow": _trace_flow_args}
@@ -813,7 +827,8 @@ def trace_chain(session, tool_name, chain, include_tests):
     for _ in range(10):
         pages.append(session.call(tool_name, dict(args, offset=offset) if offset and paged else args))
         # Footer: "More rows: repeat the same call with `offset: N` for the next page."
-        m = re.search(r"More rows:.*?offset:\s*(\d+)", pages[-1])
+        # (trace_flow pages by hop: "More hops: ...").
+        m = re.search(r"More (?:rows|hops):.*?offset:\s*(\d+)", pages[-1])
         if not m or int(m.group(1)) <= offset:
             break
         offset = int(m.group(1))
@@ -868,12 +883,15 @@ def _chain_table(cs):
     rows = [("all chains", cs["all"]), ("chains with min_hops >= 3", cs["min_hops_ge_3"])]
     rows += [(f"direction: {d}", v) for d, v in cs["per_direction"].items()]
     rows.append((f"longer than the cap (> {cap} hops after the entry step)", cs["longer_than_cap"]))
+    rows.append(("topic entry, forward (like-for-like across tools)", cs["topic_forward"]))
     rows += [(f"tag: {t}", v) for t, v in cs["per_tag"].items()]
     out = [f"### chains (tool depth cap: {cap}; reverse chains and chains longer than the cap miss by construction, "
-           "and still count as misses)", "", "| slice | chains | traced in order | recall in order | presence (any order) | recall presence |",
-           "|---|---|---|---|---|---|"]
+           "and still count as misses; endpoints = every consume / produce step present, any order)", "",
+           "| slice | chains | traced in order | recall in order | presence (any order) | recall presence | endpoints present |",
+           "|---|---|---|---|---|---|---|"]
     for name, r in rows:
-        out.append(f"| {name} | {r['chains']} | {r['in_order']} | {_pct(r['recall_in_order'])} | {r['presence']} | {_pct(r['recall_presence'])} |")
+        out.append(f"| {name} | {r['chains']} | {r['in_order']} | {_pct(r['recall_in_order'])} | {r['presence']} | "
+                   f"{_pct(r['recall_presence'])} | {r['endpoints']} |")
     return "\n".join(out) + "\n"
 
 

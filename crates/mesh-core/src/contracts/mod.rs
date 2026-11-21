@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 mod calls;
 mod delta;
+mod flow;
 mod index;
 mod query;
 mod reconcile;
@@ -21,6 +22,11 @@ pub use calls::{
     MAX_STRUCTURAL_PAIRS, MAX_TYPE_HOPS,
 };
 pub use delta::ReconcileMode;
+pub use flow::{
+    FlowBounds, FlowDirection, FlowEnd, FlowEntry, FlowHop, FlowLimit, FlowNext, FlowOutcome,
+    FlowSite, FlowStep, FlowStepKind, FlowTrace, DEFAULT_CALL_DEPTH, DEFAULT_EVENT_DEPTH,
+    DEFAULT_FAN_OUT, MAX_CALL_DEPTH, MAX_EVENT_DEPTH, MAX_FAN_OUT, MAX_FLOW_HOPS,
+};
 
 #[cfg(test)]
 mod calls_langs_tests;
@@ -28,6 +34,8 @@ mod calls_langs_tests;
 mod calls_tests;
 #[cfg(test)]
 mod delta_tests;
+#[cfg(test)]
+mod flow_tests;
 #[cfg(test)]
 mod handler_ref_tests;
 #[cfg(test)]
@@ -285,9 +293,10 @@ pub struct ImpactFlow<'g> {
     pub topics: Vec<&'g ContractNode>,
     pub downstream_consumers: Vec<&'g ContractNode>,
     pub related_sagas: Vec<&'g ContractNode>,
-    /// Hops past the first: producers declared in the file of a consumer
-    /// reached on the previous hop (a handler that re-emits), through which
-    /// the walk continued. Linked by file, not by a call edge.
+    /// Hops past the first: producers a consumer reached on the previous hop
+    /// publishes through, found by the chain engine (`contracts::flow`): through
+    /// resolved calls (ids in `call_linked_producers`), else declared in the
+    /// consumer's own file (the 8.x rule, a handler that re-emits).
     pub downstream_producers: Vec<&'g ContractNode>,
     /// Consumers (or sagas) the walk reached but did not expand because the
     /// depth limit was hit: a higher `depth` would follow them. Nothing is
@@ -298,6 +307,9 @@ pub struct ImpactFlow<'g> {
     /// chain, or a hop whose publish name is resolved at runtime. Sorted by
     /// location.
     pub chain_end: Vec<&'g ContractNode>,
+    /// Ids (sorted) of the `downstream_producers` reached through a resolved call
+    /// path (`Calls` edges); the others are linked by the same-file fallback.
+    pub call_linked_producers: Vec<NodeId>,
     /// Number of source files in the index searched during this flow trace.
     pub files_scanned: usize,
 }
@@ -390,6 +402,9 @@ pub struct ImpactMatrix<'g> {
     /// The walk continued past the first hop through producers found in a
     /// consumer's file ([`ImpactFlow::downstream_producers`]).
     pub file_linked_hops: bool,
+    /// The walk continued past the first hop through resolved calls from a
+    /// consumer to a publish ([`ImpactFlow::call_linked_producers`]).
+    pub call_linked_hops: bool,
     /// Hops requested (clamped), for the depth-limit note.
     pub depth: usize,
     /// See [`ImpactFlow::unexpanded`], without nodes in test files.

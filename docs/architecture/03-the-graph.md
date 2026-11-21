@@ -99,6 +99,22 @@ differently still meet. A broker literal such as `orders.created` is kept whole.
 TypeScript, the extractor resolves literals, templates, constants and enums inside the file; an
 imported constant is passed to the graph as written to be reduced here.
 
+## Calls and chains (9.0)
+
+A separate layer holds `Callable` nodes (a method or function) and `Calls` edges between them,
+derived after every reconcile from per-file call facts (`contracts/calls.rs`). Only the callables on
+a call path from an entry (a consumer, an HTTP route, a gRPC handler) to a publish are kept. Each
+`Calls` edge records the resolution rule and the line of the call expression.
+
+The chain engine (`contracts/flow.rs`) walks that layer: from an entry, a breadth-first walk over
+`Calls` edges finds every publish the entry's callable reaches (one **hop**); the topic published
+continues at its consumers (one **event level** further), and `reverse` walks the callers instead.
+Each walk has a visited set (each callable once per walk, each topic once per trace), so a cyclic
+call graph or a cyclic event chain ends, and the answer says where. When no call path reaches a
+publish, the 8.x rule is the fallback: producers in the same file as the consumer, `heuristic`.
+`trace_flow` renders the hops; `analyze_impact` with `depth > 1` lists the same producers, topics
+and consumers as matrix rows.
+
 ## Wildcards and relays
 
 A NATS subject with `*` or `>`, or an MQTT topic with `+` or `#`, is linked to the producers of every

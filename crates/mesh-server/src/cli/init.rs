@@ -473,6 +473,7 @@ repositories, start from the graph, then check what matters with your usual read
 - who imports or uses a package, module or symbol → `find_dependents`
 - events: who publishes, which topics, queues or streams, which consumers → `analyze_impact`
 - gRPC: server handlers, client call sites, `.proto` changes → `analyze_grpc`
+- an event flow end to end (handler -> calls -> publish -> next consumers, or reverse) → `trace_flow`
 
 Every row carries a `path:line`: a verifiable starting point, not an answer to take on trust. Rows
 marked `heuristic` or `ambiguous` deserve a check.
@@ -484,7 +485,7 @@ For an exact identifier (an enum value, a class name), plain text search is stil
         text.push_str(
             "
 In Claude Code these tools load on demand: `ToolSearch` with
-`select:mcp__mesh-mcp__find_dependents,mcp__mesh-mcp__analyze_impact,mcp__mesh-mcp__analyze_grpc`.
+`select:mcp__mesh-mcp__find_dependents,mcp__mesh-mcp__analyze_impact,mcp__mesh-mcp__analyze_grpc,mcp__mesh-mcp__trace_flow`.
 ",
         );
     }

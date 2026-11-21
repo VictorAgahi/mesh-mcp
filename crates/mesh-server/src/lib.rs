@@ -151,10 +151,11 @@ WHEN TO USE IT: for a question that spans several repositories, start from the g
 3. gRPC (server handlers, \"who calls this RPC\" client call sites, .proto wire-format checks): `analyze_grpc`; `find_dependents` is for imports and symbol usage, not RPC callers.
 4. Symbol declarations across roots: `smart_search`.
 5. What does my branch change in the mesh / what will this change break (contract-level diff against a Git base, with callers, dependents and the .proto wire check): `diff_mesh`.
+6. An event flow end to end (what does handling an event, route or handler trigger; what ends up publishing an event), hop by hop with each call's path:line: `trace_flow`.
 For an exact identifier (an enum value, a class name), plain grep is fine.
 
 LOADING: in clients that defer MCP tool schemas (such as Claude Code), load them with:
-  ToolSearch select:mcp__mesh-mcp__find_dependents,mcp__mesh-mcp__analyze_impact,mcp__mesh-mcp__analyze_grpc
+  ToolSearch select:mcp__mesh-mcp__find_dependents,mcp__mesh-mcp__analyze_impact,mcp__mesh-mcp__analyze_grpc,mcp__mesh-mcp__trace_flow
 
 READING RESULTS: every row carries a path:line you can open to check it. A 0 means no literal call site in any indexed root. 'Not statically resolved' (no producer or consumer found) is not absence: the name may be built at runtime (registry, config, template string) or live in an unindexed root. A claim of absence (\"never called\", \"no producer\") needs a query across ALL roots with the tool that matches the question. Rows marked 'heuristic' or 'ambiguous', and notes about unresolved, dynamic or depth-limited hops, are worth a targeted check.";
 

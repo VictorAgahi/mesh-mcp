@@ -38,12 +38,15 @@ pub use config::{
 };
 pub use contracts::{
     fold_rpc_name, normalize_topic_key, service_from_client_field_name, CallFact, CallFacts,
-    CallReceiver, CallStats, CallableFact, ContractGraph, DependentsMatch, GrpcTrace, ImpactFlow,
-    ImpactMatrix, ImpactRole, ImpactRow, ImpactScope, ImportFact, InjectionFact, ReconcileMode,
-    RecordedCaller, ResolvedRpcRecord, RpcRecordResolver, TypeFact, TypeFactKind, CALLABLE_ID_BASE,
-    CLIENT_FIELD_BINDING_PREFIX, CONST_VALUE_PREFIX, HANDLER_REF_PREFIX, MAX_DERIVED_CALL_SITES,
-    MAX_STRUCTURAL_IMPLS, MAX_STRUCTURAL_PAIRS, MAX_TYPE_HOPS, RPC_EXACT_METHOD_PREFIX,
-    RPC_INFERRED_METHOD_PREFIX, RPC_INHERITED_METHOD_PREFIX,
+    CallReceiver, CallStats, CallableFact, ContractGraph, DependentsMatch, FlowBounds,
+    FlowDirection, FlowEnd, FlowEntry, FlowHop, FlowLimit, FlowNext, FlowOutcome, FlowSite,
+    FlowStep, FlowStepKind, FlowTrace, GrpcTrace, ImpactFlow, ImpactMatrix, ImpactRole, ImpactRow,
+    ImpactScope, ImportFact, InjectionFact, ReconcileMode, RecordedCaller, ResolvedRpcRecord,
+    RpcRecordResolver, TypeFact, TypeFactKind, CALLABLE_ID_BASE, CLIENT_FIELD_BINDING_PREFIX,
+    CONST_VALUE_PREFIX, DEFAULT_CALL_DEPTH, DEFAULT_EVENT_DEPTH, DEFAULT_FAN_OUT,
+    HANDLER_REF_PREFIX, MAX_CALL_DEPTH, MAX_DERIVED_CALL_SITES, MAX_EVENT_DEPTH, MAX_FAN_OUT,
+    MAX_FLOW_HOPS, MAX_STRUCTURAL_IMPLS, MAX_STRUCTURAL_PAIRS, MAX_TYPE_HOPS,
+    RPC_EXACT_METHOD_PREFIX, RPC_INFERRED_METHOD_PREFIX, RPC_INHERITED_METHOD_PREFIX,
 };
 pub use crawler::{ExcludeMatcher, FilesystemCrawler, WatchPlan};
 pub use docs::{DocIndex, DocSection};

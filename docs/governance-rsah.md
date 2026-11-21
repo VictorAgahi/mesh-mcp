@@ -51,7 +51,7 @@ runs:
 
 | Call | `allow_all` | `audit_warn` | `enforce_refusal` |
 | :--- | :--- | :--- | :--- |
-| Read-only tool (all seven shipped tools) | runs | runs, a warning is logged on stderr | refused with RSAH |
+| Read-only tool (all eight shipped tools) | runs | runs, a warning is logged on stderr | refused with RSAH |
 | Tool that declares `mutates() == true` (none shipped) | refused with RSAH | refused | refused |
 
 So with the default configuration no call is ever refused: stop rules only take effect if you
