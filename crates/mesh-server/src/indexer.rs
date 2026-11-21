@@ -516,6 +516,9 @@ impl WorkspaceIndexer {
         snapshot.contract_graph.reconcile_edges();
         let call_stats = snapshot.contract_graph.call_stats();
         snapshot.health.set_call_stats(&call_stats);
+        snapshot
+            .health
+            .set_wildcards_capped(snapshot.contract_graph.wildcard_hubs_capped());
 
         tracing::info!(
             target: "mesh::indexer",
@@ -1202,6 +1205,9 @@ impl WorkspaceIndexer {
         };
         let call_stats = snapshot.contract_graph.call_stats();
         snapshot.health.set_call_stats(&call_stats);
+        snapshot
+            .health
+            .set_wildcards_capped(snapshot.contract_graph.wildcard_hubs_capped());
         // Files this batch brought onto an entry -> producer path whose call sites an
         // earlier derive pruned (they lay off every path then): re-extracted below.
         let missing_sites: Vec<(RepoId, PathBuf)> = snapshot

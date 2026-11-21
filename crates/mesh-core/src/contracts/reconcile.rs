@@ -86,12 +86,27 @@ impl ContractGraph {
         // it was edited to use a different topic, or deleted) must not linger
         // forever: a full rebuild from the current facts alone would never create
         // it, so leaving it in place would make an incremental reload permanently
-        // diverge from a full rebuild (idempotence invariant I2).
-        let live_topics: HashSet<&CompactStr> = all_topics.iter().collect();
+        // diverge from a full rebuild (idempotence invariant I2). The same holds
+        // for a broker hub whose broker no longer shares the name with another one.
+        let topic_hubs: Vec<(CompactStr, Vec<Option<Broker>>)> = all_topics
+            .into_iter()
+            .map(|key| {
+                let hubs = self.topic_hubs(&key);
+                (key, hubs)
+            })
+            .collect();
+        let live_hubs: HashSet<(&str, Option<Broker>)> = topic_hubs
+            .iter()
+            .flat_map(|(key, hubs)| hubs.iter().map(move |hub| (key.as_str(), *hub)))
+            .collect();
         let stale_hubs: HashSet<NodeId> = self
             .nodes
             .values()
-            .filter(|n| Self::is_hub_like(n) && !live_topics.contains(&n.name))
+            .filter(|n| {
+                Self::is_hub_like(n)
+                    && (!live_hubs.contains(&(Self::hub_key(n), Self::hub_broker(n)))
+                        || !self.hub_name_is_current(n))
+            })
             .map(|n| n.id)
             .collect();
         self.remove_nodes(&stale_hubs);
@@ -100,14 +115,20 @@ impl ContractGraph {
         // subscription only.
         let mut concrete_producers: Option<Vec<(CompactStr, Vec<NodeId>)>> = None;
         let mut topic_edges = Vec::new();
-        for topic_key in all_topics {
-            let topic_id = self.topic_node_or_create(&topic_key);
-            self.topic_unit_edges(
-                &topic_key,
-                topic_id,
-                &mut concrete_producers,
-                &mut topic_edges,
-            );
+        self.wildcard_capped.clear();
+        for (topic_key, hubs) in topic_hubs {
+            for hub in hubs {
+                let topic_id = self.topic_node_or_create(&topic_key, hub);
+                if self.topic_unit_edges(
+                    &topic_key,
+                    hub,
+                    topic_id,
+                    &mut concrete_producers,
+                    &mut topic_edges,
+                ) {
+                    self.wildcard_capped.insert((topic_key.clone(), hub));
+                }
+            }
         }
         self.edges.extend(topic_edges);
 
@@ -184,20 +205,26 @@ impl ContractGraph {
             )
     }
 
-    /// The topic node of `topic_key`, created as a synthetic hub when missing.
-    pub(super) fn topic_node_or_create(&mut self, topic_key: &CompactStr) -> NodeId {
-        // `add_node` indexes stream-like nodes under their lowercase name, and
-        // `topic_key` is already lowercase.
-        if let Some(id) = self.existing_topic_node(topic_key) {
+    /// The hub of `topic_key` on `hub` (`None`: the plain hub), created as a synthetic hub
+    /// when missing.
+    pub(super) fn topic_node_or_create(
+        &mut self,
+        topic_key: &CompactStr,
+        hub: Option<Broker>,
+    ) -> NodeId {
+        if let Some(id) = self.existing_topic_node(topic_key, hub) {
             return id;
         }
         // Declarative `[[engines.contracts.patterns]]` hits are transport-agnostic
         // (Kafka, Redis Streams, BullMQ, SQS, ...) — label them EventStream, not
         // KafkaTopic. Real Kafka usage is still tagged NodeKind::KafkaTopic by the
         // language-specific extractors that actually detect it (e.g. Spring @KafkaListener).
+        let name = self.hub_name(topic_key, hub);
+        let docstring = self.hub_docstring(topic_key, hub);
         let node = ContractNode {
             id: 0,
-            name: topic_key.clone(),
+            signature: Some(CompactStr::new(format!("topic://{name}"))),
+            name,
             kind: NodeKind::EventStream,
             file_path: FilePath::from(Path::new("event-bus")),
             line_start: 1,
@@ -210,46 +237,77 @@ impl ContractGraph {
             // event/topic in the mesh to that one repo. `RepoId::MAX`
             // is a sentinel no real root index can ever reach.
             repo_id: RepoId::MAX,
-            signature: Some(CompactStr::new(format!("topic://{topic_key}"))),
-            docstring: None,
+            docstring,
         };
         self.add_node(node)
     }
 
-    /// The first event-bus `EventStream` node indexed under `topic_key`.
-    pub(super) fn existing_topic_node(&self, topic_key: &str) -> Option<NodeId> {
-        self.name_to_nodes.get(topic_key).and_then(|ids| {
+    /// The first event-bus `EventStream` node of `topic_key` on `hub`. `add_node` indexes
+    /// stream-like nodes under their lowercase name, and a hub name is already lowercase.
+    pub(super) fn existing_topic_node(
+        &self,
+        topic_key: &str,
+        hub: Option<Broker>,
+    ) -> Option<NodeId> {
+        let name = self.hub_name(topic_key, hub);
+        self.name_to_nodes.get(&name).and_then(|ids| {
             ids.iter().copied().find(|id| {
-                self.nodes
-                    .get(id)
-                    .is_some_and(|n| n.package == "event-bus" && n.kind == NodeKind::EventStream)
+                self.nodes.get(id).is_some_and(|n| {
+                    n.package == "event-bus"
+                        && n.kind == NodeKind::EventStream
+                        && Self::hub_broker(n) == hub
+                })
             })
         })
     }
 
-    /// Every edge of one topic: its producers, its consumers, and, for a wildcard
+    /// Every edge of one hub of a topic: its producers, its consumers, and, for a wildcard
     /// subscription, the producers of the concrete subjects it matches.
+    ///
+    /// `hub` is the broker the hub stands for (`None`: the plain hub, which takes every site
+    /// of the key). On a broker hub a site of that broker is linked as its registration says
+    /// (exact unless its source is heuristic); a site whose broker is not known is linked
+    /// `heuristic`; a site of another broker is left to its own hub.
     pub(super) fn topic_unit_edges(
         &self,
         topic_key: &CompactStr,
+        hub: Option<Broker>,
         topic_id: NodeId,
         concrete_producers: &mut Option<Vec<(CompactStr, Vec<NodeId>)>>,
         out: &mut Vec<ContractEdge>,
-    ) {
+    ) -> bool {
         // Every edge here touches `topic_id`, so de-duplication is per topic.
         let mut edge_set: HashSet<(NodeId, NodeId, EdgeKind)> = HashSet::new();
-        let producers = self
-            .topic_producers
-            .get(topic_key)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let consumers = self
-            .topic_consumers
-            .get(topic_key)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+        // The sites of this hub with the confidence they link at.
+        let members = |is_producer: bool| -> Vec<(NodeId, EdgeConfidence)> {
+            let all = if is_producer {
+                &self.topic_producers
+            } else {
+                &self.topic_consumers
+            };
+            all.get(topic_key)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|&id| {
+                    let Some(broker) = hub else {
+                        return Some((id, self.topic_confidence(id)));
+                    };
+                    let mask = self.site_mask(is_producer, topic_key, id);
+                    if mask & broker.bit() != 0 {
+                        Some((id, self.topic_confidence(id)))
+                    } else if mask == 0 {
+                        Some((id, EdgeConfidence::Heuristic))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let producers = members(true);
+        let consumers = members(false);
 
-        for &prod_id in producers {
+        for &(prod_id, confidence) in &producers {
             if edge_set.insert((prod_id, topic_id, EdgeKind::Produces)) {
                 out.push(ContractEdge {
                     from: prod_id,
@@ -258,12 +316,12 @@ impl ContractGraph {
                     metadata: Some(topic_key.clone()),
                     // Structural: derived directly from producer registration,
                     // unless the registering source is itself heuristic.
-                    confidence: self.topic_confidence(prod_id),
+                    confidence,
                 });
             }
         }
 
-        for &cons_id in consumers {
+        for &(cons_id, confidence) in &consumers {
             if edge_set.insert((topic_id, cons_id, EdgeKind::Consumes)) {
                 out.push(ContractEdge {
                     from: topic_id,
@@ -272,7 +330,7 @@ impl ContractGraph {
                     metadata: Some(topic_key.clone()),
                     // Structural: derived directly from consumer registration,
                     // unless the registering source is itself heuristic.
-                    confidence: self.topic_confidence(cons_id),
+                    confidence,
                 });
             }
         }
@@ -282,12 +340,20 @@ impl ContractGraph {
         // Direct edges come first so an exact edge is never shadowed by a heuristic one.
         // Kafka topics and queues have no subject wildcards: a pattern read only by such
         // consumers (`orders.*` as a Kafka regex or a Redis glob) is a literal key.
-        let subject_consumer = consumers.iter().any(|id| {
+        let subject_consumer = consumers.iter().any(|(id, _)| {
             self.nodes
                 .get(id)
                 .is_none_or(|n| !matches!(n.kind, NodeKind::KafkaTopic | NodeKind::Queue))
         });
+        let mut cut = false;
         if is_subject_pattern(topic_key) && subject_consumer {
+            // The brokers the pattern's consumers speak to: a producer of a concrete subject
+            // on another known broker is not heard (0: some consumer's broker is unknown).
+            let consumer_brokers = consumers
+                .iter()
+                .map(|(id, _)| self.site_mask(false, topic_key, *id))
+                .try_fold(0u32, |acc, m| (m != 0).then_some(acc | m))
+                .unwrap_or(0);
             let concrete = concrete_producers.get_or_insert_with(|| {
                 let mut v: Vec<(CompactStr, Vec<NodeId>)> = self
                     .topic_producers
@@ -305,7 +371,14 @@ impl ContractGraph {
                 }
                 for &prod_id in prods {
                     // A relay that consumes the pattern is not its own cause.
-                    if consumers.contains(&prod_id) {
+                    if consumers.iter().any(|(id, _)| *id == prod_id) {
+                        continue;
+                    }
+                    let producer_brokers = self.site_mask(true, subject, prod_id);
+                    if producer_brokers != 0
+                        && consumer_brokers != 0
+                        && producer_brokers & consumer_brokers == 0
+                    {
                         continue;
                     }
                     if linked >= MAX_WILDCARD_PRODUCERS {
@@ -314,6 +387,7 @@ impl ContractGraph {
                             cap = MAX_WILDCARD_PRODUCERS,
                             "wildcard subscription truncated"
                         );
+                        cut = true;
                         break 'subjects;
                     }
                     if edge_set.insert((prod_id, topic_id, EdgeKind::Produces)) {
@@ -333,6 +407,14 @@ impl ContractGraph {
         // Direct `Produces` and `Consumes` edges carry topic routing via a
         // two-hop producer -> topic -> consumer walk with linear O(producers + consumers)
         // edge complexity, rather than quadratic O(producers * consumers) edge growth.
+        cut
+    }
+
+    /// Wildcard hubs the last topic pass cut at [`MAX_WILDCARD_PRODUCERS`] (counted in
+    /// `IndexHealth`). The cap is per hub, so a name on several brokers allows that many per
+    /// broker hub.
+    pub fn wildcard_hubs_capped(&self) -> usize {
+        self.wildcard_capped.len()
     }
 
     /// Only nodes the language extractors actually tagged as a gRPC handler

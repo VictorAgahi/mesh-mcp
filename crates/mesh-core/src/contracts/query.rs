@@ -608,9 +608,59 @@ impl ContractGraph {
         out
     }
 
+    /// The literal key behind a qualified `target` (`rabbitmq:orders`) that is also the
+    /// `rabbitmq` channel of `orders`: a key written so in source (a Kafka topic literally named
+    /// `rabbitmq:orders`) while RabbitMQ also uses `orders`. Such a target is ambiguous and
+    /// [`Self::analyze_impact`] lists both readings.
+    pub fn target_literal_clash(&self, target: &str) -> Option<CompactStr> {
+        let norm = normalize_topic_key(target);
+        let (broker, bare) = split_qualified_topic_key(&norm)?;
+        let literal = self.topic_producers.contains_key(norm.as_str())
+            || self.topic_consumers.contains_key(norm.as_str());
+        (literal && self.known_brokers(bare) & broker.bit() != 0).then(|| CompactStr::new(&norm))
+    }
+
     /// Asynchronous causal impact flow resolution
     pub fn analyze_impact(&self, target: &str) -> ImpactFlow<'_> {
-        let mut norm_target = normalize_topic_key(target);
+        let norm = normalize_topic_key(target);
+        // A qualified target (`kafka:orders`, the name of a broker hub) selects one broker's
+        // channel of the name: its sites, the unknown-broker ones included (they join every
+        // channel of the name). A key that literally is the target (a Redis key spelled
+        // `kafka:orders`) is read as that key; when the broker also has sites for the bare
+        // name the target is ambiguous and both readings are listed.
+        let literal = self.topic_producers.contains_key(norm.as_str())
+            || self.topic_consumers.contains_key(norm.as_str());
+        let Some((broker, bare)) = split_qualified_topic_key(&norm) else {
+            return self.impact_for(target, norm, None);
+        };
+        if !literal {
+            return self.impact_for(target, bare.to_string(), Some(broker));
+        }
+        if self.known_brokers(bare) & broker.bit() == 0 {
+            return self.impact_for(target, norm, None);
+        }
+        let mut flow = self.impact_for(target, norm.clone(), None);
+        let channel = self.impact_for(target, bare.to_string(), Some(broker));
+        for (mine, theirs) in [
+            (&mut flow.upstream_producers, channel.upstream_producers),
+            (&mut flow.topics, channel.topics),
+            (&mut flow.downstream_consumers, channel.downstream_consumers),
+            (&mut flow.related_sagas, channel.related_sagas),
+        ] {
+            let seen: HashSet<NodeId> = mine.iter().map(|n| n.id).collect();
+            mine.extend(theirs.into_iter().filter(|n| !seen.contains(&n.id)));
+        }
+        flow
+    }
+
+    /// [`Self::analyze_impact`] for one reading of the target: `norm_target` is its key, read
+    /// as `broker_filter`'s channel of that name when given.
+    fn impact_for(
+        &self,
+        target: &str,
+        mut norm_target: String,
+        broker_filter: Option<Broker>,
+    ) -> ImpactFlow<'_> {
         // The value a constant holds (`'event.created'`) is how people often
         // name an event, while the index keys on the member (`event_created`):
         // the tool description itself cited `event.created`, which 7.0.6 did
@@ -655,6 +705,10 @@ impl ContractGraph {
                 upstream_producers.extend(
                     self.topic_producers[topic_name]
                         .iter()
+                        .filter(|id| {
+                            broker_filter
+                                .is_none_or(|b| !self.site_excluded_from(true, topic_name, **id, b))
+                        })
                         .filter_map(|id| self.nodes.get(id)),
                 );
             }
@@ -667,6 +721,11 @@ impl ContractGraph {
                 downstream_consumers.extend(
                     self.topic_consumers[topic_name]
                         .iter()
+                        .filter(|id| {
+                            broker_filter.is_none_or(|b| {
+                                !self.site_excluded_from(false, topic_name, **id, b)
+                            })
+                        })
                         .filter_map(|id| self.nodes.get(id)),
                 );
             }
@@ -685,7 +744,21 @@ impl ContractGraph {
             if !interesting {
                 continue;
             }
-            let name = node.name.as_str();
+            // A broker hub is named `kafka:orders` for display; it is the topic `orders`.
+            let hub = Self::is_hub_like(node);
+            if let Some(b) = broker_filter {
+                if hub && Self::hub_broker(node).is_some_and(|nb| nb != b) {
+                    continue;
+                }
+                if !hub && self.node_excluded_from(&norm_target, node.id, b) {
+                    continue;
+                }
+            }
+            let name = if hub {
+                Self::hub_key(node)
+            } else {
+                node.name.as_str()
+            };
             let pattern_topic = name
                 .strip_prefix("produce:")
                 .or_else(|| name.strip_prefix("consume:"));
@@ -699,7 +772,7 @@ impl ContractGraph {
             let matched = if exact && is_topic_like {
                 normalize_topic_key(pattern_topic.unwrap_or(name)) == norm_target
             } else {
-                contains_ignore_ascii_case(node.name.as_str(), &norm_target)
+                contains_ignore_ascii_case(name, &norm_target)
             };
             if !matched {
                 continue;
@@ -1244,7 +1317,11 @@ impl ContractGraph {
                 .get(target_lc)
                 .is_some_and(|ids| ids.contains(&node.id))
         };
-        let name = node.name.as_str();
+        let name = if Self::is_hub_like(node) {
+            Self::hub_key(node)
+        } else {
+            node.name.as_str()
+        };
         let bare = name
             .strip_prefix("produce:")
             .or_else(|| name.strip_prefix("consume:"))
@@ -1253,8 +1330,18 @@ impl ContractGraph {
             || registered(&self.topic_consumers)
             || bare.eq_ignore_ascii_case(target_lc)
         {
-            // A registration made by a heuristic source (declarative patterns by
-            // default) stays heuristic in the matrix as it does on the edge.
+            // A site of unknown broker on a name two brokers share joins both channels,
+            // so its link is a guess; a registration made by a heuristic source
+            // (declarative patterns by default) stays heuristic in the matrix as it
+            // does on the edge.
+            if (registered(&self.topic_producers) || registered(&self.topic_consumers))
+                && self.known_brokers(target_lc).count_ones() >= 2
+                && [true, false]
+                    .into_iter()
+                    .all(|is_producer| self.site_mask(is_producer, target_lc, node.id) == 0)
+            {
+                return EdgeConfidence::Heuristic;
+            }
             self.topic_confidence(node.id)
         } else {
             EdgeConfidence::Heuristic

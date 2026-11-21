@@ -204,10 +204,12 @@ impl McpTool for TraceFlowTool {
         let mut trace = graph.trace_flow(entry, direction, bounds, &hide);
         trace.target = CompactStr::new(target);
         let offset = args.offset.unwrap_or(0) as usize;
-        Ok(ToolOutput::text(MarkdownFormatter::format_flow_trace(
-            &trace,
-            &state.allowed_roots,
-            offset,
-        )))
+        let text = MarkdownFormatter::format_flow_trace(&trace, &state.allowed_roots, offset);
+        let text = if kind == EntryKind::Topic || kind == EntryKind::Auto {
+            crate::tools::analyze_impact::with_literal_clash_note(text, graph, target)
+        } else {
+            text
+        };
+        Ok(ToolOutput::text(text))
     }
 }

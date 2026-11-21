@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+mod broker;
 mod calls;
 mod delta;
 mod flow;
@@ -16,6 +17,7 @@ mod reconcile;
 mod render;
 mod resolve;
 
+pub use broker::{qualified_topic_key, split_qualified_topic_key, Broker};
 pub use calls::{
     CallFact, CallFacts, CallReceiver, CallStats, CallableFact, ImportFact, InjectionFact,
     TypeFact, TypeFactKind, CALLABLE_ID_BASE, MAX_DERIVED_CALL_SITES, MAX_STRUCTURAL_IMPLS,
@@ -88,7 +90,7 @@ pub fn subject_matches(pattern: &str, topic: &str) -> bool {
 }
 
 /// Most producers one wildcard subscription is linked to.
-const MAX_WILDCARD_PRODUCERS: usize = 256;
+pub const MAX_WILDCARD_PRODUCERS: usize = 256;
 
 /// Query results borrow from the graph: the snapshot guard held by the caller
 /// keeps them alive, and cloning every `ContractNode` (with its `PathBuf`) per
@@ -441,6 +443,17 @@ pub struct ContractGraph {
     reverse_deps: HashMap<CompactStr, Vec<NodeId>>,
     topic_producers: HashMap<CompactStr, Vec<NodeId>>,
     topic_consumers: HashMap<CompactStr, Vec<NodeId>>,
+    /// Per topic key and site, the brokers a producer / consumer is statically known to talk
+    /// to (a [`Broker::bit`] mask). A site with no entry has an unknown broker. Never read
+    /// for display: the topic pass partitions a name's sites by it (see `broker`).
+    producer_brokers: HashMap<CompactStr, HashMap<NodeId, u32>>,
+    consumer_brokers: HashMap<CompactStr, HashMap<NodeId, u32>>,
+    /// The broker of a node that is itself one site of a broker interaction (a TypeScript call
+    /// site named after its topic); read only to tell the topic rows of a query apart.
+    node_brokers: HashMap<NodeId, Broker>,
+    /// Hubs `(key, broker)` whose wildcard subscription was cut at [`MAX_WILDCARD_PRODUCERS`]
+    /// by the last topic pass. Counted in `IndexHealth`, shown by `doctor`.
+    wildcard_capped: BTreeSet<(CompactStr, Option<Broker>)>,
     rpc_calls: Vec<(NodeId, CompactStr)>,
     /// Producer / consumer nodes registered by a heuristic source (declarative
     /// patterns by default): their topic edges are `heuristic`, not `exact`.

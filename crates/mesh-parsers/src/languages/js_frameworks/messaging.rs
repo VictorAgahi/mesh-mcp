@@ -9,7 +9,7 @@
 
 use super::scope::unquote;
 use super::{CallRule, CtorRule, DecoratorRule, Role, Site};
-use mesh_core::NodeKind;
+use mesh_core::{Broker, NodeKind};
 use tree_sitter::Node;
 
 // ---- argument readers -------------------------------------------------------------
@@ -1169,6 +1169,40 @@ pub(super) const DECORATOR_RULES: &[DecoratorRule] = &[
         extract: first_arg,
     },
 ];
+
+/// The broker a rule's `signature` (`kafkajs producer.send`, `aws-sdk sns.publish`) speaks to:
+/// the signature names its library first. `None` for a NestJS microservice client or handler,
+/// whose transport is configured elsewhere (9.0 ticket T7: such a site joins every broker's
+/// channel of its name).
+pub(super) fn broker_of_signature(signature: &str) -> Option<Broker> {
+    let mut words = signature.split(' ');
+    let family = words.next()?;
+    Some(match family {
+        "kafkajs" | "kafka-node" | "node-rdkafka" | "platformatic" => Broker::Kafka,
+        "amqp" | "rabbitmq" => Broker::RabbitMq,
+        "redis" => Broker::Redis,
+        "nats" => Broker::Nats,
+        "mqtt" => Broker::Mqtt,
+        "sqs" => Broker::Sqs,
+        "sns" => Broker::Sns,
+        // The v2 SDK names the service in the member: `aws-sdk sqs.sendMessage`.
+        "aws-sdk" => match words.next()?.split('.').next()? {
+            "sqs" => Broker::Sqs,
+            "sns" => Broker::Sns,
+            _ => return None,
+        },
+        "kinesis" => Broker::Kinesis,
+        "eventbridge" => Broker::EventBridge,
+        "pubsub" => Broker::PubSub,
+        "pulsar" => Broker::Pulsar,
+        "servicebus" => Broker::ServiceBus,
+        "eventhubs" => Broker::EventHubs,
+        "stomp" => Broker::Stomp,
+        "bull" | "bullmq" | "nestjs-bull" => Broker::Bull,
+        "bee-queue" => Broker::BeeQueue,
+        _ => return None,
+    })
+}
 
 /// Whether `source` could hold a broker interaction any rule recognises: it names one
 /// of their libraries or decorators, or the historical import-free shapes (a `Queue` /

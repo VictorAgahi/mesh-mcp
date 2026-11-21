@@ -67,6 +67,7 @@ golden must be rejected).
 | layered-go | go | 3 | 2 | 6 | 4 | 1 | 0 | kafka_basic 5, layered_calls 10 |
 | layered-py | python | 3 | 2 | 4 | 2 | 2 | 0 | kafka_basic 3, layered_calls 6, py_broker 3 |
 | layered-ts | ts | 6 | 5 | 13 | 10 | 4 | 0 | kafka_basic 12, layered_calls 22 |
+| multi-broker | go, ts | 9 | 14 | 2 | 2 | 0 | 0 | broker_key 27, kafka_basic 7, layered_calls 4 |
 | nestjs-monolith-bus | ts | 7 | 8 | 7 | 5 | 2 | 0 | cqrs 9, cron 4, inproc_bus 20, layered_calls 11 |
 | polyglot-shop | go, java, python, rust, ts | 4 | 7 | 4 | 2 | 0 | 8 | declared_pattern 8, go_broker 2, kafka_basic 5, layered_calls 4, py_broker 3 |
 | spring-monolith | java | 5 | 4 | 8 | 5 | 2 | 0 | config_topic 3, cron 3, inproc_bus 8, kafka_basic 8, layered_calls 13 |

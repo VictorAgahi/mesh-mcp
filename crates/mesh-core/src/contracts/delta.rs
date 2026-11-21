@@ -373,7 +373,7 @@ impl DirtyKeys {
             }
             if n.package == "event-bus" && n.kind == NodeKind::EventStream {
                 keys.hub_topics
-                    .insert(CompactStr::new(n.name.to_lowercase()));
+                    .insert(CompactStr::new(ContractGraph::hub_key(n).to_lowercase()));
             }
             if n.kind == NodeKind::GrpcService {
                 let key = n.name.as_str().to_lowercase();
@@ -652,23 +652,45 @@ impl ContractGraph {
             topics.extend(patterns);
         }
 
-        // A hub's liveness changes with its own topic's facts, so a stale one is
-        // a new node or one named after a topic whose facts changed.
+        // A key spelled like a broker hub of a dirty name (`rabbitmq:orders` when `orders`
+        // changed) takes or loses the `(literal)` hub name with that name's broker set.
+        let spelled: Vec<CompactStr> = topics
+            .iter()
+            .flat_map(|key| {
+                Broker::ALL
+                    .iter()
+                    .map(move |b| CompactStr::new(super::qualified_topic_key(*b, key)))
+            })
+            .filter(|q| {
+                self.topic_producers.contains_key(q) || self.topic_consumers.contains_key(q)
+            })
+            .collect();
+        topics.extend(spelled);
+
+        // A hub's liveness changes with its own topic's facts (and, for a broker hub, with
+        // whether the name still has two known brokers), so a stale one is a new node or one
+        // belonging to a topic whose facts changed.
         let live = |g: &Self, name: &CompactStr| {
             g.topic_producers.contains_key(name) || g.topic_consumers.contains_key(name)
+        };
+        let hub_live = |g: &Self, n: &ContractNode| {
+            let key = Self::hub_key(n);
+            (g.topic_producers.contains_key(key) || g.topic_consumers.contains_key(key))
+                && g.topic_hubs(key).contains(&Self::hub_broker(n))
+                && g.hub_name_is_current(n)
         };
         let mut stale: HashSet<NodeId> = HashSet::new();
         for id in &journal.added {
             if let Some(n) = self.nodes.get(id) {
-                if Self::is_hub_like(n) && !live(self, &n.name) {
+                if Self::is_hub_like(n) && !hub_live(self, n) {
                     stale.insert(n.id);
                 }
             }
         }
-        for key in &journal.topics {
-            for id in self.name_to_nodes.get(key).into_iter().flatten() {
-                if let Some(n) = self.nodes.get(id) {
-                    if n.name == *key && Self::is_hub_like(n) && !live(self, &n.name) {
+        for key in &topics {
+            for id in self.hub_nodes_of(key) {
+                if let Some(n) = self.nodes.get(&id) {
+                    if !hub_live(self, n) {
                         stale.insert(n.id);
                     }
                 }
@@ -705,20 +727,27 @@ impl ContractGraph {
         let kept: Vec<(CompactStr, Vec<ContractEdge>)> = groups
             .into_iter()
             .filter_map(|(id, group)| {
-                let key = CompactStr::new(self.nodes.get(&id)?.name.to_lowercase());
+                let key = CompactStr::new(Self::hub_key(self.nodes.get(&id)?).to_lowercase());
                 (!topics.contains(&key)).then_some((key, group))
             })
             .collect();
 
         let mut concrete_producers: Option<Vec<(CompactStr, Vec<NodeId>)>> = None;
+        // Dirty keys are recomputed below: their old cap flags go with their old edges.
+        self.wildcard_capped
+            .retain(|(key, _)| !topics.contains(key));
         let mut fresh: Vec<(CompactStr, Vec<ContractEdge>)> = Vec::new();
         for key in &topics {
             if !live(self, key) {
                 continue;
             }
-            let topic_id = self.topic_node_or_create(key);
             let mut out = Vec::new();
-            self.topic_unit_edges(key, topic_id, &mut concrete_producers, &mut out);
+            for hub in self.topic_hubs(key) {
+                let topic_id = self.topic_node_or_create(key, hub);
+                if self.topic_unit_edges(key, hub, topic_id, &mut concrete_producers, &mut out) {
+                    self.wildcard_capped.insert((key.clone(), hub));
+                }
+            }
             fresh.push((key.clone(), out));
         }
 

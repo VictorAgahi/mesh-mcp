@@ -1,0 +1,13 @@
+# Fixture: one channel name ("orders") on six brokers (Kafka, RabbitMQ, SNS, SQS, Redis, NATS),
+# in TypeScript and Go. Broker-qualified topic keys (9.0 T7) keep the channels apart.
+[workspace]
+name = "multi-broker"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/node_modules/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true

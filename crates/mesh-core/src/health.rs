@@ -169,6 +169,11 @@ pub struct IndexHealth {
     /// `files_scanned`: by what each scan pass saw.
     #[serde(default)]
     pub files_call_facts_skipped_path: usize,
+    /// Wildcard subscriptions (`orders.*`) that hear fewer producers than match them, because
+    /// their hub reached `MAX_WILDCARD_PRODUCERS` (the cap is per hub: a name on several
+    /// brokers has one hub, so one cap, per broker). Set after every reconcile.
+    #[serde(default)]
+    pub topic_wildcards_capped: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -258,9 +263,21 @@ impl IndexHealth {
         self.call_files_missing_sites = stats.missing_sites;
     }
 
+    /// Takes the number of wildcard hubs the last topic pass cut at the producer cap.
+    #[inline]
+    pub fn set_wildcards_capped(&mut self, hubs: usize) {
+        self.topic_wildcards_capped = hubs;
+    }
+
     #[inline]
     pub fn record_calls_skipped_path(&mut self) {
         self.files_call_facts_skipped_path += 1;
+    }
+
+    /// Whether the topic pass dropped links (a wildcard hub hit its producer cap).
+    #[inline]
+    pub fn topics_truncated(&self) -> bool {
+        self.topic_wildcards_capped > 0
     }
 
     /// Whether the calls layer dropped facts (a cap was hit): a call path may be cut.
@@ -455,6 +472,15 @@ impl IndexHealth {
                  per repository (calls layer: calls through them are not resolved)",
                 self.call_interfaces_unmatched,
                 crate::contracts::MAX_STRUCTURAL_PAIRS
+            );
+        }
+        if self.topic_wildcards_capped > 0 {
+            let _ = writeln!(
+                out,
+                "    {} wildcard subscription hub(s) hear only the first {} matching producers each \
+                 (topics: a subscription may be linked to fewer producers than match it)",
+                self.topic_wildcards_capped,
+                crate::contracts::MAX_WILDCARD_PRODUCERS
             );
         }
         if self.call_files_missing_sites > 0 {

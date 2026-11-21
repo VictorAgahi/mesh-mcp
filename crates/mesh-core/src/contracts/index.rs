@@ -88,24 +88,69 @@ impl ContractGraph {
             .push(consumer_node_id);
     }
 
+    /// Registers `producer_node_id` as a producer of `topic`, broker not known.
     pub fn add_producer(&mut self, producer_node_id: NodeId, topic: &str) {
+        self.add_producer_on(producer_node_id, topic, None);
+    }
+
+    /// Registers `producer_node_id` as a producer of `topic` on `broker` (`None`: not
+    /// statically known, the site then joins every broker's channel of that name, see
+    /// `broker`).
+    pub fn add_producer_on(
+        &mut self,
+        producer_node_id: NodeId,
+        topic: &str,
+        broker: Option<Broker>,
+    ) {
         let key = CompactStr::new(normalize_topic_key(topic));
         self.journal.topic(&key);
         self.touch_calls_node(producer_node_id);
+        if let Some(b) = broker {
+            *self
+                .producer_brokers
+                .entry(key.clone())
+                .or_default()
+                .entry(producer_node_id)
+                .or_default() |= b.bit();
+        }
         self.topic_producers
             .entry(key)
             .or_default()
             .push(producer_node_id);
     }
 
+    /// Registers `consumer_node_id` as a consumer of `topic`, broker not known.
     pub fn add_consumer(&mut self, consumer_node_id: NodeId, topic: &str) {
+        self.add_consumer_on(consumer_node_id, topic, None);
+    }
+
+    /// Registers `consumer_node_id` as a consumer of `topic` on `broker`.
+    pub fn add_consumer_on(
+        &mut self,
+        consumer_node_id: NodeId,
+        topic: &str,
+        broker: Option<Broker>,
+    ) {
         let key = CompactStr::new(normalize_topic_key(topic));
         self.journal.topic(&key);
         self.touch_calls_node(consumer_node_id);
+        if let Some(b) = broker {
+            *self
+                .consumer_brokers
+                .entry(key.clone())
+                .or_default()
+                .entry(consumer_node_id)
+                .or_default() |= b.bit();
+        }
         self.topic_consumers
             .entry(key)
             .or_default()
             .push(consumer_node_id);
+    }
+
+    /// Records the broker of a node that is itself a site of a broker interaction.
+    pub fn set_node_broker(&mut self, node_id: NodeId, broker: Broker) {
+        self.node_brokers.insert(node_id, broker);
     }
 
     /// Marks a producer / consumer node whose topic link is heuristic.
@@ -170,6 +215,13 @@ impl ContractGraph {
                     }
                 }
                 !ids.is_empty()
+            });
+        }
+        self.node_brokers.retain(|id, _| !stale_set.contains(id));
+        for map in [&mut self.producer_brokers, &mut self.consumer_brokers] {
+            map.retain(|_, sites| {
+                sites.retain(|id, _| !stale_set.contains(id));
+                !sites.is_empty()
             });
         }
         self.rpc_calls.retain(|(id, record)| {

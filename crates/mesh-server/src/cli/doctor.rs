@@ -106,10 +106,15 @@ impl DoctorCommand {
         let health = &snapshot.health;
         let summary = health.render_summary(10);
         let summary = summary.trim_end();
-        if health.calls_truncated() && health.rejected.is_empty() && health.rejected_overflow == 0 {
+        if (health.calls_truncated() || health.topics_truncated())
+            && health.rejected.is_empty()
+            && health.rejected_overflow == 0
+        {
             DoctorCheck::warn(
                 "Index health",
-                format!("{summary}\n    A call path through these files may be cut."),
+                format!(
+                    "{summary}\n    A call path through these files, or a wildcard subscription, may be cut."
+                ),
             )
         } else if health.rejected.is_empty() && health.rejected_overflow == 0 {
             DoctorCheck::ok("Index health", summary)
