@@ -51,6 +51,8 @@ pub enum FlowDirection {
 pub enum FlowEntry<'a> {
     /// An event, topic, queue or stream, matched like `analyze_impact`.
     Topic(&'a str),
+    /// An event when one matches the name, else a handler symbol (one topic match).
+    Auto(&'a str),
     /// HTTP route handlers, already resolved by the caller (`routes::find_routes`).
     Route(Vec<NodeId>),
     /// A handler symbol (`OrderService.place`, `place`).
@@ -134,6 +136,8 @@ pub enum FlowOutcome {
     DepthLimit(usize),
     /// The topic was already traced in this trace (a cycle or a join).
     AlreadyTraced,
+    /// Its counterparts were queued but [`MAX_FLOW_HOPS`] stopped the trace first.
+    HopLimit,
 }
 
 /// What follows a hop: one entry per topic it publishes (forward) or consumes
@@ -155,6 +159,9 @@ pub enum FlowEnd {
     ChainEnd,
     /// Reverse: the chain starts at a route, handler or cron entry.
     Origin,
+    /// The call walk was cut by `call_depth` before reaching a publish (forward)
+    /// or an entry (reverse): not an end, a bound.
+    CallDepthLimit,
 }
 
 /// One hop: an entry, the calls, the publish (forward) or the reverse of it.
@@ -224,6 +231,8 @@ pub struct FlowTrace<'g> {
     pub hidden: usize,
     /// [`MAX_FLOW_HOPS`] was reached.
     pub capped: bool,
+    /// Entry sites left out past `fan_out`.
+    pub entries_more: usize,
 }
 
 /// `(path, line, name, id)`: the one sort order of every list of the engine.
@@ -290,6 +299,8 @@ struct Segment<'g> {
 struct Walk<'g> {
     order: Vec<NodeId>,
     parent: HashMap<NodeId, (NodeId, &'g ContractEdge)>,
+    /// `call_depth` stopped the walk somewhere with calls left to follow.
+    cut: bool,
 }
 
 /// An entry waiting to be expanded.
@@ -312,10 +323,23 @@ impl ContractGraph {
         bounds: FlowBounds,
         hide: &dyn Fn(&ContractNode) -> bool,
     ) -> FlowTrace<'_> {
+        let mut entry = entry;
+        let mut matched = None;
+        if let FlowEntry::Auto(t) | FlowEntry::Topic(t) = entry {
+            let flow = self.analyze_impact(t);
+            let any = !(flow.topics.is_empty()
+                && flow.upstream_producers.is_empty()
+                && flow.downstream_consumers.is_empty());
+            if matches!(entry, FlowEntry::Auto(_)) && !any {
+                entry = FlowEntry::Handler(t);
+            } else {
+                entry = FlowEntry::Topic(t);
+                matched = Some(flow);
+            }
+        }
         let (target, kind, starts, seen_topics, topic): (String, _, Vec<&ContractNode>, _, _) =
-            match &entry {
-                FlowEntry::Topic(t) => {
-                    let flow = self.analyze_impact(t);
+            match (&entry, matched) {
+                (FlowEntry::Topic(t), Some(flow)) => {
                     let starts: Vec<&ContractNode> = match direction {
                         FlowDirection::Forward => flow
                             .downstream_consumers
@@ -328,27 +352,31 @@ impl ContractGraph {
                     let seen = flow.topics.iter().map(|n| n.id).collect();
                     (t.to_string(), "topic", starts, seen, Some(flow.key.clone()))
                 }
-                FlowEntry::Route(ids) => (
+                (FlowEntry::Route(ids), _) => (
                     String::new(),
                     "route",
                     ids.iter().filter_map(|id| self.get_node(*id)).collect(),
                     HashSet::new(),
                     None,
                 ),
-                FlowEntry::Handler(name) => (
+                (FlowEntry::Handler(name), _) => (
                     name.to_string(),
                     "handler",
                     self.resolve_handler(name),
                     HashSet::new(),
                     None,
                 ),
-                FlowEntry::Cron(name) => (
+                (FlowEntry::Cron(name), _) => (
                     name.to_string(),
                     "cron",
                     self.resolve_handler(name),
                     HashSet::new(),
                     None,
                 ),
+                // Unreachable: a topic entry always carries its match.
+                (FlowEntry::Topic(t) | FlowEntry::Auto(t), _) => {
+                    (t.to_string(), "topic", Vec::new(), HashSet::new(), None)
+                }
             };
         let start_kind = match kind {
             "route" => FlowStepKind::Route,
@@ -502,6 +530,7 @@ impl ContractGraph {
         let mut seen: HashSet<NodeId> = starts.iter().copied().collect();
         let mut parent = HashMap::new();
         let mut order = Vec::new();
+        let mut cut = false;
         let mut queue: VecDeque<(NodeId, usize)> = starts.iter().map(|&s| (s, 0)).collect();
         while let Some((id, depth)) = queue.pop_front() {
             order.push(id);
@@ -533,6 +562,7 @@ impl ContractGraph {
             };
             if depth >= bounds.call_depth {
                 limits.push(FlowLimit::CallDepth(label()));
+                cut = true;
                 continue;
             }
             if next.len() > bounds.fan_out {
@@ -550,11 +580,12 @@ impl ContractGraph {
                 }
             }
         }
-        Walk { order, parent }
+        Walk { order, parent, cut }
     }
 
-    /// The `Call` steps from the walk's root to `to`, root excluded, in walk order.
-    fn call_steps<'g>(&'g self, walk: &Walk<'g>, to: NodeId) -> Vec<FlowStep<'g>> {
+    /// The `Call` steps from the walk's root to `to`, root excluded, in walk order,
+    /// and that root.
+    fn call_steps<'g>(&'g self, walk: &Walk<'g>, to: NodeId) -> (Vec<FlowStep<'g>>, NodeId) {
         let mut steps = Vec::new();
         let mut cur = to;
         while let Some(&(prev, edge)) = walk.parent.get(&cur) {
@@ -574,7 +605,60 @@ impl ContractGraph {
             cur = prev;
         }
         steps.reverse();
-        steps
+        (steps, cur)
+    }
+
+    /// The first step of a segment whose call walk started at `root`: a root the
+    /// site is anchored on only through a Go constructor (not its own enclosing
+    /// callable) is an inference, so the step is shown in that root and capped
+    /// at `heuristic`; the weakest-hop rule carries it to the chain.
+    fn rooted_start<'g>(
+        &'g self,
+        s: &'g ContractNode,
+        start: &FlowStep<'g>,
+        root: NodeId,
+    ) -> FlowStep<'g> {
+        let mut step = start.clone();
+        let own = s.kind == NodeKind::Callable && s.id == root
+            || self.enclosing_callable(s).is_some_and(|c| c.id == root);
+        if !own {
+            step.within = self.get_node(root).or(step.within);
+            step.confidence = weakest(step.confidence, EdgeConfidence::Heuristic);
+        }
+        step
+    }
+
+    /// The confidence of a site reached in callable `x`: its own, capped at
+    /// `heuristic` when `x` does not enclose it (a Go constructor anchoring).
+    fn anchored_confidence(&self, site: &ContractNode, x: NodeId) -> EdgeConfidence {
+        let own = self.topic_confidence(site.id);
+        if self.enclosing_callable(site).is_some_and(|c| c.id == x) {
+            own
+        } else {
+            weakest(own, EdgeConfidence::Heuristic)
+        }
+    }
+
+    /// Keeps the first `fan_out` segments of one entry, the rest named in `limits`.
+    fn cap_segments(
+        segs: &mut Vec<Segment<'_>>,
+        site: &ContractNode,
+        bounds: FlowBounds,
+        limits: &mut Vec<FlowLimit>,
+    ) {
+        if segs.len() > bounds.fan_out {
+            limits.push(FlowLimit::FanOut(
+                FlowSite {
+                    file: site.file_path.clone(),
+                    line: site.line_start,
+                    name: site.name.clone(),
+                    repo_id: site.repo_id,
+                },
+                bounds.fan_out,
+                segs.len() - bounds.fan_out,
+            ));
+            segs.truncate(bounds.fan_out);
+        }
     }
 
     fn site_step<'g>(
@@ -617,8 +701,9 @@ impl ContractGraph {
         limits: &mut Vec<FlowLimit>,
         hide: &dyn Fn(&ContractNode) -> bool,
         hidden: &mut usize,
-    ) -> Vec<Segment<'g>> {
+    ) -> (Vec<Segment<'g>>, bool) {
         let mut segs = Vec::new();
+        let mut cut = false;
         let produce = |p: &'g ContractNode, confidence| {
             self.site_step(
                 FlowStepKind::Produce,
@@ -645,6 +730,7 @@ impl ContractGraph {
         };
         if !roots.is_empty() {
             let walk = self.call_walk(idx, &roots, FlowDirection::Forward, bounds, limits);
+            cut = walk.cut;
             for &x in &walk.order {
                 for &p in idx.producers_in.get(&x).map(Vec::as_slice).unwrap_or(&[]) {
                     if p.id == s.id {
@@ -654,9 +740,10 @@ impl ContractGraph {
                         *hidden += 1;
                         continue;
                     }
-                    let mut steps = vec![start.clone()];
-                    steps.extend(self.call_steps(&walk, x));
-                    steps.push(produce(p, self.topic_confidence(p.id)));
+                    let (calls, root) = self.call_steps(&walk, x);
+                    let mut steps = vec![self.rooted_start(s, &start, root)];
+                    steps.extend(calls);
+                    steps.push(produce(p, self.anchored_confidence(p, x)));
                     call_linked = true;
                     segs.push(Segment {
                         steps,
@@ -668,7 +755,8 @@ impl ContractGraph {
         // The fallback applies when no call path reaches a publish: the entry node
         // publishing itself does not count (a Java handler can carry its own
         // Produces edge on the handler line and a second publish further down).
-        if !call_linked {
+        // A walk cut by `call_depth` is a bound, not "no call path": no fallback.
+        if !call_linked && !cut {
             let mut same_file: Vec<&ContractNode> = self
                 .get_nodes_for_file(&s.file_path)
                 .iter()
@@ -687,7 +775,8 @@ impl ContractGraph {
                 });
             }
         }
-        segs
+        Self::cap_segments(&mut segs, s, bounds, limits);
+        (segs, cut && !call_linked)
     }
 
     /// Reverse segments of the producer `p`: every entry whose callable reaches
@@ -702,8 +791,9 @@ impl ContractGraph {
         limits: &mut Vec<FlowLimit>,
         hide: &dyn Fn(&ContractNode) -> bool,
         hidden: &mut usize,
-    ) -> Vec<Segment<'g>> {
+    ) -> (Vec<Segment<'g>>, bool) {
         let mut segs = Vec::new();
+        let mut cut = false;
         let entry_step = |e: &'g ContractNode, confidence| {
             let (kind, topic) = if idx.consumer_ids.contains(&e.id) {
                 (
@@ -729,6 +819,7 @@ impl ContractGraph {
         };
         if !roots.is_empty() {
             let walk = self.call_walk(idx, &roots, FlowDirection::Reverse, bounds, limits);
+            cut = walk.cut;
             for &x in &walk.order {
                 for &e in idx.entries_in.get(&x).map(Vec::as_slice).unwrap_or(&[]) {
                     if e.id == p.id {
@@ -738,9 +829,10 @@ impl ContractGraph {
                         *hidden += 1;
                         continue;
                     }
-                    let mut steps = vec![start.clone()];
-                    steps.extend(self.call_steps(&walk, x));
-                    steps.push(entry_step(e, self.topic_confidence(e.id)));
+                    let (calls, root) = self.call_steps(&walk, x);
+                    let mut steps = vec![self.rooted_start(p, &start, root)];
+                    steps.extend(calls);
+                    steps.push(entry_step(e, self.anchored_confidence(e, x)));
                     segs.push(Segment {
                         steps,
                         fallback: false,
@@ -748,7 +840,8 @@ impl ContractGraph {
                 }
             }
         }
-        if segs.is_empty() {
+        let call_linked = !segs.is_empty();
+        if !call_linked && !cut {
             let mut same_file: Vec<&ContractNode> = self
                 .get_nodes_for_file(&p.file_path)
                 .iter()
@@ -767,7 +860,8 @@ impl ContractGraph {
                 });
             }
         }
-        segs
+        Self::cap_segments(&mut segs, p, bounds, limits);
+        (segs, cut && !call_linked)
     }
 
     /// The engine: BFS over event levels from `starts`, then the hops reordered
@@ -790,9 +884,14 @@ impl ContractGraph {
         let mut seen_entries: HashSet<NodeId> = HashSet::new();
         let mut queue: VecDeque<Pending<'g>> = VecDeque::new();
         let mut entries = Vec::new();
+        let mut entries_more = 0;
         for s in starts {
             if hide(s) {
                 hidden += 1;
+                continue;
+            }
+            if entries.len() >= bounds.fan_out {
+                entries_more += 1;
                 continue;
             }
             if seen_entries.insert(s.id) {
@@ -847,7 +946,7 @@ impl ContractGraph {
                 within,
                 self.topic_confidence(p.node.id),
             );
-            let segs = match direction {
+            let (segs, cut) = match direction {
                 FlowDirection::Forward => self.forward_segments(
                     &idx,
                     p.node,
@@ -872,7 +971,13 @@ impl ContractGraph {
                 .and_then(|i| hops.get(i))
                 .map_or(EdgeConfidence::Exact, |h| h.chain_confidence);
             if segs.is_empty() {
-                chain_end.push(p.node);
+                if hops.len() >= MAX_FLOW_HOPS {
+                    capped = true;
+                    break;
+                }
+                if !cut {
+                    chain_end.push(p.node);
+                }
                 hops.push(FlowHop {
                     id: String::new(),
                     level: p.level,
@@ -882,12 +987,20 @@ impl ContractGraph {
                     steps: vec![start],
                     fallback: false,
                     next: Vec::new(),
-                    end: Some(FlowEnd::ChainEnd),
+                    end: Some(if cut {
+                        FlowEnd::CallDepthLimit
+                    } else {
+                        FlowEnd::ChainEnd
+                    }),
                     parent_slot: p.slot,
                 });
                 continue;
             }
             for seg in segs {
+                if hops.len() >= MAX_FLOW_HOPS {
+                    capped = true;
+                    break;
+                }
                 let hop_idx = hops.len();
                 let confidence = seg
                     .steps
@@ -991,6 +1104,9 @@ impl ContractGraph {
                     parent_slot: p.slot,
                 });
             }
+            if capped {
+                break;
+            }
         }
         let hops = Self::depth_first(hops);
         sort_nodes(&mut unexpanded);
@@ -1011,6 +1127,7 @@ impl ContractGraph {
             limits,
             hidden,
             capped,
+            entries_more,
         }
     }
 
@@ -1061,6 +1178,12 @@ impl ContractGraph {
                 }) = h.next.get_mut(slot_of[c])
                 {
                     v.push(new_index[c]);
+                }
+            }
+            // Counterparts queued but never expanded: the hop cap stopped the trace.
+            for nx in h.next.iter_mut() {
+                if matches!(&nx.outcome, FlowOutcome::Followed(v) if v.is_empty()) {
+                    nx.outcome = FlowOutcome::HopLimit;
                 }
             }
             out.push(h);

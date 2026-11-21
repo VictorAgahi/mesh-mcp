@@ -912,16 +912,25 @@ consumer statically resolved" (chain end), **Depth limit reached**, or "already 
 a join: each topic is expanded once per answer).
 
 Calls are resolved without a type checker, from the calls layer (`Callable` nodes and `Calls`
-edges, `contracts/calls.rs`): today TypeScript / NestJS / Angular; Java/Spring, Go and Python when
-their call extraction lands. A hop with no resolved call path falls back on the producers declared
-in the entry's own file, marked `same file, no call path (legacy rule, heuristic)`.
+edges, `contracts/calls.rs`): TypeScript / NestJS / Angular (9.0 T2a), Java / Spring, Go and Python
+(9.0 T2b). A Go consumer or producer bound where its client is built (`kafka.ReaderConfig`,
+`kafka.Writer` in a `NewT` constructor) is anchored on the methods of `T` that call through a field;
+that anchoring is an inference (it can pick a method that never handles the messages), so such a
+step and its chain are at most `heuristic`. A hop with no resolved call path falls back on the
+producers declared in the entry's own file, marked `same file, no call path (legacy rule,
+heuristic)`; a walk cut by `call_depth` does not fall back and says **Call depth limit reached**
+(a bound, not a chain end).
 
-Bounds, each a parameter with a cap: `event_depth` (default 3, max 5), `call_depth` per hop
-(default 6, max 12), `fan_out` per node (default 20, max 50, the rest reported as `+K more`). A bound
-that cut the walk is named in the notes (**Call depth limit reached**, **Fan-out limit reached**,
-**Depth limit reached**); **Chain ends** lists the entries with no statically resolved onward
-publish. At most 2,000 hops per trace (**Hop limit reached**). Every list is sorted by path, line,
-name and id, so two runs on the same index give byte-identical answers.
+Bounds, each a parameter with a cap (values above the cap are clamped, and the header shows the
+values used; a negative or non-integer value is refused with a message naming the argument):
+`event_depth` (default 3, 1 to 5), `call_depth` per hop (default 6, 1 to 12), `fan_out` (default
+20, 1 to 50: callees per callable, publishes per entry, consumers or producers per topic and entry
+sites, the rest reported as `+K more`). A bound that cut the walk is named in the notes (**Call
+depth limit reached**, **Fan-out limit reached**, **Depth limit reached**); **Chain ends** lists
+the entries with no statically resolved onward publish. At most 2,000 hops per trace: past it the
+trace stops (**Hop limit reached**), and a topic whose consumers were queued but not reached says
+"not traced: the hop limit stopped the trace first". Every list is sorted by path, line, name and
+id, so two runs on the same index give byte-identical answers.
 
 `entry_kind`: `auto` (default: a `VERB /path` is a route, else an indexed event, else a handler),
 `topic`, `route`, `handler`, `cron` (a scheduled method, resolved like a handler: schedules
@@ -949,9 +958,9 @@ page. The notes are on the first page.
     "target": { "type": "string" },
     "entry_kind": { "enum": ["auto", "topic", "route", "handler", "cron"] },
     "direction": { "enum": ["forward", "reverse"] },
-    "event_depth": { "type": "integer", "minimum": 0, "maximum": 255 },
-    "call_depth": { "type": "integer", "minimum": 0, "maximum": 255 },
-    "fan_out": { "type": "integer", "minimum": 0, "maximum": 255 },
+    "event_depth": { "type": "integer", "minimum": 1, "maximum": 5 },
+    "call_depth": { "type": "integer", "minimum": 1, "maximum": 12 },
+    "fan_out": { "type": "integer", "minimum": 1, "maximum": 50 },
     "offset": { "type": "integer", "minimum": 0 },
     "include_tests": { "type": "boolean" }
   }
@@ -961,7 +970,7 @@ page. The notes are on the first page.
 #### Sample Response (`examples/eda/layered-ts`, `POST /orders`, first two hops)
 ```markdown
 ## Flow trace for `POST /orders` (forward)
-*Entry: route `POST /orders`, 1 entry site(s). Bounds: event_depth 3, call_depth 6, fan_out 20. Hops: 4; weakest chain confidence: ambiguous.*
+*Entry: route `POST /orders`, 1 entry site(s). Bounds (clamped): event_depth 3, call_depth 6, fan_out 20. Hops: 4; weakest chain confidence: ambiguous.*
 
 ### Hop 1 (level 1, exact; chain exact)
 1. route `POST /orders` at `src/order.controller.ts:9`, in `OrderController.create` (`src/order.controller.ts:9`) [exact]

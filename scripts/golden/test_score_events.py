@@ -392,6 +392,18 @@ class ChainSummary(unittest.TestCase):
         self.assertEqual((cs["per_direction"]["reverse"]["chains"], cs["per_direction"]["forward"]["chains"]), (1, 1))
         self.assertEqual(cs["longer_than_cap"]["chains"], 1)
 
+    def test_topic_forward_slice_counts_endpoints_without_call_steps(self):
+        steps = [{"kind": "consume", "file": "src/a.ts", "line": 1}, self.call(0),
+                 {"kind": "produce", "file": "src/p.ts", "line": 9}]
+        chains = [{"id": "t", "entry": {"kind": "topic", "value": "t"}, "steps": steps},
+                  {"id": "r", "entry": {"kind": "route", "value": "POST /x"}, "steps": steps}]
+        # A flat answer: both endpoints, no call step, reversed order.
+        answer = "`src/p.ts:9` then `src/a.ts:1`"
+        cs = se.chain_summary(run(golden(chains=chains), graph(), {"t": answer, "r": answer})[0])
+        tf = cs["topic_forward"]
+        self.assertEqual((tf["chains"], tf["endpoints"], tf["presence"], tf["in_order"]), (1, 1, 0, 0))
+        self.assertEqual(cs["all"]["endpoints"], 2)
+
     def test_min_hops_slice_and_tags(self):
         long_steps = [{"kind": "consume", "file": "src/a.ts", "line": 1}] + [self.call(i) for i in range(3)]
         short_steps = [{"kind": "consume", "file": "src/a.ts", "line": 1}, self.call(9)]

@@ -46,23 +46,38 @@ pub struct TraceFlowArgs {
     )]
     pub direction: Option<Direction>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(
-        description = "Event levels to chain through topics (default 3, max 5). Level 1 is the entry's own hop."
+    #[serde(
+        default,
+        deserialize_with = "event_depth_arg",
+        skip_serializing_if = "Option::is_none"
     )]
-    pub event_depth: Option<u8>,
+    #[schemars(
+        range(min = 1, max = 5),
+        description = "Event levels to chain through topics (default 3, 1 to 5; a larger value is clamped to 5, and the header shows the value used). Level 1 is the entry's own hop."
+    )]
+    pub event_depth: Option<u32>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(
-        description = "Longest call path followed inside one hop, entry to publish (default 6, max 12)."
+    #[serde(
+        default,
+        deserialize_with = "call_depth_arg",
+        skip_serializing_if = "Option::is_none"
     )]
-    pub call_depth: Option<u8>,
+    #[schemars(
+        range(min = 1, max = 12),
+        description = "Longest call path followed inside one hop, entry to publish (default 6, 1 to 12; a larger value is clamped to 12)."
+    )]
+    pub call_depth: Option<u32>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(
-        description = "Callees, consumers or producers followed per node (default 20, max 50); the rest is reported as '+K more'."
+    #[serde(
+        default,
+        deserialize_with = "fan_out_arg",
+        skip_serializing_if = "Option::is_none"
     )]
-    pub fan_out: Option<u8>,
+    #[schemars(
+        range(min = 1, max = 50),
+        description = "Callees, consumers, producers or entry sites followed per node (default 20, 1 to 50; a larger value is clamped to 50); the rest is reported as '+K more'."
+    )]
+    pub fan_out: Option<u32>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
@@ -79,6 +94,37 @@ pub struct TraceFlowArgs {
     #[serde(default)]
     #[schemars(skip)]
     pub _meta: Option<RequestMeta>,
+}
+
+/// A bound argument: any non-negative integer (clamped later to `1..=max`); anything
+/// else is refused with a message naming the argument and its range, never a Rust
+/// type name.
+fn bound_arg<'de, D: serde::Deserializer<'de>>(
+    d: D,
+    name: &str,
+    max: u32,
+) -> Result<Option<u32>, D::Error> {
+    match Option::<serde_json::Value>::deserialize(d)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) if n.as_u64().is_some() => Ok(n
+            .as_u64()
+            .map(|v| u32::try_from(v).unwrap_or(u32::MAX))),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "`{name}` must be a whole number from 1 to {max} (larger values are clamped to {max}), got {other}"
+        ))),
+    }
+}
+
+fn event_depth_arg<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    bound_arg(d, "event_depth", mesh_core::MAX_EVENT_DEPTH as u32)
+}
+
+fn call_depth_arg<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    bound_arg(d, "call_depth", mesh_core::MAX_CALL_DEPTH as u32)
+}
+
+fn fan_out_arg<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    bound_arg(d, "fan_out", mesh_core::MAX_FAN_OUT as u32)
 }
 
 pub struct TraceFlowTool;
@@ -119,24 +165,13 @@ impl McpTool for TraceFlowTool {
             _ => FlowDirection::Forward,
         };
         let bounds = FlowBounds::clamped(
-            args.call_depth.map(usize::from),
-            args.event_depth.map(usize::from),
-            args.fan_out.map(usize::from),
+            args.call_depth.map(|v| v as usize),
+            args.event_depth.map(|v| v as usize),
+            args.fan_out.map(|v| v as usize),
         );
         let route = RouteQuery::parse_target(target);
         let kind = match args.entry_kind.unwrap_or(EntryKind::Auto) {
             EntryKind::Auto if route.is_some() => EntryKind::Route,
-            EntryKind::Auto => {
-                let flow = graph.analyze_impact(target);
-                if flow.topics.is_empty()
-                    && flow.upstream_producers.is_empty()
-                    && flow.downstream_consumers.is_empty()
-                {
-                    EntryKind::Handler
-                } else {
-                    EntryKind::Topic
-                }
-            }
             k => k,
         };
         let entry = match kind {
@@ -162,7 +197,9 @@ impl McpTool for TraceFlowTool {
             }
             EntryKind::Handler => FlowEntry::Handler(target),
             EntryKind::Cron => FlowEntry::Cron(target),
-            EntryKind::Topic | EntryKind::Auto => FlowEntry::Topic(target),
+            EntryKind::Topic => FlowEntry::Topic(target),
+            // One topic match in the engine decides event vs handler.
+            EntryKind::Auto => FlowEntry::Auto(target),
         };
         let mut trace = graph.trace_flow(entry, direction, bounds, &hide);
         trace.target = CompactStr::new(target);

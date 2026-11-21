@@ -935,11 +935,23 @@ impl MarkdownFormatter {
             "## Flow trace for `{}` ({dir})\n",
             Self::clamp_chars(&trace.target.replace('`', "'"), Self::NOTE_NAME_CHARS)
         );
+        let more_entries = if trace.entries_more > 0 {
+            format!(" (+{} more not followed, fan_out)", trace.entries_more)
+        } else {
+            String::new()
+        };
+        let entry = if trace.entries.is_empty() {
+            "no match".to_string()
+        } else {
+            format!(
+                "{} `{}`, {} entry site(s){more_entries}",
+                trace.entry_kind,
+                Self::clamp_chars(&trace.target.replace('`', "'"), Self::NOTE_NAME_CHARS),
+                trace.entries.len(),
+            )
+        };
         out.push_str(&format!(
-            "*Entry: {} `{}`, {} entry site(s). Bounds: event_depth {}, call_depth {}, fan_out {}. Hops: {total}; weakest chain confidence: {weakest}.*\n",
-            trace.entry_kind,
-            Self::clamp_chars(&trace.target.replace('`', "'"), Self::NOTE_NAME_CHARS),
-            trace.entries.len(),
+            "*Entry: {entry}. Bounds (clamped): event_depth {}, call_depth {}, fan_out {}. Hops: {total}; weakest chain confidence: {weakest}.*\n",
             trace.bounds.event_depth,
             trace.bounds.call_depth,
             trace.bounds.fan_out,
@@ -1109,6 +1121,11 @@ impl MarkdownFormatter {
                 trace.bounds.call_depth
             )),
             Some(FlowEnd::Origin) => out.push_str("-> Chain starts here.\n"),
+            Some(FlowEnd::CallDepthLimit) => out.push_str(&format!(
+                "-> **Call depth limit reached** (call_depth {}): the call walk stopped before reaching a {raise}; this is a bound, not a chain end. Raise `call_depth` (max {}).\n",
+                trace.bounds.call_depth,
+                mesh_core::MAX_CALL_DEPTH
+            )),
             None => {}
         }
         for nx in &hop.next {
@@ -1135,6 +1152,10 @@ impl MarkdownFormatter {
                     }
                 )
                 }
+                FlowOutcome::HopLimit => format!(
+                    "not traced: the hop limit ({}) stopped the trace first",
+                    mesh_core::MAX_FLOW_HOPS
+                ),
                 FlowOutcome::AlreadyTraced => {
                     "already traced in this answer (cycle or join), not expanded again".to_string()
                 }
@@ -1976,7 +1997,11 @@ mod tests {
         let trace = g.trace_flow(
             FlowEntry::Topic("in"),
             FlowDirection::Forward,
-            FlowBounds::clamped(None, Some(1), Some(50)),
+            FlowBounds {
+                call_depth: 6,
+                event_depth: 1,
+                fan_out: usize::MAX,
+            },
             &|_| false,
         );
         assert_eq!(trace.hops.len(), 500);
@@ -2016,5 +2041,42 @@ mod tests {
         // Past the end: a clear note, no hop.
         let past = MarkdownFormatter::format_flow_trace(&trace, &roots, 10_000);
         assert!(past.contains("No hops at `offset: 10000`"), "{past}");
+    }
+
+    #[test]
+    fn flow_trace_hop_cap_is_said_on_the_first_page() {
+        use mesh_core::{FlowBounds, FlowDirection, FlowEntry, MAX_FLOW_HOPS};
+        let g = wide_flow_graph(50, 45);
+        let bounds = FlowBounds {
+            call_depth: 6,
+            event_depth: 1,
+            fan_out: usize::MAX,
+        };
+        let trace = g.trace_flow(
+            FlowEntry::Topic("in"),
+            FlowDirection::Forward,
+            bounds,
+            &|_| false,
+        );
+        assert_eq!(trace.hops.len(), MAX_FLOW_HOPS);
+        let roots = vec![PathBuf::from("/w")];
+        let page = MarkdownFormatter::format_flow_trace(&trace, &roots, 0);
+        assert!(page.contains("**Hop limit reached**"), "{page}");
+        assert!(page.contains("Hops: 2000;"), "{page}");
+    }
+
+    #[test]
+    fn flow_trace_unknown_target_says_no_match() {
+        use mesh_core::{FlowBounds, FlowDirection, FlowEntry};
+        let g = mesh_core::ContractGraph::new();
+        let trace = g.trace_flow(
+            FlowEntry::Handler("Nope.run"),
+            FlowDirection::Forward,
+            FlowBounds::default(),
+            &|_| false,
+        );
+        let page = MarkdownFormatter::format_flow_trace(&trace, &[], 0);
+        assert!(page.contains("*Entry: no match."), "{page}");
+        assert!(!page.contains("0 entry site(s)"), "{page}");
     }
 }

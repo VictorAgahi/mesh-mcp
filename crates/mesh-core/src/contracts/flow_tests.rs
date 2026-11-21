@@ -259,12 +259,17 @@ fn call_depth_cap_stops_and_says_so() {
         FlowBounds::clamped(Some(6), None, None),
     );
     assert_eq!(short.hops.len(), 1);
-    assert_eq!(short.hops[0].end, Some(FlowEnd::ChainEnd), "{short:#?}");
+    // A bound, not an end: not listed among the chain ends.
+    assert_eq!(
+        short.hops[0].end,
+        Some(FlowEnd::CallDepthLimit),
+        "{short:#?}"
+    );
     assert!(short
         .limits
         .iter()
         .any(|l| matches!(l, FlowLimit::CallDepth(_))));
-    assert_eq!(short.chain_end.len(), 1);
+    assert!(short.chain_end.is_empty());
     let long = trace(
         &g,
         "in",
@@ -363,7 +368,8 @@ fn two_megabyte_stack_on_a_deep_graph() {
         })
         .expect("spawn");
     let (f, r, ends) = handle.join().expect("no stack overflow");
-    assert_eq!((f, r, ends), (1, 1, 1));
+    // The 3,000-call chain is cut by call_depth both ways: a bound, not a chain end.
+    assert_eq!((f, r, ends), (1, 1, 0));
 }
 
 /// The nodes `analyze_impact` at `depth` lists past the first hop, and the ones
@@ -435,4 +441,93 @@ fn analyze_impact_past_depth_one_agrees_with_the_engine() {
         .analyze_impact_with_depth("in", 1)
         .downstream_producers
         .is_empty());
+}
+
+// ---- Fix round 1 (review of c3adbda) ----
+
+/// One handler `h` consuming `in`, calling `p`, which publishes `n` topics, each
+/// consumed by its own handler `c{k}` (so every hop has a child to queue).
+fn wide(n: usize) -> Vec<F> {
+    let mut p = f("p");
+    p.fns[0].2 = 100_000;
+    let mut files = vec![f("h").consumes(2, "in").calls("p", 3)];
+    for k in 0..n {
+        p = p.produces(10 + k, &format!("t.{k}"));
+        files.push(f(&format!("c{k}")).consumes(2, &format!("t.{k}")));
+    }
+    files.push(p);
+    files
+}
+
+fn unbounded_fan_out() -> FlowBounds {
+    FlowBounds {
+        call_depth: DEFAULT_CALL_DEPTH,
+        event_depth: MAX_EVENT_DEPTH,
+        fan_out: usize::MAX,
+    }
+}
+
+#[test]
+fn hop_cap_is_enforced_per_hop_and_flagged() {
+    let g = build(&wide(2_100));
+    let t = trace(&g, "in", FlowDirection::Forward, unbounded_fan_out());
+    assert_eq!(t.hops.len(), MAX_FLOW_HOPS, "hop cap");
+    assert!(t.capped);
+}
+
+#[test]
+fn followed_without_traced_children_says_hop_limit() {
+    let g = build(&wide(1_500));
+    let t = trace(&g, "in", FlowDirection::Forward, unbounded_fan_out());
+    assert!(t.capped);
+    for h in &t.hops {
+        for nx in &h.next {
+            assert!(
+                !matches!(&nx.outcome, FlowOutcome::Followed(v) if v.is_empty()),
+                "hop {} topic {} followed into nothing",
+                h.id,
+                nx.topic
+            );
+        }
+    }
+    assert!(t
+        .hops
+        .iter()
+        .any(|h| h.next.iter().any(|nx| nx.outcome == FlowOutcome::HopLimit)));
+}
+
+#[test]
+fn call_depth_cut_is_not_relabelled_as_same_file_fallback() {
+    let mut files = long_chain(8);
+    // Outside f0 (lines 1-20): only the same-file fallback could link it.
+    files[0] = files[0].clone().produces(25, "side");
+    let g = build(&files);
+    let t = trace(
+        &g,
+        "in",
+        FlowDirection::Forward,
+        FlowBounds::clamped(Some(6), None, None),
+    );
+    assert!(t.hops.iter().all(|h| !h.fallback), "{t:#?}");
+    assert_eq!(t.hops.len(), 1);
+    assert_eq!(t.hops[0].end, Some(FlowEnd::CallDepthLimit));
+}
+
+#[test]
+fn fan_out_caps_the_publishes_of_one_entry() {
+    let g = build(&wide(100));
+    let t = trace(
+        &g,
+        "in",
+        FlowDirection::Forward,
+        FlowBounds::clamped(None, Some(1), Some(20)),
+    );
+    assert_eq!(t.hops.len(), 20);
+    assert!(
+        t.limits
+            .iter()
+            .any(|l| matches!(l, FlowLimit::FanOut(_, 20, 80))),
+        "{:?}",
+        t.limits
+    );
 }

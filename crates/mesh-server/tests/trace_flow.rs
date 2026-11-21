@@ -239,3 +239,165 @@ async fn layered_go_chain_through_constructor_anchored_sites() {
             .unwrap_or_else(|| panic!("{loc} missing or out of order\n{text}"));
     }
 }
+
+// ---- Fix round 1 (review of c3adbda) ----
+
+fn temp_workspace(files: &[(&str, &str)]) -> (tempfile::TempDir, Arc<AppState>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("mesh-mcp.toml"),
+        "[workspace]\nname = \"t\"\nversion = \"1.0.0\"\nroots = [\".\"]\n\n[engines.contracts]\nenabled = true\n",
+    )
+    .expect("config");
+    for (name, body) in files {
+        std::fs::write(dir.path().join(name), body).expect("file");
+    }
+    let root = dunce::canonicalize(dir.path()).expect("canonicalize");
+    let rel = root.to_string_lossy().to_string();
+    let state = state_for_abs(&rel);
+    (dir, state)
+}
+
+fn state_for_abs(dir: &str) -> Arc<AppState> {
+    let dir = Path::new(dir);
+    let config = Config::load_from_file(&dir.join("mesh-mcp.toml")).expect("config");
+    let roots = expand_roots(
+        &config.workspace.roots,
+        dir,
+        &config.workspace.workspace_root,
+    )
+    .expect("expand roots");
+    let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+    let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+    let state = Arc::new(AppState::new(config, roots, audit, rescan));
+    let snapshot = mesh_server::WorkspaceIndexer::build_snapshot(
+        &state.config,
+        &state.allowed_roots,
+        None,
+        None,
+        None,
+    );
+    state.install_snapshot(snapshot);
+    state
+}
+
+/// Go constructor anchoring is an inference: `Flush` is never called by `Run`,
+/// yet a site in `NewConsumer` is anchored on every field-using method of the
+/// struct. A chain through such a root must not read `exact`.
+#[tokio::test]
+async fn go_constructor_anchored_chain_is_heuristic() {
+    let consumer = r#"package main
+
+import (
+	"context"
+
+	"github.com/segmentio/kafka-go"
+)
+
+type Consumer struct {
+	reader *kafka.Reader
+	pub    *Publisher
+}
+
+func NewConsumer(brokers []string, pub *Publisher) *Consumer {
+	r := kafka.NewReader(kafka.ReaderConfig{Brokers: brokers, Topic: "topic.in", GroupID: "g"})
+	return &Consumer{reader: r, pub: pub}
+}
+
+func (c *Consumer) Run(ctx context.Context) error {
+	for {
+		if _, err := c.reader.ReadMessage(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+func (c *Consumer) Flush(ctx context.Context) error {
+	return c.pub.Publish(ctx, "x")
+}
+"#;
+    let publisher = r#"package main
+
+import (
+	"context"
+
+	"github.com/segmentio/kafka-go"
+)
+
+type Publisher struct {
+	writer *kafka.Writer
+}
+
+func NewPublisher(addr string) *Publisher {
+	return &Publisher{writer: &kafka.Writer{Addr: kafka.TCP(addr), Topic: "topic.out"}}
+}
+
+func (p *Publisher) Publish(ctx context.Context, id string) error {
+	return p.writer.WriteMessages(ctx, kafka.Message{Key: []byte(id)})
+}
+"#;
+    let (_dir, state) = temp_workspace(&[
+        ("go.mod", "module example.com/t\n\ngo 1.22\n"),
+        ("consumer.go", consumer),
+        ("publisher.go", publisher),
+    ]);
+    let text = call(&state, "trace_flow", json!({ "target": "topic.in" })).await;
+    let flush_hop = text
+        .split("\n### Hop ")
+        .find(|h| h.contains("Consumer.Flush"))
+        .unwrap_or_else(|| panic!("the anchored chain is still shown\n{text}"));
+    assert!(flush_hop.contains("chain heuristic"), "{flush_hop}");
+    assert!(!flush_hop.contains("; chain exact"), "{flush_hop}");
+}
+
+#[tokio::test]
+async fn bounds_have_maxima_are_clamped_and_fail_cleanly() {
+    let tools = ToolRegistry::list_tools();
+    let schema = tools
+        .as_array()
+        .and_then(|t| t.iter().find(|t| t["name"] == "trace_flow"))
+        .map(|t| t["inputSchema"]["properties"].clone())
+        .expect("trace_flow listed");
+    assert_eq!(
+        schema["event_depth"]["maximum"].as_f64(),
+        Some(5.0),
+        "{schema}"
+    );
+    assert_eq!(
+        schema["call_depth"]["maximum"].as_f64(),
+        Some(12.0),
+        "{schema}"
+    );
+    assert_eq!(
+        schema["fan_out"]["maximum"].as_f64(),
+        Some(50.0),
+        "{schema}"
+    );
+    let state = state_for("examples/eda/layered-ts");
+    let clamped = call(
+        &state,
+        "trace_flow",
+        json!({ "target": "order.requested", "event_depth": 13, "call_depth": 300, "fan_out": 51 }),
+    )
+    .await;
+    assert!(
+        clamped.contains("Bounds (clamped): event_depth 5, call_depth 12, fan_out 50."),
+        "{clamped}"
+    );
+    for bad in [json!(-1), json!(2.5), json!("3")] {
+        let res = ToolRegistry::call_tool(
+            "trace_flow",
+            json!({ "target": "order.requested", "event_depth": bad }),
+            state.clone(),
+        )
+        .await
+        .expect("tool call");
+        let text = res["content"][0]["text"].as_str().unwrap_or_default();
+        assert_eq!(res["isError"], json!(true), "{bad}: {text}");
+        assert!(
+            text.contains("`event_depth` must be a whole number from 1 to 5"),
+            "{text}"
+        );
+        assert!(!text.contains("u8") && !text.contains("u32"), "{text}");
+    }
+}

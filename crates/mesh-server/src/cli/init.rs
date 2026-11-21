@@ -485,7 +485,7 @@ For an exact identifier (an enum value, a class name), plain text search is stil
         text.push_str(
             "
 In Claude Code these tools load on demand: `ToolSearch` with
-`select:mcp__mesh-mcp__find_dependents,mcp__mesh-mcp__analyze_impact,mcp__mesh-mcp__analyze_grpc`.
+`select:mcp__mesh-mcp__find_dependents,mcp__mesh-mcp__analyze_impact,mcp__mesh-mcp__analyze_grpc,mcp__mesh-mcp__trace_flow`.
 ",
         );
     }
