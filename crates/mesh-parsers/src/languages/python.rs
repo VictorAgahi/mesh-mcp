@@ -746,9 +746,52 @@ impl PythonExtractor {
         }
     }
 
+    /// `os.environ["KEY"]`, `os.environ.get("KEY"[, "def"])`, `os.getenv("KEY"[, "def"])`
+    /// as the `${KEY}` placeholder the configuration files resolve; anything else is not a
+    /// config read.
+    fn config_value(node: Node, source: &[u8]) -> Option<String> {
+        let string_arg =
+            |n: Node| (n.kind() == "string").then(|| Self::string_literal_value(n, source))?;
+        match node.kind() {
+            "subscript" => {
+                let object = node.child_by_field_name("value")?.utf8_text(source).ok()?;
+                if !matches!(object, "os.environ" | "environ") {
+                    return None;
+                }
+                let key = string_arg(node.child_by_field_name("subscript")?)?;
+                crate::config_ref::placeholder(&key, None)
+            }
+            "call" => {
+                let func = node
+                    .child_by_field_name("function")?
+                    .utf8_text(source)
+                    .ok()?;
+                if !matches!(
+                    func,
+                    "os.getenv" | "os.environ.get" | "environ.get" | "getenv"
+                ) {
+                    return None;
+                }
+                let args = node.child_by_field_name("arguments")?;
+                let mut cursor = args.walk();
+                let mut positional = args.named_children(&mut cursor);
+                let key = string_arg(positional.next()?)?;
+                let default = match positional.next() {
+                    None => None,
+                    Some(d) => Some(string_arg(d)?),
+                };
+                crate::config_ref::placeholder(&key, default.as_deref())
+            }
+            _ => None,
+        }
+    }
+
     fn resolve_expr_to_string(node: Node, source: &[u8], root: Node) -> Option<String> {
         if node.kind() == "string" {
             return Self::string_literal_value(node, source);
+        }
+        if let Some(reference) = Self::config_value(node, source) {
+            return Some(reference);
         }
         if node.kind() == "identifier" || node.kind() == "attribute" {
             let var_name = node.utf8_text(source).ok()?.trim();
@@ -771,6 +814,11 @@ impl PythonExtractor {
                         if left_name == target_name && right.kind() == "string" {
                             return Self::string_literal_value(right, source);
                         }
+                        if left_name == target_name {
+                            if let Some(reference) = Self::config_value(right, source) {
+                                return Some(reference);
+                            }
+                        }
                     }
                 }
             } else if child.kind() == "assignment" {
@@ -779,6 +827,11 @@ impl PythonExtractor {
                 let left_name = left.utf8_text(source).ok()?.trim();
                 if left_name == target_name && right.kind() == "string" {
                     return Self::string_literal_value(right, source);
+                }
+                if left_name == target_name {
+                    if let Some(reference) = Self::config_value(right, source) {
+                        return Some(reference);
+                    }
                 }
             }
         }
@@ -1337,37 +1390,46 @@ def send_event():
         );
     }
 
-    /// A variable resolved via `find_assignment_in_root` must only count when
-    /// its assignment is a genuine string literal. `string_literal_value`
-    /// finds the *first and last quote characters* in a node's raw text —
-    /// for a non-string right-hand side like `os.getenv('KAFKA_TOPIC')`,
-    /// that raw text still contains quotes, so it used to extract
-    /// "KAFKA_TOPIC" (the *env var's key*, from `getenv`'s own argument) as
-    /// if it were the resolved topic value, which it never was.
+    /// A variable resolved via `find_assignment_in_root` must only count when its
+    /// assignment is a string literal or a config read. `string_literal_value` finds the
+    /// first and last quote characters in a node's raw text, so for `os.getenv('KAFKA_TOPIC')`
+    /// it used to extract "KAFKA_TOPIC" (the env var's KEY) as if it were the topic. The
+    /// site now records the `${KAFKA_TOPIC}` placeholder (resolved against the config files
+    /// at fold time), never the bare key; an arbitrary call records nothing.
     #[test]
-    fn test_python_topic_variable_assigned_from_non_literal_records_nothing() {
-        let code = r#"
-from confluent_kafka import Producer
-
-TOPIC = os.getenv('KAFKA_TOPIC')
-
-def send_event():
-    producer = Producer({})
-    producer.produce(TOPIC, b"data")
-"#;
-        let mut parser = make_parser();
-        let tree = parser.parse(code, None).expect("parse");
-        let (_, relations) = PythonExtractor::extract_with_relations(
-            Path::new("services/producer.py"),
-            code,
-            1,
-            &tree,
+    fn test_python_topic_variable_assigned_from_non_literal() {
+        let record = |assignment: &str| {
+            let code = format!(
+                "from confluent_kafka import Producer\n\n{assignment}\n\ndef send_event():\n    producer = Producer({{}})\n    producer.produce(TOPIC, b\"data\")\n"
+            );
+            let mut parser = make_parser();
+            let tree = parser.parse(&code, None).expect("parse");
+            let (_, relations) = PythonExtractor::extract_with_relations(
+                Path::new("services/producer.py"),
+                &code,
+                1,
+                &tree,
+            );
+            relations
+                .producers
+                .into_iter()
+                .map(|(_, t)| t.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            record("TOPIC = os.getenv('KAFKA_TOPIC')"),
+            ["${KAFKA_TOPIC}"]
         );
-        assert!(
-            relations.producers.is_empty(),
-            "expected no fabricated topic from a non-literal assignment, got: {:?}",
-            relations.producers
+        assert_eq!(
+            record("TOPIC = os.environ.get('KAFKA_TOPIC', 'orders')"),
+            ["${KAFKA_TOPIC:orders}"]
         );
+        assert_eq!(
+            record("TOPIC = os.environ['KAFKA_TOPIC']"),
+            ["${KAFKA_TOPIC}"]
+        );
+        assert!(record("TOPIC = compute_topic('KAFKA_TOPIC')").is_empty());
+        assert!(record("TOPIC = os.getenv(KEY_NAME)").is_empty());
     }
 
     #[test]

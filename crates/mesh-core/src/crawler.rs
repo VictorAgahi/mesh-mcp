@@ -8,6 +8,9 @@ use std::sync::Arc;
 
 pub struct FilesystemCrawler;
 
+/// The default exclude pattern for dotenv files (`Config`'s `exclude_patterns`).
+const DEFAULT_ENV_PATTERN: &str = "**/.env*";
+
 /// Compiled exclusion matcher built once per crawl from the workspace `exclude_patterns`.
 ///
 /// Patterns are gitignore-style globs (`**/node_modules/**`, `**/*.pem`, `.env*`). A pattern
@@ -102,6 +105,22 @@ impl ExcludeMatcher {
             return true;
         }
         let matches = self.set.matches(rel);
+        // A `.env.example` template is read for the topic names it documents (ticket T6):
+        // the one carve-out of the default `**/.env*` secret pattern, and only of it. A real
+        // `.env`, and any `.env*` an operator listed themselves, stay excluded.
+        if !matches.is_empty()
+            && crate::config_values::is_env_template_name(
+                rel.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+            )
+            && matches.iter().all(|m| {
+                self.pattern_indices
+                    .get(*m)
+                    .and_then(|&i| self.raw_patterns.get(i))
+                    .is_some_and(|raw| raw == DEFAULT_ENV_PATTERN)
+            })
+        {
+            return false;
+        }
         if !matches.is_empty() {
             for m in matches {
                 if let Some(&raw_idx) = self.pattern_indices.get(m) {
@@ -553,6 +572,52 @@ mod tests {
                 "{excluded} must be excluded, got {rel:?}"
             );
         }
+    }
+
+    /// Ticket T6: a `.env.example` template is crawled under the default patterns, a real
+    /// `.env*` is not, and an operator's own `.env*` pattern is honoured whatever the file.
+    #[test]
+    fn env_templates_are_the_one_carve_out_of_the_default_env_pattern() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ws = temp.path();
+        for rel in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            ".env.example",
+            "svc/.env.sample",
+            "a.ts",
+        ] {
+            let p = ws.join(rel);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&p, "K=v").expect("write");
+        }
+        let allowed = dunce::canonicalize(ws).expect("canon");
+        let scope =
+            ValidatedScope::resolve(&allowed.to_string_lossy(), std::slice::from_ref(&allowed))
+                .expect("scope");
+        let names = |patterns: &[String]| {
+            let mut v: Vec<String> = FilesystemCrawler::crawl_scope(&scope, patterns, Some(5))
+                .iter()
+                .map(|f| {
+                    f.strip_prefix(&allowed)
+                        .expect("rel")
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            names(&[DEFAULT_ENV_PATTERN.to_string()]),
+            [".env.example", "a.ts", "svc/.env.sample"]
+        );
+        assert_eq!(
+            names(&[".env*".to_string()]),
+            ["a.ts"],
+            "an explicit pattern is honoured"
+        );
     }
 
     #[cfg(unix)]

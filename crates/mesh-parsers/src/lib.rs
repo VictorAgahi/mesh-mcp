@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod config_ref;
 pub mod decapitate;
 pub mod graph;
 pub mod guard;

@@ -646,6 +646,12 @@ impl FileWatcherService {
             return true;
         }
 
+        // A dotenv file (`.env`, `.env.local`, `prod.env`) can hold the topic a source file
+        // reads from the environment (ticket T6): editing one re-resolves those topics.
+        if crate::config_values::is_dotenv_name(name) {
+            return true;
+        }
+
         // `.sql` in any case: the crawler indexes `UPPER.SQL`, so an edit must reload it.
         if path
             .extension()

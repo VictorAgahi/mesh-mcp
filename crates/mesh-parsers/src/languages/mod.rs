@@ -27,11 +27,11 @@ pub use ts_config::TsAliasIndex;
 use crate::decapitate::LanguageKind;
 use crate::guard::{AstGuard, ParseOutcome};
 use mesh_core::{
-    Broker, CallFacts, CompactStr, ContractGraph, ContractNode, ContractsConfig,
+    Broker, CallFacts, CompactStr, ConfigValues, ContractGraph, ContractNode, ContractsConfig,
     CustomPatternConfig, FilePath, NodeKind, PatternKind, RepoId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -278,8 +278,26 @@ impl FileIndex {
         self.sql_capped |= other.sql_capped;
     }
 
-    /// Inserts the extracted nodes and relations into `graph`.
+    /// Inserts the extracted nodes and relations into `graph`. A `${key}` topic is resolved
+    /// against nothing (only its own `${key:default}` fallback applies).
     pub fn apply(self, graph: &mut ContractGraph) {
+        self.apply_with(graph, &ConfigValues::default());
+    }
+
+    /// Whether a producer or consumer topic of this file is a `${key}` config placeholder.
+    pub fn has_config_topic(&self) -> bool {
+        self.producers
+            .iter()
+            .chain(&self.consumers)
+            .any(|(_, topic)| topic.contains("${"))
+    }
+
+    /// [`Self::apply`] with the workspace's configuration values: a `${key}` topic is
+    /// registered under each topic the configuration resolves it to (more than one when
+    /// profiles disagree), and the site is linked `heuristic` unless exactly one strong
+    /// value says so. A placeholder nothing resolves stays registered as the `${key}` topic
+    /// itself, `heuristic`: visible, never guessed.
+    pub fn apply_with(self, graph: &mut ContractGraph, config: &ConfigValues) {
         // Call facts are keyed by the file their nodes live in: a file with call
         // facts always has the declaration nodes they were read from.
         if let Some(first) = self.nodes.first() {
@@ -292,17 +310,35 @@ impl FileIndex {
                 );
             }
         }
-        let ids: Vec<_> = self.nodes.into_iter().map(|n| graph.add_node(n)).collect();
+        // A call-site node named after its topic shows the resolved name when the
+        // configuration gives exactly one.
+        let mut nodes = self.nodes;
+        for n in nodes.iter_mut().filter(|n| n.name.contains("${")) {
+            if let Some(r) = config.resolve(&n.name).filter(|r| r.topics.len() == 1) {
+                n.name = CompactStr::new(&r.topics[0].0);
+            }
+        }
+        let ids: Vec<_> = nodes.into_iter().map(|n| graph.add_node(n)).collect();
         for (i, target) in self.dependencies {
             graph.add_dependency(ids[i], &target);
         }
         let producer_brokers: HashMap<usize, Broker> = self.producer_brokers.into_iter().collect();
+        let mut weak_nodes: BTreeSet<usize> = BTreeSet::new();
         for (pair, (i, topic)) in self.producers.into_iter().enumerate() {
-            graph.add_producer_on(ids[i], &topic, producer_brokers.get(&pair).copied());
+            let broker = producer_brokers.get(&pair).copied();
+            for topic in Self::config_topics(&topic, config, i, &mut weak_nodes) {
+                graph.add_producer_on(ids[i], &topic, broker);
+            }
         }
         let consumer_brokers: HashMap<usize, Broker> = self.consumer_brokers.into_iter().collect();
         for (pair, (i, topic)) in self.consumers.into_iter().enumerate() {
-            graph.add_consumer_on(ids[i], &topic, consumer_brokers.get(&pair).copied());
+            let broker = consumer_brokers.get(&pair).copied();
+            for topic in Self::config_topics(&topic, config, i, &mut weak_nodes) {
+                graph.add_consumer_on(ids[i], &topic, broker);
+            }
+        }
+        for i in weak_nodes {
+            graph.mark_heuristic_topic_node(ids[i]);
         }
         for (i, target) in self.rpc_calls {
             graph.add_rpc_call(ids[i], &target);
@@ -313,6 +349,35 @@ impl FileIndex {
         for (i, broker) in self.node_brokers {
             if let Some(id) = ids.get(i) {
                 graph.set_node_broker(*id, broker);
+            }
+        }
+    }
+
+    /// The topics a recorded topic stands for: itself when it holds no placeholder, else what
+    /// `config` resolves it to. A weak or unresolved link adds node `i` to `weak`.
+    fn config_topics(
+        topic: &CompactStr,
+        config: &ConfigValues,
+        i: usize,
+        weak: &mut BTreeSet<usize>,
+    ) -> Vec<CompactStr> {
+        if !topic.contains("${") {
+            return vec![topic.clone()];
+        }
+        match config.resolve(topic) {
+            Some(resolved) if !resolved.topics.is_empty() => resolved
+                .topics
+                .into_iter()
+                .map(|(t, is_weak)| {
+                    if is_weak {
+                        weak.insert(i);
+                    }
+                    CompactStr::new(t)
+                })
+                .collect(),
+            _ => {
+                weak.insert(i);
+                vec![topic.clone()]
             }
         }
     }

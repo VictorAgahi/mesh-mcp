@@ -318,6 +318,7 @@ pub(crate) fn graphql_decorator(method: Node, source: &[u8], fx: &FrameworkCtx) 
             continue;
         }
         let names = Names {
+            config: false,
             source,
             consts: &built.consts,
             bindings: &built.bindings,

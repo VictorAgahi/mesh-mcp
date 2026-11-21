@@ -1,4 +1,5 @@
 use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
@@ -57,6 +58,7 @@ impl JavaExtractor {
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let mut package_name = CompactStr::default();
+        let value_fields = Self::value_placeholder_fields(content);
 
         Self::visit_node(
             root,
@@ -67,6 +69,7 @@ impl JavaExtractor {
             &mut nodes,
             &mut producers,
             &mut rpc_calls,
+            &value_fields,
             None,
             0,
         );
@@ -198,7 +201,10 @@ impl JavaExtractor {
     /// paren — so `kafkaTemplate.send(topicVar, msg); logger.info("...")`
     /// could walk straight past the call and pick up an unrelated string
     /// literal from a completely different statement as the "topic".
-    fn extract_kafka_producer_topic(text: &str) -> Option<String> {
+    fn extract_kafka_producer_topic(
+        text: &str,
+        value_fields: &HashMap<String, String>,
+    ) -> Option<String> {
         let lower = text.to_lowercase();
         let mut search_start = 0;
         while let Some(rel_idx) = lower[search_start..].find(".send(") {
@@ -237,6 +243,13 @@ impl JavaExtractor {
                             return Some(rest[..q_end].to_string());
                         }
                     }
+                    // A field or parameter injected with `@Value("${...}")` in this file:
+                    // its placeholder, resolved against the configuration at fold time.
+                    let first = args.split(',').next().unwrap_or("").trim();
+                    let name = first.strip_prefix("this.").unwrap_or(first);
+                    if let Some(placeholder) = value_fields.get(name) {
+                        return Some(placeholder.clone());
+                    }
                 }
             }
             search_start = call_start;
@@ -254,6 +267,7 @@ impl JavaExtractor {
         nodes: &mut Vec<ContractNode>,
         producers: &mut Vec<(usize, CompactStr)>,
         rpc_calls: &mut Vec<(usize, CompactStr)>,
+        value_fields: &HashMap<String, String>,
         enclosing_class_idx: Option<usize>,
         depth: usize,
     ) {
@@ -385,7 +399,7 @@ impl JavaExtractor {
                 };
 
                 let method_text = node.utf8_text(source).unwrap_or("");
-                let producer_topic = Self::extract_kafka_producer_topic(method_text);
+                let producer_topic = Self::extract_kafka_producer_topic(method_text, value_fields);
                 let grpc_client_services = Self::extract_grpc_client_services(method_text);
 
                 nodes.push(ContractNode {
@@ -438,6 +452,7 @@ impl JavaExtractor {
                 nodes,
                 producers,
                 rpc_calls,
+                value_fields,
                 child_enclosing_class_idx,
                 depth + 1,
             );
@@ -500,6 +515,59 @@ impl JavaExtractor {
             }
         }
         None
+    }
+
+    /// `name -> "${key}"` for every field or parameter of the file annotated
+    /// `@Value("${key}")` / `@Value("${key:default}")`: the Spring way to read a topic name
+    /// from `application.yml`. Bounded; a name injected twice with different keys is
+    /// ambiguous and left out.
+    fn value_placeholder_fields(content: &str) -> HashMap<String, String> {
+        const MAX_FIELDS: usize = 256;
+        let mut out: HashMap<String, String> = HashMap::new();
+        let mut dup: HashSet<String> = HashSet::new();
+        let mut from = 0;
+        while let Some(rel) = content[from..].find("@Value(") {
+            let open = from + rel + "@Value(".len();
+            from = open;
+            let Some(close_rel) = content[open..].find(')') else {
+                break;
+            };
+            let literal = content[open..open + close_rel].trim();
+            let Some(inner) = literal
+                .strip_prefix('"')
+                .and_then(|l| l.strip_suffix('"'))
+                .filter(|l| {
+                    l.starts_with("${") && l.ends_with('}') && l.matches("${").count() == 1
+                })
+            else {
+                continue;
+            };
+            // The declared name: the last identifier before the `;` `,` `)` `=` that ends
+            // the field or parameter.
+            let after = &content[open + close_rel + 1..];
+            let Some(end) = after.find([';', ',', ')', '=']) else {
+                continue;
+            };
+            let Some(name) = after[..end]
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .rfind(|w| !w.is_empty())
+            else {
+                continue;
+            };
+            if out.len() >= MAX_FIELDS && !out.contains_key(name) {
+                break;
+            }
+            match out.get(name) {
+                Some(prev) if prev != inner => {
+                    dup.insert(name.to_string());
+                }
+                _ => {
+                    out.insert(name.to_string(), inner.to_string());
+                }
+            }
+        }
+        out.retain(|k, _| !dup.contains(k));
+        out
     }
 
     fn extract_annotation_param(annotation: &str, param: &str) -> Option<String> {
@@ -837,14 +905,17 @@ public class BillingListener {
     #[test]
     fn kafka_producer_topic_does_not_cross_into_later_statement() {
         let code = r#"kafkaTemplate.send(topicVar, payload); logger.info("database is down");"#;
-        assert_eq!(JavaExtractor::extract_kafka_producer_topic(code), None);
+        assert_eq!(
+            JavaExtractor::extract_kafka_producer_topic(code, &HashMap::new()),
+            None
+        );
     }
 
     #[test]
     fn kafka_producer_topic_extracts_literal_first_argument() {
         let code = r#"kafkaTemplate.send("orders.created", payload);"#;
         assert_eq!(
-            JavaExtractor::extract_kafka_producer_topic(code),
+            JavaExtractor::extract_kafka_producer_topic(code, &HashMap::new()),
             Some("orders.created".to_string())
         );
     }

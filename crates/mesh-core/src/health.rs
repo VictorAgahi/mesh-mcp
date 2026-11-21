@@ -184,6 +184,18 @@ pub struct IndexHealth {
     /// made up. Counted like `files_scanned`.
     #[serde(default)]
     pub sql_sites_unresolved: usize,
+    /// Configuration files (yaml, properties, dotenv, compose / Kubernetes env lists) with
+    /// more entries than the per-file cap: the rest are not available to `${key}` topic
+    /// resolution. Counted like `files_scanned`.
+    #[serde(default)]
+    pub files_config_capped: usize,
+    /// Configuration entries dropped by the workspace-wide cap. Set after every fold.
+    #[serde(default)]
+    pub config_entries_dropped: usize,
+    /// Distinct `${key}` topics no configuration value resolved: they stay in the graph under
+    /// their placeholder name (never guessed). Set after every reconcile.
+    #[serde(default)]
+    pub config_topics_unresolved: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -295,6 +307,18 @@ impl IndexHealth {
     pub fn record_sql(&mut self, capped: bool, unresolved: u32) {
         self.files_sql_capped += usize::from(capped);
         self.sql_sites_unresolved += unresolved as usize;
+    }
+
+    /// One configuration file's per-file cap.
+    #[inline]
+    pub fn record_config(&mut self, capped: bool) {
+        self.files_config_capped += usize::from(capped);
+    }
+
+    /// Whether a configuration cap dropped entries: some `${key}` topics may stay unresolved.
+    #[inline]
+    pub fn config_truncated(&self) -> bool {
+        self.files_config_capped > 0 || self.config_entries_dropped > 0
     }
 
     /// Whether a SQL scan cap dropped events: some outbox / NOTIFY / LISTEN sites are missing.
@@ -539,6 +563,23 @@ impl IndexHealth {
                 self.sql_sites_unresolved
             );
         }
+        if self.config_truncated() {
+            let _ = writeln!(
+                out,
+                "    {} configuration file(s) over the per-file entry cap and {} entries over the \
+                 workspace cap (docs/parser-support.md, config-driven topics): some ${{key}} topics \
+                 may stay unresolved",
+                self.files_config_capped, self.config_entries_dropped
+            );
+        }
+        if self.config_topics_unresolved > 0 {
+            let _ = writeln!(
+                out,
+                "    ({} ${{key}} topic(s) no configuration file resolves: kept under their \
+                 placeholder name, never guessed)",
+                self.config_topics_unresolved
+            );
+        }
         if self.rejected_overflow > 0 {
             // The breakdown above only covers the capped `rejected` list (step 4.1
             // review): say so here, or it reads as a per-reason total that silently
@@ -571,6 +612,7 @@ impl IndexHealth {
         self.files_call_facts_skipped_path += other.files_call_facts_skipped_path;
         self.files_sql_capped += other.files_sql_capped;
         self.sql_sites_unresolved += other.sql_sites_unresolved;
+        self.files_config_capped += other.files_config_capped;
         self.files_skipped_non_source += other.files_skipped_non_source;
         // The calls-layer counters are the graph's, set after the reconcile.
     }
