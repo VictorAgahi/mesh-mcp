@@ -17,10 +17,13 @@ mod resolve;
 
 pub use calls::{
     CallFact, CallFacts, CallReceiver, CallStats, CallableFact, ImportFact, InjectionFact,
-    TypeFact, TypeFactKind, CALLABLE_ID_BASE, MAX_DERIVED_CALL_SITES,
+    TypeFact, TypeFactKind, CALLABLE_ID_BASE, MAX_DERIVED_CALL_SITES, MAX_STRUCTURAL_IMPLS,
+    MAX_STRUCTURAL_PAIRS, MAX_TYPE_HOPS,
 };
 pub use delta::ReconcileMode;
 
+#[cfg(test)]
+mod calls_langs_tests;
 #[cfg(test)]
 mod calls_tests;
 #[cfg(test)]
@@ -451,6 +454,8 @@ pub struct ContractGraph {
     calls_dirty: bool,
     /// Test override of [`MAX_DERIVED_CALL_SITES`] (0: the constant).
     call_site_budget: usize,
+    /// Test override of [`MAX_STRUCTURAL_PAIRS`] (0: the constant).
+    structural_pair_budget: usize,
 
     next_node_id: u32,
 }

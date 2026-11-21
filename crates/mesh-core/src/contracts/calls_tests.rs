@@ -3,11 +3,11 @@
 use super::*;
 use std::sync::Arc;
 
-fn path(p: &str) -> FilePath {
+pub(super) fn path(p: &str) -> FilePath {
     Arc::from(Path::new(p))
 }
 
-fn node(name: &str, kind: NodeKind, file: &str, line: usize) -> ContractNode {
+pub(super) fn node(name: &str, kind: NodeKind, file: &str, line: usize) -> ContractNode {
     ContractNode {
         id: 0,
         name: CompactStr::new(name),
@@ -22,7 +22,7 @@ fn node(name: &str, kind: NodeKind, file: &str, line: usize) -> ContractNode {
     }
 }
 
-fn callable(owner: Option<&str>, name: &str, start: u32, end: u32) -> CallableFact {
+pub(super) fn callable(owner: Option<&str>, name: &str, start: u32, end: u32) -> CallableFact {
     CallableFact {
         name: CompactStr::new(name),
         owner: owner.map(CompactStr::new),
@@ -31,7 +31,7 @@ fn callable(owner: Option<&str>, name: &str, start: u32, end: u32) -> CallableFa
     }
 }
 
-fn site(caller: u32, callee: &str, receiver: CallReceiver, line: u32) -> CallFact {
+pub(super) fn site(caller: u32, callee: &str, receiver: CallReceiver, line: u32) -> CallFact {
     CallFact {
         caller,
         callee: CompactStr::new(callee),
@@ -40,11 +40,11 @@ fn site(caller: u32, callee: &str, receiver: CallReceiver, line: u32) -> CallFac
     }
 }
 
-fn field(f: &str) -> CallReceiver {
+pub(super) fn field(f: &str) -> CallReceiver {
     CallReceiver::InjectedField(CompactStr::new(f))
 }
 
-fn import(local: &str, module: &str) -> ImportFact {
+pub(super) fn import(local: &str, module: &str) -> ImportFact {
     ImportFact {
         local: CompactStr::new(local),
         exported: CompactStr::new(local),
@@ -52,16 +52,17 @@ fn import(local: &str, module: &str) -> ImportFact {
     }
 }
 
-fn class(name: &str, kind: TypeFactKind, implements: &[&str]) -> TypeFact {
+pub(super) fn class(name: &str, kind: TypeFactKind, implements: &[&str]) -> TypeFact {
     TypeFact {
         name: CompactStr::new(name),
         kind,
         extends: Vec::new(),
         implements: implements.iter().map(|s| CompactStr::new(*s)).collect(),
+        methods: Vec::new(),
     }
 }
 
-fn inject(class: &str, f: &str, t: &str) -> InjectionFact {
+pub(super) fn inject(class: &str, f: &str, t: &str) -> InjectionFact {
     InjectionFact {
         class: CompactStr::new(class),
         field: CompactStr::new(f),
@@ -71,14 +72,14 @@ fn inject(class: &str, f: &str, t: &str) -> InjectionFact {
 
 /// One file: a declaration node per callable (so the file has nodes), its facts,
 /// plus extra nodes (consumers / producers / routes) registered as asked.
-struct FileSpec {
-    path: &'static str,
-    facts: CallFacts,
-    consumers: Vec<(usize, &'static str)>,
-    producers: Vec<(usize, &'static str)>,
+pub(super) struct FileSpec {
+    pub(super) path: &'static str,
+    pub(super) facts: CallFacts,
+    pub(super) consumers: Vec<(usize, &'static str)>,
+    pub(super) producers: Vec<(usize, &'static str)>,
 }
 
-fn build(files: &[FileSpec]) -> ContractGraph {
+pub(super) fn build(files: &[FileSpec]) -> ContractGraph {
     let mut g = ContractGraph::new();
     for f in files {
         g.add_call_facts(path(f.path), 0, CompactStr::new("app"), f.facts.clone());
@@ -96,7 +97,7 @@ fn build(files: &[FileSpec]) -> ContractGraph {
     g
 }
 
-fn calls(g: &ContractGraph) -> Vec<(String, String, EdgeConfidence)> {
+pub(super) fn calls(g: &ContractGraph) -> Vec<(String, String, EdgeConfidence)> {
     g.call_edges()
         .iter()
         .map(|e| {

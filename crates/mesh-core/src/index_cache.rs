@@ -103,7 +103,10 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// payloads store root-relative node paths (8.0.0).
 /// v13: `FileIndex::calls` (9.0 calls layer: callables, call sites, injections, imports,
 /// type heritage), and TypeScript producers / consumers registered on their call-site node.
-const SCHEMA_VERSION: u8 = 13;
+/// v14: Java, Go and Python call facts (`CallReceiver::Namespace`, `TypeFact::methods`).
+/// v15: parameters and locals no longer give Python / Go calls on a module or package of the
+/// same name, `CallReceiver::InheritedField`, `FileIndex::calls_skipped_path`.
+const SCHEMA_VERSION: u8 = 15;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

@@ -145,6 +145,30 @@ pub struct IndexHealth {
     /// (`MAX_DERIVED_CALL_SITES`). Set after every reconcile.
     #[serde(default)]
     pub call_sites_skipped: usize,
+    /// Go interfaces the last calls derive left without implementations because more
+    /// than `MAX_STRUCTURAL_IMPLS` struct types satisfy them: a call path through such
+    /// an interface is cut. Set after every reconcile.
+    #[serde(default)]
+    pub call_interfaces_overflow: usize,
+    /// Base-class, embedding and re-export lookups the last calls derive cut at the hop
+    /// cap (`MAX_TYPE_HOPS`): a call path through a chain that deep is cut. Set after
+    /// every reconcile.
+    #[serde(default)]
+    pub call_hops_capped: usize,
+    /// Go interfaces the last calls derive did not match against struct types because
+    /// their repository hit `MAX_STRUCTURAL_PAIRS`. Set after every reconcile.
+    #[serde(default)]
+    pub call_interfaces_unmatched: usize,
+    /// Files on an entry -> producer path whose call sites the indexer could not restore
+    /// after an earlier prune (the file no longer reads or parses): their calls are not
+    /// resolved. Set after every reconcile.
+    #[serde(default)]
+    pub call_files_missing_sites: usize,
+    /// Java, Go and Python files indexed without call facts because of their path (test
+    /// code, generated code, `testing/`, `fixtures/`, `gen/` directories). Counted like
+    /// `files_scanned`: by what each scan pass saw.
+    #[serde(default)]
+    pub files_call_facts_skipped_path: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -228,12 +252,26 @@ impl IndexHealth {
     pub fn set_call_stats(&mut self, stats: &crate::contracts::CallStats) {
         self.files_call_facts_capped = stats.files_capped;
         self.call_sites_skipped = stats.sites_skipped;
+        self.call_interfaces_overflow = stats.dispatch_overflow;
+        self.call_hops_capped = stats.hops_capped;
+        self.call_interfaces_unmatched = stats.pairs_capped;
+        self.call_files_missing_sites = stats.missing_sites;
+    }
+
+    #[inline]
+    pub fn record_calls_skipped_path(&mut self) {
+        self.files_call_facts_skipped_path += 1;
     }
 
     /// Whether the calls layer dropped facts (a cap was hit): a call path may be cut.
     #[inline]
     pub fn calls_truncated(&self) -> bool {
-        self.files_call_facts_capped > 0 || self.call_sites_skipped > 0
+        self.files_call_facts_capped > 0
+            || self.call_sites_skipped > 0
+            || self.call_interfaces_overflow > 0
+            || self.call_hops_capped > 0
+            || self.call_interfaces_unmatched > 0
+            || self.call_files_missing_sites > 0
     }
 
     #[inline]
@@ -392,6 +430,49 @@ impl IndexHealth {
                 crate::contracts::MAX_DERIVED_CALL_SITES
             );
         }
+        if self.call_interfaces_overflow > 0 {
+            let _ = writeln!(
+                out,
+                "    {} Go interface(s) with more than {} implementations (calls layer: calls \
+                 through them are not resolved)",
+                self.call_interfaces_overflow,
+                crate::contracts::MAX_STRUCTURAL_IMPLS
+            );
+        }
+        if self.call_hops_capped > 0 {
+            let _ = writeln!(
+                out,
+                "    {} base-class / embedding / re-export lookup(s) cut at {} hops (calls layer: \
+                 calls through such a chain are not resolved)",
+                self.call_hops_capped,
+                crate::contracts::MAX_TYPE_HOPS
+            );
+        }
+        if self.call_interfaces_unmatched > 0 {
+            let _ = writeln!(
+                out,
+                "    {} Go interface(s) not matched against struct types past {} candidate pairs \
+                 per repository (calls layer: calls through them are not resolved)",
+                self.call_interfaces_unmatched,
+                crate::contracts::MAX_STRUCTURAL_PAIRS
+            );
+        }
+        if self.call_files_missing_sites > 0 {
+            let _ = writeln!(
+                out,
+                "    {} file(s) on a call path without call sites (calls layer: their calls are \
+                 not resolved; the file no longer reads or parses)",
+                self.call_files_missing_sites
+            );
+        }
+        if self.files_call_facts_skipped_path > 0 {
+            let _ = writeln!(
+                out,
+                "    ({} Java / Go / Python file(s) carry no call facts by path: test code, generated \
+                 code, testing/ fixtures/ gen/ generated/ directories)",
+                self.files_call_facts_skipped_path
+            );
+        }
         if self.rejected_overflow > 0 {
             // The breakdown above only covers the capped `rejected` list (step 4.1
             // review): say so here, or it reads as a per-reason total that silently
@@ -421,6 +502,7 @@ impl IndexHealth {
         self.files_rejected_guard += other.files_rejected_guard;
         self.files_read_error += other.files_read_error;
         self.files_parse_failed += other.files_parse_failed;
+        self.files_call_facts_skipped_path += other.files_call_facts_skipped_path;
         self.files_skipped_non_source += other.files_skipped_non_source;
         // The calls-layer counters are the graph's, set after the reconcile.
     }

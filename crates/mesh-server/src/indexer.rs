@@ -226,6 +226,12 @@ struct ScanConfig<'a> {
     path_context: &'a PathContext,
 }
 
+/// Files one scan pass parses before it writes their cache records (see `run_scan_pass`).
+const SCAN_CHUNK_FILES: usize = 2_048;
+
+/// Label of the pass that restores the call sites of files that came onto a call path.
+const CALLS_REFRESH_LABEL: &str = "Calls refresh";
+
 pub struct WorkspaceIndexer;
 
 impl WorkspaceIndexer {
@@ -570,8 +576,8 @@ impl WorkspaceIndexer {
         scan_cfg: &ScanConfig,
         pool: Option<&BackgroundRescanEngine>,
     ) -> (Vec<FileFragment>, IndexHealth, Vec<StableReject>) {
-        let work = || {
-            files
+        let work = |chunk: &[(RepoId, PathBuf)]| {
+            chunk
                 .par_iter()
                 .map(|(repo_id, path)| {
                     let root = roots
@@ -591,10 +597,25 @@ impl WorkspaceIndexer {
                 })
                 .collect::<Vec<_>>()
         };
-        let results = match pool {
-            Some(engine) => engine.install(work),
-            None => work(),
-        };
+        // In chunks: each file's serialized cache record is written and dropped after its
+        // chunk instead of every record of the workspace being held until the whole
+        // pass ends (the peak of a cold build).
+        let mut results = Vec::with_capacity(files.len());
+        for chunk in files.chunks(SCAN_CHUNK_FILES) {
+            let mut part = match pool {
+                Some(engine) => engine.install(|| work(chunk)),
+                None => work(chunk),
+            };
+            if let Some(cache) = scan_cfg.cache {
+                let writes: Vec<CacheEntry> = part
+                    .iter_mut()
+                    .filter_map(|(_, _, outcome, _)| outcome.as_mut().ok())
+                    .flat_map(|f| std::mem::take(&mut f.cache_write))
+                    .collect();
+                cache.put_batch(&writes);
+            }
+            results.extend(part);
+        }
 
         let mut health = IndexHealth::default();
         health.record_scanned(results.len());
@@ -649,6 +670,9 @@ impl WorkspaceIndexer {
         }
 
         for frag in &fragments {
+            if frag.code.calls_skipped_path {
+                health.record_calls_skipped_path();
+            }
             if frag.code.calls.capped {
                 tracing::warn!(
                     target: "mesh::indexer",
@@ -1178,6 +1202,16 @@ impl WorkspaceIndexer {
         };
         let call_stats = snapshot.contract_graph.call_stats();
         snapshot.health.set_call_stats(&call_stats);
+        // Files this batch brought onto an entry -> producer path whose call sites an
+        // earlier derive pruned (they lay off every path then): re-extracted below.
+        let missing_sites: Vec<(RepoId, PathBuf)> = snapshot
+            .contract_graph
+            .call_files_missing_sites()
+            .iter()
+            .filter_map(|p| {
+                Self::most_specific_root(p, roots).map(|(repo, _)| (repo, p.to_path_buf()))
+            })
+            .collect();
         let t_reconciled = std::time::Instant::now();
         let node_count = snapshot.contract_graph.node_count();
         let edge_count = snapshot.contract_graph.edge_count();
@@ -1201,6 +1235,32 @@ impl WorkspaceIndexer {
             "{label} reload (gen {generation}): {changed_count} re-indexed, {} removed, {node_count} contract nodes.",
             deleted.len()
         );
+
+        // One restoring pass, never a loop: a file that cannot be re-extracted (gone, no
+        // longer parses) stays counted in `IndexHealth::call_files_missing_sites`. The files
+        // are forgotten by the VFS so the pass sees them as new; nothing else about them
+        // changed, so it takes the delta reconcile.
+        if !missing_sites.is_empty() && label != CALLS_REFRESH_LABEL {
+            tracing::debug!(
+                target: "mesh::calls",
+                "{} file(s) came onto a call path: restoring their call sites",
+                missing_sites.len()
+            );
+            {
+                let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
+                for (_, path) in &missing_sites {
+                    vfs.remove(path);
+                }
+            }
+            Self::apply_incremental(
+                state,
+                CALLS_REFRESH_LABEL,
+                missing_sites,
+                Vec::new(),
+                None,
+                None,
+            );
+        }
     }
 
     /// Whether `path` is a file that defines import aliases for the scripts under it:
@@ -1751,6 +1811,117 @@ mod tests {
                 "{file}: {summary}"
             );
         }
+    }
+
+    /// 9.0 calls layer, memory strategy: a Python file off every entry -> producer path keeps
+    /// no call sites after a derive; an edit that brings it onto a path makes the indexer
+    /// re-extract it (one restoring pass), so the live graph equals a fresh build and
+    /// nothing is left counted as missing.
+    #[test]
+    fn a_file_brought_onto_a_call_path_gets_its_call_sites_back() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/eda/layered-py");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let dir = root.join("src/layered_py");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        for entry in std::fs::read_dir(fixture.join("src/layered_py")).expect("fixture") {
+            let from = entry.expect("entry").path();
+            let text = std::fs::read_to_string(&from)
+                .expect("read")
+                .replace("\r\n", "\n");
+            let name = from.file_name().expect("name").to_owned();
+            let text = match name.to_str() {
+                Some("handler.py") => format!("from layered_py.service import InvoiceService\n{text}")
+                    .replace("def __init__(self, service):", "def __init__(self, service: InvoiceService):"),
+                Some("service.py") => text
+                    .replace(
+                        "from layered_py.tasks import generate_report\n",
+                        "from layered_py.tasks import generate_report\nfrom layered_py.publisher import InvoicePublisher\n",
+                    )
+                    .replace(
+                        "def __init__(self, publisher):",
+                        "def __init__(self, publisher: \"InvoicePublisher\"):",
+                    ),
+                _ => text,
+            };
+            std::fs::write(dir.join(name), text).expect("write");
+        }
+        // The consumer does not import the handler yet: handler, service and publisher
+        // lie on no path.
+        let consumer = dir.join("consumer.py");
+        let annotated = std::fs::read_to_string(&consumer)
+            .expect("read")
+            .replace("\r\n", "\n");
+        let with_import = annotated
+            .replace(
+                "from confluent_kafka import Consumer\n",
+                "from confluent_kafka import Consumer\nfrom layered_py.handler import OrderHandler\n",
+            )
+            .replace("def __init__(self, handler):", "def __init__(self, handler: OrderHandler):");
+        assert_ne!(with_import, annotated, "fixture changed: update the edit");
+
+        let state = make_state(&root);
+        let snap = {
+            let mut vfs = state.vfs.lock().expect("vfs");
+            WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                Some(&state.rescan),
+                Some(&mut vfs),
+                None,
+            )
+        };
+        state.install_snapshot(snap);
+        let names = |state: &AppState| {
+            let view = state.snapshot();
+            let g = &view.contract_graph;
+            let mut v: Vec<(String, String)> = g
+                .call_edges()
+                .iter()
+                .map(|e| {
+                    let name = |id| {
+                        g.callable_nodes()
+                            .iter()
+                            .find(|n| n.id == id)
+                            .map_or(String::new(), |n| n.name.to_string())
+                    };
+                    (name(e.from), name(e.to))
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let before = names(&state);
+        assert!(
+            !before.iter().any(|e| e.0 == "OrderHandler.handle"),
+            "{before:?}"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(&consumer, &with_import).expect("edit");
+        WorkspaceIndexer::reload_paths(&state, &[consumer]);
+        let after = names(&state);
+        assert_eq!(
+            after,
+            vec![
+                (
+                    "InvoiceService.issue".to_string(),
+                    "InvoicePublisher.announce".to_string()
+                ),
+                (
+                    "OrderConsumer.run".to_string(),
+                    "OrderHandler.handle".to_string()
+                ),
+                (
+                    "OrderHandler.handle".to_string(),
+                    "InvoiceService.issue".to_string()
+                ),
+                ("generate_report".to_string(), "build_report".to_string()),
+            ]
+        );
+        let view = state.snapshot();
+        assert_eq!(view.health.call_files_missing_sites, 0);
+        assert!(view.contract_graph.call_files_missing_sites().is_empty());
     }
 
     /// Regression (step 4.12d review): two roots sharing a directory name

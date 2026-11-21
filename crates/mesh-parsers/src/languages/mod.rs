@@ -1,11 +1,15 @@
+mod call_support;
 pub mod cpp;
 pub mod csharp;
 pub mod go;
+mod go_calls;
 pub mod java;
+mod java_calls;
 mod js_frameworks;
 pub mod kotlin;
 pub mod php;
 pub mod proto;
+mod py_calls;
 pub mod python;
 pub mod ruby;
 pub mod rust_lang;
@@ -199,6 +203,11 @@ pub struct FileIndex {
     /// language without a call extractor.
     #[serde(default)]
     pub calls: CallFacts,
+    /// A Java, Go or Python file that carries no call facts because of its path (test code,
+    /// generated code, a `testing/`, `fixtures/` or `gen/` directory): counted in
+    /// `IndexHealth`, so a chain through such a file is not silently absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub calls_skipped_path: bool,
 }
 
 impl FileIndex {
@@ -223,6 +232,7 @@ impl FileIndex {
             .extend(other.heuristic_topic_nodes.into_iter().map(|i| i + offset));
         self.parse_failed |= other.parse_failed;
         self.calls.merge(other.calls);
+        self.calls_skipped_path |= other.calls_skipped_path;
     }
 
     /// Inserts the extracted nodes and relations into `graph`.
@@ -717,6 +727,27 @@ impl PolyglotIndexer {
         out
     }
 
+    /// Whether a Java, Go or Python file carries call facts: not test code (a chain
+    /// entered from a test is not an architecture flow, and tests only cost memory;
+    /// judged below the workspace root, as for TypeScript) and not generated code
+    /// (stubs, `zz_generated` files: thousands of callables nothing hand-written calls
+    /// through).
+    fn wants_call_facts(cfg: &ExtractConfig, file_path: &Path) -> bool {
+        let rel = Self::routing_path(cfg, file_path);
+        let judged = rel.as_deref().unwrap_or(file_path);
+        let name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let in_test = match rel.as_deref() {
+            Some(rel) => mesh_core::is_test_path(rel),
+            None => file_path
+                .file_name()
+                .is_some_and(|n| mesh_core::is_test_path(Path::new(n))),
+        };
+        !in_test && !mesh_core::is_generated_path(judged) && !name.starts_with("zz_generated")
+    }
+
     fn extract_as(
         file_path: &Path,
         content: &str,
@@ -766,9 +797,23 @@ impl PolyglotIndexer {
             }
 
             LanguageKind::Java => {
-                if let Some((nodes, dependencies, producers, rpc_calls)) = parsed!(|tree| {
-                    java::JavaExtractor::extract_relations(file_path, content, repo_id, tree)
-                }) {
+                let with_calls = Self::wants_call_facts(cfg, file_path);
+                out.calls_skipped_path = !with_calls;
+                if let Some(((nodes, dependencies, producers, rpc_calls), calls)) =
+                    parsed!(|tree| {
+                        (
+                            java::JavaExtractor::extract_relations(
+                                file_path, content, repo_id, tree,
+                            ),
+                            if with_calls {
+                                java_calls::extract(tree, content.as_bytes())
+                            } else {
+                                CallFacts::default()
+                            },
+                        )
+                    })
+                {
+                    out.calls = calls;
                     for (i, node) in nodes.iter().enumerate() {
                         if node.kind == NodeKind::KafkaTopic {
                             out.consumers.push((i, node.name.clone()));
@@ -781,9 +826,19 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::Go => {
-                if let Some((nodes, relations)) = parsed!(|tree| {
-                    go::GoExtractor::extract_with_relations(file_path, content, repo_id, tree)
+                let with_calls = Self::wants_call_facts(cfg, file_path);
+                out.calls_skipped_path = !with_calls;
+                if let Some(((nodes, relations), calls)) = parsed!(|tree| {
+                    (
+                        go::GoExtractor::extract_with_relations(file_path, content, repo_id, tree),
+                        if with_calls {
+                            go_calls::extract(tree, content.as_bytes())
+                        } else {
+                            CallFacts::default()
+                        },
+                    )
                 }) {
+                    out.calls = calls;
                     out.nodes = nodes;
                     out.dependencies = relations.dependencies;
                     out.producers = relations.producers;
@@ -792,11 +847,21 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::Python => {
-                if let Some((nodes, relations)) = parsed!(|tree| {
-                    python::PythonExtractor::extract_with_relations(
-                        file_path, content, repo_id, tree,
+                let with_calls = Self::wants_call_facts(cfg, file_path);
+                out.calls_skipped_path = !with_calls;
+                if let Some(((nodes, relations), calls)) = parsed!(|tree| {
+                    (
+                        python::PythonExtractor::extract_with_relations(
+                            file_path, content, repo_id, tree,
+                        ),
+                        if with_calls {
+                            py_calls::extract(tree, content.as_bytes())
+                        } else {
+                            CallFacts::default()
+                        },
                     )
                 }) {
+                    out.calls = calls;
                     out.nodes = nodes;
                     out.dependencies = relations.dependencies;
                     out.producers = relations.producers;
@@ -1451,6 +1516,7 @@ mod tests {
             heuristic_topic_nodes: vec![1],
             parse_failed: false,
             calls: CallFacts::default(),
+            calls_skipped_path: false,
         };
         let before = format!("{index:?}");
         let anchored = index.relativize(&root_a).expect("all under root");

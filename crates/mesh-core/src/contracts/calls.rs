@@ -8,10 +8,32 @@
 //! the whole layer from the current facts: it is never journaled, so it cannot
 //! drift from a full rebuild. Its index pass is linear in ALL files with facts
 //! (resolution only in the candidate files), and it is skipped when no re-folded
-//! file has call facts or no file holds both kinds of endpoint. The raw facts of
-//! every non-test TS file stay in memory: pruning happens at derive time, not at
-//! fold time (design note 6.5 asked for fold-time pruning; a file off every path
-//! today can be on one after another file changes, and its facts are then needed).
+//! file has call facts or no file holds both kinds of endpoint.
+//!
+//! What stays in memory, and when. Every non-test, non-generated file with facts is
+//! folded whole: a full build holds all of them until its one derive, because a file is
+//! on a path or not only once every entry and producer is known (design note 6.5 asked
+//! for fold-time pruning; that is impossible in one pass). TypeScript files keep their
+//! facts for good. For Java, Go and Python files, the derive that follows a fold drops
+//! the CALL SITES of every file off all entry -> producer paths (the bulk of a file's
+//! facts; only a candidate file's are ever resolved) and keeps its callables, imports,
+//! injections and types, which decide which files lie on a path. A file that a later
+//! edit brings onto a path is reported by [`ContractGraph::call_files_missing_sites`]
+//! and the indexer re-extracts it in one restoring pass; until then its calls resolve
+//! to nothing (counted in `IndexHealth`, never silent). A fresh build prunes exactly
+//! the files a live graph does, so the two give the same layer. The previous layer is
+//! freed before a derive builds the next one.
+//!
+//! Languages (by file extension, [`Lang`]): TypeScript resolves relative module
+//! specifiers; Java types resolve through a qualified import (matched against the
+//! file path), a wildcard import or the package, which is the directory; Go
+//! resolves a package-qualified call through the directory an import path's tail
+//! names, sees every file of its own directory, files methods under the file
+//! declaring the receiver type and matches interfaces to struct types by method
+//! set (at most [`MAX_STRUCTURAL_IMPLS`]); Python resolves relative and absolute
+//! dotted module imports, `from pkg import mod` and package `__init__` re-exports.
+//! A path that matches several files resolves to the closest to the importer, a
+//! tie to nothing.
 //!
 //! Derivation, in order:
 //! 1. File-level pruning: a file takes part only when it lies on an import path
@@ -37,6 +59,8 @@
 use super::*;
 use serde::Deserialize;
 use std::collections::VecDeque;
+use std::rc::Rc;
+use std::sync::Arc;
 
 /// First id of the derived `Callable` nodes. Real nodes are numbered from 0 by
 /// `add_node` and never get near it.
@@ -47,13 +71,29 @@ pub const CALLABLE_ID_BASE: NodeId = 1 << 31;
 pub const MAX_DERIVED_CALL_SITES: usize = 2_000_000;
 
 /// Longest chain of base classes / re-exports followed for one lookup.
-const MAX_TYPE_HOPS: usize = 16;
+pub const MAX_TYPE_HOPS: usize = 16;
+
+/// Most struct types a Go interface may resolve to, matched structurally (the
+/// methods of the interface are a subset of the struct's). Past it the interface
+/// resolves to nothing and is counted in [`CallStats::dispatch_overflow`].
+pub const MAX_STRUCTURAL_IMPLS: usize = 64;
+
+/// Most (interface, candidate struct) pairs one repository's Go interface matching
+/// tests per derive. Past it the remaining interfaces of that repository get no
+/// implementation and are counted in [`CallStats::pairs_capped`], never silently.
+pub const MAX_STRUCTURAL_PAIRS: usize = 1_000_000;
 
 /// Extensions a relative module specifier may omit.
 const SCRIPT_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
+// The facts of every file are serialized into the parse cache, and a full build holds
+// every file's serialized record at once before writing them: the four list element
+// types below serialize as arrays (`[3,"Handle",1,"svc",25]`), not as maps with field
+// names, which is about a quarter of the bytes.
+
 /// A method or function declared in a file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "CallableRepr", into = "CallableRepr")]
 pub struct CallableFact {
     /// Bare name (`place`, `handleOrder`).
     pub name: CompactStr,
@@ -65,6 +105,26 @@ pub struct CallableFact {
     pub line_end: u32,
 }
 
+#[derive(Serialize, Deserialize)]
+struct CallableRepr(CompactStr, Option<CompactStr>, u32, u32);
+
+impl From<CallableFact> for CallableRepr {
+    fn from(c: CallableFact) -> Self {
+        Self(c.name, c.owner, c.line_start, c.line_end)
+    }
+}
+
+impl From<CallableRepr> for CallableFact {
+    fn from(r: CallableRepr) -> Self {
+        Self {
+            name: r.0,
+            owner: r.1,
+            line_start: r.2,
+            line_end: r.3,
+        }
+    }
+}
+
 /// How a call site names its callee.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,14 +133,21 @@ pub enum CallReceiver {
     This,
     /// `this.field.m()`: the field's declared type is in [`CallFacts::injections`].
     InjectedField(CompactStr),
+    /// `field.m()` on a bare identifier the extractor only guessed to be a field a base
+    /// class declares (Java, no `this.`): resolved like an injected field, never `exact`.
+    InheritedField(CompactStr),
     /// `f()` where `f` is an imported binding (the callee is the local name).
     ImportedSymbol,
-    /// `f()` where `f` is a free function of the same file.
+    /// `f()` where `f` is a free function of the same file (Go: of the same package).
     SameModule,
+    /// `ns.f()` where `ns` is an imported module or package (a Go package alias, a
+    /// Python module): the callee is `f`, a free function of that module.
+    Namespace(CompactStr),
 }
 
 /// One call site, inside a callable of the same file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "CallFactRepr", into = "CallFactRepr")]
 pub struct CallFact {
     /// Index into [`CallFacts::callables`].
     pub caller: u32,
@@ -89,9 +156,50 @@ pub struct CallFact {
     pub line: u32,
 }
 
+/// (caller, callee, receiver kind, receiver field or namespace, line).
+#[derive(Serialize, Deserialize)]
+struct CallFactRepr(u32, CompactStr, u8, CompactStr, u32);
+
+impl From<CallFact> for CallFactRepr {
+    fn from(c: CallFact) -> Self {
+        let (kind, name) = match c.receiver {
+            CallReceiver::This => (0, CompactStr::default()),
+            CallReceiver::InjectedField(f) => (1, f),
+            CallReceiver::ImportedSymbol => (2, CompactStr::default()),
+            CallReceiver::SameModule => (3, CompactStr::default()),
+            CallReceiver::Namespace(n) => (4, n),
+            CallReceiver::InheritedField(f) => (5, f),
+        };
+        Self(c.caller, c.callee, kind, name, c.line)
+    }
+}
+
+impl TryFrom<CallFactRepr> for CallFact {
+    type Error = String;
+
+    fn try_from(r: CallFactRepr) -> Result<Self, String> {
+        let receiver = match r.2 {
+            0 => CallReceiver::This,
+            1 => CallReceiver::InjectedField(r.3),
+            2 => CallReceiver::ImportedSymbol,
+            3 => CallReceiver::SameModule,
+            4 => CallReceiver::Namespace(r.3),
+            5 => CallReceiver::InheritedField(r.3),
+            other => return Err(format!("unknown call receiver kind {other}")),
+        };
+        Ok(Self {
+            caller: r.0,
+            callee: r.1,
+            receiver,
+            line: r.4,
+        })
+    }
+}
+
 /// A field of `class` holding a dependency of type `declared_type` (a constructor
 /// parameter property, an `inject(T)` field, a Spring constructor parameter, ...).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "TripleRepr", into = "TripleRepr")]
 pub struct InjectionFact {
     pub class: CompactStr,
     pub field: CompactStr,
@@ -103,12 +211,49 @@ pub struct InjectionFact {
 /// (`export { X } from './x'`) is recorded as an import of `X` too, and
 /// `export * from './x'` as `local == exported == "*"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "TripleRepr", into = "TripleRepr")]
 pub struct ImportFact {
     pub local: CompactStr,
     pub exported: CompactStr,
     /// The module as written once aliases are applied. Only a relative specifier
     /// (`./x`, `../y/z`) is resolved to a file; a package import resolves to nothing.
     pub module: CompactStr,
+}
+
+/// Three names (an injection's class, field and type; an import's local, exported and module).
+#[derive(Serialize, Deserialize)]
+struct TripleRepr(CompactStr, CompactStr, CompactStr);
+
+impl From<InjectionFact> for TripleRepr {
+    fn from(i: InjectionFact) -> Self {
+        Self(i.class, i.field, i.declared_type)
+    }
+}
+
+impl From<TripleRepr> for InjectionFact {
+    fn from(r: TripleRepr) -> Self {
+        Self {
+            class: r.0,
+            field: r.1,
+            declared_type: r.2,
+        }
+    }
+}
+
+impl From<ImportFact> for TripleRepr {
+    fn from(i: ImportFact) -> Self {
+        Self(i.local, i.exported, i.module)
+    }
+}
+
+impl From<TripleRepr> for ImportFact {
+    fn from(r: TripleRepr) -> Self {
+        Self {
+            local: r.0,
+            exported: r.1,
+            module: r.2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,10 +270,14 @@ pub enum TypeFactKind {
 pub struct TypeFact {
     pub name: CompactStr,
     pub kind: TypeFactKind,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extends: Vec<CompactStr>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub implements: Vec<CompactStr>,
+    /// Method names an interface declares (Go: its structural method set, matched
+    /// against the methods of struct types; empty elsewhere).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<CompactStr>,
 }
 
 /// Every call fact of one file. Stored in the parse cache with the rest of the
@@ -167,6 +316,7 @@ impl CallFacts {
         for t in &mut self.types {
             t.extends.shrink_to_fit();
             t.implements.shrink_to_fit();
+            t.methods.shrink_to_fit();
         }
     }
 
@@ -191,7 +341,12 @@ impl CallFacts {
 pub(super) struct FileCallFacts {
     pub(super) repo_id: RepoId,
     pub(super) package: CompactStr,
-    pub(super) facts: CallFacts,
+    /// Shared: a reload clones the whole graph to patch it, and the facts of the files
+    /// it did not touch are by far the largest part of the layer.
+    pub(super) facts: Arc<CallFacts>,
+    /// The call sites were dropped after a derive found the file on no entry -> producer
+    /// path (Java, Go, Python; see the module doc). Cleared when the file is re-folded.
+    pub(super) sites_pruned: bool,
 }
 
 /// Counters of the last derive.
@@ -211,9 +366,24 @@ pub struct CallStats {
     pub calls: usize,
     /// Files whose stored call facts hit a per-file cap (`CallFacts::capped`).
     pub files_capped: usize,
+    /// Go interfaces left without implementations because more than
+    /// [`MAX_STRUCTURAL_IMPLS`] struct types satisfy them (a calls path through such an
+    /// interface is cut, counted in `IndexHealth`).
+    pub dispatch_overflow: usize,
     /// Approximate bytes of the stored raw facts (vector lengths times element
     /// sizes; strings over 24 bytes, rare in identifiers, are not counted).
     pub facts_bytes: usize,
+    /// Lookups (base-class, embedding and re-export walks) cut at [`MAX_TYPE_HOPS`]: a
+    /// call path through a chain that deep is cut (counted in `IndexHealth`).
+    pub hops_capped: usize,
+    /// Go interfaces not matched against struct types because their repository hit
+    /// [`MAX_STRUCTURAL_PAIRS`] (counted in `IndexHealth`).
+    pub pairs_capped: usize,
+    /// Files whose call sites are not retained (off every entry -> producer path).
+    pub files_pruned: usize,
+    /// Files on an entry -> producer path whose call sites were pruned earlier and not
+    /// restored yet: the indexer re-extracts them (`call_files_missing_sites`).
+    pub missing_sites: usize,
 }
 
 /// The derived layer.
@@ -226,6 +396,8 @@ pub(super) struct DerivedCalls {
     /// Per file, indices into `callables` (sorted by line).
     pub(super) by_file: HashMap<FilePath, Vec<u32>>,
     pub(super) stats: CallStats,
+    /// Candidate files holding no call sites (pruned by an earlier derive), sorted.
+    pub(super) missing_sites: Vec<FilePath>,
 }
 
 impl ContractGraph {
@@ -247,9 +419,18 @@ impl ContractGraph {
             FileCallFacts {
                 repo_id,
                 package,
-                facts,
+                facts: Arc::new(facts),
+                sites_pruned: false,
             },
         );
+    }
+
+    /// Files (Java, Go, Python) that lie on an entry -> producer path but whose call
+    /// sites an earlier derive pruned, when the file was not on a path: the caller
+    /// re-extracts them and stores the full facts with [`Self::add_call_facts`]. Empty
+    /// after a fresh build (nothing is pruned before the first derive).
+    pub fn call_files_missing_sites(&self) -> &[FilePath] {
+        &self.derived_calls.missing_sites
     }
 
     /// The derived `Callable` nodes, sorted by (path, line, name).
@@ -278,14 +459,17 @@ impl ContractGraph {
             .min_by_key(|c| (c.line_end - c.line_start, c.line_start, c.id))
     }
 
-    /// (files whose facts were capped, approximate bytes of all stored facts).
-    fn raw_fact_totals(&self) -> (usize, usize) {
+    /// (files whose facts were capped, approximate bytes of all stored facts, files
+    /// whose call sites are pruned).
+    fn raw_fact_totals(&self) -> (usize, usize, usize) {
         use std::mem::size_of;
         let mut capped = 0;
         let mut bytes = 0;
+        let mut pruned = 0;
         for f in self.call_facts.values() {
             let c = &f.facts;
             capped += usize::from(c.capped);
+            pruned += usize::from(f.sites_pruned);
             bytes += c.callables.len() * size_of::<CallableFact>()
                 + c.call_sites.len() * size_of::<CallFact>()
                 + c.injections.len() * size_of::<InjectionFact>()
@@ -293,10 +477,40 @@ impl ContractGraph {
                 + c.types.len() * size_of::<TypeFact>()
                 + c.types
                     .iter()
-                    .map(|t| (t.extends.len() + t.implements.len()) * size_of::<CompactStr>())
+                    .map(|t| {
+                        (t.extends.len() + t.implements.len() + t.methods.len())
+                            * size_of::<CompactStr>()
+                    })
                     .sum::<usize>();
         }
-        (capped, bytes)
+        (capped, bytes, pruned)
+    }
+
+    /// Drops the call sites of `paths` (files off every entry -> producer path): the
+    /// callables, imports, injections and types stay, they decide which files lie on a
+    /// path and how a call from a candidate file resolves. Sites are the bulk of a
+    /// file's facts and only a candidate file's are ever resolved.
+    fn prune_call_sites(&mut self, paths: &[FilePath]) {
+        for path in paths {
+            let Some(f) = self.call_facts.get_mut(path) else {
+                continue;
+            };
+            if f.sites_pruned || f.facts.call_sites.is_empty() {
+                continue;
+            }
+            // Unique right after a fold; shared with the previous snapshot after a graph
+            // clone, in which case the file gets a slimmed copy and the old one is freed
+            // with that snapshot.
+            match Arc::get_mut(&mut f.facts) {
+                Some(facts) => facts.call_sites = Vec::new(),
+                None => {
+                    let mut slim = (*f.facts).clone();
+                    slim.call_sites = Vec::new();
+                    f.facts = Arc::new(slim);
+                }
+            }
+            f.sites_pruned = true;
+        }
     }
 
     /// Whether some file with call facts holds an entry (consumer, route, gRPC
@@ -364,30 +578,82 @@ impl ContractGraph {
         }
         self.calls_dirty = false;
         let started = std::time::Instant::now();
-        let (files_capped, facts_bytes) = self.raw_fact_totals();
+        // Nothing reads the previous layer: free it before the new one is built (the graph
+        // of a reload is a clone of the live one, and the live snapshot keeps its own
+        // copy). `run` cannot fail; only a panic would leave the layer empty, and that
+        // unwinds the whole reload.
+        self.derived_calls = DerivedCalls::default();
         // No path can exist without both an entry and a producer among the files
         // with facts: skip the index (a whole workspace without events).
         let indexed;
-        if self.has_entry_and_producer() {
+        let prune: Vec<FilePath> = if self.has_entry_and_producer() {
             let deriver = Deriver::new(self);
             indexed = started.elapsed();
-            self.derived_calls = deriver.run();
+            let (derived, off_path) = deriver.run();
+            self.derived_calls = derived;
+            off_path
         } else {
             indexed = started.elapsed();
-            self.derived_calls = DerivedCalls::default();
             self.derived_calls.stats.files_with_facts = self.call_facts.len();
-        }
+            self.call_facts
+                .keys()
+                .filter(|p| lang_of(&p.to_string_lossy()) != Lang::Script)
+                .cloned()
+                .collect()
+        };
+        self.prune_call_sites(&prune);
+        let (files_capped, facts_bytes, files_pruned) = self.raw_fact_totals();
         self.derived_calls.stats.files_capped = files_capped;
         self.derived_calls.stats.facts_bytes = facts_bytes;
+        self.derived_calls.stats.files_pruned = files_pruned;
         let s = self.derived_calls.stats;
+        if tracing::enabled!(target: "mesh::calls", tracing::Level::DEBUG) {
+            let mut n = [0usize; 5];
+            let mut by_receiver = [0usize; 6];
+            for f in self.call_facts.values() {
+                let c = &f.facts;
+                for site in &c.call_sites {
+                    by_receiver[match site.receiver {
+                        CallReceiver::This => 0,
+                        CallReceiver::InjectedField(_) => 1,
+                        CallReceiver::ImportedSymbol => 2,
+                        CallReceiver::SameModule => 3,
+                        CallReceiver::Namespace(_) => 4,
+                        CallReceiver::InheritedField(_) => 5,
+                    }] += 1;
+                }
+                for (slot, len) in n.iter_mut().zip([
+                    c.callables.len(),
+                    c.call_sites.len(),
+                    c.injections.len(),
+                    c.imports.len(),
+                    c.types.len(),
+                ]) {
+                    *slot += len;
+                }
+            }
+            tracing::debug!(
+                target: "mesh::calls",
+                "call facts stored: {} callables, {} call sites, {} injections, {} imports, {} types",
+                n[0], n[1], n[2], n[3], n[4]
+            );
+            tracing::debug!(
+                target: "mesh::calls",
+                "call sites by receiver: {} this, {} injected field, {} imported symbol, {} same module, \
+                 {} namespace, {} inherited field",
+                by_receiver[0], by_receiver[1], by_receiver[2], by_receiver[3], by_receiver[4],
+                by_receiver[5]
+            );
+        }
         tracing::debug!(
             target: "mesh::calls",
-            "calls derive: {:.1} ms (index {:.1} ms), {} files with facts ({} KiB), {} candidates, {} sites resolved \
-             ({} skipped), {} pairs, {} callables, {} calls",
+            "calls derive: {:.1} ms (index {:.1} ms), {} files with facts ({} KiB retained, {} without call \
+             sites), {} candidates, {} sites resolved ({} skipped), {} pairs, {} callables, {} calls",
             started.elapsed().as_secs_f64() * 1000.0,
             indexed.as_secs_f64() * 1000.0,
             s.files_with_facts,
             s.facts_bytes / 1024,
+            s.files_pruned,
             s.candidate_files,
             s.sites_resolved,
             s.sites_skipped,
@@ -395,6 +661,13 @@ impl ContractGraph {
             s.callables,
             s.calls
         );
+        if s.hops_capped > 0 || s.pairs_capped > 0 {
+            tracing::warn!(
+                target: "mesh::calls",
+                "calls layer: {} lookups cut at {MAX_TYPE_HOPS} hops, {} Go interfaces unmatched past the pair cap",
+                s.hops_capped, s.pairs_capped
+            );
+        }
         if s.sites_skipped > 0 {
             tracing::warn!(
                 target: "mesh::calls",
@@ -493,6 +766,69 @@ fn confidence_rank(c: EdgeConfidence) -> u8 {
 /// A type (or free function) by (file index, name).
 type TypeKey<'g> = (usize, &'g str);
 
+/// Source language of a file with call facts, from its extension: it picks how an
+/// import is resolved and whether files of one directory see each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    /// TypeScript / JavaScript: relative module specifiers.
+    Script,
+    /// Java: dotted imports, one package per directory.
+    Java,
+    /// Go: import paths name a directory, one package per directory.
+    Go,
+    /// Python: dotted or relative module imports.
+    Python,
+    Other,
+}
+
+fn lang_of(path: &str) -> Lang {
+    match path.rsplit_once('.').map(|(_, e)| e) {
+        Some(e) if SCRIPT_EXTENSIONS.contains(&e) => Lang::Script,
+        Some("java") => Lang::Java,
+        Some("go") => Lang::Go,
+        Some("py") => Lang::Python,
+        _ => Lang::Other,
+    }
+}
+
+/// `a/b/c.py` -> `a/b/c`; `a/b/__init__.py` -> `a/b`; for a Java file the path
+/// without its extension. `None` for any other file.
+fn module_stem(path: &str, lang: Lang) -> Option<&str> {
+    let (base, _) = path.rsplit_once('.')?;
+    match lang {
+        Lang::Java => Some(base),
+        Lang::Python => Some(base.strip_suffix("/__init__").unwrap_or(base)),
+        _ => None,
+    }
+}
+
+/// Last path segment.
+fn last_segment(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Whether `path` ends with the `/`-separated `suffix` on a segment boundary.
+fn ends_with_path(path: &str, suffix: &str) -> bool {
+    path.strip_suffix(suffix)
+        .is_some_and(|rest| rest.is_empty() || rest.ends_with('/'))
+}
+
+/// Number of trailing `/`-separated segments `a` and `b` share.
+fn common_tail(a: &str, b: &str) -> usize {
+    a.rsplit('/')
+        .zip(b.rsplit('/'))
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
+/// Number of leading `/`-separated segments `a` and `b` share.
+fn common_head(a: &str, b: &str) -> usize {
+    a.split('/')
+        .zip(b.split('/'))
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
 /// What an import binding names.
 #[derive(Debug, Clone, Copy)]
 enum Binding<'g> {
@@ -501,6 +837,8 @@ enum Binding<'g> {
     /// `exported` of a workspace package (`@scope/name` -> `name`), matched against
     /// the package each file was indexed under: `heuristic`, `ambiguous` on a tie.
     Package(&'g str, &'g str),
+    /// `exported` of a package directory (Go): `*` names the package itself.
+    Dir(usize, &'g str),
 }
 
 /// `@scope/name/sub` -> `name`, `name/sub` -> `name`; `None` for a relative or
@@ -540,24 +878,66 @@ struct Deriver<'g> {
     files: Vec<(&'g FilePath, &'g FileCallFacts)>,
     /// Global index of each file's first callable.
     offsets: Vec<usize>,
+    lang: Vec<Lang>,
     /// Per file: import local name -> binding; `export * from` targets apart.
     imports: Vec<FastMap<&'g str, Binding<'g>>>,
     star_exports: Vec<Vec<usize>>,
     types: FastMap<TypeKey<'g>, &'g TypeFact>,
     /// (package, name, is_type) -> files declaring it, sorted (test files carry no
-    /// call facts, see the TypeScript extractor).
+    /// call facts, see the TypeScript extractor). TypeScript only.
     package_decls: FastMap<(&'g str, &'g str, bool), Vec<usize>>,
+    /// Directory of each Java / Go file (`usize::MAX` for any other file): the files of
+    /// one directory form one package and see each other's declarations.
+    dir_of: Vec<usize>,
+    dir_files: Vec<Vec<usize>>,
+    /// (directory, name, is_type) -> files of the directory declaring it, sorted.
+    dir_decls: FastMap<(usize, &'g str, bool), Vec<usize>>,
+    /// Per file: directories brought in by wildcard imports (Java `import a.b.*`).
+    star_dirs: Vec<Vec<usize>>,
     /// (file, class) -> resolved base classes.
     bases: FastMap<TypeKey<'g>, Vec<TypeKey<'g>>>,
     /// Resolved type -> types extending or implementing it (sorted).
     subtypes: FastMap<TypeKey<'g>, Vec<TypeKey<'g>>>,
     /// (file, owner, name) -> global callable index; free functions have owner "".
+    /// A Go method is filed under the file declaring its receiver type.
     methods: FastMap<(usize, &'g str, &'g str), usize>,
+    /// Go: type -> its methods (global callable indices, sorted).
+    methods_of: FastMap<TypeKey<'g>, Vec<usize>>,
     /// (file, class, field) -> declared type.
     injections: FastMap<(usize, &'g str, &'g str), &'g str>,
     /// `dispatch` results: an interface with thousands of implementations is
     /// walked once per method name, not once per call site.
     dispatched: std::cell::RefCell<FastMap<(TypeKey<'g>, CompactStr), Vec<usize>>>,
+    /// Go interfaces dropped past [`MAX_STRUCTURAL_IMPLS`].
+    dispatch_overflow: usize,
+    /// Go interfaces not matched past [`MAX_STRUCTURAL_PAIRS`] of their repository.
+    pairs_capped: usize,
+    /// Lookups cut at [`MAX_TYPE_HOPS`].
+    hops_capped: std::cell::Cell<usize>,
+    /// Go: global indices of the callables that call through a field of their type.
+    field_users: FastSet<usize>,
+}
+
+/// The one candidate closest to `importer` (most leading path segments shared); `None`
+/// when there is no candidate or the best is a tie.
+fn pick_closest<'a>(
+    importer: &str,
+    candidates: impl Iterator<Item = (usize, &'a str)>,
+) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    let mut tie = false;
+    for (id, path) in candidates {
+        let score = common_head(importer, path);
+        match best {
+            Some((s, _)) if score < s => {}
+            Some((s, _)) if score == s => tie = true,
+            _ => {
+                best = Some((score, id));
+                tie = false;
+            }
+        }
+    }
+    best.filter(|_| !tie).map(|(_, id)| id)
 }
 
 impl<'g> Deriver<'g> {
@@ -569,19 +949,30 @@ impl<'g> Deriver<'g> {
             offsets.push(total);
             total += f.facts.callables.len();
         }
+        let n = files.len();
         let mut d = Self {
             graph,
             files,
             offsets,
+            lang: Vec::new(),
             imports: Vec::new(),
             star_exports: Vec::new(),
             types: FastMap::default(),
             package_decls: FastMap::default(),
+            dir_of: vec![usize::MAX; n],
+            dir_files: Vec::new(),
+            dir_decls: FastMap::default(),
+            star_dirs: vec![Vec::new(); n],
             bases: FastMap::default(),
             subtypes: FastMap::default(),
             methods: FastMap::default(),
+            methods_of: FastMap::default(),
             injections: FastMap::default(),
             dispatched: std::cell::RefCell::default(),
+            dispatch_overflow: 0,
+            pairs_capped: 0,
+            hops_capped: std::cell::Cell::new(0),
+            field_users: FastSet::default(),
         };
         d.index();
         d
@@ -595,6 +986,11 @@ impl<'g> Deriver<'g> {
             .iter()
             .map(|(p, _)| p.to_str().map(|s| s.replace('\\', "/")))
             .collect();
+        self.lang = slashed
+            .iter()
+            .map(|s| s.as_deref().map_or(Lang::Other, lang_of))
+            .collect();
+        let langs = self.lang.clone();
         let mut by_module: FastMap<&str, usize> = FastMap::default();
         for (i, s) in slashed.iter().enumerate() {
             if let Some(stem) = s.as_deref().and_then(strip_script_ext_str) {
@@ -621,20 +1017,162 @@ impl<'g> Deriver<'g> {
                 .copied()
                 .or_else(|| strip_script_ext_str(&joined).and_then(|s| by_module.get(s).copied()))
         };
+
+        // Java / Python module files by the last segment of their module path (a
+        // Python `__init__.py` by its directory), Java / Go directories by name.
+        let mut stems: Vec<Option<&str>> = vec![None; slashed.len()];
+        let mut by_stem: FastMap<&str, Vec<usize>> = FastMap::default();
+        let mut dir_ids: FastMap<&str, usize> = FastMap::default();
+        let mut dir_paths: Vec<&str> = Vec::new();
+        let mut dirs_by_name: FastMap<&str, Vec<usize>> = FastMap::default();
+        let mut dir_files: Vec<Vec<usize>> = Vec::new();
+        for (i, s) in slashed.iter().enumerate() {
+            let Some(s) = s.as_deref() else { continue };
+            let lang = self.lang[i];
+            if matches!(lang, Lang::Java | Lang::Python) {
+                if let Some(stem) = module_stem(s, lang) {
+                    stems[i] = Some(stem);
+                    by_stem.entry(last_segment(stem)).or_default().push(i);
+                }
+            }
+            if matches!(lang, Lang::Java | Lang::Go) {
+                if let Some((dir, _)) = s.rsplit_once('/') {
+                    let d = *dir_ids.entry(dir).or_insert_with(|| {
+                        dir_paths.push(dir);
+                        dir_files.push(Vec::new());
+                        dirs_by_name
+                            .entry(last_segment(dir))
+                            .or_default()
+                            .push(dir_paths.len() - 1);
+                        dir_paths.len() - 1
+                    });
+                    dir_files[d].push(i);
+                    self.dir_of[i] = d;
+                }
+            }
+        }
+        // The module file `suffix` (`a/b/c`) names, closest to the importer.
+        let module_file = |importer: usize, lang: Lang, suffix: &str| -> Option<usize> {
+            let cands = by_stem.get(last_segment(suffix))?;
+            pick_closest(
+                slashed[importer].as_deref()?,
+                cands.iter().filter_map(|&c| {
+                    let stem = stems[c]?;
+                    (langs[c] == lang && ends_with_path(stem, suffix)).then_some((c, stem))
+                }),
+            )
+        };
+        // The directory whose path ends with `suffix` (`a/b`), closest to the importer.
+        let package_dir = |importer: usize, suffix: &str| -> Option<usize> {
+            let cands = dirs_by_name.get(last_segment(suffix))?;
+            pick_closest(
+                slashed[importer].as_deref()?,
+                cands
+                    .iter()
+                    .filter(|&&d| ends_with_path(dir_paths[d], suffix))
+                    .map(|&d| (d, dir_paths[d])),
+            )
+        };
+        // A Go import path names the directory sharing the longest tail with it; one
+        // segment is a standard-library package, never a workspace directory.
+        let go_dir = |importer: usize, path: &str| -> Option<usize> {
+            let (_, last) = path.rsplit_once('/')?;
+            let cands = dirs_by_name.get(last)?;
+            let best = cands
+                .iter()
+                .map(|&d| common_tail(dir_paths[d], path))
+                .max()?;
+            // `net/http`, `encoding/json`: without a host the match must be a long one.
+            if best < 2 && !path.split('/').next().is_some_and(|h| h.contains('.')) {
+                return None;
+            }
+            pick_closest(
+                slashed[importer].as_deref()?,
+                cands
+                    .iter()
+                    .filter(|&&d| common_tail(dir_paths[d], path) == best)
+                    .map(|&d| (d, dir_paths[d])),
+            )
+        };
+        // A Python module (relative: leading dots; absolute: matched by path suffix).
+        let py_module = |importer: usize, module: &str, sub: Option<&str>| -> Option<usize> {
+            let dots = module.bytes().take_while(|&b| b == b'.').count();
+            let mut path = module[dots..].replace('.', "/");
+            if let Some(sub) = sub {
+                if !path.is_empty() {
+                    path.push('/');
+                }
+                path.push_str(sub);
+            }
+            if dots == 0 {
+                return module_file(importer, Lang::Python, &path);
+            }
+            // `.x` is a sibling of the importer, `..x` one directory up.
+            let mut dir = slashed[importer].as_deref()?.rsplit_once('/')?.0;
+            for _ in 1..dots {
+                dir = dir.rsplit_once('/')?.0;
+            }
+            let wanted = if path.is_empty() {
+                dir.to_string()
+            } else {
+                format!("{dir}/{path}")
+            };
+            by_stem
+                .get(last_segment(&wanted))?
+                .iter()
+                .copied()
+                .find(|&c| langs[c] == Lang::Python && stems[c] == Some(wanted.as_str()))
+        };
+
         for (i, (_, f)) in self.files.iter().enumerate() {
             let mut map = FastMap::default();
             let mut stars = Vec::new();
             for imp in &f.facts.imports {
-                let binding = match resolve(i, &imp.module) {
-                    Some(target) => Binding::File(target, imp.exported.as_str()),
-                    None => match package_key(&imp.module) {
-                        Some(pkg) => Binding::Package(pkg, imp.exported.as_str()),
+                let binding = match self.lang[i] {
+                    Lang::Java => {
+                        let as_path = imp.module.replace('.', "/");
+                        if imp.local == "*" {
+                            if let Some(d) = package_dir(i, &as_path) {
+                                self.star_dirs[i].push(d);
+                            }
+                            continue;
+                        }
+                        // `a.b.C` is the file `a/b/C`; `a.b.Outer.Inner` a type of `a/b/Outer`.
+                        let file =
+                            module_file(i, Lang::Java, &format!("{as_path}/{}", imp.exported))
+                                .or_else(|| module_file(i, Lang::Java, &as_path));
+                        match file {
+                            Some(t) => Binding::File(t, imp.exported.as_str()),
+                            None => continue,
+                        }
+                    }
+                    Lang::Go => match go_dir(i, &imp.module) {
+                        Some(d) => Binding::Dir(d, "*"),
                         None => continue,
+                    },
+                    Lang::Python => {
+                        let exported = imp.exported.as_str();
+                        // `from pkg import mod` names a module when `pkg/mod` is one.
+                        let sub = (exported != "*")
+                            .then(|| py_module(i, &imp.module, Some(exported)))
+                            .flatten();
+                        match (sub, py_module(i, &imp.module, None)) {
+                            (Some(m), _) => Binding::File(m, "*"),
+                            (None, Some(m)) => Binding::File(m, exported),
+                            (None, None) => continue,
+                        }
+                    }
+                    _ => match resolve(i, &imp.module) {
+                        Some(target) => Binding::File(target, imp.exported.as_str()),
+                        None => match package_key(&imp.module) {
+                            Some(pkg) => Binding::Package(pkg, imp.exported.as_str()),
+                            None => continue,
+                        },
                     },
                 };
                 match (imp.local == "*", binding) {
                     (true, Binding::File(target, _)) => stars.push(target),
-                    (true, Binding::Package(..)) => {}
+                    (true, _) => {}
                     (false, b) => {
                         map.entry(imp.local.as_str()).or_insert(b);
                     }
@@ -642,23 +1180,38 @@ impl<'g> Deriver<'g> {
             }
             stars.sort_unstable();
             stars.dedup();
+            self.star_dirs[i].sort_unstable();
+            self.star_dirs[i].dedup();
             self.imports.push(map);
             self.star_exports.push(stars);
             for t in &f.facts.types {
                 self.types.entry((i, t.name.as_str())).or_insert(t);
-                self.package_decls
-                    .entry((f.package.as_str(), t.name.as_str(), true))
-                    .or_default()
-                    .push(i);
+                if self.lang[i] == Lang::Script {
+                    self.package_decls
+                        .entry((f.package.as_str(), t.name.as_str(), true))
+                        .or_default()
+                        .push(i);
+                }
+                if self.dir_of[i] != usize::MAX {
+                    self.dir_decls
+                        .entry((self.dir_of[i], t.name.as_str(), true))
+                        .or_default()
+                        .push(i);
+                }
             }
-            for (k, c) in f.facts.callables.iter().enumerate() {
-                let owner = c.owner.as_deref().unwrap_or("");
-                self.methods
-                    .entry((i, owner, c.name.as_str()))
-                    .or_insert(self.offsets[i] + k);
-                if owner.is_empty() {
+            for c in &f.facts.callables {
+                if c.owner.is_some() {
+                    continue;
+                }
+                if self.lang[i] == Lang::Script {
                     self.package_decls
                         .entry((f.package.as_str(), c.name.as_str(), false))
+                        .or_default()
+                        .push(i);
+                }
+                if self.dir_of[i] != usize::MAX {
+                    self.dir_decls
+                        .entry((self.dir_of[i], c.name.as_str(), false))
                         .or_default()
                         .push(i);
                 }
@@ -669,10 +1222,52 @@ impl<'g> Deriver<'g> {
                     .or_insert(inj.declared_type.as_str());
             }
         }
-        for v in self.package_decls.values_mut() {
+        self.dir_files = dir_files;
+        for v in self
+            .package_decls
+            .values_mut()
+            .chain(self.dir_decls.values_mut())
+        {
             v.sort_unstable();
             v.dedup();
         }
+        // Methods, after the type declarations: a Go method is filed under the file
+        // declaring its receiver type, which may be another file of the package.
+        for (i, (_, f)) in self.files.iter().enumerate() {
+            for (k, c) in f.facts.callables.iter().enumerate() {
+                let owner = c.owner.as_deref().unwrap_or("");
+                let global = self.offsets[i] + k;
+                let at = if self.lang[i] == Lang::Go && !owner.is_empty() {
+                    self.owner_file(i, owner)
+                } else {
+                    i
+                };
+                self.methods
+                    .entry((at, owner, c.name.as_str()))
+                    .or_insert(global);
+                if self.lang[i] == Lang::Go && !owner.is_empty() {
+                    self.methods_of.entry((at, owner)).or_default().push(global);
+                }
+            }
+        }
+        for v in self.methods_of.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+        // Go: the callables that call through a field of their type, found once per
+        // file (`constructed_methods` asks per method of a type).
+        for (i, (_, f)) in self.files.iter().enumerate() {
+            if self.lang[i] != Lang::Go {
+                continue;
+            }
+            for site in &f.facts.call_sites {
+                if matches!(site.receiver, CallReceiver::InjectedField(_)) {
+                    self.field_users
+                        .insert(self.offsets[i] + site.caller as usize);
+                }
+            }
+        }
+
         let mut bases: FastMap<TypeKey<'g>, Vec<TypeKey<'g>>> = FastMap::default();
         let mut subtypes: FastMap<TypeKey<'g>, Vec<TypeKey<'g>>> = FastMap::default();
         for (i, (_, f)) in self.files.iter().enumerate() {
@@ -691,12 +1286,182 @@ impl<'g> Deriver<'g> {
                 }
             }
         }
-        for v in subtypes.values_mut().chain(bases.values_mut()) {
+        self.bases = bases;
+        self.structural_impls(&mut subtypes);
+        for v in subtypes.values_mut().chain(self.bases.values_mut()) {
             v.sort_unstable();
             v.dedup();
         }
-        self.bases = bases;
         self.subtypes = subtypes;
+    }
+
+    /// Go: a struct implements an interface when its methods (own and promoted from
+    /// embedded types) include every method of the interface. Only the interfaces a
+    /// struct field is declared with are matched. More than [`MAX_STRUCTURAL_IMPLS`]
+    /// implementations drop the interface (counted).
+    fn structural_impls(&mut self, subtypes: &mut FastMap<TypeKey<'g>, Vec<TypeKey<'g>>>) {
+        let mut ifaces: BTreeSet<TypeKey<'g>> = BTreeSet::new();
+        for (i, (_, f)) in self.files.iter().enumerate() {
+            if self.lang[i] != Lang::Go {
+                continue;
+            }
+            for inj in &f.facts.injections {
+                for (k, _) in self.resolve_type(i, inj.declared_type.as_str()) {
+                    if self
+                        .types
+                        .get(&k)
+                        .is_some_and(|t| t.kind == TypeFactKind::Interface)
+                    {
+                        ifaces.insert(k);
+                    }
+                }
+            }
+        }
+        if ifaces.is_empty() {
+            return;
+        }
+        // Method name -> struct types having it (own methods; promoted ones are
+        // found by the superset test, which follows embedding).
+        let mut method_types: FastMap<&'g str, Vec<TypeKey<'g>>> = FastMap::default();
+        for (&t, globals) in &self.methods_of {
+            if self.types.get(&t).map(|f| f.kind) != Some(TypeFactKind::Class) {
+                continue;
+            }
+            for &g in globals {
+                let (_, c) = self.callable(g);
+                method_types.entry(c.name.as_str()).or_default().push(t);
+            }
+        }
+        for v in method_types.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+        let mut sets: FastMap<TypeKey<'g>, Rc<BTreeSet<&'g str>>> = FastMap::default();
+        let mut dropped = 0;
+        let mut capped = 0;
+        // (interface, candidate struct) pairs tested so far, per repository.
+        let mut spent: BTreeMap<RepoId, usize> = BTreeMap::new();
+        let cap = match self.graph.structural_pair_budget {
+            0 => MAX_STRUCTURAL_PAIRS,
+            n => n,
+        };
+        for iface in ifaces {
+            let want = self.method_set(iface, &mut sets);
+            let Some(rarest) = want
+                .iter()
+                .min_by_key(|m| method_types.get(*m).map_or(0, Vec::len))
+            else {
+                continue;
+            };
+            let candidates = method_types.get(rarest).map_or(&[][..], Vec::as_slice);
+            let used = spent.entry(self.files[iface.0].1.repo_id).or_default();
+            if *used + candidates.len() > cap {
+                capped += 1;
+                continue;
+            }
+            *used += candidates.len();
+            let mut found = Vec::new();
+            for &t in candidates {
+                let have = self.method_set(t, &mut sets);
+                if want.iter().all(|m| have.contains(m)) {
+                    found.push(t);
+                }
+            }
+            if found.len() > MAX_STRUCTURAL_IMPLS {
+                dropped += 1;
+                continue;
+            }
+            subtypes.entry(iface).or_default().extend(found);
+        }
+        self.dispatch_overflow = dropped;
+        self.pairs_capped = capped;
+    }
+
+    /// Method names of `t`: an interface's declared ones and a struct's own, plus those
+    /// of its embedded types (`bases`), bounded by [`MAX_TYPE_HOPS`] (counted).
+    fn method_set(
+        &self,
+        t: TypeKey<'g>,
+        cache: &mut FastMap<TypeKey<'g>, Rc<BTreeSet<&'g str>>>,
+    ) -> Rc<BTreeSet<&'g str>> {
+        if let Some(hit) = cache.get(&t) {
+            return Rc::clone(hit);
+        }
+        let mut out = BTreeSet::new();
+        let mut stack = vec![t];
+        let mut seen = FastSet::default();
+        let mut truncated = false;
+        while let Some(c) = stack.pop() {
+            if seen.len() > MAX_TYPE_HOPS {
+                truncated |= !seen.contains(&c);
+                continue;
+            }
+            if !seen.insert(c) {
+                continue;
+            }
+            if let Some(fact) = self.types.get(&c) {
+                out.extend(fact.methods.iter().map(CompactStr::as_str));
+            }
+            if let Some(globals) = self.methods_of.get(&c) {
+                out.extend(globals.iter().map(|&g| self.callable(g).1.name.as_str()));
+            }
+            if let Some(bs) = self.bases.get(&c) {
+                stack.extend(bs.iter().copied());
+            }
+        }
+        self.note_hops(truncated);
+        let out = Rc::new(out);
+        cache.insert(t, Rc::clone(&out));
+        out
+    }
+
+    /// The file declaring class `owner` as seen from `file`: the file itself, or for a
+    /// Java / Go package the sibling declaring it (a Go method may sit in another file
+    /// than its receiver type).
+    fn owner_file(&self, file: usize, owner: &str) -> usize {
+        if self.types.contains_key(&(file, owner)) {
+            return file;
+        }
+        match self.dir_of[file] {
+            usize::MAX => file,
+            d => self
+                .dir_decls
+                .get(&(d, owner, true))
+                .and_then(|v| v.first().copied())
+                .unwrap_or(file),
+        }
+    }
+
+    /// Declarations of the package `file` belongs to (Java / Go: its own directory,
+    /// else the directories of its wildcard imports) named `name`.
+    fn scope_candidates(
+        &self,
+        file: usize,
+        name: &'g str,
+        is_type: bool,
+    ) -> Vec<(TypeKey<'g>, EdgeConfidence)> {
+        let d = self.dir_of[file];
+        if d == usize::MAX {
+            return Vec::new();
+        }
+        let mut files: Vec<usize> = Vec::new();
+        for dir in std::iter::once(d).chain(self.star_dirs[file].iter().copied()) {
+            if let Some(v) = self.dir_decls.get(&(dir, name, is_type)) {
+                files.extend(v.iter().copied());
+            }
+            // The own package shadows wildcard imports.
+            if !files.is_empty() {
+                break;
+            }
+        }
+        files.sort_unstable();
+        files.dedup();
+        let confidence = if files.len() > 1 {
+            EdgeConfidence::Ambiguous
+        } else {
+            EdgeConfidence::Exact
+        };
+        files.into_iter().map(|f| ((f, name), confidence)).collect()
     }
 
     fn declared(&self, f: usize, n: &str, is_type: bool) -> bool {
@@ -728,14 +1493,21 @@ impl<'g> Deriver<'g> {
 
     /// Where `name`, as written in file `file`, is declared: through an import
     /// binding (re-exports of relative modules followed, `exact`; a workspace
-    /// package matched by name, see [`Binding::Package`]), else the file itself.
+    /// package matched by name, see [`Binding::Package`]), else the file itself, else
+    /// the package it belongs to (Java, Go). `ns.T` names `T` of the module or package
+    /// imported as `ns`.
     fn resolve_export(
         &self,
         file: usize,
         name: &'g str,
         is_type: bool,
     ) -> Vec<(TypeKey<'g>, EdgeConfidence)> {
+        if let Some((ns, rest)) = name.split_once('.') {
+            return self.resolve_qualified(file, ns, rest, is_type);
+        }
         let start = match self.imports.get(file).and_then(|m| m.get(name)) {
+            // A namespace import names a module, not a symbol.
+            Some(&Binding::File(_, "*")) | Some(&Binding::Dir(..)) => return Vec::new(),
             Some(&Binding::File(f, exported)) => (f, exported),
             Some(&Binding::Package(pkg, exported)) => {
                 return self.package_candidates(pkg, exported, is_type)
@@ -743,42 +1515,93 @@ impl<'g> Deriver<'g> {
             None if self.declared(file, name, is_type) => {
                 return vec![((file, name), EdgeConfidence::Exact)]
             }
-            None => return Vec::new(),
+            None => return self.scope_candidates(file, name, is_type),
         };
-        // Follow re-exports: a barrel imports (or re-exports) the name from another file.
+        self.follow(start, is_type)
+    }
+
+    /// `name` exported by file `start.0` as `start.1`, through re-exports.
+    fn follow(&self, start: TypeKey<'g>, is_type: bool) -> Vec<(TypeKey<'g>, EdgeConfidence)> {
         let mut queue = VecDeque::from([start]);
         let mut seen: FastSet<TypeKey<'g>> = FastSet::default();
+        let mut truncated = false;
         while let Some((f, n)) = queue.pop_front() {
-            if seen.len() > MAX_TYPE_HOPS || !seen.insert((f, n)) {
+            if seen.len() > MAX_TYPE_HOPS {
+                truncated |= !seen.contains(&(f, n));
+                continue;
+            }
+            if !seen.insert((f, n)) {
                 continue;
             }
             if self.declared(f, n, is_type) {
                 return vec![((f, n), EdgeConfidence::Exact)];
             }
             match self.imports.get(f).and_then(|m| m.get(n)) {
-                Some(&Binding::File(g, exported)) => queue.push_back((g, exported)),
+                Some(&Binding::File(g, exported)) if exported != "*" => {
+                    queue.push_back((g, exported))
+                }
                 Some(&Binding::Package(pkg, exported)) => {
                     return self.package_candidates(pkg, exported, is_type)
                 }
-                None => {}
+                _ => {}
             }
             for &g in self.star_exports.get(f).map_or(&[][..], Vec::as_slice) {
                 queue.push_back((g, n));
             }
         }
+        self.note_hops(truncated);
         Vec::new()
+    }
+
+    /// `ns.name`: `name` declared by the module (Python) or package (Go) `ns` names.
+    fn resolve_qualified(
+        &self,
+        file: usize,
+        ns: &'g str,
+        name: &'g str,
+        is_type: bool,
+    ) -> Vec<(TypeKey<'g>, EdgeConfidence)> {
+        match self.imports.get(file).and_then(|m| m.get(ns)) {
+            Some(&Binding::File(f, "*")) => self.follow((f, name), is_type),
+            Some(&Binding::Dir(d, "*")) => {
+                let found: Vec<usize> = self.dir_files[d]
+                    .iter()
+                    .copied()
+                    .filter(|&f| self.declared(f, name, is_type))
+                    .collect();
+                let confidence = if found.len() > 1 {
+                    EdgeConfidence::Ambiguous
+                } else {
+                    EdgeConfidence::Exact
+                };
+                found.into_iter().map(|f| ((f, name), confidence)).collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn resolve_type(&self, file: usize, name: &'g str) -> Vec<(TypeKey<'g>, EdgeConfidence)> {
         self.resolve_export(file, name, true)
     }
 
+    /// Counts one lookup cut at [`MAX_TYPE_HOPS`] (`CallStats::hops_capped`).
+    fn note_hops(&self, truncated: bool) {
+        if truncated {
+            self.hops_capped.set(self.hops_capped.get() + 1);
+        }
+    }
+
     /// Method `m` of class `class` or of its nearest base class declaring it.
     fn find_method(&self, class: TypeKey<'g>, m: &str) -> Option<usize> {
         let mut stack = vec![class];
         let mut seen = FastSet::default();
+        let mut truncated = false;
         while let Some(c) = stack.pop() {
-            if seen.len() > MAX_TYPE_HOPS || !seen.insert(c) {
+            if seen.len() > MAX_TYPE_HOPS {
+                truncated |= !seen.contains(&c);
+                continue;
+            }
+            if !seen.insert(c) {
                 continue;
             }
             if let Some(&idx) = self.methods.get(&(c.0, c.1, m)) {
@@ -789,6 +1612,7 @@ impl<'g> Deriver<'g> {
                 stack.extend(bs.iter().rev().copied());
             }
         }
+        self.note_hops(truncated);
         None
     }
 
@@ -796,8 +1620,13 @@ impl<'g> Deriver<'g> {
     fn field_type(&self, class: TypeKey<'g>, field: &str) -> Option<(usize, &'g str)> {
         let mut stack = vec![class];
         let mut seen = FastSet::default();
+        let mut truncated = false;
         while let Some(c) = stack.pop() {
-            if seen.len() > MAX_TYPE_HOPS || !seen.insert(c) {
+            if seen.len() > MAX_TYPE_HOPS {
+                truncated |= !seen.contains(&c);
+                continue;
+            }
+            if !seen.insert(c) {
                 continue;
             }
             if let Some(&t) = self.injections.get(&(c.0, c.1, field)) {
@@ -807,6 +1636,7 @@ impl<'g> Deriver<'g> {
                 stack.extend(bs.iter().rev().copied());
             }
         }
+        self.note_hops(truncated);
         None
     }
 
@@ -861,18 +1691,23 @@ impl<'g> Deriver<'g> {
         let mut found = BTreeMap::new();
         let via = match &site.receiver {
             CallReceiver::This => {
-                if let Some(t) = owner.and_then(|o| self.find_method((file, o), callee)) {
+                let class = owner.map(|o| (self.owner_file(file, o), o));
+                if let Some(t) = class.and_then(|c| self.find_method(c, callee)) {
                     found.insert(t, EdgeConfidence::Exact);
                 }
                 "this"
             }
-            CallReceiver::InjectedField(field) => {
-                if let Some((decl_file, t)) = owner.and_then(|o| self.field_type((file, o), field))
-                {
+            CallReceiver::InjectedField(field) | CallReceiver::InheritedField(field) => {
+                let guessed = matches!(site.receiver, CallReceiver::InheritedField(_));
+                let class = owner.map(|o| (self.owner_file(file, o), o));
+                if let Some((decl_file, t)) = class.and_then(|c| self.field_type(c, field)) {
                     for (ty, c) in self.resolve_type(decl_file, t) {
                         let impls = self.dispatch(ty, callee);
                         let c = if impls.len() > 1 {
                             EdgeConfidence::Ambiguous
+                        } else if guessed && c == EdgeConfidence::Exact {
+                            // The identifier was only assumed to name the base class's field.
+                            EdgeConfidence::Heuristic
                         } else {
                             c
                         };
@@ -881,7 +1716,11 @@ impl<'g> Deriver<'g> {
                         }
                     }
                 }
-                "injected_field"
+                if guessed {
+                    "inherited_field"
+                } else {
+                    "injected_field"
+                }
             }
             CallReceiver::ImportedSymbol => {
                 if self.imports[file].contains_key(callee) {
@@ -896,8 +1735,23 @@ impl<'g> Deriver<'g> {
             CallReceiver::SameModule => {
                 if let Some(&t) = self.methods.get(&(file, "", callee)) {
                     found.insert(t, EdgeConfidence::Exact);
+                } else {
+                    // Go: a function of another file of the package.
+                    for ((f2, name), c) in self.scope_candidates(file, callee, false) {
+                        if let Some(&t) = self.methods.get(&(f2, "", name)) {
+                            keep_strongest(&mut found, t, c);
+                        }
+                    }
                 }
                 "same_module"
+            }
+            CallReceiver::Namespace(ns) => {
+                for ((f2, name), c) in self.resolve_qualified(file, ns.as_str(), callee, false) {
+                    if let Some(&t) = self.methods.get(&(f2, "", name)) {
+                        keep_strongest(&mut found, t, c);
+                    }
+                }
+                "namespace"
             }
         };
         (finish(found), via)
@@ -922,14 +1776,67 @@ impl<'g> Deriver<'g> {
             .map(|(k, _)| self.offsets[file] + k)
     }
 
-    fn run(self) -> DerivedCalls {
+    /// Go: a client is built in the constructor `NewT` of the struct `T` that holds it
+    /// (`&T{writer: &kafka.Writer{Topic: "t"}}`), and `T`'s methods use it. When the
+    /// topic site lies in such a constructor, the methods of `T` that call through one
+    /// of their fields are the entry (or producer) callables too. Anything not named
+    /// `New<Type>` with that type in the package anchors on its own callable only.
+    fn constructed_methods(&self, file: usize, callable: usize) -> Vec<usize> {
+        let d = self.dir_of[file];
+        if self.lang[file] != Lang::Go || d == usize::MAX {
+            return Vec::new();
+        }
+        let (_, c) = self.callable(callable);
+        if c.owner.is_some() {
+            return Vec::new();
+        }
+        let Some(rest) = c
+            .name
+            .strip_prefix("New")
+            .or_else(|| c.name.strip_prefix("new"))
+            .filter(|r| !r.is_empty())
+        else {
+            return Vec::new();
+        };
+        let mut lowered = rest.to_string();
+        if let Some(first) = lowered.get_mut(..1) {
+            first.make_ascii_lowercase();
+        }
+        for ty in [rest, lowered.as_str()] {
+            let Some(&at) = self
+                .dir_decls
+                .get(&(d, ty, true))
+                .and_then(|files| files.first())
+            else {
+                continue;
+            };
+            let Some(methods) = self.methods_of.get(&(at, ty)) else {
+                continue;
+            };
+            return methods
+                .iter()
+                .copied()
+                .filter(|&m| self.uses_fields(m))
+                .collect();
+        }
+        Vec::new()
+    }
+
+    /// Whether the callable makes a call through a field of its type.
+    fn uses_fields(&self, global: usize) -> bool {
+        self.field_users.contains(&global)
+    }
+
+    /// The derived layer and the files (Java, Go, Python) off every entry -> producer
+    /// path that still hold call sites, for the caller to prune.
+    fn run(self) -> (DerivedCalls, Vec<FilePath>) {
         let n = self.files.len();
         let mut stats = CallStats {
             files_with_facts: n,
             ..CallStats::default()
         };
         if n == 0 {
-            return DerivedCalls::default();
+            return (DerivedCalls::default(), Vec::new());
         }
 
         // Entry and producer nodes of each file.
@@ -966,12 +1873,23 @@ impl<'g> Deriver<'g> {
             }
         }
 
-        // 1. File-level pruning over imports and implementation links.
-        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        // 1. File-level pruning over imports and implementation links. The files of a
+        // Java / Go package see each other: one hub node per directory (`n + dir`)
+        // links them without a quadratic edge list.
+        let hubs = self.dir_files.len();
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n + hubs];
+        for (d, members) in self.dir_files.iter().enumerate() {
+            adj[n + d] = members.clone();
+        }
         for (i, map) in self.imports.iter().enumerate() {
+            if self.dir_of[i] != usize::MAX {
+                adj[i].push(n + self.dir_of[i]);
+            }
+            adj[i].extend(self.star_dirs[i].iter().map(|d| n + d));
             for b in map.values() {
                 match *b {
                     Binding::File(f, _) => adj[i].push(f),
+                    Binding::Dir(d, _) => adj[i].push(n + d),
                     Binding::Package(pkg, name) => {
                         for is_type in [true, false] {
                             adj[i].extend(
@@ -988,7 +1906,7 @@ impl<'g> Deriver<'g> {
         for (base, subs) in &self.subtypes {
             adj[base.0].extend(subs.iter().map(|s| s.0));
         }
-        let mut radj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut radj: Vec<Vec<usize>> = vec![Vec::new(); n + hubs];
         for (i, out) in adj.iter_mut().enumerate() {
             out.sort_unstable();
             out.dedup();
@@ -996,14 +1914,40 @@ impl<'g> Deriver<'g> {
                 radj[j].push(i);
             }
         }
-        let fwd_files = bfs((0..n).filter(|&i| !entry_lines[i].is_empty()), &adj, n);
-        let bwd_files = bfs((0..n).filter(|&i| !producer_lines[i].is_empty()), &radj, n);
+        let fwd_files = bfs(
+            (0..n).filter(|&i| !entry_lines[i].is_empty()),
+            &adj,
+            n + hubs,
+        );
+        let bwd_files = bfs(
+            (0..n).filter(|&i| !producer_lines[i].is_empty()),
+            &radj,
+            n + hubs,
+        );
         let candidate: Vec<bool> = (0..n).map(|i| fwd_files[i] && bwd_files[i]).collect();
         stats.candidate_files = candidate.iter().filter(|&&c| c).count();
+        drop((adj, radj, fwd_files, bwd_files));
 
-        // 2. Resolution of the candidate files' call sites.
-        let mut pairs: BTreeMap<(usize, usize), (u32, EdgeConfidence, &'static str)> =
-            BTreeMap::new();
+        // Files to prune after this derive, files whose pruned sites are needed again.
+        let mut off_path: Vec<FilePath> = Vec::new();
+        let mut missing_sites: Vec<FilePath> = Vec::new();
+        for (i, (path, f)) in self.files.iter().enumerate() {
+            if matches!(self.lang[i], Lang::Script | Lang::Other) {
+                continue;
+            }
+            if !candidate[i] {
+                if !f.sites_pruned && !f.facts.call_sites.is_empty() {
+                    off_path.push((*path).clone());
+                }
+            } else if f.sites_pruned {
+                missing_sites.push((*path).clone());
+            }
+        }
+        stats.missing_sites = missing_sites.len();
+
+        // 2. Resolution of the candidate files' call sites. One entry per resolved site in
+        // resolution order; sorted and reduced to one per (caller, callee) below.
+        let mut pairs: Vec<(usize, usize, u32, EdgeConfidence, &'static str)> = Vec::new();
         let mut budget = match self.graph.call_site_budget {
             0 => MAX_DERIVED_CALL_SITES,
             n => n,
@@ -1025,36 +1969,48 @@ impl<'g> Deriver<'g> {
                 let caller = self.offsets[i] + site.caller as usize;
                 let (targets, via) = self.resolve_site(i, caller_fact.owner.as_deref(), site);
                 for (t, confidence) in targets {
-                    let entry = pairs
-                        .entry((caller, t))
-                        .or_insert((site.line, confidence, via));
-                    if (confidence_rank(confidence), site.line)
-                        < (confidence_rank(entry.1), entry.0)
-                    {
-                        *entry = (site.line, confidence, via);
+                    pairs.push((caller, t, site.line, confidence, via));
+                }
+            }
+        }
+        // The best site per (caller, callee): strongest confidence, then lowest line; a
+        // stable sort keeps the first resolved one on a full tie.
+        pairs.sort_by_key(|p| (p.0, p.1, confidence_rank(p.3), p.2));
+        pairs.dedup_by_key(|p| (p.0, p.1));
+        pairs.shrink_to_fit();
+        stats.resolved_pairs = pairs.len();
+
+        // 3. Callable-level pruning: entry -> ... -> producer. `pairs` is sorted by caller:
+        // the callees of a caller are a contiguous slice; the callers of a callee are found
+        // in the same list sorted the other way.
+        let out_edges: Vec<(usize, usize)> = pairs.iter().map(|p| (p.0, p.1)).collect();
+        let mut in_edges: Vec<(usize, usize)> = out_edges.iter().map(|&(a, b)| (b, a)).collect();
+        in_edges.sort_unstable();
+        let mut entries = BTreeSet::new();
+        let mut producers = BTreeSet::new();
+        // `constructed_methods` per anchoring callable, not per line: several sites may
+        // lie in one constructor.
+        let mut constructed: FastMap<usize, Vec<usize>> = FastMap::default();
+        for i in (0..n).filter(|&i| candidate[i]) {
+            for (lines, set) in [
+                (&entry_lines[i], &mut entries),
+                (&producer_lines[i], &mut producers),
+            ] {
+                for &l in lines {
+                    if let Some(c) = self.enclosing(i, l) {
+                        set.insert(c);
+                        set.extend(
+                            constructed
+                                .entry(c)
+                                .or_insert_with(|| self.constructed_methods(i, c))
+                                .iter()
+                                .copied(),
+                        );
                     }
                 }
             }
         }
-        stats.resolved_pairs = pairs.len();
-
-        // 3. Callable-level pruning: entry -> ... -> producer.
-        let mut out_edges: HashMap<usize, Vec<usize>> = HashMap::new();
-        let mut in_edges: HashMap<usize, Vec<usize>> = HashMap::new();
-        for &(a, b) in pairs.keys() {
-            out_edges.entry(a).or_default().push(b);
-            in_edges.entry(b).or_default().push(a);
-        }
-        let mut entries = BTreeSet::new();
-        let mut producers = BTreeSet::new();
-        for i in (0..n).filter(|&i| candidate[i]) {
-            entries.extend(entry_lines[i].iter().filter_map(|&l| self.enclosing(i, l)));
-            producers.extend(
-                producer_lines[i]
-                    .iter()
-                    .filter_map(|&l| self.enclosing(i, l)),
-            );
-        }
+        drop(constructed);
         let fwd = reach(entries, &out_edges);
         let bwd = reach(producers, &in_edges);
         let kept: BTreeSet<usize> = fwd.intersection(&bwd).copied().collect();
@@ -1102,13 +2058,13 @@ impl<'g> Deriver<'g> {
             });
         }
         let mut edges = Vec::new();
-        for (&(a, b), &(line, confidence, via)) in &pairs {
+        for &(a, b, line, confidence, via) in &pairs {
             if let (Some(&from), Some(&to)) = (id_of.get(&a), id_of.get(&b)) {
                 edges.push(ContractEdge {
                     from,
                     to,
                     kind: EdgeKind::Calls,
-                    metadata: Some(CompactStr::new(format!("{via} L{line}"))),
+                    metadata: Some(compact_str::format_compact!("{via} L{line}")),
                     confidence,
                 });
             }
@@ -1116,12 +2072,19 @@ impl<'g> Deriver<'g> {
         edges.sort_by_key(|e| (e.from, e.to));
         stats.callables = callables.len();
         stats.calls = edges.len();
-        DerivedCalls {
-            callables,
-            edges,
-            by_file,
-            stats,
-        }
+        stats.dispatch_overflow = self.dispatch_overflow;
+        stats.pairs_capped = self.pairs_capped;
+        stats.hops_capped = self.hops_capped.get();
+        (
+            DerivedCalls {
+                callables,
+                edges,
+                by_file,
+                stats,
+                missing_sites,
+            },
+            off_path,
+        )
     }
 }
 
@@ -1146,12 +2109,15 @@ fn bfs(starts: impl Iterator<Item = usize>, adj: &[Vec<usize>], n: usize) -> Vec
     seen
 }
 
-/// Callables reachable from `starts` over `adj`, the starts included (iterative).
-fn reach(starts: BTreeSet<usize>, adj: &HashMap<usize, Vec<usize>>) -> BTreeSet<usize> {
+/// Callables reachable from `starts` over `edges` (sorted `(from, to)` pairs), the
+/// starts included (iterative).
+fn reach(starts: BTreeSet<usize>, edges: &[(usize, usize)]) -> BTreeSet<usize> {
     let mut seen = starts.clone();
     let mut stack: Vec<usize> = starts.into_iter().collect();
     while let Some(i) = stack.pop() {
-        for &j in adj.get(&i).map_or(&[][..], Vec::as_slice) {
+        let lo = edges.partition_point(|e| e.0 < i);
+        let hi = edges.partition_point(|e| e.0 <= i);
+        for &(_, j) in &edges[lo..hi] {
             if seen.insert(j) {
                 stack.push(j);
             }
