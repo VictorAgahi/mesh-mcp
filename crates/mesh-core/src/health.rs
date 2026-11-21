@@ -184,6 +184,11 @@ pub struct IndexHealth {
     /// made up. Counted like `files_scanned`.
     #[serde(default)]
     pub sql_sites_unresolved: usize,
+    /// Files where the per-file cap on in-process bus sites and schedules (NestJS EventEmitter2
+    /// and CQRS, Spring application events, `@Cron` / `@Scheduled`) dropped sites: the sites
+    /// past the cap are not registered. Counted like `files_scanned`.
+    #[serde(default)]
+    pub files_inproc_capped: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -295,6 +300,18 @@ impl IndexHealth {
     pub fn record_sql(&mut self, capped: bool, unresolved: u32) {
         self.files_sql_capped += usize::from(capped);
         self.sql_sites_unresolved += unresolved as usize;
+    }
+
+    /// One file's in-process bus cap (`FileIndex::inproc_capped`).
+    #[inline]
+    pub fn record_inproc(&mut self, capped: bool) {
+        self.files_inproc_capped += usize::from(capped);
+    }
+
+    /// Whether the in-process site cap dropped events: some bus sites or schedules are missing.
+    #[inline]
+    pub fn inproc_truncated(&self) -> bool {
+        self.files_inproc_capped > 0
     }
 
     /// Whether a SQL scan cap dropped events: some outbox / NOTIFY / LISTEN sites are missing.
@@ -531,6 +548,15 @@ impl IndexHealth {
                 self.files_sql_capped
             );
         }
+        if self.files_inproc_capped > 0 {
+            let _ = writeln!(
+                out,
+                "    {} file(s) cut by the in-process bus site cap (NestJS EventEmitter2 / CQRS, Spring \
+                 events, schedules; docs/parser-support.md, section 3.5): the sites past the cap are \
+                 not registered",
+                self.files_inproc_capped
+            );
+        }
         if self.sql_sites_unresolved > 0 {
             let _ = writeln!(
                 out,
@@ -571,6 +597,7 @@ impl IndexHealth {
         self.files_call_facts_skipped_path += other.files_call_facts_skipped_path;
         self.files_sql_capped += other.files_sql_capped;
         self.sql_sites_unresolved += other.sql_sites_unresolved;
+        self.files_inproc_capped += other.files_inproc_capped;
         self.files_skipped_non_source += other.files_skipped_non_source;
         // The calls-layer counters are the graph's, set after the reconcile.
     }

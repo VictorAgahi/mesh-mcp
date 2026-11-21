@@ -119,7 +119,8 @@ carries it. Up to 8.x a Kafka topic `orders`, a RabbitMQ queue `orders` and an S
 collapsed into one key, so a producer of one appeared linked to a consumer of another. Since 9.0
 (ticket T7) each producer and consumer may carry the `Broker` its client library speaks to
 (`mesh_core::Broker`: `kafka`, `rabbitmq`, `redis`, `nats`, `mqtt`, `sqs`, `sns`, `kinesis`,
-`eventbridge`, `pubsub`, `pulsar`, `servicebus`, `eventhubs`, `stomp`, `bull`, `beequeue`):
+`eventbridge`, `pubsub`, `pulsar`, `servicebus`, `eventhubs`, `stomp`, `bull`, `beequeue`,
+`inproc` for the application's own buses, [parser support 3.5](parser-support.md#35-in-process-buses-and-schedules)):
 
 - The registry maps (`topic_producers`, `topic_consumers`) are still keyed by the plain name. The
   broker of each site lives beside them (`ContractGraph::add_producer_on` / `add_consumer_on`; the

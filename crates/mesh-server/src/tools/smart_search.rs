@@ -583,7 +583,11 @@ impl SmartSearchTool {
         let kind_rank: u8 = match node.kind {
             NodeKind::GrpcService | NodeKind::GrpcMethod | NodeKind::HttpEndpoint => 0,
             NodeKind::ProtoMessage | NodeKind::Interface => 1,
-            NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue | NodeKind::Saga => 2,
+            NodeKind::KafkaTopic
+            | NodeKind::EventStream
+            | NodeKind::Queue
+            | NodeKind::Saga
+            | NodeKind::Schedule => 2,
             NodeKind::PostProcessor => 3,
             NodeKind::ServiceClass => 4,
             // A `Callable` is never in the graph indices this search reads.

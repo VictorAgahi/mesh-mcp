@@ -3,7 +3,7 @@
 //! hand in `tests/golden/events/*.expected.yaml`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use mesh_core::{ContractGraph, EdgeConfidence, NodeKind};
+use mesh_core::{ContractGraph, EdgeConfidence};
 use mesh_parsers::languages::PolyglotIndexer;
 use std::path::{Path, PathBuf};
 
@@ -136,38 +136,19 @@ fn layered_ts_is_deterministic() {
 }
 
 #[test]
-fn monolith_hops_resolve_once_a_producer_is_known() {
-    // EventEmitter2 / CQRS producers are not detected before T4, so nothing is on an
-    // entry -> producer path and the layer is empty, by design.
-    let mut graph = index_dir(&fixture_dir("nestjs-monolith-bus"));
-    assert!(graph.call_edges().is_empty());
-    // Declare the two publishes the source makes (`eventEmitter.emit` in
-    // OrderEvents.announce, `commandBus.execute` in RefundService.request).
-    for (file, line, topic) in [
-        ("order.events.ts", 9, "order.created"),
-        ("refund.service.ts", 10, "IssueRefundCommand"),
-    ] {
-        let path = fixture_dir("nestjs-monolith-bus").join(file);
-        let id = graph.add_node(mesh_core::ContractNode {
-            id: 0,
-            name: topic.into(),
-            kind: NodeKind::EventStream,
-            file_path: std::sync::Arc::from(path.as_path()),
-            line_start: line,
-            line_end: line,
-            package: "nestjs-monolith-bus".into(),
-            repo_id: 0,
-            signature: None,
-            docstring: None,
-        });
-        graph.add_producer(id, topic);
-    }
-    graph.reconcile_edges();
+fn monolith_hops_resolve_through_the_in_process_buses() {
+    // EventEmitter2, CQRS and `@Cron` entries are read since T4: every golden hop of the
+    // fixture resolves from the real extraction, with no producer declared by hand.
+    let graph = index_dir(&fixture_dir("nestjs-monolith-bus"));
     let got = calls(&graph);
     for (from, to) in [
         ("OrderController.create", "OrderService.create"),
         ("OrderService.create", "OrderEvents.announce"),
+        ("InvoiceListener.onOrderCreated", "InvoiceService.issue"),
         ("RefundController.request", "RefundService.request"),
+        ("IssueRefundHandler.execute", "RefundLedger.record"),
+        ("ReportScheduler.hourly", "ReportService.generate"),
+        ("ReportScheduler.nightlyPurge", "ReportService.purge"),
     ] {
         assert!(
             got.iter()

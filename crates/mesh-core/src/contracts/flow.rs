@@ -57,8 +57,9 @@ pub enum FlowEntry<'a> {
     Route(Vec<NodeId>),
     /// A handler symbol (`OrderService.place`, `place`).
     Handler(&'a str),
-    /// A scheduled method (`ReportScheduler.hourly`). Schedules are not indexed
-    /// yet: the method is resolved like a handler.
+    /// A scheduled method (`ReportScheduler.hourly`): an indexed schedule (`@Cron`,
+    /// `@Interval`, `@Timeout`, `@Scheduled`) when one carries the name, else the method
+    /// resolved like a handler.
     Cron(&'a str),
 }
 
@@ -287,6 +288,23 @@ struct FlowIndex<'g> {
     /// `Consumes` edges in both directions (topic <-> consumer).
     consumes: HashMap<NodeId, Vec<NodeId>>,
     consumer_ids: HashSet<NodeId>,
+    /// Site -> the brokers (a [`Broker::bit`] mask) it is statically known to talk to; absent
+    /// when unknown.
+    site_brokers: HashMap<NodeId, u32>,
+}
+
+impl FlowIndex<'_> {
+    /// Whether linking `a` and `b` through the legacy same-file fallback would cross the
+    /// in-process boundary: one is known to be an in-process site (`Broker::InProc` only) and
+    /// the other is known to talk to another broker. A site whose broker is unknown links as
+    /// before.
+    fn crosses_inproc(&self, a: NodeId, b: NodeId) -> bool {
+        let inproc = Broker::InProc.bit();
+        match (self.site_brokers.get(&a), self.site_brokers.get(&b)) {
+            (Some(&x), Some(&y)) => (x == inproc) != (y == inproc),
+            _ => false,
+        }
+    }
 }
 
 /// One segment found by a call walk, before it becomes a hop.
@@ -331,7 +349,12 @@ impl ContractGraph {
                 && flow.upstream_producers.is_empty()
                 && flow.downstream_consumers.is_empty());
             if matches!(entry, FlowEntry::Auto(_)) && !any {
-                entry = FlowEntry::Handler(t);
+                // A name that is a scheduled method reads as a cron entry, not a handler.
+                entry = if self.schedules_named(t).is_empty() {
+                    FlowEntry::Handler(t)
+                } else {
+                    FlowEntry::Cron(t)
+                };
             } else {
                 entry = FlowEntry::Topic(t);
                 matched = Some(flow);
@@ -369,7 +392,7 @@ impl ContractGraph {
                 (FlowEntry::Cron(name), _) => (
                     name.to_string(),
                     "cron",
-                    self.resolve_handler(name),
+                    self.resolve_schedule(name),
                     HashSet::new(),
                     None,
                 ),
@@ -399,6 +422,34 @@ impl ContractGraph {
         trace.target = CompactStr::new(target);
         trace.entry_kind = kind;
         trace
+    }
+
+    /// The scheduled methods named `name` (`Owner.method` or a bare method); a name no
+    /// schedule carries falls back to [`Self::resolve_handler`], so a method scheduled by
+    /// something the indexer does not see (a runtime registry) still traces as a handler.
+    /// Sorted.
+    fn resolve_schedule(&self, name: &str) -> Vec<&ContractNode> {
+        let out = self.schedules_named(name);
+        if out.is_empty() {
+            return self.resolve_handler(name);
+        }
+        out
+    }
+
+    /// The `Schedule` nodes named `name` (`Owner.method` or a bare method), sorted.
+    fn schedules_named(&self, name: &str) -> Vec<&ContractNode> {
+        let name = name.trim();
+        let mut out: Vec<&ContractNode> = self
+            .nodes
+            .values()
+            .filter(|n| {
+                n.kind == NodeKind::Schedule
+                    && (n.name == name
+                        || (!name.contains('.') && n.name.rsplit('.').next() == Some(name)))
+            })
+            .collect();
+        sort_nodes(&mut out);
+        out
     }
 
     /// Callables named `name` (`Owner.method` or a bare method), else declarations
@@ -470,8 +521,7 @@ impl ContractGraph {
                     continue;
                 };
                 let is_producer = produces.contains_key(id);
-                let is_entry = consumer_ids.contains(id)
-                    || matches!(node.kind, NodeKind::HttpEndpoint | NodeKind::GrpcMethod);
+                let is_entry = consumer_ids.contains(id) || node.kind.is_entry_site();
                 if !(is_producer || is_entry) {
                     continue;
                 }
@@ -488,7 +538,16 @@ impl ContractGraph {
         for v in producers_in.values_mut().chain(entries_in.values_mut()) {
             sort_nodes(v);
         }
+        let mut site_brokers: HashMap<NodeId, u32> = HashMap::new();
+        for map in [&self.producer_brokers, &self.consumer_brokers] {
+            for sites in map.values() {
+                for (id, mask) in sites {
+                    *site_brokers.entry(*id).or_insert(0) |= mask;
+                }
+            }
+        }
         FlowIndex {
+            site_brokers,
             calls_out,
             calls_in,
             producers_in,
@@ -794,7 +853,9 @@ impl ContractGraph {
             let mut same_file: Vec<&ContractNode> = self
                 .get_nodes_for_file(&s.file_path)
                 .iter()
-                .filter(|id| **id != s.id && idx.produces.contains_key(id))
+                .filter(|id| {
+                    **id != s.id && idx.produces.contains_key(id) && !idx.crosses_inproc(s.id, **id)
+                })
                 .filter_map(|id| self.nodes.get(id))
                 .collect();
             sort_nodes(&mut same_file);
@@ -839,6 +900,8 @@ impl ContractGraph {
                 )
             } else if e.kind == NodeKind::HttpEndpoint {
                 (FlowStepKind::Route, None)
+            } else if e.kind == NodeKind::Schedule {
+                (FlowStepKind::Cron, None)
             } else {
                 (FlowStepKind::Handler, None)
             };
@@ -879,7 +942,9 @@ impl ContractGraph {
             let mut same_file: Vec<&ContractNode> = self
                 .get_nodes_for_file(&p.file_path)
                 .iter()
-                .filter(|id| **id != p.id && idx.consumer_ids.contains(id))
+                .filter(|id| {
+                    **id != p.id && idx.consumer_ids.contains(id) && !idx.crosses_inproc(p.id, **id)
+                })
                 .filter_map(|id| self.nodes.get(id))
                 .collect();
             sort_nodes(&mut same_file);

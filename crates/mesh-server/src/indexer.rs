@@ -680,6 +680,7 @@ impl WorkspaceIndexer {
                 health.record_calls_skipped_path();
             }
             health.record_sql(frag.code.sql_capped, frag.code.sql_unresolved);
+            health.record_inproc(frag.code.inproc_capped);
             if frag.code.calls.capped {
                 tracing::warn!(
                     target: "mesh::indexer",
@@ -2170,6 +2171,41 @@ mod tests {
             assert!(summary.contains("SQL scan cap"), "{summary}");
             assert!(summary.contains("3 SQL outbox insert"), "{summary}");
         }
+    }
+
+    /// The in-process site cap (9.0 T4) is counted, listed by the summary and survives the parse
+    /// cache; a file under the cap is not counted.
+    #[test]
+    fn inproc_site_cap_reaches_index_health_and_survives_the_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let mut hostile =
+            String::from("import { OnEvent } from '@nestjs/event-emitter';\nexport class L {\n");
+        for i in 0..2_100 {
+            hostile.push_str(&format!("@OnEvent('e.{i}') h{i}() {{}}\n"));
+        }
+        hostile.push_str("}\n");
+        std::fs::write(root.join("hostile.ts"), hostile).expect("write hostile");
+        std::fs::write(
+            root.join("ok.ts"),
+            "import { OnEvent } from '@nestjs/event-emitter';\nexport class K {\n @OnEvent('a') h() {}\n}\n",
+        )
+        .expect("write ok");
+        let config =
+            Config::load_from_str("[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n")
+                .expect("config");
+        let roots = vec![root.clone()];
+        let cache = mesh_core::PersistentIndexCache::in_memory().expect("cache");
+        let mut prints = Vec::new();
+        for pass in ["cold", "warm"] {
+            let snap = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
+            assert_eq!(snap.health.files_inproc_capped, 1, "{pass}");
+            assert!(snap.health.inproc_truncated(), "{pass}");
+            let summary = snap.health.render_summary(5);
+            assert!(summary.contains("in-process bus site cap"), "{summary}");
+            prints.push(snap.fingerprint());
+        }
+        assert_eq!(prints[0], prints[1]);
     }
 
     /// The path-driven `reload_paths` must produce the exact same result as the
