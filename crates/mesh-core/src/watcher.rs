@@ -646,6 +646,15 @@ impl FileWatcherService {
             return true;
         }
 
+        // `.sql` in any case: the crawler indexes `UPPER.SQL`, so an edit must reload it.
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("sql"))
+        {
+            return true;
+        }
+
         matches!(
             path.extension().and_then(|e| e.to_str()),
             Some(
@@ -674,7 +683,6 @@ impl FileWatcherService {
                     | "scala"
                     | "sc"
                     | "proto"
-                    | "sql"
                     | "yaml"
                     | "yml"
                     | "properties"
@@ -1102,6 +1110,16 @@ mod tests {
             None,
             "guard cleared it"
         );
+    }
+
+    #[test]
+    fn sql_files_are_relevant_in_any_case() {
+        for f in ["db/001.sql", "db/UPPER.SQL", "db/Mixed.Sql"] {
+            assert!(FileWatcherService::is_relevant_path(Path::new(f)), "{f}");
+        }
+        assert!(!FileWatcherService::is_relevant_path(Path::new(
+            "db/x.sqlx"
+        )));
     }
 
     #[test]

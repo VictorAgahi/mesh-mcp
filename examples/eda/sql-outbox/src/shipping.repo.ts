@@ -23,4 +23,13 @@ export class ShippingRepo {
   hint(): string {
     return "to publish, run INSERT INTO outbox (topic, payload) VALUES ('prose.only', 1)";
   }
+
+  async escaped(): Promise<void> {
+    await this.pool.query('INSERT INTO outbox (topic, payload) VALUES (\'order.escaped\', 1)');
+  }
+
+  announce(log: { info(message: string): void }): void {
+    log.info("Notify admins");
+    log.info("Listen 3000");
+  }
 }

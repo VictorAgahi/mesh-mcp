@@ -5,8 +5,12 @@
 # an unquoted name is folded to lower case (listen Invoice_Ready listens on invoice_ready), a quoted one
 # is kept as written (the scorer lower-cases every key anyway).
 # Not resolved on purpose, so not annotated as sites: the insert whose topic is TG_TABLE_NAME || '.changed'
-# and the insert whose topic is the bind parameter $1. They are listed as negatives (a key made up for them
-# would be a false positive), together with the comment and string-literal mentions.
+# and the insert whose topic is the bind parameter $1 (also the bind row inside a multi-row VALUES, and
+# pg_notify on a variable channel). They are listed as negatives (a key made up for them would be a false
+# positive), together with the comment and string-literal mentions, the log lines "Notify admins" and
+# "Listen 3000" (prose, not statements) and documentation text in a dollar-quoted COMMENT ON string.
+# 004_long_comment.sql has a 70-line `-- (` banner and a comment line of 1,029 bytes before its NOTIFY: a
+# lexer reads it (a tree-sitter style line-length or nesting guard would drop the whole file).
 corpus: sql-outbox
 root: examples/eda/sql-outbox
 config: mesh-mcp.toml
@@ -21,6 +25,10 @@ producers:
   - {id: p6, topic: order.shipped, file: src/shipping.repo.ts, line: 10, language: ts, tags: [sql]}
   - {id: p7, topic: stock_changed, file: go/stock.go, line: 11, language: go, tags: [sql]}
   - {id: p8, topic: invoice.issued, file: java/InvoiceOutbox.java, line: 13, language: java, tags: [sql]}
+  - {id: p9, topic: order.escaped, file: src/shipping.repo.ts, line: 28, language: ts, tags: [sql]}
+  - {id: p10, topic: multi.first, file: db/migrations/003_adversarial.sql, line: 3, language: sql, tags: [sql]}
+  - {id: p11, topic: multi.third, file: db/migrations/003_adversarial.sql, line: 3, language: sql, tags: [sql]}
+  - {id: p12, topic: after_long_comment, file: db/migrations/004_long_comment.sql, line: 73, language: sql, tags: [sql]}
 
 consumers:
   - {id: c1, topic: invoice_ready, file: db/migrations/002_channels.sql, line: 5, language: sql, tags: [sql]}
@@ -62,3 +70,7 @@ negatives:
   - {kind: producer, file: src/shipping.repo.ts, line: 20, note: "audit_log is not an outbox"}
   - {kind: producer, file: src/shipping.repo.ts, line: 24, note: "prose string that mentions INSERT INTO outbox"}
   - {kind: consumer, file: src/notifier.py, line: 5, note: "LISTEN in a comment"}
+  - {kind: producer, file: src/shipping.repo.ts, line: 32, note: "log line Notify admins: prose, not a NOTIFY statement"}
+  - {kind: consumer, file: src/shipping.repo.ts, line: 33, note: "log line Listen 3000: prose, not a LISTEN statement"}
+  - {kind: producer, file: db/migrations/003_adversarial.sql, line: 6, note: "pg_notify on a variable channel: not statically resolved"}
+  - {kind: producer, file: db/migrations/003_adversarial.sql, line: 9, note: "NOTIFY inside a dollar-quoted COMMENT ON string, not a statement"}

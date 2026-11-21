@@ -116,6 +116,14 @@ impl DoctorCommand {
                     "{summary}\n    A call path through these files, or a wildcard subscription, may be cut."
                 ),
             )
+        } else if health.sql_truncated()
+            && health.rejected.is_empty()
+            && health.rejected_overflow == 0
+        {
+            DoctorCheck::warn(
+                "Index health",
+                format!("{summary}\n    Some SQL events of these files are not registered."),
+            )
         } else if health.rejected.is_empty() && health.rejected_overflow == 0 {
             DoctorCheck::ok("Index health", summary)
         } else {

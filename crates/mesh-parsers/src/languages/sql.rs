@@ -14,23 +14,31 @@
 //! - `NOTIFY channel[, 'payload']` and `pg_notify('channel', ...)`: produce `channel`;
 //! - `LISTEN channel`: consume `channel`.
 //!
-//! Function and trigger bodies need no special case: a dollar-quoted body is scanned as code, so the
-//! `INSERT` / `pg_notify` inside a trigger function is the producer, on the line of its literal.
-//! An unquoted channel is folded to lower case (Postgres does), a quoted one is kept as written.
+//! Function and trigger bodies need no special case: a dollar-quoted body that follows `AS` (a
+//! function body) or `DO` is scanned as code, so the `INSERT` / `pg_notify` inside a trigger function
+//! is the producer, on the line of its literal. Any other dollar-quoted text (`COMMENT ON ... IS
+//! $$..$$`, `SELECT $$..$$`) is a string literal and registers nothing. An unquoted channel is folded
+//! to lower case (Postgres does), a quoted one is kept as written.
 //!
 //! The same statements are read from the string literals of TypeScript / JavaScript, Go, Java and
 //! Python files ([`scan_embedded`]): a literal is scanned only when it BEGINS with `INSERT`,
 //! `NOTIFY`, `LISTEN`, `SELECT`, `PERFORM` or `BEGIN`, so prose that merely mentions `INSERT INTO
-//! outbox`, and every comment, are ignored. Limits: adjacent literals (`"INSERT ..." + "VALUES ..."`)
-//! are not joined, and a regex literal that holds a quote can desynchronise the host lexer for the
-//! rest of its line (it ends at the newline).
+//! outbox`, and every comment, are ignored. In a host literal `NOTIFY` and `LISTEN` must be written in
+//! upper case and the channel must start with a letter or `_` (`log.info("Notify admins")` and
+//! `log.info("Listen 3000")` are log lines, not events); `INSERT` and `pg_notify` stay case-insensitive.
+//! Backslash escapes of the host string (`\'`, `\n`) are decoded first. Limits: adjacent literals
+//! (`"INSERT ..." + "VALUES ..."`) are not joined, and a regex literal that holds a quote can
+//! desynchronise the host lexer for the rest of its line (it ends at the newline).
 //!
-//! Bounds (CLAUDE.md commandment 2): a `.sql` file goes through `AstGuard::check_content` (384 KB,
-//! null-byte sniff, 1,024-byte lines, nesting depth 64) before any scan; the token list is capped, as
-//! are the facts per file and the rows per `VALUES`.
+//! Bounds (CLAUDE.md commandment 2): a `.sql` file goes through [`check_content`] (384 KB and the
+//! null-byte sniff: a lexer is linear and its token list is capped, so the line-length and nesting
+//! rules that protect a tree-sitter parse do not apply, and a long comment or a `-- (` banner must not
+//! drop the file). Every cap (tokens, sites per file, rows per `VALUES`, scanned literals) is COUNTED:
+//! `SqlScan::truncated` reaches `IndexHealth::files_sql_capped`, and the outbox inserts and
+//! `pg_notify` calls whose key is not a static literal reach `IndexHealth::sql_sites_unresolved`.
 
 use super::FileIndex;
-use crate::guard::AstGuard;
+use crate::guard::{AstGuard, GuardRejection};
 use mesh_core::{CompactStr, ContractNode, NodeKind, RepoId};
 use std::path::Path;
 use std::sync::Arc;
@@ -45,6 +53,8 @@ const MAX_ROWS: usize = 512;
 const MAX_COLUMNS: usize = 256;
 /// Embedded string literals scanned per file.
 const MAX_LITERALS: usize = 4_096;
+/// Nested dollar-quoted code bodies read as code; deeper ones are string literals.
+const MAX_CODE_BODIES: usize = 8;
 /// Longest topic or channel kept.
 const MAX_TOPIC_LEN: usize = 255;
 
@@ -89,7 +99,7 @@ pub struct SqlScan {
     pub facts: Vec<SqlFact>,
     /// Outbox inserts and `pg_notify` calls whose key is not a static literal.
     pub unresolved: usize,
-    /// A bound (tokens, facts) cut the scan short.
+    /// A cap (tokens, sites, rows of a `VALUES`, scanned literals) dropped something.
     pub truncated: bool,
 }
 
@@ -126,6 +136,7 @@ fn is_ident_part(b: u8) -> bool {
 /// Length of a dollar-quote delimiter (`$$`, `$tag$`) starting at `i`, if it is one. `$1` is a
 /// parameter, not a delimiter.
 fn dollar_tag_len(b: &[u8], i: usize) -> Option<usize> {
+    const MAX_TAG: usize = 64;
     let mut j = i + 1;
     if b.get(j)
         .is_some_and(|&c| c.is_ascii_alphabetic() || c == b'_')
@@ -134,7 +145,23 @@ fn dollar_tag_len(b: &[u8], i: usize) -> Option<usize> {
             j += 1;
         }
     }
-    (j < b.len() && b[j] == b'$').then_some(j + 1 - i)
+    (j < b.len() && b[j] == b'$' && j + 1 - i <= MAX_TAG).then_some(j + 1 - i)
+}
+
+/// Whether a dollar-quoted body that starts after `toks` is code: a function body (`AS $$`) or a
+/// `DO` block (`DO $$`, `DO LANGUAGE plpgsql $$`). Anything else is a string literal.
+fn opens_code(src: &str, toks: &[Tok]) -> bool {
+    let word = |t: &Tok, kw: &str| {
+        t.kind == Kind::Word
+            && src
+                .get(t.start as usize..t.end as usize)
+                .is_some_and(|w| w.eq_ignore_ascii_case(kw))
+    };
+    match toks {
+        [.., last] if word(last, "as") || word(last, "do") => true,
+        [.., a, b, _] => word(a, "do") && word(b, "language"),
+        _ => false,
+    }
 }
 
 /// Splits `src` into tokens. Comments (`--`, nested `/* */`) are dropped; line numbers start at
@@ -145,6 +172,8 @@ fn lex(src: &str, first_line: usize) -> (Vec<Tok>, bool) {
     let mut toks: Vec<Tok> = Vec::new();
     let mut line = first_line as u32;
     let mut i = 0usize;
+    // Delimiters of the dollar-quoted CODE bodies (function bodies, `DO` blocks) being read.
+    let mut code_tags: Vec<&[u8]> = Vec::new();
     let push = |toks: &mut Vec<Tok>, kind, start: usize, end: usize, line: u32, byte| {
         toks.push(Tok {
             kind,
@@ -222,10 +251,38 @@ fn lex(src: &str, first_line: usize) -> (Vec<Tok>, bool) {
                 push(&mut toks, kind, i + 1, end, start_line, 0);
                 i = j + 1;
             }
-            b'$' => {
-                push(&mut toks, Kind::Punct, i, i + 1, line, b'$');
-                i += dollar_tag_len(b, i).unwrap_or(1);
-            }
+            b'$' => match dollar_tag_len(b, i) {
+                None => {
+                    push(&mut toks, Kind::Punct, i, i + 1, line, b'$');
+                    i += 1;
+                }
+                Some(len) => {
+                    let tag = &b[i..i + len];
+                    if code_tags.last() == Some(&tag) {
+                        // The closing delimiter of a code body.
+                        code_tags.pop();
+                        push(&mut toks, Kind::Punct, i, i + 1, line, b'$');
+                        i += len;
+                    } else if code_tags.len() < MAX_CODE_BODIES && opens_code(src, &toks) {
+                        code_tags.push(tag);
+                        push(&mut toks, Kind::Punct, i, i + 1, line, b'$');
+                        i += len;
+                    } else {
+                        // A dollar-quoted string literal: `start..end` is the inside.
+                        let start_line = line;
+                        let start = i + len;
+                        let mut j = start;
+                        while j < n && !b[j..].starts_with(tag) {
+                            if b[j] == b'\n' {
+                                line += 1;
+                            }
+                            j += 1;
+                        }
+                        push(&mut toks, Kind::Str, start, j, start_line, 0);
+                        i = (j + len).min(n);
+                    }
+                }
+            },
             _ if is_ident_start(c) => {
                 let start = i;
                 while i < n && is_ident_part(b[i]) {
@@ -258,6 +315,10 @@ struct Scanner<'a> {
     src: &'a str,
     t: &'a [Tok],
     out: SqlScan,
+    /// Reading the SQL held in a host-language string literal: `NOTIFY` / `LISTEN` must be upper case.
+    embedded: bool,
+    /// The site cap was hit: stop scanning.
+    full: bool,
 }
 
 impl<'a> Scanner<'a> {
@@ -288,6 +349,7 @@ impl<'a> Scanner<'a> {
     fn push(&mut self, role: SqlRole, topic: CompactStr, line: u32, via: &'static str) {
         if self.out.facts.len() >= MAX_FACTS {
             self.out.truncated = true;
+            self.full = true;
             return;
         }
         self.out.facts.push(SqlFact {
@@ -300,15 +362,15 @@ impl<'a> Scanner<'a> {
 
     fn run(&mut self) {
         let mut i = 0;
-        while i < self.t.len() && !self.out.truncated {
+        while i < self.t.len() && !self.full {
             i = if self.t[i].kind != Kind::Word {
                 i + 1
             } else if self.word_is(i, "insert") {
                 self.insert(i)
             } else if self.word_is(i, "notify") {
-                self.channel(i, SqlRole::Produce, "sql NOTIFY")
+                self.channel(i, SqlRole::Produce, "sql NOTIFY", "NOTIFY")
             } else if self.word_is(i, "listen") {
-                self.channel(i, SqlRole::Consume, "sql LISTEN")
+                self.channel(i, SqlRole::Consume, "sql LISTEN", "LISTEN")
             } else if self.word_is(i, "pg_notify") {
                 self.pg_notify(i)
             } else {
@@ -320,7 +382,7 @@ impl<'a> Scanner<'a> {
     /// `NOTIFY ch` / `LISTEN ch` at the start of a statement. A statement start is the text start,
     /// `;`, a dollar-quote delimiter, or `BEGIN` / `THEN` / `ELSE` / `LOOP` / `DO`: a column or a
     /// type that happens to be named `notify` is not one.
-    fn channel(&mut self, i: usize, role: SqlRole, via: &'static str) -> usize {
+    fn channel(&mut self, i: usize, role: SqlRole, via: &'static str, keyword: &str) -> usize {
         let at_start = i == 0
             || self.punct_is(i - 1, b';')
             || self.punct_is(i - 1, b'$')
@@ -331,7 +393,16 @@ impl<'a> Scanner<'a> {
             || self.punct_is(i + 2, b';')
             || self.punct_is(i + 2, b',')
             || self.punct_is(i + 2, b'$');
-        if !at_start || !self.is_ident(i + 1) || !ends {
+        // A channel is an identifier: it starts with a letter or `_` (`Listen 3000` is prose).
+        let named = self.is_ident(i + 1)
+            && (self.t[i + 1].kind == Kind::Quoted
+                || self
+                    .text(i + 1)
+                    .bytes()
+                    .next()
+                    .is_some_and(|c| !c.is_ascii_digit()));
+        let spelled = !self.embedded || self.text(i) == keyword;
+        if !at_start || !named || !ends || !spelled {
             return i + 1;
         }
         let t = self.t[i + 1];
@@ -431,7 +502,11 @@ impl<'a> Scanner<'a> {
         if self.word_is(k, "values") {
             k += 1;
             let mut rows = 0;
-            while self.punct_is(k, b'(') && rows < MAX_ROWS {
+            while self.punct_is(k, b'(') {
+                if rows >= MAX_ROWS {
+                    self.out.truncated = true;
+                    break;
+                }
                 let (item, end) = self.list_item(k + 1, target);
                 k = if self.punct_is(end, b')') {
                     end + 1
@@ -535,6 +610,10 @@ fn valid_topic(s: &str) -> Option<CompactStr> {
 
 /// Scans SQL text. Facts come in source order, so the result is deterministic.
 pub fn scan_sql(src: &str, first_line: usize) -> SqlScan {
+    scan_text(src, first_line, false)
+}
+
+fn scan_text(src: &str, first_line: usize, embedded: bool) -> SqlScan {
     if src.len() as u64 > AstGuard::MAX_FILE_SIZE_BYTES {
         return SqlScan {
             truncated: true,
@@ -546,10 +625,28 @@ pub fn scan_sql(src: &str, first_line: usize) -> SqlScan {
         src,
         t: &toks,
         out: SqlScan::default(),
+        embedded,
+        full: false,
     };
     s.run();
     s.out.truncated |= cut;
     s.out
+}
+
+/// The guard of a `.sql` file: the size budget and the null-byte sniff only. The line-length and
+/// nesting rules protect a tree-sitter parse; this lexer is linear and token-capped, so a long comment
+/// line or a `-- (` banner must not cost the file its events.
+pub fn check_content(len: u64, content: &[u8]) -> Result<(), GuardRejection> {
+    if len > AstGuard::MAX_FILE_SIZE_BYTES {
+        return Err(GuardRejection::Oversized {
+            size: len,
+            budget: AstGuard::MAX_FILE_SIZE_BYTES,
+        });
+    }
+    if AstGuard::looks_binary(content) {
+        return Err(GuardRejection::Binary);
+    }
+    Ok(())
 }
 
 /// Host language of a file whose string literals are scanned.
@@ -592,6 +689,35 @@ fn starts_like_sql(body: &str) -> bool {
     ["insert", "notify", "listen", "select", "perform", "begin"]
         .iter()
         .any(|kw| word.eq_ignore_ascii_case(kw))
+}
+
+/// Decodes the backslash escapes of a host string literal, as the host does: `\'` and `\"` become
+/// the quote, `\\` a backslash, `\n`, `\r` and `\t` a blank (they are not newlines of the source, so
+/// line numbers stay true). Other escapes are kept.
+fn unescape_host(body: &str) -> std::borrow::Cow<'_, str> {
+    if !body.contains('\\') {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\'') => out.push('\''),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('n' | 'r' | 't') => out.push(' '),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Scans the SQL held in the string literals of a host-language file. Comments are skipped by the
@@ -674,9 +800,18 @@ pub fn scan_embedded(src: &str, host: Host) -> SqlScan {
                 }
                 let end = j.min(n);
                 if let Some(body) = src.get(body_start..end) {
-                    if starts_like_sql(body) && literals < MAX_LITERALS {
+                    if starts_like_sql(body) {
+                        if literals >= MAX_LITERALS {
+                            out.truncated = true;
+                            break;
+                        }
                         literals += 1;
-                        let found = scan_sql(body, start_line);
+                        let decoded = if escapes {
+                            unescape_host(body)
+                        } else {
+                            std::borrow::Cow::Borrowed(body)
+                        };
+                        let found = scan_text(&decoded, start_line, true);
                         out.unresolved += found.unresolved;
                         out.truncated |= found.truncated;
                         for fact in found.facts {
@@ -704,10 +839,12 @@ pub fn scan_embedded(src: &str, host: Host) -> SqlScan {
 
 /// Registers every fact of `scan` as an `EventStream` node and a producer or consumer on it.
 fn register(out: &mut FileIndex, scan: SqlScan, file_path: &Path, repo_id: RepoId) {
+    out.sql_unresolved = out.sql_unresolved.saturating_add(scan.unresolved as u32);
     if scan.truncated {
-        tracing::debug!(
+        out.sql_capped = true;
+        tracing::warn!(
             target: "mesh::parser",
-            "SQL scan of {} hit a bound (tokens, facts or size)",
+            "{}: SQL scan hit a cap (tokens, sites, VALUES rows or literals); some events are not registered",
             file_path.display()
         );
     }
@@ -741,7 +878,7 @@ fn register(out: &mut FileIndex, scan: SqlScan, file_path: &Path, repo_id: RepoI
 /// indexer already counts that as a rejection before it gets here).
 pub fn extract_file(file_path: &Path, content: &str, repo_id: RepoId) -> FileIndex {
     let mut out = FileIndex::default();
-    if AstGuard::check_content(file_path, content.as_bytes()).is_err() {
+    if check_content(content.len() as u64, content.as_bytes()).is_err() {
         return out;
     }
     register(&mut out, scan_sql(content, 1), file_path, repo_id);
@@ -762,6 +899,14 @@ pub fn add_embedded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sites_of(idx: &FileIndex) -> Vec<String> {
+        idx.producers
+            .iter()
+            .chain(idx.consumers.iter())
+            .map(|(_, t)| t.to_string())
+            .collect()
+    }
 
     fn produced(scan: &SqlScan) -> Vec<(String, usize)> {
         scan.facts
@@ -964,21 +1109,25 @@ mod tests {
     #[test]
     fn hostile_inputs_are_bounded() {
         let p = Path::new("x.sql");
-        // Oversized, binary and long-line files are refused by the guard.
+        // Oversized and binary files are refused by the guard.
         assert!(extract_file(p, &"-- x\n".repeat(100_000), 0)
             .nodes
             .is_empty());
         assert!(extract_file(p, "NOTIFY a;\0\n", 0).nodes.is_empty());
-        assert!(
-            extract_file(p, &format!("NOTIFY a;{}\n", " ".repeat(10_000)), 0)
-                .nodes
-                .is_empty()
-        );
-        // Nesting depth 65 is refused.
+        // A lexer has no line-length or nesting rule: a long comment, a CJK line of 1,026 bytes and
+        // a `-- (` banner must not cost the file its events (F4).
+        let long = format!("-- {}\nNOTIFY after_long;\n", "x".repeat(1_100));
+        assert_eq!(sites_of(&extract_file(p, &long, 0)), vec!["after_long"]);
+        let cjk = format!("-- {}\nNOTIFY after_cjk;\n", "\u{4e2d}".repeat(342));
+        assert!(cjk.lines().next().is_some_and(|l| l.len() == 1_029));
+        assert_eq!(sites_of(&extract_file(p, &cjk, 0)), vec!["after_cjk"]);
+        let banner = format!("{}NOTIFY after_banner;\n", "-- (\n".repeat(70));
+        assert_eq!(sites_of(&extract_file(p, &banner, 0)), vec!["after_banner"]);
         let deep = format!("{}1{}", "(".repeat(65), ")".repeat(65));
-        assert!(extract_file(p, &format!("NOTIFY a;\n{deep}\n"), 0)
-            .nodes
-            .is_empty());
+        assert_eq!(
+            sites_of(&extract_file(p, &format!("NOTIFY a;\n{deep}\n"), 0)),
+            vec!["a"]
+        );
         // Unterminated quote, comment and dollar tag end at the end of the text.
         for t in ["'abc", "/* abc", "$tag$ abc", "\"abc", "E'a\\"] {
             let _ = scan_sql(t, 1);
@@ -1021,7 +1170,7 @@ mod tests {
                     ("1,000 quotes then a statement", quotes, 0),
                     ("60-deep parentheses in VALUES", nest, 0),
                     ("200 nested comments", comments, 1),
-                    ("10,000-character line", long_line, 0),
+                    ("10,000-character line", long_line, 1),
                     ("binary file named .sql", binary, 0),
                 ];
                 for (name, text, want) in probes {
@@ -1042,6 +1191,100 @@ mod tests {
             })
             .unwrap();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn prose_in_host_strings_is_not_an_event() {
+        // F1: log lines are not NOTIFY / LISTEN statements.
+        let ts = "log.info(\"Notify admins\");\nlog.info(\"Listen 3000\");\n\
+                  log.info(\"LISTEN to the radio\");\nlog.info(\"NOTIFY 42\");\n\
+                  log.info(\"listen orders\");\n";
+        assert!(scan_embedded(ts, Host::Ts).facts.is_empty());
+        // A real statement still matches.
+        let s = scan_embedded(
+            "db.exec(\"NOTIFY orders\"); db.exec(\"LISTEN orders_in\");",
+            Host::Ts,
+        );
+        assert_eq!(produced(&s), vec![("orders".to_string(), 1)]);
+        assert_eq!(consumed(&s), vec![("orders_in".to_string(), 1)]);
+        // A `.sql` file stays case-insensitive.
+        assert_eq!(scan_sql("notify Orders;", 1).facts.len(), 1);
+    }
+
+    #[test]
+    fn only_a_function_body_or_do_block_is_code() {
+        // F5: documentation text in `$$..$$` is a string literal.
+        let doc = "COMMENT ON FUNCTION f() IS $$NOTIFY doc_only$$;\nSELECT $t$LISTEN x$t$;\n";
+        assert!(scan_sql(doc, 1).facts.is_empty());
+        let body = "CREATE FUNCTION f() RETURNS void AS $f$ BEGIN NOTIFY real_one; END; $f$ LANGUAGE plpgsql;\n\
+                    DO $$ BEGIN PERFORM pg_notify('do_one', ''); END $$;\n\
+                    DO LANGUAGE plpgsql $x$ BEGIN NOTIFY do_two; END $x$;\n";
+        let s = scan_sql(body, 1);
+        assert_eq!(
+            produced(&s),
+            vec![
+                ("real_one".to_string(), 1),
+                ("do_one".to_string(), 2),
+                ("do_two".to_string(), 3)
+            ]
+        );
+        // The statement after a code body is read again (the closing delimiter ends the body).
+        let after = "CREATE FUNCTION f() RETURNS void AS $$ BEGIN NULL; END; $$ LANGUAGE sql;\nNOTIFY after_body;\n\
+                     COMMENT ON TABLE t IS $$NOTIFY doc$$;\n";
+        assert_eq!(
+            produced(&scan_sql(after, 1)),
+            vec![("after_body".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn host_escapes_are_decoded() {
+        // F6: `\'` in a host string is a SQL quote; `\n` is a blank, not a source line.
+        let ts = "q(\'x\');\nconst a = 'INSERT INTO outbox (topic) VALUES (\\'p.escaped.ts\\')';\n\
+                  const b = \"INSERT INTO outbox (topic)\\nVALUES ('p.newline')\";\n";
+        let s = scan_embedded(ts, Host::Ts);
+        assert_eq!(
+            produced(&s),
+            vec![
+                ("p.escaped.ts".to_string(), 2),
+                ("p.newline".to_string(), 3)
+            ]
+        );
+    }
+
+    #[test]
+    fn caps_are_counted_and_unresolved_sites_are_reported() {
+        // F2: more rows than MAX_ROWS in one VALUES.
+        let rows: Vec<String> = (0..MAX_ROWS + 5).map(|i| format!("('r.{i}')")).collect();
+        let sql = format!("INSERT INTO outbox (topic) VALUES {};\n", rows.join(", "));
+        let s = scan_sql(&sql, 1);
+        assert_eq!(s.facts.len(), MAX_ROWS);
+        assert!(s.truncated);
+        // More sites than MAX_FACTS.
+        let many = "NOTIFY c;\n".repeat(MAX_FACTS + 10);
+        let s = scan_sql(&many, 1);
+        assert_eq!(s.facts.len(), MAX_FACTS);
+        assert!(s.truncated);
+        // More SQL literals than MAX_LITERALS.
+        let lits = "x(\"LISTEN c\");\n".repeat(MAX_LITERALS + 3);
+        let s = scan_embedded(&lits, Host::Ts);
+        assert!(s.truncated);
+        assert_eq!(s.facts.len(), MAX_LITERALS);
+        // The counters reach the FileIndex.
+        let idx = extract_file(Path::new("m.sql"), &many, 0);
+        assert!(idx.sql_capped);
+        // Bind parameters are counted, never guessed, one per unresolved row.
+        let bind = "INSERT INTO outbox (topic, payload) VALUES ($1, '{}'), ('ok.one', '{}'), ($2, '{}');\n\
+                    SELECT pg_notify(TG_TABLE_NAME, 'x');\n";
+        let idx = extract_file(Path::new("b.sql"), bind, 0);
+        assert_eq!(idx.sql_unresolved, 3);
+        assert!(!idx.sql_capped);
+        assert_eq!(sites_of(&idx), vec!["ok.one"]);
+        let host = scan_embedded(
+            "q(\"INSERT INTO outbox (topic, payload) VALUES ($1, $2)\");",
+            Host::Ts,
+        );
+        assert_eq!((host.unresolved, host.facts.len()), (1, 0));
     }
 
     #[test]

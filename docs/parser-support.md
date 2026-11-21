@@ -243,25 +243,42 @@ over the string literals of TypeScript / JavaScript, Go, Java and Python files. 
 - An outbox table is one whose last name part (schema prefix and quoted identifiers are read,
   case-insensitive) contains `outbox`, or is `event_queue` / `event_queues`. Every row of a
   multi-row `VALUES` registers its own key.
-- A trigger needs no special rule: its function body (a `$$` or `$tag$` body is read as code)
-  is scanned, so the `INSERT` or `pg_notify` inside it is the producer, on the line of its literal.
-  The trigger's own table is not read.
+- A trigger needs no special rule: its function body is scanned, so the `INSERT` or `pg_notify`
+  inside it is the producer, on the line of its literal. A dollar-quoted body (`$$` or `$tag$`) is
+  read as code only after `AS` (a function body) or in a `DO` block; any other `$$..$$` text
+  (`COMMENT ON ... IS $$NOTIFY x$$`, `SELECT $$..$$`) is a string literal and registers nothing. The
+  trigger's own table is not read.
 - A key that is not a static literal (a bind parameter such as `$1` or `?`, `TG_TABLE_NAME || '.x'`,
-  a column, a missing column list) is not resolved: no producer is registered and no key is made
-  up. An unquoted channel is folded to lower case, as Postgres does; a quoted one is kept.
-- Comments are skipped, and a string literal is read as SQL only when it BEGINS with `INSERT`,
-  `NOTIFY`, `LISTEN`, `SELECT`, `PERFORM` or `BEGIN`: prose or a log line that mentions `INSERT INTO
-  outbox` is not a producer. Adjacent literals (`"INSERT ..." + "VALUES ..."`) are not joined.
+  a column, a missing column list, `pg_notify` on a variable) is not resolved: no producer is
+  registered and no key is made up. Each such site is COUNTED: `IndexHealth::sql_sites_unresolved`,
+  listed by `mesh-mcp doctor`. This is the usual shape of application code
+  (`INSERT INTO outbox (topic, payload) VALUES ($1, $2)` with the topic as an argument), which
+  therefore shows as unresolved, not as a producer. An unquoted channel is folded to lower case, as
+  Postgres does; a quoted one is kept.
+- Comments are skipped, and a host-language string literal is read as SQL only when it BEGINS with
+  `INSERT`, `NOTIFY`, `LISTEN`, `SELECT`, `PERFORM` or `BEGIN`: prose that mentions `INSERT INTO
+  outbox` is not a producer. In such a literal `NOTIFY` and `LISTEN` must be written in upper case
+  and the channel must start with a letter or `_` (`log.info("Notify admins")` and
+  `log.info("Listen 3000")` are log lines); a lower-case `listen orders` in code is therefore not
+  read, while `INSERT` and `pg_notify` stay case-insensitive. A `"NOTIFY stock"` string that is only
+  documentation cannot be told from a statement and is read. Host escapes (`\'`, `\n`) are decoded
+  before the scan. Adjacent literals (`"INSERT ..." + "VALUES ..."`) are not joined.
 - Sites go through the ordinary producer / consumer path (an `EventStream` node on the line of the
   key), so `analyze_impact`, `trace_flow` and the topic matching see them like any broker call; a
   SQL producer inside a service method is reached by the calls layer of its language.
 - Not covered: stored procedures called by name, `COPY`, CDC / Debezium, MySQL or SQL Server
   queues, other host languages (Kotlin, C#, Ruby, PHP, Rust), and a topic taken from a bind
   argument at the call site.
-- Bounds: a `.sql` file goes through the same guards as source files (384 KB, null-byte sniff,
-  1,024-byte lines, nesting 64); at most 200,000 tokens, 4,096 sites per file, 512 rows per `VALUES`
-  and 4,096 scanned literals per host file. A file cut by one of these keeps the sites found before
-  the cut (debug log only, not an `IndexHealth` counter).
+- Known limits: a site is not deduplicated across files, so 300 migrations that each re-create the
+  same trigger function give 600 site nodes (nothing in `doctor` signals it: no cap is hit and each
+  site is a resolved literal); a file under `test/` or `tests/` gives nodes like any other file; a
+  regex literal holding a quote can desynchronise the host lexer for the rest of its line.
+- Bounds: a `.sql` file has its own guard, the 384 KB budget and the null-byte sniff (a lexer is
+  linear and capped, so the line-length and nesting rules of the tree-sitter guard do not apply: a
+  long comment line or a `-- (` banner does not drop the file). Caps: 200,000 tokens, 4,096 sites per
+  file, 512 rows per `VALUES`, 4,096 scanned literals per host file. Every cap is counted:
+  `IndexHealth::files_sql_capped`, listed by `mesh-mcp doctor` (a warning); the sites found before
+  the cut are kept.
 
 Fixture and ground truth: `examples/eda/sql-outbox` and `tests/golden/events/sql-outbox.expected.yaml`.
 

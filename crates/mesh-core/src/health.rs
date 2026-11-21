@@ -174,6 +174,16 @@ pub struct IndexHealth {
     /// brokers has one hub, so one cap, per broker). Set after every reconcile.
     #[serde(default)]
     pub topic_wildcards_capped: usize,
+    /// Files where a SQL scan cap (tokens, sites per file, `VALUES` rows, scanned literals)
+    /// dropped events: some outbox / NOTIFY / LISTEN sites are not registered. Counted like
+    /// `files_scanned`: by what each scan pass saw.
+    #[serde(default)]
+    pub files_sql_capped: usize,
+    /// SQL outbox inserts and `pg_notify` calls whose key is not a static literal (a bind
+    /// parameter, a concatenation, a column): no producer is registered for them, and no key is
+    /// made up. Counted like `files_scanned`.
+    #[serde(default)]
+    pub sql_sites_unresolved: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -278,6 +288,19 @@ impl IndexHealth {
     #[inline]
     pub fn topics_truncated(&self) -> bool {
         self.topic_wildcards_capped > 0
+    }
+
+    /// One file's SQL counters (`FileIndex::sql_capped`, `FileIndex::sql_unresolved`).
+    #[inline]
+    pub fn record_sql(&mut self, capped: bool, unresolved: u32) {
+        self.files_sql_capped += usize::from(capped);
+        self.sql_sites_unresolved += unresolved as usize;
+    }
+
+    /// Whether a SQL scan cap dropped events: some outbox / NOTIFY / LISTEN sites are missing.
+    #[inline]
+    pub fn sql_truncated(&self) -> bool {
+        self.files_sql_capped > 0
     }
 
     /// Whether the calls layer dropped facts (a cap was hit): a call path may be cut.
@@ -499,6 +522,23 @@ impl IndexHealth {
                 self.files_call_facts_skipped_path
             );
         }
+        if self.files_sql_capped > 0 {
+            let _ = writeln!(
+                out,
+                "    {} file(s) cut by a SQL scan cap (sites per file, VALUES rows, SQL literals or \
+                 tokens; docs/parser-support.md, section 3.4): some outbox / NOTIFY / LISTEN events \
+                 are not registered",
+                self.files_sql_capped
+            );
+        }
+        if self.sql_sites_unresolved > 0 {
+            let _ = writeln!(
+                out,
+                "    ({} SQL outbox insert(s) / pg_notify call(s) with a key that is not a static \
+                 literal: not registered, no key is guessed)",
+                self.sql_sites_unresolved
+            );
+        }
         if self.rejected_overflow > 0 {
             // The breakdown above only covers the capped `rejected` list (step 4.1
             // review): say so here, or it reads as a per-reason total that silently
@@ -529,6 +569,8 @@ impl IndexHealth {
         self.files_read_error += other.files_read_error;
         self.files_parse_failed += other.files_parse_failed;
         self.files_call_facts_skipped_path += other.files_call_facts_skipped_path;
+        self.files_sql_capped += other.files_sql_capped;
+        self.sql_sites_unresolved += other.sql_sites_unresolved;
         self.files_skipped_non_source += other.files_skipped_non_source;
         // The calls-layer counters are the graph's, set after the reconcile.
     }

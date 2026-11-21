@@ -71,7 +71,7 @@ golden must be rejected).
 | nestjs-monolith-bus | ts | 7 | 8 | 7 | 5 | 2 | 0 | cqrs 9, cron 4, inproc_bus 20, layered_calls 11 |
 | polyglot-shop | go, java, python, rust, ts | 4 | 7 | 4 | 2 | 0 | 8 | declared_pattern 8, go_broker 2, kafka_basic 5, layered_calls 4, py_broker 3 |
 | spring-monolith | java | 5 | 4 | 8 | 5 | 2 | 0 | config_topic 3, cron 3, inproc_bus 8, kafka_basic 8, layered_calls 13 |
-| sql-outbox | go, java, python, sql, ts | 8 | 4 | 2 | 1 | 0 | 0 | kafka_basic 2, layered_calls 3, sql 11 |
+| sql-outbox | go, java, python, sql, ts | 12 | 4 | 2 | 1 | 0 | 0 | kafka_basic 2, layered_calls 3, sql 15 |
 | unresolved-flow | ts | 14 | 21 | 0 | 2 | 0 | 0 | config_topic 1 |
 
 "Chains >= 3 call steps" counts chains whose `min_hops` is at least 3. Tag counts are items

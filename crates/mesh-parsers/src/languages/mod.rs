@@ -222,6 +222,18 @@ pub struct FileIndex {
     /// `IndexHealth`, so a chain through such a file is not silently absent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub calls_skipped_path: bool,
+    /// SQL outbox inserts and `pg_notify` calls of this file whose key is not a static literal
+    /// (no event is registered for them): counted in `IndexHealth::sql_sites_unresolved`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub sql_unresolved: u32,
+    /// A SQL scan cap (tokens, sites, `VALUES` rows, literals) dropped events of this file:
+    /// counted in `IndexHealth::files_sql_capped`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sql_capped: bool,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 impl FileIndex {
@@ -262,6 +274,8 @@ impl FileIndex {
         self.parse_failed |= other.parse_failed;
         self.calls.merge(other.calls);
         self.calls_skipped_path |= other.calls_skipped_path;
+        self.sql_unresolved = self.sql_unresolved.saturating_add(other.sql_unresolved);
+        self.sql_capped |= other.sql_capped;
     }
 
     /// Inserts the extracted nodes and relations into `graph`.
@@ -1611,6 +1625,8 @@ mod tests {
             parse_failed: false,
             calls: CallFacts::default(),
             calls_skipped_path: false,
+            sql_unresolved: 0,
+            sql_capped: false,
         };
         let before = format!("{index:?}");
         let anchored = index.relativize(&root_a).expect("all under root");
