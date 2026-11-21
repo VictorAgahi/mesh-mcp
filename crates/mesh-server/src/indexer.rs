@@ -1300,7 +1300,7 @@ impl WorkspaceIndexer {
     /// dotenv file.
     fn is_config_source(path: &Path) -> bool {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        config_values::is_dotenv_name(name)
+        config_values::is_env_template_name(name)
             || matches!(
                 path.extension().and_then(|e| e.to_str()),
                 Some("yml" | "yaml" | "properties")
@@ -1637,7 +1637,7 @@ impl WorkspaceIndexer {
         };
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let template = config_values::is_template_name(file_name);
-        if config_values::is_dotenv_name(file_name) {
+        if config_values::is_env_template_name(file_name) {
             frag.config = Some(config_values::from_dotenv(content, template));
         }
 

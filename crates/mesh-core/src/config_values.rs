@@ -266,13 +266,108 @@ impl ConfigValues {
 
 // ---- extraction of entries from configuration files ------------------------------------------
 
-/// A value worth keeping as a topic candidate: a bounded token with no whitespace or quote.
+/// A value worth keeping as a topic candidate (commandment 5: only a topic-shaped value is
+/// ever retained, so nothing else a config file holds can reach the graph): a bounded token of
+/// ASCII name characters and `${key:default}` placeholder syntax, with no URL scheme, no
+/// userinfo (`@`), and nothing that looks like a credential token.
 fn name_shaped(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_VALUE_LEN
-        && !value
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '.' | '_' | '-' | ':' | '/' | '$' | '{' | '}' | '#' | '*' | '+'
+                )
+        })
+        && !value.contains("://")
+        && !looks_like_token(value)
+}
+
+/// Well-known credential prefixes, a long hex run, or a long mixed-case / digit run with no
+/// separator (a base64-ish key): never a topic name.
+fn looks_like_token(value: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "sk_live_",
+        "sk_test_",
+        "rk_live_",
+        "pk_live_",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "akia",
+        "asia",
+        "aiza",
+        "eyj",
+    ];
+    let lower = value.to_ascii_lowercase();
+    if PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return true;
+    }
+    let compact = value.len() >= 24
+        && value
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '\\' | '`'))
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '=');
+    let hex = value.len() >= 32 && value.chars().all(|c| c.is_ascii_hexdigit());
+    hex || (compact
+        && value.chars().any(|c| c.is_ascii_digit())
+        && value.chars().any(|c| c.is_ascii_alphabetic()))
+}
+
+/// A key that names a credential, a connection string or a secret: never kept, whatever the
+/// value looks like. Stricter than `PropertyRegistry::is_sensitive_key` on purpose.
+fn secret_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    const SUFFIXES: &[&str] = &[
+        "_key",
+        "-key",
+        ".key",
+        "_dsn",
+        "-dsn",
+        ".dsn",
+        "_url",
+        "-url",
+        ".url",
+        "_uri",
+        "-uri",
+        ".uri",
+        "_password",
+        "_passwd",
+        "_pwd",
+        "-password",
+        ".password",
+        "_credentials",
+        "-credentials",
+        ".credentials",
+        "_auth",
+        "-auth",
+        ".auth",
+    ];
+    const PARTS: &[&str] = &[
+        "dsn",
+        "stripe",
+        "secret",
+        "token",
+        "password",
+        "passwd",
+        "credential",
+        "private",
+        "passphrase",
+        "apikey",
+        "api_key",
+        "api-key",
+        "jwt",
+        "cert",
+    ];
+    lower == "key"
+        || SUFFIXES.iter().any(|x| lower.ends_with(x))
+        || PARTS.iter().any(|x| lower.contains(x))
 }
 
 fn push_entry(
@@ -282,7 +377,12 @@ fn push_entry(
     value: &str,
     weak: bool,
 ) {
-    if key.is_empty() || key.len() > 200 || !name_shaped(value) || secrets.is_sensitive_key(key) {
+    if key.is_empty()
+        || key.len() > 200
+        || !name_shaped(value)
+        || secret_key(key)
+        || secrets.is_sensitive_key(key)
+    {
         return;
     }
     if file.entries.len() >= MAX_ENTRIES_PER_FILE {
@@ -334,17 +434,15 @@ pub fn is_multi_document(content: &str) -> bool {
     false
 }
 
-/// Whether a file name is a dotenv file: `.env`, `.env.local`, `prod.env`.
-pub fn is_dotenv_name(name: &str) -> bool {
-    name == ".env" || name.starts_with(".env.") || name.ends_with(".env")
-}
-
-/// A `.env.example`-style template: the one dotenv shape the default exclusion lets through.
+/// The only dotenv files read: the four template names, exactly. A real dotenv file
+/// (`.env`, `.env.local`, `.env.production`, `production.env`, `.env.distributor`) holds
+/// secrets and is never read; the default `exclude_patterns` agree for `.env*`, and this
+/// check holds for `*.env` and for a workspace that cleared the default.
 pub fn is_env_template_name(name: &str) -> bool {
-    name.starts_with(".env.")
-        && ["example", "sample", "template", "dist"]
-            .iter()
-            .any(|w| name.to_ascii_lowercase().contains(w))
+    matches!(
+        name,
+        ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
+    )
 }
 
 /// A file that only documents the shape of the real configuration.
@@ -596,6 +694,50 @@ mod tests {
             .map(|e| (e.key.as_str(), e.value.as_str()))
             .collect();
         assert_eq!(got, [("KAFKA_TOPIC", "orders")]);
+    }
+
+    #[test]
+    fn only_the_four_template_names_are_dotenv_files() {
+        for yes in [".env.example", ".env.sample", ".env.template", ".env.dist"] {
+            assert!(is_env_template_name(yes), "{yes}");
+        }
+        for no in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            "production.env",
+            "secrets.env",
+            ".env.distributor",
+            ".env.examples",
+            "x.env.example.bak",
+            ".env.example.local",
+            "env.example",
+            ".ENV.EXAMPLE",
+        ] {
+            assert!(!is_env_template_name(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn credentials_and_urls_are_never_retained_but_topics_are() {
+        let text =
+            "STRIPE_KEY=sk_live_leakstripe\nSENTRY_DSN=https://leakdsn@o1.ingest.sentry.io/1\n\
+            DATABASE_URL=postgres://admin:leakpw@db/app\nPG_URL=postgres://u:pwcompose@db/x\n\
+            DB_PASSWORD=hunter2\nAPI_KEY=abc\nSECRET_TOPIC=leak.secret.topic\nQUOTED=\"a b\"\n\
+            WEBHOOK=ghp_abcdefghijklmnopqrstuvwxyz0123456789\nAWS=AKIAIOSFODNN7EXAMPLE\n\
+            BLOB=aGVsbG8gd29ybGQgdGhpcyBpcyBhIHNlY3JldA==\nHEX=0123456789abcdef0123456789abcdef\n\
+            HOSTED=admin@db.internal\nTOPIC_A=orders.v1\nTOPIC_B=user:deletion:success\n\
+            TOPIC_C=sensors/temp\nTOPIC_D=${PREFIX:-pre}.orders\n";
+        let f = from_dotenv(text, false);
+        let got: Vec<&str> = f.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(got, ["TOPIC_A", "TOPIC_B", "TOPIC_C", "TOPIC_D"]);
+        let mut reg = PropertyRegistry::new();
+        reg.ingest_properties_str(
+            "app.dsn=orders\napp.stripe.topic=orders\napp.auth=orders\napp.db.uri=orders\nok.topic=orders\n",
+        );
+        let f = from_registry(&reg, false, false);
+        let got: Vec<&str> = f.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(got, ["ok.topic"]);
     }
 
     #[test]

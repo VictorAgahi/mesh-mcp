@@ -646,9 +646,10 @@ impl FileWatcherService {
             return true;
         }
 
-        // A dotenv file (`.env`, `.env.local`, `prod.env`) can hold the topic a source file
-        // reads from the environment (ticket T6): editing one re-resolves those topics.
-        if crate::config_values::is_dotenv_name(name) {
+        // A `.env.example`-style template can hold the topic a source file reads from the
+        // environment (ticket T6): editing one re-resolves those topics. Real dotenv files
+        // are never read.
+        if crate::config_values::is_env_template_name(name) {
             return true;
         }
 
