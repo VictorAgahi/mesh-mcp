@@ -151,3 +151,26 @@ fn extraction_is_deterministic_and_survives_the_cache_round_trip() {
     assert_eq!(sites(&back), sites(&first));
     assert_eq!(serde_json::to_string(&back).unwrap(), json);
 }
+
+#[test]
+fn sql_sites_carry_no_broker_so_they_join_every_broker_channel_of_their_name() {
+    // T7 rule: a site of unknown broker joins the channel of every broker that uses the name
+    // (`heuristic` when two or more do). An outbox key is usually the topic its relay publishes, so
+    // the SQL sites stay broker-less and `Broker` has no Postgres entry.
+    for (file, code) in [
+        (
+            "db/a.sql",
+            "INSERT INTO outbox (topic) VALUES ('orders');\nLISTEN orders;\n",
+        ),
+        (
+            "src/r.ts",
+            "q(\"INSERT INTO outbox (topic) VALUES ('orders')\");\n",
+        ),
+    ] {
+        let fi = extract(file, code);
+        assert!(!fi.producers.is_empty(), "{file}");
+        assert!(fi.producer_brokers.is_empty(), "{file}");
+        assert!(fi.consumer_brokers.is_empty(), "{file}");
+        assert!(fi.node_brokers.is_empty(), "{file}");
+    }
+}
