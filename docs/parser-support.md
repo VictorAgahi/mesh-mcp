@@ -122,7 +122,8 @@ WebClient links to routes; WebFlux functional routes; a topic given as a constan
 
 Stops: this extractor has no constant propagation (a topic built in code is not resolved; use
 Spring properties), and it reads only the Kafka and HTTP idioms named above. `@Value` is read by
-field or parameter name inside one file; `@ConfigurationProperties` classes, SpEL
+field or parameter name inside the declaring class (a parameter or local that shadows the field is
+still taken for it); `@ConfigurationProperties` classes, SpEL
 (`#{...}`) and Spring's relaxed binding (`APP_TOPICS_ORDERS` for `app.topics.orders`) are not.
 
 ### 2.3 Go (level 3)
@@ -303,24 +304,38 @@ config edit re-resolves it without the source file changing:
 | Java `"${a.b}"` / `"${a.b:d}"` in `@KafkaListener`, or a field / parameter annotated `@Value("${a.b}")` passed to `kafkaTemplate.send` | as written |
 
 Values come from: Spring `application*.yml` / `*.properties` (dotted keys; honours
-`[engines.contracts.spring] property_files`), dotenv files, a compose `environment:` block (map or
-list form) and a Kubernetes `env:` list (`name` / `value`). Resolution:
+`[engines.contracts.spring] property_files`), the four dotenv templates `.env.example`,
+`.env.sample`, `.env.template` and `.env.dist` (exact names; no other dotenv file is read), a compose
+`environment:` block (map or list form) and a Kubernetes `env:` list (`name` / `value`). Resolution:
 
 - one value for a key: the link is `exact`; a value that only a template (`.env.example`), a
   multi-document yaml (only its first document is read) or the source's own `:default` supplies, or
   two files that disagree (profiles, `.env` against an overlay), makes the link `heuristic` and
   registers every candidate. A deployed value always wins over a template value.
 - a placeholder nothing resolves (no file defines it, a cycle, nesting beyond 8 hops, more than 8
-  candidates) stays a visible `${KEY}` topic, `heuristic`, counted in
+  candidates or more than 256 expansion steps, checked while expanding, so a wide chain of profiles
+  is abandoned early) stays a visible `${KEY}` topic, `heuristic`, counted in
   `IndexHealth::config_topics_unresolved`. Producers and consumers of the same unresolved key meet on
   it. No name is guessed; the env key is never recorded as a Go or Python topic.
-- secrets (commandment 5): a real `.env*` stays excluded by the default `exclude_patterns`; the one
-  carve-out is a `.env.example` / `.sample` / `.template` / `.dist` file, whose values are weak. Keys
-  that look like secrets (`password`, `token`, `*_key`, ...) and values with whitespace or quotes are
-  never retained; a value is only ever shown as the topic a site references.
+- secrets (commandment 5): a real dotenv file (`.env`, `.env.local`, `.env.production`,
+  `production.env`, `.env.distributor`, `.env.example.local`) is never read, whatever
+  `exclude_patterns` says; the default `**/.env*` pattern lets exactly the four template names
+  through, and only that default pattern is carved out (an operator pattern written exactly
+  `**/.env*` is indistinguishable from the default and gets the same carve-out; write `.env*` to
+  exclude templates too). A template's values are weak. An entry is kept only if its value is
+  topic-shaped (ASCII letters, digits, `. _ - : / $ { } # * +`, at most 249 bytes, no `://`, no `@`,
+  no token-looking run such as `sk_live_`, `ghp_`, `AKIA`, a 32-char hex run or a long base64-ish
+  run) and its key is not a credential name (ending `_KEY`, `_DSN`, `_URL`, `_URI`, `_PASSWORD`,
+  `_PASSWD`, `_PWD`, `_CREDENTIALS`, `_AUTH`, or containing `dsn`, `stripe`, `secret`, `token`,
+  `password`, `credential`, `apikey`, ...). A topic site whose key is dropped stays a visible
+  `${KEY}`.
 - bounds, all counted (`IndexHealth::files_config_capped`, `config_entries_dropped`, `doctor`): 2,048
   entries per file, 50,000 per workspace, values up to 249 bytes; config files go through the same
-  384 KB / binary guards as every file; symlinks are not followed outside the root.
+  384 KB / binary guards as every file; symlinks are not followed outside the root. Also counted
+  (`files_config_parse_failed`, `files_config_lossy`): a yaml that does not parse (a profile file next
+  to it is read as weak, since the base may hold the active value) and a non-UTF-8 config file (read
+  with the invalid bytes replaced, only the lines that held them are lost). `doctor` warns on any of
+  them, and says when an unresolved placeholder may be due to a skipped (oversized) config file.
 
 Not resolved: Spring relaxed binding, `@ConfigurationProperties`, Helm / Kustomize templating,
 `env_file:` indirection, `docker-compose` `${VAR}` interpolation, a config object
