@@ -14,6 +14,9 @@ type ExtractedRelations = (
     Vec<(usize, CompactStr)>,
 );
 
+/// `@Value` placeholder fields (`name -> "${key}"`) of each class declaration, by node id.
+type ClassValueFields = HashMap<usize, HashMap<String, String>>;
+
 pub struct JavaExtractor;
 
 impl JavaExtractor {
@@ -58,7 +61,8 @@ impl JavaExtractor {
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let mut package_name = CompactStr::default();
-        let value_fields = Self::value_placeholder_fields(content);
+        let mut value_fields = HashMap::new();
+        Self::collect_class_value_fields(root, content, &mut value_fields, 0);
 
         Self::visit_node(
             root,
@@ -267,7 +271,7 @@ impl JavaExtractor {
         nodes: &mut Vec<ContractNode>,
         producers: &mut Vec<(usize, CompactStr)>,
         rpc_calls: &mut Vec<(usize, CompactStr)>,
-        value_fields: &HashMap<String, String>,
+        value_fields: &ClassValueFields,
         enclosing_class_idx: Option<usize>,
         depth: usize,
     ) {
@@ -399,7 +403,13 @@ impl JavaExtractor {
                 };
 
                 let method_text = node.utf8_text(source).unwrap_or("");
-                let producer_topic = Self::extract_kafka_producer_topic(method_text, value_fields);
+                // `@Value` fields of the class the method sits in (scoped per class, so a
+                // same-named field of another class is not mistaken for it).
+                let no_fields = HashMap::new();
+                let class_fields = Self::enclosing_class(node)
+                    .and_then(|c| value_fields.get(&c.id()))
+                    .unwrap_or(&no_fields);
+                let producer_topic = Self::extract_kafka_producer_topic(method_text, class_fields);
                 let grpc_client_services = Self::extract_grpc_client_services(method_text);
 
                 nodes.push(ContractNode {
@@ -515,6 +525,47 @@ impl JavaExtractor {
             }
         }
         None
+    }
+
+    /// The nearest class or record declaration around `node`.
+    fn enclosing_class(node: Node) -> Option<Node> {
+        let mut cur = node.parent();
+        while let Some(n) = cur {
+            if matches!(n.kind(), "class_declaration" | "record_declaration") {
+                return Some(n);
+            }
+            cur = n.parent();
+        }
+        None
+    }
+
+    /// Fills `out` with [`Self::value_placeholder_fields`] of every class declaration's own
+    /// text, by node id. Nested classes are scanned in their own right (and their text is
+    /// part of the outer class's scan: an outer field read from an inner method is not
+    /// seen, an inner `@Value` field is also seen by outer methods of the same name).
+    fn collect_class_value_fields(
+        node: Node,
+        content: &str,
+        out: &mut ClassValueFields,
+        depth: usize,
+    ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+        if matches!(node.kind(), "class_declaration" | "record_declaration") {
+            if let Some(text) = content.get(node.start_byte()..node.end_byte()) {
+                if text.contains("@Value(") {
+                    let fields = Self::value_placeholder_fields(text);
+                    if !fields.is_empty() {
+                        out.insert(node.id(), fields);
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            Self::collect_class_value_fields(child, content, out, depth + 1);
+        }
     }
 
     /// `name -> "${key}"` for every field or parameter of the file annotated

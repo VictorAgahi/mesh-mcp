@@ -660,3 +660,58 @@ fn http_prefixes_keys_matching_no_root_are_warned_about() {
     let check = find(&checks, "HTTP prefixes").expect("http prefixes check present");
     assert_eq!(check["status"], "ok", "{check:?}");
 }
+
+/// T6 review F5/F6/F7/F8: a workspace whose configuration is capped, unparsable, not UTF-8 or
+/// skipped must not read "Index health OK": the status is `warn` and the message names why.
+#[test]
+fn doctor_warns_when_configuration_is_degraded() {
+    let java = "package a;\npublic class S {\n  @KafkaListener(topics = \"${t}\")\n  public void on(String m) {}\n}\n";
+    type Case<'a> = (&'a str, Vec<(&'a str, Vec<u8>)>, &'a str);
+    let cases: Vec<Case> = vec![
+        (
+            "capped",
+            vec![(
+                "application.properties",
+                (0..3000)
+                    .map(|i| format!("k{i}=v{i}\n"))
+                    .collect::<String>()
+                    .into_bytes(),
+            )],
+            "over the per-file entry cap",
+        ),
+        (
+            "parse failure",
+            vec![("application.yml", b"t: orders\nt: orders2\n".to_vec())],
+            "did not parse",
+        ),
+        (
+            "not utf-8",
+            vec![("application.properties", b"a=good\nb=\xff\xfe\n".to_vec())],
+            "not valid UTF-8",
+        ),
+        (
+            "skipped oversized",
+            vec![(
+                "application.yml",
+                format!("k: {}\n", "v".repeat(400_000)).into_bytes(),
+            )],
+            "its file was skipped",
+        ),
+    ];
+    for (name, files, expect) in cases {
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project");
+        let config = write_config(project.path());
+        std::fs::write(project.path().join("S.java"), java).expect("java");
+        for (file, bytes) in files {
+            std::fs::write(project.path().join(file), bytes).expect("config file");
+        }
+        let checks = run_doctor(home.path(), &config, false);
+        let health = find(&checks, "Index health").expect("Index health check");
+        assert_eq!(health["status"], "warn", "{name}: {health}");
+        assert!(
+            health["message"].as_str().unwrap().contains(expect),
+            "{name}: {health}"
+        );
+    }
+}

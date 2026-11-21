@@ -32,6 +32,8 @@ const MAX_VALUE_LEN: usize = 249;
 const MAX_RESOLVE_DEPTH: usize = 8;
 /// Candidate topics one placeholder may expand to (profiles x nested keys).
 const MAX_ALTERNATIVES: usize = 8;
+/// Expansion steps one placeholder may take (each expanded text and each candidate counts).
+pub const MAX_RESOLVE_STEPS: usize = 256;
 
 /// One `key = value` a configuration file sets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,12 +51,18 @@ pub struct ConfigFile {
     pub entries: Vec<ConfigEntry>,
     /// The per-file cap dropped entries.
     pub capped: bool,
+    /// The file did not parse as yaml: it contributes nothing it should have.
+    pub failed: bool,
+    /// The file is not valid UTF-8 and was read with the invalid bytes replaced.
+    pub lossy: bool,
 }
 
 impl ConfigFile {
     /// Appends `other`'s entries, within the per-file cap.
     pub fn merge(&mut self, other: ConfigFile) {
         self.capped |= other.capped;
+        self.failed |= other.failed;
+        self.lossy |= other.lossy;
         for e in other.entries {
             if self.entries.len() >= MAX_ENTRIES_PER_FILE {
                 self.capped = true;
@@ -77,11 +85,15 @@ pub struct ConfigValues {
     by_file: BTreeMap<PathBuf, Vec<ConfigEntry>>,
     /// key -> distinct (value, weak). Rebuilt by [`Self::rebuild`].
     index: HashMap<CompactStr, Vec<(CompactStr, bool)>>,
+    /// Files that did not parse. A profile file in the same directory is read as weak: the
+    /// base file that failed may hold the value that is really active.
+    failed: std::collections::BTreeSet<PathBuf>,
     /// Source files whose file index holds a `${...}` topic: re-folded when a config file
     /// changes, since their resolution may move without their own bytes changing.
     ref_files: HashSet<PathBuf>,
     /// Entries dropped by [`MAX_ENTRIES_TOTAL`] at the last rebuild.
     dropped_total: usize,
+    memo: Memo,
 }
 
 impl ConfigValues {
@@ -92,6 +104,7 @@ impl ConfigValues {
     /// Sets (or, with no entries, clears) what `path` contributes. Call [`Self::rebuild`]
     /// once after a batch.
     pub fn set_file(&mut self, path: &Path, entries: Vec<ConfigEntry>) {
+        self.failed.remove(path);
         if entries.is_empty() {
             self.by_file.remove(path);
         } else {
@@ -99,8 +112,14 @@ impl ConfigValues {
         }
     }
 
+    /// Records that `path` did not parse (call after [`Self::set_file`]).
+    pub fn mark_failed(&mut self, path: &Path) {
+        self.failed.insert(path.to_path_buf());
+    }
+
     pub fn remove_files(&mut self, paths: &HashSet<&Path>) {
         self.by_file.retain(|p, _| !paths.contains(p.as_path()));
+        self.failed.retain(|p| !paths.contains(p.as_path()));
         self.ref_files.retain(|p| !paths.contains(p.as_path()));
     }
 
@@ -125,20 +144,24 @@ impl ConfigValues {
     /// Rebuilds the key index from the per-file entries, in path order (deterministic).
     pub fn rebuild(&mut self) {
         self.index.clear();
+        self.memo.clear();
         self.dropped_total = 0;
         let mut kept = 0usize;
-        for entries in self.by_file.values() {
+        let failed_dirs: HashSet<&Path> = self.failed.iter().filter_map(|p| p.parent()).collect();
+        for (path, entries) in &self.by_file {
+            let sibling_failed = path.parent().is_some_and(|d| failed_dirs.contains(d));
             for e in entries {
                 if kept >= MAX_ENTRIES_TOTAL {
                     self.dropped_total += 1;
                     continue;
                 }
                 kept += 1;
+                let weak = e.weak || sibling_failed;
                 let slot = self.index.entry(e.key.clone()).or_default();
                 match slot.iter_mut().find(|(v, _)| *v == e.value) {
                     // The same value from a strong file is a strong value.
-                    Some((_, weak)) => *weak &= e.weak,
-                    None => slot.push((e.value.clone(), e.weak)),
+                    Some((_, w)) => *w &= weak,
+                    None => slot.push((e.value.clone(), weak)),
                 }
             }
         }
@@ -164,17 +187,42 @@ impl ConfigValues {
                 })
             })
             .collect();
+        lines.extend(self.failed.iter().map(|p| {
+            serde_json::json!([
+                "config-failed",
+                crate::state::root_relative_path(p, roots, None)
+            ])
+            .to_string()
+        }));
         lines.sort_unstable();
         lines
     }
 
     /// Resolves a topic holding `${key}` / `${key:default}` placeholders. `None` when any
-    /// placeholder has neither a configured value nor a default, is cyclic, or is nested too
-    /// deep: the caller keeps the placeholder as the (visible) topic.
+    /// placeholder has neither a configured value nor a default, is cyclic, is nested too
+    /// deep, or needs more than [`MAX_RESOLVE_STEPS`] steps / [`MAX_ALTERNATIVES`] candidates:
+    /// the caller keeps the placeholder as the (visible) topic. Answers are memoized per
+    /// topic until the next [`Self::rebuild`].
     pub fn resolve(&self, topic: &str) -> Option<Resolved> {
+        if let Some(hit) = self.memo.get(topic) {
+            return hit;
+        }
+        let (resolved, _) = self.resolve_counted(topic);
+        self.memo.put(topic, &resolved);
+        resolved
+    }
+
+    /// [`Self::resolve`] without the memo, and the work it took (expansion steps).
+    pub fn resolve_counted(&self, topic: &str) -> (Option<Resolved>, usize) {
+        let mut work = Work::default();
         let mut visiting: Vec<&str> = Vec::new();
-        let topics = self.expand(topic, 0, &mut visiting)?;
-        Some(Resolved { topics })
+        let topics = self.expand(topic, 0, &mut visiting, &mut work);
+        let resolved = if work.over {
+            None
+        } else {
+            topics.map(|topics| Resolved { topics })
+        };
+        (resolved, work.steps)
     }
 
     fn expand<'a>(
@@ -182,8 +230,9 @@ impl ConfigValues {
         text: &'a str,
         depth: usize,
         visiting: &mut Vec<&'a str>,
+        work: &mut Work,
     ) -> Option<Vec<(String, bool)>> {
-        if depth > MAX_RESOLVE_DEPTH {
+        if depth > MAX_RESOLVE_DEPTH || !work.step() {
             return None;
         }
         let mut acc: Vec<(String, bool)> = vec![(String::new(), false)];
@@ -196,8 +245,9 @@ impl ConfigValues {
             let end = body.find('}')?;
             let inner = &body[..end];
             rest = &body[end + 1..];
-            let alternatives = self.expand_key(inner, depth, visiting)?;
+            let alternatives = self.expand_key(inner, depth, visiting, work)?;
             if acc.len().saturating_mul(alternatives.len()) > MAX_ALTERNATIVES {
+                work.over = true;
                 return None;
             }
             acc = acc
@@ -215,12 +265,15 @@ impl ConfigValues {
         Some(acc)
     }
 
-    /// The candidates of one `key` / `key:default` placeholder body.
+    /// The candidates of one `key` / `key:default` placeholder body. The work budget and the
+    /// candidate cap are checked inside the loops, so a key with many values chained through
+    /// many keys is abandoned as soon as it exceeds them.
     fn expand_key<'a>(
         &'a self,
         inner: &'a str,
         depth: usize,
         visiting: &mut Vec<&'a str>,
+        work: &mut Work,
     ) -> Option<Vec<(String, bool)>> {
         let (key, default) = match inner.split_once(':') {
             Some((k, d)) => (k, Some(d)),
@@ -234,11 +287,20 @@ impl ConfigValues {
             visiting.push(key);
             let mut out: Vec<(String, bool)> = Vec::new();
             for (value, weak) in values {
-                let Some(expanded) = self.expand(value, depth + 1, visiting) else {
+                let Some(expanded) = self.expand(value, depth + 1, visiting, work) else {
+                    if work.over {
+                        visiting.pop();
+                        return None;
+                    }
                     continue;
                 };
                 for (v, w) in expanded {
                     if !out.iter().any(|(o, _)| *o == v) {
+                        if out.len() >= MAX_ALTERNATIVES || !work.step() {
+                            work.over = true;
+                            visiting.pop();
+                            return None;
+                        }
                         out.push((v, *weak || w || ambiguous));
                     }
                 }
@@ -261,6 +323,59 @@ impl ConfigValues {
         default
             .filter(|d| !d.is_empty())
             .map(|d| vec![(d.to_string(), true)])
+    }
+}
+
+/// Expansion budget of one [`ConfigValues::resolve`] call.
+#[derive(Debug, Default)]
+struct Work {
+    steps: usize,
+    /// The budget or the candidate cap was exceeded: abandon the whole expansion.
+    over: bool,
+}
+
+impl Work {
+    /// Counts one step; `false` (and `over`) once the budget is spent.
+    fn step(&mut self) -> bool {
+        self.steps += 1;
+        if self.steps > MAX_RESOLVE_STEPS {
+            self.over = true;
+        }
+        !self.over
+    }
+}
+
+/// Answers of [`ConfigValues::resolve`] by topic, cleared on every rebuild. Shared between the
+/// reader threads of a snapshot (hence the lock); a clone starts empty.
+#[derive(Debug, Default)]
+struct Memo(std::sync::Mutex<HashMap<String, Option<Resolved>>>);
+
+impl Clone for Memo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl Memo {
+    /// Most memoized topics.
+    const MAX: usize = 4096;
+
+    fn get(&self, topic: &str) -> Option<Option<Resolved>> {
+        self.0.lock().ok()?.get(topic).cloned()
+    }
+
+    fn put(&self, topic: &str, resolved: &Option<Resolved>) {
+        if let Ok(mut m) = self.0.lock() {
+            if m.len() < Self::MAX {
+                m.insert(topic.to_string(), resolved.clone());
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        if let Ok(m) = self.0.get_mut() {
+            m.clear();
+        }
     }
 }
 
@@ -432,6 +547,16 @@ pub fn is_multi_document(content: &str) -> bool {
         }
     }
     false
+}
+
+/// Whether `path` is a file configuration is read from (yaml, properties, a dotenv template).
+pub fn is_config_path(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    is_env_template_name(name)
+        || matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("yml" | "yaml" | "properties")
+        )
 }
 
 /// The only dotenv files read: the four template names, exactly. A real dotenv file
@@ -694,6 +819,46 @@ mod tests {
             .map(|e| (e.key.as_str(), e.value.as_str()))
             .collect();
         assert_eq!(got, [("KAFKA_TOPIC", "orders")]);
+    }
+
+    /// F4: 64 files x 8 values per key, chained 8 levels deep, used to expand to the full
+    /// cross product before any cap was checked (70 s). The work is now bounded by a step
+    /// counter checked inside the loops; the placeholder stays unresolved.
+    #[test]
+    fn a_wide_chained_fan_out_is_abandoned_within_the_step_budget() {
+        let mut v = ConfigValues::default();
+        for f in 0..64 {
+            let mut text = String::new();
+            for level in 0..8 {
+                // 8 distinct values per key across the 64 files (f % 8).
+                text.push_str(&format!("k{level}=${{k{}}}.v{}\n", level + 1, f % 8));
+            }
+            text.push_str("k8=leaf\n");
+            let mut reg = PropertyRegistry::new();
+            reg.ingest_properties_str(&text);
+            v.set_file(
+                Path::new(&format!("f{f}.properties")),
+                from_registry(&reg, false, false).entries,
+            );
+        }
+        v.rebuild();
+        let (resolved, steps) = v.resolve_counted("${k0}");
+        assert!(resolved.is_none());
+        assert!(steps <= MAX_RESOLVE_STEPS + 1, "{steps} steps");
+        // 20 sites asking for the same topic cost one expansion (memo), and stay unresolved.
+        for _ in 0..20 {
+            assert!(v.resolve("${k0}").is_none());
+        }
+        // A small chain still resolves.
+        let mut ok = ConfigValues::default();
+        ok.set_file(
+            Path::new("a.properties"),
+            props("a=${b}\nb=${c}\nc=end\n").entries,
+        );
+        ok.rebuild();
+        let (r, steps) = ok.resolve_counted("${a}");
+        assert_eq!(r.unwrap().topics, [("end".to_string(), false)]);
+        assert!(steps < 20, "{steps}");
     }
 
     #[test]

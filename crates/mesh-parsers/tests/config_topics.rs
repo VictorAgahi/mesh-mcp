@@ -173,6 +173,41 @@ fn java_value_injected_fields_and_listener_placeholders_are_recorded() {
     );
 }
 
+/// F10: `@Value` fields are scoped to the class that declares them. The same name on a plain
+/// field of another class of the same file is not a config read. Documented limit: inside the
+/// declaring class a parameter or local that shadows the field is still taken for it.
+#[test]
+fn java_value_fields_are_scoped_to_their_own_class() {
+    let fi = index(
+        "src/Two.java",
+        "package a;\n\
+         public class First {\n\
+         \x20 @Value(\"${app.topics.orders}\") private String ordersTopic;\n\
+         \x20 public void go() { kafkaTemplate.send(ordersTopic, \"x\"); }\n\
+         }\n\
+         class Second {\n\
+         \x20 private String ordersTopic = compute();\n\
+         \x20 public void go() { kafkaTemplate.send(ordersTopic, \"y\"); }\n\
+         }\n\
+         class Third {\n\
+         \x20 @Value(\"${app.topics.orders}\") private String ordersTopic;\n\
+         \x20 public void shadow(String ordersTopic) { kafkaTemplate.send(ordersTopic, \"z\"); }\n\
+         }\n",
+    );
+    let got = recorded(&fi);
+    // First and Third (the documented shadowing limit); Second records nothing.
+    assert_eq!(
+        got,
+        vec![p("${app.topics.orders}"), p("${app.topics.orders}")]
+    );
+    let lines: Vec<usize> = fi
+        .producers
+        .iter()
+        .map(|(i, _)| fi.nodes[*i].line_start)
+        .collect();
+    assert_eq!(lines, vec![4, 12], "{lines:?}");
+}
+
 fn entry(key: &str, value: &str, weak: bool) -> ConfigEntry {
     ConfigEntry {
         key: key.into(),

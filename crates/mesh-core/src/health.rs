@@ -196,6 +196,14 @@ pub struct IndexHealth {
     /// their placeholder name (never guessed). Set after every reconcile.
     #[serde(default)]
     pub config_topics_unresolved: usize,
+    /// Configuration files (yaml) that did not parse: they contribute nothing, so a profile
+    /// file next to one is read as weak. Counted like `files_scanned`.
+    #[serde(default)]
+    pub files_config_parse_failed: usize,
+    /// Configuration files that are not valid UTF-8: read with the invalid bytes replaced, so
+    /// only the lines that held them are lost. Counted like `files_scanned`.
+    #[serde(default)]
+    pub files_config_lossy: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -311,8 +319,17 @@ impl IndexHealth {
 
     /// One configuration file's per-file cap.
     #[inline]
-    pub fn record_config(&mut self, capped: bool) {
+    pub fn record_config(&mut self, capped: bool, parse_failed: bool, lossy: bool) {
         self.files_config_capped += usize::from(capped);
+        self.files_config_parse_failed += usize::from(parse_failed);
+        self.files_config_lossy += usize::from(lossy);
+    }
+
+    /// Whether configuration was dropped, misread or only partly read: some `${key}` topics
+    /// may stay unresolved or resolve weakly (`doctor` warns).
+    #[inline]
+    pub fn config_degraded(&self) -> bool {
+        self.config_truncated() || self.files_config_parse_failed > 0 || self.files_config_lossy > 0
     }
 
     /// Whether a configuration cap dropped entries: some `${key}` topics may stay unresolved.
@@ -572,6 +589,22 @@ impl IndexHealth {
                 self.files_config_capped, self.config_entries_dropped
             );
         }
+        if self.files_config_parse_failed > 0 {
+            let _ = writeln!(
+                out,
+                "    {} configuration file(s) did not parse (invalid yaml, a duplicate key, a Helm \
+                 template): they contribute nothing, and a profile file next to one is read as weak",
+                self.files_config_parse_failed
+            );
+        }
+        if self.files_config_lossy > 0 {
+            let _ = writeln!(
+                out,
+                "    {} configuration file(s) are not valid UTF-8: read with the invalid bytes \
+                 replaced, the lines that held them are lost",
+                self.files_config_lossy
+            );
+        }
         if self.config_topics_unresolved > 0 {
             let _ = writeln!(
                 out,
@@ -579,6 +612,18 @@ impl IndexHealth {
                  placeholder name, never guessed)",
                 self.config_topics_unresolved
             );
+            let skipped = self
+                .rejected
+                .iter()
+                .filter(|r| crate::config_values::is_config_path(&r.path))
+                .count();
+            if skipped > 0 {
+                let _ = writeln!(
+                    out,
+                    "    ({skipped} configuration file(s) were not indexed (listed below): a \
+                     placeholder may be unresolved only because its file was skipped)"
+                );
+            }
         }
         if self.rejected_overflow > 0 {
             // The breakdown above only covers the capped `rejected` list (step 4.1
@@ -613,6 +658,8 @@ impl IndexHealth {
         self.files_sql_capped += other.files_sql_capped;
         self.sql_sites_unresolved += other.sql_sites_unresolved;
         self.files_config_capped += other.files_config_capped;
+        self.files_config_parse_failed += other.files_config_parse_failed;
+        self.files_config_lossy += other.files_config_lossy;
         self.files_skipped_non_source += other.files_skipped_non_source;
         // The calls-layer counters are the graph's, set after the reconcile.
     }

@@ -687,7 +687,12 @@ impl WorkspaceIndexer {
             if frag.code.calls_skipped_path {
                 health.record_calls_skipped_path();
             }
-            health.record_config(frag.config.as_ref().is_some_and(|c| c.capped));
+            let c = frag.config.as_ref();
+            health.record_config(
+                c.is_some_and(|c| c.capped),
+                c.is_some_and(|c| c.failed),
+                c.is_some_and(|c| c.lossy),
+            );
             health.record_sql(frag.code.sql_capped, frag.code.sql_unresolved);
             if frag.code.calls.capped {
                 tracing::warn!(
@@ -1623,7 +1628,17 @@ impl WorkspaceIndexer {
                 return Err(RejectKind::DeepNesting(depth))
             }
         }
-        let content = std::str::from_utf8(&bytes).map_err(|_| RejectKind::ReadError)?;
+        // A configuration file that is not UTF-8 is read with the invalid bytes replaced (the
+        // lines that held them are lost, counted), instead of losing all its valid lines.
+        let lossy_text;
+        let (content, config_lossy) = match std::str::from_utf8(&bytes) {
+            Ok(c) => (c, false),
+            Err(_) if Self::is_config_source(path) => {
+                lossy_text = String::from_utf8_lossy(&bytes).into_owned();
+                (lossy_text.as_str(), true)
+            }
+            Err(_) => return Err(RejectKind::ReadError),
+        };
         let signature = DifferentialVfs::compute_signature(&metadata, &bytes);
 
         let mut frag = FileFragment {
@@ -1658,12 +1673,13 @@ impl WorkspaceIndexer {
             }
             "yml" | "yaml" => {
                 let mut props = None;
+                let mut yaml_failed = false;
                 if spring.is_property_source(path) {
                     let mut reg = PropertyRegistry::with_redaction(spring.auto_redact_secrets);
-                    let _ = reg.ingest_yaml_str(content);
+                    yaml_failed = reg.ingest_yaml_str(content).is_err();
                     props = Some(reg);
                 }
-                frag.config = Self::yaml_config(content, props.as_ref(), template);
+                frag.config = Self::yaml_config(content, props.as_ref(), template, yaml_failed);
                 frag.props = props;
                 if toggles.contracts_enabled {
                     let (code, cache_write) = Self::extract_with_cache(
@@ -1697,6 +1713,9 @@ impl WorkspaceIndexer {
             frag.code.merge(PolyglotIndexer::extract_custom_patterns(
                 path, content, repo_id, patterns,
             ));
+        }
+        if config_lossy {
+            frag.config.get_or_insert_with(Default::default).lossy = true;
         }
 
         Ok(frag)
@@ -1837,6 +1856,7 @@ impl WorkspaceIndexer {
         content: &str,
         props: Option<&PropertyRegistry>,
         template: bool,
+        failed: bool,
     ) -> Option<mesh_core::ConfigFile> {
         let env_lists = config_values::may_hold_env_list(content);
         let weak = template || config_values::is_multi_document(content);
@@ -1844,15 +1864,18 @@ impl WorkspaceIndexer {
             Some(reg) => config_values::from_registry(reg, weak, false),
             None if env_lists => {
                 let mut reg = PropertyRegistry::new();
-                let _ = reg.ingest_yaml_str(content);
-                config_values::from_registry(&reg, weak, true)
+                let throwaway_failed = reg.ingest_yaml_str(content).is_err();
+                let mut file = config_values::from_registry(&reg, weak, true);
+                file.failed = throwaway_failed;
+                file
             }
             None => return None,
         };
+        file.failed |= failed;
         if env_lists {
             file.merge(config_values::from_env_lists(content, weak));
         }
-        (!file.entries.is_empty() || file.capped).then_some(file)
+        (!file.entries.is_empty() || file.capped || file.failed).then_some(file)
     }
 
     /// Takes every fragment's configuration into the snapshot, before any source file is
@@ -1860,8 +1883,11 @@ impl WorkspaceIndexer {
     /// against the files folded so far.
     fn fold_config(fragments: &mut [FileFragment], snapshot: &mut MeshSnapshot) {
         for frag in fragments.iter_mut() {
-            let entries = frag.config.take().map(|c| c.entries).unwrap_or_default();
-            snapshot.config_values.set_file(&frag.path, entries);
+            let config = frag.config.take().unwrap_or_default();
+            snapshot.config_values.set_file(&frag.path, config.entries);
+            if config.failed {
+                snapshot.config_values.mark_failed(&frag.path);
+            }
         }
         snapshot.config_values.rebuild();
         snapshot.health.config_entries_dropped = snapshot.config_values.dropped_total();
@@ -3500,5 +3526,117 @@ resolve_placeholders = true
             "the 1 MB yaml is counted as oversized"
         );
         assert!(view.health.config_truncated());
+    }
+
+    const ONE_LISTENER: &str = "package a;\npublic class S {\n  @KafkaListener(topics = \"${t}\")\n  public void on(String m) {}\n}\n";
+
+    /// F6: a base file that does not parse (a duplicate key) must not promote the profile file
+    /// next to it to an exact value: it is weak, and the failure is counted.
+    #[test]
+    fn an_unparsable_base_file_leaves_the_profile_value_weak_and_is_counted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        write(&root, "S.java", ONE_LISTENER);
+        write(&root, "res/application.yml", "t: orders\nt: orders2\n");
+        write(&root, "res/application-prod.yml", "t: orders.prod\n");
+        let state = make_state(&root);
+        build_and_install(&state);
+        let view = state.snapshot();
+        assert_eq!(topic_rows(&view), ["Consumes heuristic orders.prod S.java"]);
+        assert_eq!(view.health.files_config_parse_failed, 1);
+        drop(view);
+        // Fixing the base file makes the profile value ambiguous with it, no longer failed.
+        write(&root, "res/application.yml", "t: orders\n");
+        WorkspaceIndexer::reload(&state);
+        let view = state.snapshot();
+        assert_eq!(
+            topic_rows(&view),
+            [
+                "Consumes heuristic orders S.java",
+                "Consumes heuristic orders.prod S.java"
+            ]
+        );
+    }
+
+    /// F7: a non-UTF-8 properties file keeps every valid line and is counted.
+    #[test]
+    fn a_non_utf8_config_file_keeps_its_valid_lines_and_is_counted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        write(&root, "S.java", ONE_LISTENER);
+        std::fs::write(
+            root.join("application.properties"),
+            b"x=before\nbad=caf\xe9\nt=good.topic\n",
+        )
+        .expect("write");
+        let state = make_state(&root);
+        build_and_install(&state);
+        let view = state.snapshot();
+        assert_eq!(topic_rows(&view), ["Consumes exact good.topic S.java"]);
+        assert_eq!(view.health.files_config_lossy, 1);
+        assert!(view.health.config_degraded());
+    }
+
+    /// F8: a placeholder that stays unresolved while a config file was skipped says so.
+    #[test]
+    fn an_unresolved_placeholder_names_the_skipped_config_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        write(&root, "S.java", ONE_LISTENER);
+        write(
+            &root,
+            "application.yml",
+            &format!("t: orders\nfiller: {}\n", "v".repeat(400_000)),
+        );
+        let state = make_state(&root);
+        build_and_install(&state);
+        let view = state.snapshot();
+        assert_eq!(topic_rows(&view), ["Consumes heuristic ${t} S.java"]);
+        let summary = view.health.render_summary(10);
+        assert!(
+            summary.contains("1 ${key} topic(s) no configuration file resolves"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("1 configuration file(s) were not indexed"),
+            "{summary}"
+        );
+    }
+
+    /// F4: 20 listeners on one key whose values fan out 8 wide and 8 deep over 64 files stay
+    /// unresolved, visible and counted, and the work does not scale with the cross product.
+    #[test]
+    fn a_wide_chained_config_fan_out_stays_unresolved_visible_and_counted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let mut java = String::from("package a;\npublic class S {\n");
+        for i in 0..20 {
+            java.push_str(&format!(
+                "  @KafkaListener(topics = \"${{k0}}\")\n  public void on{i}(String m) {{}}\n"
+            ));
+        }
+        java.push_str("}\n");
+        write(&root, "S.java", &java);
+        for f in 0..64 {
+            let mut text = String::new();
+            for level in 0..8 {
+                text.push_str(&format!("k{level}=${{k{}}}.v{}\n", level + 1, f % 8));
+            }
+            text.push_str("k8=leaf\n");
+            write(&root, &format!("res/application-{f}.properties"), &text);
+        }
+        let state = make_state(&root);
+        let started = std::time::Instant::now();
+        build_and_install(&state);
+        assert!(started.elapsed().as_secs() < 20, "{:?}", started.elapsed());
+        let view = state.snapshot();
+        let rows = topic_rows(&view);
+        assert_eq!(rows.len(), 20, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|r| r.starts_with("Consumes heuristic ${k0} S.java")),
+            "{rows:?}"
+        );
+        assert_eq!(view.health.config_topics_unresolved, 1);
     }
 }

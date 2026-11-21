@@ -90,11 +90,7 @@ async fn real_dotenv_files_and_look_alikes_never_reach_the_graph_or_a_tool() {
     );
     write(&root, ".env.example", "GOOD_TOPIC=good.template.topic\n");
     let state = state_for(&root);
-    let all = everything(
-        &state,
-        &["${prodenv_topic}", "${dist_topic}"],
-    )
-    .await;
+    let all = everything(&state, &["${prodenv_topic}", "${dist_topic}"]).await;
     for canary in [
         "leak-prodenv",
         "leakurl",
