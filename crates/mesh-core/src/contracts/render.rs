@@ -50,12 +50,23 @@ impl ContractGraph {
         ] {
             for (target, ids) in index {
                 for &id in ids {
-                    lines.push(format!(
-                        "{label} {}",
-                        serde_json::json!([target, key_of(id)])
-                    ));
+                    // A site whose broker is known carries it: a delta and a full rebuild
+                    // must agree on which channel each site is on.
+                    let mask = match label {
+                        "produces" => self.site_mask(true, target, id),
+                        "consumes" => self.site_mask(false, target, id),
+                        _ => 0,
+                    };
+                    lines.push(if mask == 0 {
+                        format!("{label} {}", serde_json::json!([target, key_of(id)]))
+                    } else {
+                        format!("{label} {}", serde_json::json!([target, key_of(id), mask]))
+                    });
                 }
             }
+        }
+        for (key, hub) in &self.wildcard_capped {
+            lines.push(format!("wildcard-capped {}", serde_json::json!([key, hub])));
         }
         for node in self.callable_nodes() {
             lines.push(format!("node {}", Self::canonical_node_key(node, roots)));

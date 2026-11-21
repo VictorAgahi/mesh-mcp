@@ -105,7 +105,29 @@ impl McpTool for AnalyzeImpactTool {
                 "\n*{hidden_tests} row(s) in test files left out (`include_tests: true` to list them).*\n"
             ));
         }
+        let text = with_literal_clash_note(text, &snapshot.contract_graph, args.target.as_str());
         Ok(ToolOutput::text(text))
+    }
+}
+
+/// Puts the "ambiguous target" note under the heading of `text` when `target` is both a key
+/// spelled like a broker channel (`rabbitmq:orders`) and that broker's channel of the bare name.
+pub(crate) fn with_literal_clash_note(
+    text: String,
+    graph: &mesh_core::ContractGraph,
+    target: &str,
+) -> String {
+    let Some(key) = graph.target_literal_clash(target) else {
+        return text;
+    };
+    let bare = key.split_once(':').map_or("", |(_, rest)| rest);
+    let note = format!(
+        "**Ambiguous target**: `{key}` is both a topic key spelled so (its hub is `{key} (literal)`) and the `{broker}` channel of `{bare}`. Both are listed; the `{broker}` ones are `heuristic` in the matrix. Query `{bare}` for every channel of the name.\n",
+        broker = key.split_once(':').map_or("", |(b, _)| b)
+    );
+    match text.split_once('\n') {
+        Some((heading, rest)) => format!("{heading}\n\n{note}{rest}"),
+        None => format!("{text}\n\n{note}"),
     }
 }
 

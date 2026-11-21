@@ -86,9 +86,13 @@ Where it stops (all listed in `CHANGELOG.md` 7.1.0 to 7.1.10):
 - NestJS global prefixes and `@Version`, Express/Koa mounts across files, a Fastify plugin passed
   as a named function, inherited controller bases, and HTTP client calls are not linked.
 - Template-only component usage (auto-imported Vue/Nuxt components with no `import`) is not seen.
-- A Kafka topic, a Redis channel and a queue that happen to share a name are one topic in the graph
-  (the key is the lower-cased name, whatever the broker), so a consumer of one can appear linked to a
-  producer of another.
+- A Kafka topic, a Redis stream, a RabbitMQ queue, an SNS topic and so on that share a name are
+  separate channels since 9.0 (broker-qualified keys, [architecture 3.4](architecture.md#34-broker-qualified-topic-keys)):
+  each site carries the broker its client library speaks to. A NestJS `@EventPattern`,
+  `@MessagePattern` or `client.emit` has no statically known broker (the transport is configured
+  elsewhere): it joins every channel of its name, `heuristic`, while two or more brokers use the name.
+  Redis pub/sub, streams and lists are one broker (`redis`), as are SNS topics and SQS queues two
+  (`sns`, `sqs`): they are not linked, although AWS can subscribe a queue to a topic.
 - `export =`, UMD/webpack wrappers, namespace-qualified constants (`ns.Enum.MEMBER`) are not
   resolved.
 - TanStack Router, Expo Router, Qwik City and SolidStart conventions are not covered.

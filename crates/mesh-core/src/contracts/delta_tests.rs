@@ -25,6 +25,9 @@ struct NodeSpec {
     deps: Vec<&'static str>,
     produces: Vec<&'static str>,
     consumes: Vec<&'static str>,
+    /// Topics produced / consumed on a statically known broker (9.0 T7).
+    produces_on: Vec<(&'static str, Broker)>,
+    consumes_on: Vec<(&'static str, Broker)>,
     rpc: Vec<&'static str>,
     heuristic: bool,
 }
@@ -38,6 +41,8 @@ fn node(name: &'static str, kind: NodeKind, package: &'static str) -> NodeSpec {
         deps: Vec::new(),
         produces: Vec::new(),
         consumes: Vec::new(),
+        produces_on: Vec::new(),
+        consumes_on: Vec::new(),
         rpc: Vec::new(),
         heuristic: false,
     }
@@ -54,6 +59,14 @@ impl NodeSpec {
     }
     fn consumes(mut self, topics: &[&'static str]) -> Self {
         self.consumes = topics.to_vec();
+        self
+    }
+    fn produces_on(mut self, topic: &'static str, broker: Broker) -> Self {
+        self.produces_on.push((topic, broker));
+        self
+    }
+    fn consumes_on(mut self, topic: &'static str, broker: Broker) -> Self {
+        self.consumes_on.push((topic, broker));
         self
     }
     fn rpc(mut self, records: &[&'static str]) -> Self {
@@ -98,6 +111,12 @@ fn fold(g: &mut ContractGraph, f: &FileSpec) {
         }
         for t in &n.consumes {
             g.add_consumer(id, t);
+        }
+        for (t, b) in &n.produces_on {
+            g.add_producer_on(id, t, Some(*b));
+        }
+        for (t, b) in &n.consumes_on {
+            g.add_consumer_on(id, t, Some(*b));
         }
         if !f.interleave_rpc {
             for r in &n.rpc {
@@ -655,6 +674,23 @@ const TOPICS: &[&str] = &[
     "sensors/+/temp",
     "sensors/a/temp",
 ];
+/// Topics the random files register on a broker, or on none (9.0 T7). `rabbitmq:orders` and
+/// `kafka:orders` are keys spelled like the hubs of `orders`, so the literal-key hub rename is
+/// exercised.
+const BROKER_TOPICS: &[&str] = &[
+    "orders",
+    "orders.created",
+    "orders.*",
+    "rabbitmq:orders",
+    "kafka:orders",
+    "billing.done",
+];
+const BROKERS: &[Option<Broker>] = &[
+    Some(Broker::Kafka),
+    Some(Broker::RabbitMq),
+    Some(Broker::Sns),
+    None,
+];
 const RPC: &[&str] = &[
     "=UserService.SignUp",
     "~UserService.GetUser",
@@ -730,6 +766,16 @@ fn random_file(rng: &mut Rng, slot: usize) -> FileSpec {
             .rpc(&rng.some(RPC, 3));
         n.signature = rng.pick(SIGNATURES);
         n.heuristic = rng.below(4) == 0;
+        for _ in 0..rng.below(3) {
+            let topic = rng.pick(BROKER_TOPICS);
+            let broker = rng.pick(BROKERS);
+            match (rng.below(2) == 0, broker) {
+                (true, Some(b)) => n = n.produces_on(topic, b),
+                (false, Some(b)) => n = n.consumes_on(topic, b),
+                (true, None) => n.produces.push(topic),
+                (false, None) => n.consumes.push(topic),
+            }
+        }
         nodes.push(n);
     }
     let mut f = file(&path, repo, nodes);
@@ -784,5 +830,84 @@ fn delta_equals_full_over_seeded_random_edit_sequences() {
     assert!(
         deltas > 100 && grpc_full > 10 && calls_full > 10,
         "{deltas} deltas, {grpc_full} gRPC-full, {calls_full} calls-full"
+    );
+}
+
+#[test]
+fn delta_tracks_a_name_gaining_and_losing_a_second_broker() {
+    let kafka = file(
+        "/ws/a/ship.ts",
+        0,
+        vec![node("Ship", NodeKind::ServiceClass, "").produces_on("orders", Broker::Kafka)],
+    );
+    let kafka_consumer = file(
+        "/ws/b/recv.ts",
+        1,
+        vec![node("Recv", NodeKind::ServiceClass, "").consumes_on("orders", Broker::Kafka)],
+    );
+    let legacy = file(
+        "/ws/c/legacy.ts",
+        2,
+        vec![node("Legacy", NodeKind::ServiceClass, "").consumes(&["orders"])],
+    );
+    let rabbit = |broker: Broker| {
+        file(
+            "/ws/d/rabbit.ts",
+            3,
+            vec![node("Rabbit", NodeKind::ServiceClass, "").consumes_on("orders", broker)],
+        )
+    };
+    run_steps(
+        &[kafka.clone(), kafka_consumer, legacy.clone()],
+        &[
+            // A second broker appears: the plain hub splits in two, the unknown-broker
+            // consumer joins both heuristically.
+            ("/ws/d/rabbit.ts", Some(rabbit(Broker::RabbitMq)), DELTA),
+            // It moves to the first broker: back to one plain hub.
+            ("/ws/d/rabbit.ts", Some(rabbit(Broker::Kafka)), DELTA),
+            ("/ws/d/rabbit.ts", Some(rabbit(Broker::Sns)), DELTA),
+            // The Kafka producer's file is edited to another broker, then deleted.
+            (
+                "/ws/a/ship.ts",
+                Some(file(
+                    "/ws/a/ship.ts",
+                    0,
+                    vec![
+                        node("Ship", NodeKind::ServiceClass, "").produces_on("orders", Broker::Sns)
+                    ],
+                )),
+                DELTA,
+            ),
+            ("/ws/a/ship.ts", None, DELTA),
+            ("/ws/d/rabbit.ts", None, DELTA),
+            // Everything back, in the other order.
+            ("/ws/a/ship.ts", Some(kafka), DELTA),
+            ("/ws/d/rabbit.ts", Some(rabbit(Broker::RabbitMq)), DELTA),
+            ("/ws/c/legacy.ts", None, DELTA),
+            ("/ws/c/legacy.ts", Some(legacy), DELTA),
+        ],
+    );
+}
+
+#[test]
+fn delta_keeps_wildcard_subscriptions_apart_across_brokers() {
+    let nats_sub = file(
+        "/ws/a/sub.ts",
+        0,
+        vec![node("Sub", NodeKind::ServiceClass, "").consumes_on("orders.*", Broker::Nats)],
+    );
+    let producer = |broker: Broker| {
+        file(
+            "/ws/b/pub.ts",
+            1,
+            vec![node("Pub", NodeKind::ServiceClass, "").produces_on("orders.created", broker)],
+        )
+    };
+    run_steps(
+        &[nats_sub, producer(Broker::Nats)],
+        &[
+            ("/ws/b/pub.ts", Some(producer(Broker::Mqtt)), DELTA),
+            ("/ws/b/pub.ts", Some(producer(Broker::Nats)), DELTA),
+        ],
     );
 }

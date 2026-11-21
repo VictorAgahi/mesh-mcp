@@ -1,0 +1,82 @@
+# Hand-annotated from the source of examples/eda/multi-broker. Never generated from tool output.
+# The channel name `orders` is used on six brokers: Kafka (TypeScript kafkajs and Go kafka-go),
+# RabbitMQ (amqplib), SNS (publish only), SQS (consume only), Redis (stream) and NATS. They are six
+# different channels, so each is written `<broker>:orders` (SCHEMA.md "Broker-qualified keys").
+# `invoices` (Kafka) and `shipments` (RabbitMQ) are used on one broker only: plain keys.
+# `invoices` is produced in TypeScript and consumed in Go on the same broker: one channel.
+# A Go kafka.Writer / kafka.ReaderConfig literal sits on the line that carries the topic literal.
+# `LegacyOrders` is a NestJS `@EventPattern('orders')` handler: its transport is configured
+# elsewhere, so its broker is not statically known and it consumes `orders` on every channel of
+# the name that exists (rule: an unknown-broker site joins every channel, heuristic). It is
+# written once per channel (c8-c13).
+# `events.*` is a NATS wildcard subscription and `events.created` a Redis stream: another broker's
+# subject is not heard by the wildcard, so neither side has a link and the producer is NOT also a
+# producer of `events.*`.
+corpus: multi-broker
+root: examples/eda/multi-broker
+config: mesh-mcp.toml
+languages: [ts, go]
+
+producers:
+  - {id: p1, topic: "kafka:orders", file: src/kafka.ts, line: 9, language: ts, tags: [kafka_basic, broker_key]}
+  - {id: p2, topic: invoices, file: src/billing.ts, line: 6, language: ts, tags: [kafka_basic, broker_key]}
+  - {id: p3, topic: "rabbitmq:orders", file: src/rabbit.ts, line: 5, language: ts, tags: [broker_key]}
+  - {id: p4, topic: shipments, file: src/fulfilment.ts, line: 4, language: ts, tags: [broker_key]}
+  - {id: p5, topic: "sns:orders", file: src/sns.ts, line: 6, language: ts, tags: [broker_key]}
+  - {id: p6, topic: "redis:orders", file: src/redis.ts, line: 6, language: ts, tags: [broker_key]}
+  - {id: p7, topic: "nats:orders", file: src/nats.ts, line: 5, language: ts, tags: [broker_key]}
+  - {id: p8, topic: "kafka:orders", file: ledger/publisher.go, line: 6, language: go, tags: [kafka_basic, broker_key]}
+  - {id: p9, topic: "events.created", file: src/redis.ts, line: 14, language: ts, tags: [broker_key]}
+
+consumers:
+  - {id: c1, topic: "kafka:orders", file: src/kafka.ts, line: 13, language: ts, tags: [kafka_basic, broker_key]}
+  - {id: c2, topic: "rabbitmq:orders", file: src/rabbit.ts, line: 9, language: ts, tags: [broker_key]}
+  - {id: c3, topic: "sqs:orders", file: src/sqs.ts, line: 6, language: ts, tags: [broker_key]}
+  - {id: c4, topic: "redis:orders", file: src/redis.ts, line: 10, language: ts, tags: [broker_key]}
+  - {id: c5, topic: "nats:orders", file: src/nats.ts, line: 10, language: ts, tags: [broker_key]}
+  - {id: c6, topic: "kafka:orders", file: ledger/consumer.go, line: 6, language: go, tags: [kafka_basic, broker_key]}
+  - {id: c7, topic: invoices, file: ledger/consumer.go, line: 10, language: go, tags: [kafka_basic, broker_key]}
+  - {id: c8, topic: "kafka:orders", file: src/legacy.ts, line: 6, language: ts, tags: [broker_key]}
+  - {id: c9, topic: "rabbitmq:orders", file: src/legacy.ts, line: 6, language: ts, tags: [broker_key]}
+  - {id: c10, topic: "sns:orders", file: src/legacy.ts, line: 6, language: ts, tags: [broker_key]}
+  - {id: c11, topic: "sqs:orders", file: src/legacy.ts, line: 6, language: ts, tags: [broker_key]}
+  - {id: c12, topic: "redis:orders", file: src/legacy.ts, line: 6, language: ts, tags: [broker_key]}
+  - {id: c13, topic: "nats:orders", file: src/legacy.ts, line: 6, language: ts, tags: [broker_key]}
+  - {id: c14, topic: "events.*", file: src/nats.ts, line: 15, language: ts, tags: [broker_key]}
+
+hops:
+  - id: h1
+    from: {symbol: startBilling, file: src/kafka.ts, line: 14}
+    to: {symbol: billOrder, file: src/billing.ts, line: 5}
+    via: imported_function
+    tags: [layered_calls, broker_key]
+  - id: h2
+    from: {symbol: startFulfilment, file: src/rabbit.ts, line: 10}
+    to: {symbol: fulfilOrder, file: src/fulfilment.ts, line: 3}
+    via: imported_function
+    tags: [layered_calls, broker_key]
+
+chains:
+  # Kafka `orders` reaches billing and, through `invoices`, the Go ledger. It must not continue
+  # into the RabbitMQ consumer of the same name.
+  - id: ch1
+    entry: {kind: topic, value: "kafka:orders"}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/kafka.ts, line: 13, topic: "kafka:orders"}
+      - {kind: call, file: src/billing.ts, line: 5}
+      - {kind: produce, file: src/billing.ts, line: 6, topic: invoices}
+      - {kind: consume, file: ledger/consumer.go, line: 10, topic: invoices}
+    tags: [kafka_basic, layered_calls, broker_key]
+    min_hops: 1
+  # RabbitMQ `orders` reaches fulfilment and publishes `shipments`. It must not be reached from
+  # the Kafka, SNS, Redis or NATS producers of the same name.
+  - id: ch2
+    entry: {kind: topic, value: "rabbitmq:orders"}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/rabbit.ts, line: 9, topic: "rabbitmq:orders"}
+      - {kind: call, file: src/fulfilment.ts, line: 3}
+      - {kind: produce, file: src/fulfilment.ts, line: 4, topic: shipments}
+    tags: [layered_calls, broker_key]
+    min_hops: 1

@@ -535,6 +535,13 @@ written, it is tried once more with `.`, `:`, `-`, `/` turned into `_`, so the v
 (`event.created`) finds the member-keyed topic (`event_created`). Rows in test files are left out and
 counted unless `include_tests: true`.
 
+Since 9.0 a name used on two or more message brokers is two channels (broker-qualified keys,
+[architecture 3.4](architecture.md#34-broker-qualified-topic-keys)). Its topic rows are named
+`kafka:orders`, `rabbitmq:orders`; a bare target (`orders`) lists them all, a qualified one
+(`kafka:orders`) lists that broker's channel only. A producer or consumer whose broker is not
+statically known (a NestJS `@EventPattern`) is on every channel of the name, marked `heuristic`.
+A name used on one broker keeps its plain key and its output is unchanged.
+
 #### Depth
 Since 9.0, each hop past the first comes from the chain engine that `trace_flow` renders
 (`crates/mesh-core/src/contracts/flow.rs`): from each consumer reached on the previous hop, the

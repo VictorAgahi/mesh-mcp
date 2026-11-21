@@ -37,6 +37,11 @@ VIA = {"this", "injected_field", "imported_function", "same_module", "interface_
 ENTRY_KINDS = {"topic", "route", "handler", "cron"}
 STEP_KINDS = {"consume", "call", "produce"}
 NEG_KINDS = {"producer", "consumer"}
+# Broker qualifiers of a topic key (mesh_core::Broker::slug; a Rust test keeps the two in sync).
+BROKER_SLUGS = (
+    "kafka", "rabbitmq", "redis", "nats", "mqtt", "sqs", "sns", "kinesis", "eventbridge",
+    "pubsub", "pulsar", "servicebus", "eventhubs", "stomp", "bull", "beequeue",
+)
 
 
 # ---------------------------------------------------------------- minimal YAML reader
@@ -194,8 +199,24 @@ _TOPIC_BEFORE = r"(?<![A-Za-z0-9_\-.:])"
 _TOPIC_AFTER = r"(?![A-Za-z0-9_\-]|[.:](?!delay\b|apply_async\b)[A-Za-z0-9_])"
 
 
-def has_topic(line, topic):
-    return re.search(_TOPIC_BEFORE + re.escape(str(topic)) + _TOPIC_AFTER, line, re.I) is not None
+def source_topic(topic, tags):
+    """The name a line of source carries for `topic`. Under the tag `broker_key` a topic is
+    written `<broker>:<name>` when the name is used on two or more brokers of the corpus
+    (SCHEMA.md "Broker-qualified keys"); the qualifier is not in the source."""
+    if "broker_key" in (tags or []) and isinstance(topic, str):
+        slug, sep, rest = topic.partition(":")
+        if sep and rest and slug.lower() in BROKER_SLUGS:
+            return rest
+    return topic
+
+
+# An ARN (`arn:aws:sns:eu-west-1:123456789012:orders`) names its topic after a colon.
+_TOPIC_BEFORE_ARN = r"(?<![A-Za-z0-9_\-.])"
+
+
+def has_topic(line, topic, arn=False):
+    before = _TOPIC_BEFORE_ARN if arn else _TOPIC_BEFORE
+    return re.search(before + re.escape(str(topic)) + _TOPIC_AFTER, line, re.I) is not None
 
 
 def has_symbol(line, name):
@@ -312,7 +333,8 @@ class Checker:
                 text = self.line_text(w, root, it.get("file"), it.get("line"))
                 # A declared_pattern site is emitted by a custom pattern (often at the enclosing
                 # function), so its line need not carry the topic.
-                self.need(w, text, lambda t, tp=topic: has_topic(t, tp), f"topic {topic!r}",
+                self.need(w, text, lambda t, tp=source_topic(topic, tags): has_topic(t, tp, "broker_key" in tags),
+                          f"topic {topic!r}",
                           "config_topic" in tags or "declared_pattern" in tags
                           or (text is not None and "${" in text))
                 sites[kind].setdefault((it.get("file"), str(topic).lower()), []).append(
@@ -380,7 +402,8 @@ class Checker:
                         self.err(sw, "consume/produce step needs a topic")
                         continue
                     tags = it.get("tags") or []
-                    self.need(sw, text, lambda t: has_topic(t, topic), f"topic {topic!r}",
+                    self.need(sw, text, lambda t: has_topic(t, source_topic(topic, tags), "broker_key" in tags),
+                              f"topic {topic!r}",
                               "config_topic" in tags or (text is not None and "${" in text))
                     pool = sites["producers" if kind == "produce" else "consumers"]
                     hits = [o for ln, o in pool.get((st.get("file"), str(topic).lower()), [])

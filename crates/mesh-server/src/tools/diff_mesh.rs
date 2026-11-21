@@ -10,9 +10,9 @@ use crate::tools::find_dependents::is_indexable_source;
 use crate::tools::smart_search::SearchScope;
 use crate::tools::{McpTool, ToolError, ToolOutput};
 use mesh_core::{
-    AppState, CompactStr, ContractGraph, ContractNode, DependentsMatch, EdgeConfidence,
-    ExcludeMatcher, FilesystemCrawler, NodeKind, RecordedCaller, RepoId, RpcRecordResolver,
-    ValidatedScope,
+    qualified_topic_key, AppState, Broker, CompactStr, ContractGraph, ContractNode,
+    DependentsMatch, EdgeConfidence, ExcludeMatcher, FilesystemCrawler, NodeKind, RecordedCaller,
+    RepoId, RpcRecordResolver, ValidatedScope,
 };
 use mesh_parsers::{AstGuard, FileIndex};
 use schemars::JsonSchema;
@@ -607,6 +607,11 @@ enum Fact {
 }
 
 impl Fact {
+    /// A topic fact: its signatures hold the brokers of its sites (see `facts_of`).
+    fn is_topic(&self) -> bool {
+        matches!(self, Self::Produces(_) | Self::Consumes(_))
+    }
+
     /// Whether a signature change on both sides is a contract change.
     fn has_signature(&self) -> bool {
         matches!(self, Self::Rpc(..) | Self::Route(_) | Self::Decl(..))
@@ -714,54 +719,73 @@ fn facts_of(
         }
     }
     let node = |i: usize| index.nodes.get(i);
+    // The broker a topic site is statically known to talk to (9.0 T7), by position in
+    // `producers` / `consumers`.
+    let producer_broker: HashMap<usize, Broker> = index.producer_brokers.iter().copied().collect();
+    let consumer_broker: HashMap<usize, Broker> = index.consumer_brokers.iter().copied().collect();
     let relations = index
         .producers
         .iter()
-        .map(|(i, t)| (*i, Fact::Produces(t.to_string())))
-        .chain(
-            index
-                .consumers
-                .iter()
-                .map(|(i, t)| (*i, Fact::Consumes(t.to_string()))),
-        )
+        .enumerate()
+        .map(|(p, (i, t))| {
+            (
+                *i,
+                Fact::Produces(t.to_string()),
+                producer_broker.get(&p).copied(),
+            )
+        })
+        .chain(index.consumers.iter().enumerate().map(|(p, (i, t))| {
+            (
+                *i,
+                Fact::Consumes(t.to_string()),
+                consumer_broker.get(&p).copied(),
+            )
+        }))
         .chain(
             index
                 .dependencies
                 .iter()
-                .map(|(i, t)| (*i, Fact::Import(t.to_string()))),
+                .map(|(i, t)| (*i, Fact::Import(t.to_string()), None)),
         )
-        .chain(index.rpc_calls.iter().filter_map(|(i, recorded)| {
-            let inherited = recorded
-                .strip_prefix(mesh_core::RPC_INHERITED_METHOD_PREFIX)
-                .and_then(|raw| {
-                    let (base, rest) = raw.split_once('#')?;
-                    let (field, _) = rest.split_once('.')?;
-                    Some((raw, base, field))
-                });
-            let bound = inherited
-                .is_some_and(|(_, base, field)| resolver.base_binds_client_field(base, field));
-            match resolver.resolve(Some(repo), recorded) {
-                Some(r) if r.method_level && r.target.contains('.') => {
-                    let name = r.declared.map_or(r.target, |d| d.to_string());
-                    match inherited {
-                        // Only the field's name tells (the resolution's own
-                        // rule, `service_from_client_field_name`).
-                        Some((raw, _, _)) if r.confidence != EdgeConfidence::Exact => {
-                            Some((*i, Fact::CallsInferred(raw.to_string(), name)))
+        .chain(
+            index
+                .rpc_calls
+                .iter()
+                .filter_map(|(i, recorded)| {
+                    let inherited = recorded
+                        .strip_prefix(mesh_core::RPC_INHERITED_METHOD_PREFIX)
+                        .and_then(|raw| {
+                            let (base, rest) = raw.split_once('#')?;
+                            let (field, _) = rest.split_once('.')?;
+                            Some((raw, base, field))
+                        });
+                    let bound = inherited.is_some_and(|(_, base, field)| {
+                        resolver.base_binds_client_field(base, field)
+                    });
+                    match resolver.resolve(Some(repo), recorded) {
+                        Some(r) if r.method_level && r.target.contains('.') => {
+                            let name = r.declared.map_or(r.target, |d| d.to_string());
+                            match inherited {
+                                // Only the field's name tells (the resolution's own
+                                // rule, `service_from_client_field_name`).
+                                Some((raw, _, _)) if r.confidence != EdgeConfidence::Exact => {
+                                    Some((*i, Fact::CallsInferred(raw.to_string(), name)))
+                                }
+                                _ => Some((*i, Fact::Calls(name))),
+                            }
                         }
-                        _ => Some((*i, Fact::Calls(name))),
+                        // A service-level client is not a call; a binding, constant
+                        // or handler reference resolves to nothing.
+                        Some(_) => None,
+                        // An inherited field that is not a client (not bound, or bound
+                        // to a plain type, and not named like one) is not a call.
+                        None => inherited
+                            .filter(|_| bound)
+                            .map(|(raw, _, _)| (*i, Fact::CallsUnresolved(raw.to_string()))),
                     }
-                }
-                // A service-level client is not a call; a binding, constant
-                // or handler reference resolves to nothing.
-                Some(_) => None,
-                // An inherited field that is not a client (not bound, or bound
-                // to a plain type, and not named like one) is not a call.
-                None => inherited
-                    .filter(|_| bound)
-                    .map(|(raw, _, _)| (*i, Fact::CallsUnresolved(raw.to_string()))),
-            }
-        }));
+                })
+                .map(|(i, fact)| (i, fact, None)),
+        );
     let topic_kind = |k: NodeKind| {
         matches!(
             k,
@@ -771,7 +795,7 @@ fn facts_of(
     // Declarations only, once per file: a file of thousands of sends is not
     // rescanned per send.
     let decls: Vec<&ContractNode> = index.nodes.iter().filter(|d| !topic_kind(d.kind)).collect();
-    for (i, fact) in relations {
+    for (i, fact, broker) in relations {
         let n = node(i);
         // An import is the file's, not the declaration's that carries it.
         let owner = match fact {
@@ -789,7 +813,12 @@ fn facts_of(
                     .map_or(n.name.as_str(), |d| d.name.as_str())
             }),
         };
-        add_fact(&mut facts, fact, n.map(|n| n.line_start), None, owner);
+        let entry = add_fact(&mut facts, fact, n.map(|n| n.line_start), None, owner);
+        // The broker rides in the signatures of a topic fact, so moving a site to another
+        // broker is reported as a change while a topic's text stays the one it always was.
+        if let Some(b) = broker {
+            entry.signatures.insert(b.slug().to_string());
+        }
     }
     facts
 }
@@ -829,12 +858,20 @@ fn diff_facts(base: &BTreeMap<Fact, FactVal>, current: &BTreeMap<Fact, FactVal>)
                 base: Some(b.clone()),
                 current: None,
             }),
-            Some(c) if fact.has_signature() && c.signatures != b.signatures => out.push(Change {
-                kind: ChangeKind::Changed,
-                fact: fact.clone(),
-                base: Some(b.clone()),
-                current: Some(c.clone()),
-            }),
+            Some(c)
+                if c.signatures != b.signatures
+                    && (fact.has_signature()
+                        || (fact.is_topic()
+                            && !b.signatures.is_empty()
+                            && !c.signatures.is_empty())) =>
+            {
+                out.push(Change {
+                    kind: ChangeKind::Changed,
+                    fact: fact.clone(),
+                    base: Some(b.clone()),
+                    current: Some(c.clone()),
+                })
+            }
             Some(_) => {}
         }
     }
@@ -1309,7 +1346,8 @@ fn push_rows(
 enum Lookup<'a> {
     Rpc(&'a str, Option<&'a str>),
     Symbol(&'a str),
-    Topic(&'a str, bool),
+    /// A removed site of a topic; its broker when the removed site's was statically known.
+    Topic(&'a str, bool, Option<Broker>),
 }
 
 /// Looks up the impact of removed and changed elements, most important first:
@@ -1353,8 +1391,13 @@ fn render_impact<'g>(
                 {
                     (if removed { 1 } else { 2 }, Lookup::Symbol(name))
                 }
-                Fact::Produces(topic) if removed => (3, Lookup::Topic(topic, true)),
-                Fact::Consumes(topic) if removed => (3, Lookup::Topic(topic, false)),
+                Fact::Produces(topic) if removed => {
+                    (3, Lookup::Topic(topic, true, site_broker(ch.base.as_ref())))
+                }
+                Fact::Consumes(topic) if removed => (
+                    3,
+                    Lookup::Topic(topic, false, site_broker(ch.base.as_ref())),
+                ),
                 _ => continue,
             };
             wanted.push((priority, r, ch, lookup));
@@ -1385,7 +1428,9 @@ fn render_impact<'g>(
                 ch.kind == ChangeKind::Removed,
             ),
             Lookup::Symbol(name) => symbol_impact(graph, name, &r.abs),
-            Lookup::Topic(topic, producer) => topic_impact(graph, topic, *producer, &r.abs),
+            Lookup::Topic(topic, producer, broker) => {
+                topic_impact(graph, topic, *producer, *broker, &r.abs)
+            }
         };
         let what = if ch.kind == ChangeKind::Removed {
             "removed"
@@ -1530,9 +1575,13 @@ fn topic_impact<'g>(
     graph: &'g ContractGraph,
     topic: &str,
     producer: bool,
+    broker: Option<Broker>,
     file: &Path,
 ) -> Rows<'g> {
-    let flow = graph.analyze_impact(topic);
+    // The other side on the removed site's own broker; a site of another known broker is not
+    // on this channel (an unknown-broker site is, as `heuristic`).
+    let target = broker.map_or_else(|| topic.to_string(), |b| qualified_topic_key(b, topic));
+    let flow = graph.analyze_impact(&target);
     let (list, role) = if producer {
         (&flow.downstream_consumers, "consumer of the topic")
     } else {
@@ -1554,6 +1603,13 @@ fn topic_impact<'g>(
         rows,
         "no other side of this topic in the live graph (a topic name built at runtime is not seen)",
     )
+}
+
+/// The one broker a topic fact's sites were on, when the fact records exactly one.
+fn site_broker(val: Option<&FactVal>) -> Option<Broker> {
+    let mut brokers = val?.signatures.iter().filter_map(|s| Broker::from_slug(s));
+    let first = brokers.next()?;
+    brokers.next().is_none().then_some(first)
 }
 
 /// Topic rows have no per-row confidence in `ImpactFlow`; a pattern-detected
@@ -1655,9 +1711,9 @@ fn render_change(ch: &Change) -> String {
     line
 }
 
-/// Added / removed / changed counts per fact family. A relation (topic,
-/// import, call) has no signature, so `diff_facts` never reports it changed;
-/// its third slot stays 0 and is not printed.
+/// Added / removed / changed counts per fact family. An import or a call has no
+/// signature, so `diff_facts` never reports it changed; its third slot stays 0 and
+/// is not printed. A topic is changed only when its site moved to another broker.
 #[derive(Default)]
 struct Tally {
     decl: [usize; 3],
@@ -1766,6 +1822,15 @@ fn render(
     view: &RootView<'_>,
 ) -> String {
     let t = tally(reports);
+    // A topic is "changed" only when a site moved to another broker: `~N`, shown when non-zero
+    // so a workspace with no move reads as before.
+    let moved = |n: usize| {
+        if n > 0 {
+            format!(" ~{n}")
+        } else {
+            String::new()
+        }
+    };
     // A `.proto` whose wire check breaks or could not parse a version changed
     // its contract even with no declaration added or removed (a field
     // renumbered): never "body edits only". Not checked stays where its
@@ -1808,13 +1873,13 @@ fn render(
     }
     let _ = writeln!(
         out,
-        "\n**Summary**: {} changed source file(s) — {with_changes} with contract changes, {body_only} body-only, {skipped} skipped. Declarations +{} -{} ~{}; RPCs/services +{} -{} ~{}; routes +{} -{} ~{}; producers +{} -{}; consumers +{} -{}; imports +{} -{}; RPC calls +{} -{}. Wire-format breaking changes: {wire_breaks} in {breaking_protos} `.proto`{}. Impacted call sites / dependents: {}.",
+        "\n**Summary**: {} changed source file(s) — {with_changes} with contract changes, {body_only} body-only, {skipped} skipped. Declarations +{} -{} ~{}; RPCs/services +{} -{} ~{}; routes +{} -{} ~{}; producers +{} -{}{}; consumers +{} -{}{}; imports +{} -{}; RPC calls +{} -{}. Wire-format breaking changes: {wire_breaks} in {breaking_protos} `.proto`{}. Impacted call sites / dependents: {}.",
         reports.len(),
         t.decl[0], t.decl[1], t.decl[2],
         t.rpc[0], t.rpc[1], t.rpc[2],
         t.route[0], t.route[1], t.route[2],
-        t.produces[0], t.produces[1],
-        t.consumes[0], t.consumes[1],
+        t.produces[0], t.produces[1], moved(t.produces[2]),
+        t.consumes[0], t.consumes[1], moved(t.consumes[2]),
         t.imports[0], t.imports[1],
         t.calls[0], t.calls[1],
         if wire_unchecked > 0 {
@@ -2302,6 +2367,56 @@ export class ArchiveEvents {
         assert!(text.contains("`WIRE_FORMAT_BREAKING_CHANGE`"), "{text}");
         assert!(!text.contains("Wire-format breaking changes: 0"), "{text}");
         assert!(text.len() < 48 * 1024);
+    }
+
+    /// 9.0 T7: moving a producer to another broker is a contract change even though the topic
+    /// name is the same, and a topic that stays on one broker reads as before.
+    #[test]
+    fn a_producer_moved_to_another_broker_is_a_change() {
+        let repo = base_repo();
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write(
+            "events/producer.ts",
+            r#"import amqp from 'amqplib';
+
+export class UserEvents {
+  async deleted(ch: amqp.Channel, id: string) {
+    ch.sendToQueue('user-deleted', Buffer.from(id));
+  }
+}
+"#,
+        );
+        let state = indexed_state(&repo.root);
+        let out = run_with(&args(None, None), &state, &repo.runner(), Limits::DEFAULT)
+            .expect("diff_mesh ok");
+        let text = &out.text;
+        assert!(
+            text.contains("~ produces topic `user-deleted`")
+                && text.contains("`kafka` → `rabbitmq`"),
+            "{text}"
+        );
+        // The summary counts the moved producer, as the detail lists it.
+        assert!(
+            text.contains("producers +0 -0 ~1; consumers +0 -0;"),
+            "{text}"
+        );
+
+        // The same file with the same broker reports nothing for the topic.
+        repo.write(
+            "events/producer.ts",
+            &TS_PRODUCER.replace(
+                "async deleted(id: string) {",
+                "async deleted(id: string) {\n    const t = 1;",
+            ),
+        );
+        let state = indexed_state(&repo.root);
+        let out = run_with(&args(None, None), &state, &repo.runner(), Limits::DEFAULT)
+            .expect("diff_mesh ok");
+        assert!(
+            !out.text.contains("produces topic `user-deleted`"),
+            "{}",
+            out.text
+        );
     }
 
     #[test]

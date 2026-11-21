@@ -526,10 +526,31 @@ pub(crate) fn signature_role(signature: &str) -> Option<Role> {
         .map(|(_, role)| role)
 }
 
+/// The broker of the interaction a node's `signature` was recorded under (9.0 ticket T7).
+pub(crate) fn signature_broker(signature: &str) -> Option<mesh_core::Broker> {
+    messaging::broker_of_signature(signature)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// Every messaging rule names a broker except the NestJS transport-agnostic ones, so a new
+    /// rule added without a row in `broker_of_signature` fails here, not silently as "unknown".
+    #[test]
+    fn every_rule_signature_names_a_broker_but_nestjs_clients() {
+        let all: Vec<&str> = messaging::CALL_RULES
+            .iter()
+            .map(|r| r.signature)
+            .chain(messaging::CTOR_RULES.iter().map(|r| r.signature))
+            .chain(messaging::DECORATOR_RULES.iter().map(|r| r.signature))
+            .collect();
+        for sig in all {
+            let known = signature_broker(sig).is_some();
+            assert_eq!(known, !sig.starts_with("nestjs "), "{sig}");
+        }
+    }
 
     #[test]
     fn rule_signatures_are_unique() {

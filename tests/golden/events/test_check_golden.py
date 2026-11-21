@@ -141,11 +141,34 @@ class CheckGolden(unittest.TestCase):
                     path.write_text(real.replace(old, new, 1))
                     self.assertTrue(cg.run_one(path, cg.REPO, use)[0], f"not detected: {name}")
 
+    def test_broker_qualified_keys(self):
+        qualified = GOLDEN.replace(
+            "{id: c1, topic: order.created, file: src/a.ts, line: 3, language: ts, tags: [kafka_basic]}",
+            '{id: c1, topic: "kafka:order.created", file: src/a.ts, line: 3, language: ts, tags: [kafka_basic, broker_key]}',
+        ).replace(
+            "{kind: consume, file: src/a.ts, line: 3, topic: order.created}",
+            '{kind: consume, file: src/a.ts, line: 3, topic: "kafka:order.created"}',
+        ).replace("tags: [layered_calls]\n    min_hops", "tags: [layered_calls, broker_key]\n    min_hops")
+        self.assertNotEqual(qualified, GOLDEN)
+        for use in (False, True):
+            with self.subTest(pyyaml=use):
+                self.assertEqual(self.run_text(qualified, use), [])
+                # the qualifier is only accepted under the tag broker_key
+                untagged = qualified.replace("[kafka_basic, broker_key]", "[kafka_basic]")
+                self.assertTrue(self.run_text(untagged, use))
+                # and only for a known broker
+                unknown = qualified.replace("kafka:order.created", "shop:order.created")
+                self.assertTrue(self.run_text(unknown, use))
+
     def test_topic_boundary(self):
         self.assertTrue(cg.has_topic("emit('stock.reserved', e)", "stock.reserved"))
         self.assertFalse(cg.has_topic("emit('stock.reserved', e)", "stock"))
         self.assertFalse(cg.has_topic("emit('restock.reserved', e)", "stock.reserved"))
         self.assertTrue(cg.has_topic("generate_report.delay(order_id)", "generate_report"))
+        # an ARN names its topic after a colon, which only the broker_key reading accepts
+        arn = "TopicArn: 'arn:aws:sns:eu-west-1:123456789012:orders'"
+        self.assertFalse(cg.has_topic(arn, "orders"))
+        self.assertTrue(cg.has_topic(arn, "orders", arn=True))
 
 
 if __name__ == "__main__":

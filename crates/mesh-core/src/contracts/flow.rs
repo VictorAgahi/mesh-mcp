@@ -500,6 +500,40 @@ impl ContractGraph {
         }
     }
 
+    /// The topic an entry site is shown consuming (producing, in reverse): the name the caller
+    /// gave, unless the site is on broker hubs of the query (`kafka:orders`), which are named
+    /// so that two channels of one name are told apart. A single-broker workspace has no such
+    /// hub and keeps the name as given.
+    fn entry_label(
+        &self,
+        idx: &FlowIndex<'_>,
+        site: NodeId,
+        direction: FlowDirection,
+        queried: &HashSet<NodeId>,
+        given: &CompactStr,
+    ) -> CompactStr {
+        let hubs = match direction {
+            FlowDirection::Forward => idx.consumes.get(&site),
+            FlowDirection::Reverse => idx.produces.get(&site),
+        };
+        let mut names: Vec<&str> = hubs
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|h| queried.contains(h))
+            .filter_map(|h| self.get_node(*h))
+            .filter(|n| Self::hub_broker(n).is_some())
+            .map(|n| n.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        if names.is_empty() {
+            given.clone()
+        } else {
+            CompactStr::new(names.join(", "))
+        }
+    }
+
     /// Display name of a topic node (`order.requested`).
     fn topic_label(&self, id: NodeId) -> CompactStr {
         self.get_node(id)
@@ -901,7 +935,9 @@ impl ContractGraph {
                     level: 1,
                     parent: None,
                     slot: 0,
-                    topic: entry_topic.clone(),
+                    topic: entry_topic
+                        .as_ref()
+                        .map(|t| self.entry_label(&idx, s.id, direction, &seen_topics, t)),
                 });
             }
         }

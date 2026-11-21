@@ -26,11 +26,11 @@ pub use ts_config::TsAliasIndex;
 use crate::decapitate::LanguageKind;
 use crate::guard::{AstGuard, ParseOutcome};
 use mesh_core::{
-    CallFacts, CompactStr, ContractGraph, ContractNode, ContractsConfig, CustomPatternConfig,
-    FilePath, NodeKind, PatternKind, RepoId,
+    Broker, CallFacts, CompactStr, ContractGraph, ContractNode, ContractsConfig,
+    CustomPatternConfig, FilePath, NodeKind, PatternKind, RepoId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -190,6 +190,19 @@ pub struct FileIndex {
     /// reported `heuristic`, not `exact`.
     #[serde(default)]
     pub heuristic_topic_nodes: Vec<usize>,
+    /// (index into `producers`, broker): the producers whose broker is statically known (9.0,
+    /// ticket T7). A producer with no entry has an unknown broker and joins every broker's
+    /// channel of its topic (`mesh_core::Broker`). Indices past the end are ignored.
+    #[serde(default)]
+    pub producer_brokers: Vec<(usize, Broker)>,
+    /// Same for `consumers`.
+    #[serde(default)]
+    pub consumer_brokers: Vec<(usize, Broker)>,
+    /// (local node index, broker): the nodes that are themselves a broker interaction (a
+    /// TypeScript call site named after its topic). Display only: a query for one broker's
+    /// channel leaves the topic rows of another broker out.
+    #[serde(default)]
+    pub node_brokers: Vec<(usize, Broker)>,
     /// Set when this file's tree-sitter parse itself failed or exceeded its budget
     /// (`AstGuard::ParseOutcome::ParseFailed`) — as opposed to `nodes` legitimately
     /// being empty (a blank file, one with no top-level declarations, ...). Callers
@@ -222,6 +235,19 @@ impl FileIndex {
         self.nodes.extend(other.nodes);
         self.dependencies
             .extend(other.dependencies.into_iter().map(|(i, t)| (i + offset, t)));
+        let (produced, consumed) = (self.producers.len(), self.consumers.len());
+        self.producer_brokers.extend(
+            other
+                .producer_brokers
+                .into_iter()
+                .map(|(i, b)| (i + produced, b)),
+        );
+        self.consumer_brokers.extend(
+            other
+                .consumer_brokers
+                .into_iter()
+                .map(|(i, b)| (i + consumed, b)),
+        );
         self.producers
             .extend(other.producers.into_iter().map(|(i, t)| (i + offset, t)));
         self.consumers
@@ -230,6 +256,8 @@ impl FileIndex {
             .extend(other.rpc_calls.into_iter().map(|(i, t)| (i + offset, t)));
         self.heuristic_topic_nodes
             .extend(other.heuristic_topic_nodes.into_iter().map(|i| i + offset));
+        self.node_brokers
+            .extend(other.node_brokers.into_iter().map(|(i, b)| (i + offset, b)));
         self.parse_failed |= other.parse_failed;
         self.calls.merge(other.calls);
         self.calls_skipped_path |= other.calls_skipped_path;
@@ -253,11 +281,13 @@ impl FileIndex {
         for (i, target) in self.dependencies {
             graph.add_dependency(ids[i], &target);
         }
-        for (i, topic) in self.producers {
-            graph.add_producer(ids[i], &topic);
+        let producer_brokers: HashMap<usize, Broker> = self.producer_brokers.into_iter().collect();
+        for (pair, (i, topic)) in self.producers.into_iter().enumerate() {
+            graph.add_producer_on(ids[i], &topic, producer_brokers.get(&pair).copied());
         }
-        for (i, topic) in self.consumers {
-            graph.add_consumer(ids[i], &topic);
+        let consumer_brokers: HashMap<usize, Broker> = self.consumer_brokers.into_iter().collect();
+        for (pair, (i, topic)) in self.consumers.into_iter().enumerate() {
+            graph.add_consumer_on(ids[i], &topic, consumer_brokers.get(&pair).copied());
         }
         for (i, target) in self.rpc_calls {
             graph.add_rpc_call(ids[i], &target);
@@ -265,6 +295,29 @@ impl FileIndex {
         for i in self.heuristic_topic_nodes {
             graph.mark_heuristic_topic_node(ids[i]);
         }
+        for (i, broker) in self.node_brokers {
+            if let Some(id) = ids.get(i) {
+                graph.set_node_broker(*id, broker);
+            }
+        }
+    }
+
+    /// Records `broker` for every producer and consumer registered so far that has none: the
+    /// extractors of a language whose only detected broker is one (the Kafka-only Java, Go,
+    /// Kotlin, C# and Rust extractors) call this once, after extraction.
+    pub fn tag_brokers(&mut self, broker: Broker) {
+        let tagged: HashSet<usize> = self.producer_brokers.iter().map(|(i, _)| *i).collect();
+        self.producer_brokers.extend(
+            (0..self.producers.len())
+                .filter(|i| !tagged.contains(i))
+                .map(|i| (i, broker)),
+        );
+        let tagged: HashSet<usize> = self.consumer_brokers.iter().map(|(i, _)| *i).collect();
+        self.consumer_brokers.extend(
+            (0..self.consumers.len())
+                .filter(|i| !tagged.contains(i))
+                .map(|i| (i, broker)),
+        );
     }
 
     /// Whether any node carries `package`, the package [`PathContext::package_of`] infers
@@ -553,9 +606,19 @@ impl PolyglotIndexer {
                 })
                 .min_by_key(|(_, n)| n.line_end - n.line_start)
                 .map_or(i, |(j, _)| j);
+            let broker = js_frameworks::signature_broker(signature);
+            if let Some(b) = broker {
+                out.node_brokers.push((i, b));
+            }
             if produces {
+                if let Some(b) = broker {
+                    out.producer_brokers.push((out.producers.len(), b));
+                }
                 out.producers.push((owner, node.name.clone()));
             } else {
+                if let Some(b) = broker {
+                    out.consumer_brokers.push((out.consumers.len(), b));
+                }
                 out.consumers.push((owner, node.name.clone()));
             }
         }
@@ -823,6 +886,8 @@ impl PolyglotIndexer {
                     out.dependencies = dependencies;
                     out.producers = producers;
                     out.rpc_calls = rpc_calls;
+                    // Spring Kafka and `kafka-clients` are the only brokers detected.
+                    out.tag_brokers(Broker::Kafka);
                 }
             }
             LanguageKind::Go => {
@@ -844,6 +909,8 @@ impl PolyglotIndexer {
                     out.producers = relations.producers;
                     out.consumers = relations.consumers;
                     out.rpc_calls = relations.rpc_calls;
+                    // kafka-go, sarama and confluent-kafka-go are the only brokers detected.
+                    out.tag_brokers(Broker::Kafka);
                 }
             }
             LanguageKind::Python => {
@@ -1017,6 +1084,8 @@ impl PolyglotIndexer {
                     rust_lang::RustExtractor::extract_index(file_path, content, repo_id, tree)
                 }) {
                     out.merge(index);
+                    // `rdkafka` is the only broker detected.
+                    out.tag_brokers(Broker::Kafka);
                 }
             }
             LanguageKind::Cpp => {
@@ -1044,6 +1113,7 @@ impl PolyglotIndexer {
                         out.consumers.push((i, topic));
                     }
                     out.nodes = nodes;
+                    out.tag_brokers(Broker::Kafka);
                 }
             }
             LanguageKind::CSharp => {
@@ -1059,6 +1129,8 @@ impl PolyglotIndexer {
                         out.consumers.push((i, topic));
                     }
                     out.nodes = nodes;
+                    // Confluent.Kafka is the only broker detected.
+                    out.tag_brokers(Broker::Kafka);
                 }
             }
             LanguageKind::Ruby => {
@@ -1514,6 +1586,9 @@ mod tests {
             consumers: vec![(1, CompactStr::new("orders.paid"))],
             rpc_calls: vec![(0, CompactStr::new("Billing.Charge"))],
             heuristic_topic_nodes: vec![1],
+            producer_brokers: vec![(0, Broker::Kafka)],
+            consumer_brokers: Vec::new(),
+            node_brokers: Vec::new(),
             parse_failed: false,
             calls: CallFacts::default(),
             calls_skipped_path: false,

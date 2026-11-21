@@ -106,7 +106,9 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v14: Java, Go and Python call facts (`CallReceiver::Namespace`, `TypeFact::methods`).
 /// v15: parameters and locals no longer give Python / Go calls on a module or package of the
 /// same name, `CallReceiver::InheritedField`, `FileIndex::calls_skipped_path`.
-const SCHEMA_VERSION: u8 = 15;
+/// v16: broker-qualified topic keys (9.0 T7): `FileIndex::producer_brokers` /
+/// `consumer_brokers`, the broker each producer / consumer is statically known to talk to.
+const SCHEMA_VERSION: u8 = 16;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

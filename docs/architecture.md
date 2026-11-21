@@ -112,6 +112,51 @@ Tools do disk, tree-sitter and SQLite work, so `McpTool::run` is synchronous and
 `ToolRegistry::invoke` runs it on Tokio's blocking pool; the JSON-RPC loop and, in daemon mode,
 other clients keep being served meanwhile. Indexing runs on Rayon (section 8).
 
+### 3.4 Broker-qualified topic keys
+
+A topic key is the lower-cased name (`normalize_topic_key`) and names a channel, not the broker that
+carries it. Up to 8.x a Kafka topic `orders`, a RabbitMQ queue `orders` and an SNS topic `orders`
+collapsed into one key, so a producer of one appeared linked to a consumer of another. Since 9.0
+(ticket T7) each producer and consumer may carry the `Broker` its client library speaks to
+(`mesh_core::Broker`: `kafka`, `rabbitmq`, `redis`, `nats`, `mqtt`, `sqs`, `sns`, `kinesis`,
+`eventbridge`, `pubsub`, `pulsar`, `servicebus`, `eventhubs`, `stomp`, `bull`, `beequeue`):
+
+- The registry maps (`topic_producers`, `topic_consumers`) are still keyed by the plain name. The
+  broker of each site lives beside them (`ContractGraph::add_producer_on` / `add_consumer_on`; the
+  per-file record `FileIndex::producer_brokers` / `consumer_brokers` carries it through the parse
+  cache, `SCHEMA_VERSION` 16).
+- The topic pass makes one hub node per name while at most one broker is known for it: the hub is
+  named `orders`, exactly as before 9.0, and takes every site of the name. When two or more known
+  brokers use the name, it makes one hub per broker, named `kafka:orders`, `rabbitmq:orders` (the
+  qualifier is the broker slug). The hubs are in broker declaration order, so the output is
+  deterministic and a delta reconcile equals a full one.
+- Same name and same broker is one channel (`exact`). Same name on two different known brokers are two
+  channels, never linked. A site whose broker is not statically known joins every channel of its name
+  as `heuristic` (the same label as an unresolved wildcard match); where the name has at most one known
+  broker it joins that channel exactly as before, so a single-broker workspace reads as it always did.
+- A wildcard subscription (`orders.*`) does not hear a concrete subject of another known broker. Its
+  cap of `MAX_WILDCARD_PRODUCERS` (256) producers applies per hub, so a pattern on two brokers hears
+  at most 512 producers (256 per broker hub); a hub cut at the cap is counted in
+  `IndexHealth::topic_wildcards_capped` and printed by `doctor`.
+- A key written like a hub name (a Kafka topic literally named `rabbitmq:orders`, while RabbitMQ also
+  uses `orders`) gets a plain hub named `rabbitmq:orders (literal)`, so no two hub nodes share a name.
+  The target `rabbitmq:orders` is then ambiguous: `analyze_impact` and `trace_flow` list both readings
+  (the literal key and the RabbitMQ channel) under an **Ambiguous target** note.
+- `trace_flow` prints the hub name on its consume / produce steps (`consume kafka:orders`); a site
+  joined to several broker hubs lists them.
+- `analyze_impact` and `trace_flow` take the qualified spelling as a target (`kafka:orders`): only
+  that broker's sites and hub are listed (an unknown-broker site too, as `heuristic`). A bare name
+  lists every channel of the name. A key that literally is the target (a Redis key spelled
+  `kafka:orders`) wins over that reading. `diff_mesh` reports a site moved to another broker as a
+  changed topic (`kafka` -> `rabbitmq`) and looks up the other side of a removed site on that
+  site's own broker. `visualize_mesh` draws one topic node per hub.
+- Where the broker comes from: the TypeScript / JavaScript rule tables name the library of every rule
+  (`kafkajs producer.send`, `aws-sdk sns.publish`); the Kafka-only Java, Kotlin, Go, C# and Rust
+  extractors tag their sites `kafka`. Python (Kafka and Celery share one extractor), declarative
+  patterns and AsyncAPI channels have no broker: unknown.
+- Golden files write a name used on two or more brokers of a corpus as `<broker>:<name>`
+  (`tests/golden/events/SCHEMA.md`).
+
 ---
 
 ## 4. Path jail: `ValidatedScope`
@@ -409,7 +454,7 @@ The cache key of a file folds in its content hash, its `RepoId`, the extraction-
 and, for a JavaScript / TypeScript file, the `tsconfig` / `jsconfig` `paths` and `package.json`
 `imports` aliases that govern it, so editing an alias config re-extracts exactly the files under it.
 The fingerprint does not depend on the workspace roots (adding a root does not invalidate the
-cache). The record schema is versioned (`SCHEMA_VERSION` in `index_cache.rs`, 12 at 8.0.0) and the
+cache). The record schema is versioned (`SCHEMA_VERSION` in `index_cache.rs`, 16 at 9.0.0) and the
 daemon id folds in the binary version.
 
 ### 8.3 Kernel network sandbox of `meshd` (Linux, plan 4 step 4.10)
