@@ -65,7 +65,10 @@ impl ContentExtractor {
     ) -> Result<FileIndex, String> {
         let lang = LanguageKind::from_path(&path.to_string_lossy());
         let budget = AstGuard::size_budget(path);
-        let verdict = if lang.language().is_some() {
+        let verdict = if mesh_parsers::languages::sql::is_sql_path(path) {
+            // A lexer, not a parse: size and binary sniff only (no line-length or nesting rule).
+            mesh_parsers::languages::sql::check_content(bytes.len() as u64, bytes)
+        } else if lang.language().is_some() {
             AstGuard::check_content(path, bytes)
         } else if bytes.len() as u64 > budget {
             Err(GuardRejection::Oversized {
@@ -676,6 +679,7 @@ impl WorkspaceIndexer {
             if frag.code.calls_skipped_path {
                 health.record_calls_skipped_path();
             }
+            health.record_sql(frag.code.sql_capped, frag.code.sql_unresolved);
             if frag.code.calls.capped {
                 tracing::warn!(
                     target: "mesh::indexer",
@@ -1537,10 +1541,12 @@ impl WorkspaceIndexer {
         let path_str = path.to_string_lossy();
         let lang = LanguageKind::from_path(&path_str);
 
-        // Tree-sitter inputs get the full lexical guard (null bytes, line length,
-        // nesting). Markdown / YAML / properties only get the binary sniff — prose
-        // legitimately has >1 KB lines.
-        let verdict = if lang.language().is_some() {
+        // Tree-sitter inputs get the full lexical guard (null bytes, line length, nesting).
+        // `.sql` is read by a linear lexer: size and binary sniff only. Markdown / YAML /
+        // properties only get the binary sniff — prose legitimately has >1 KB lines.
+        let verdict = if mesh_parsers::languages::sql::is_sql_path(path) {
+            mesh_parsers::languages::sql::check_content(metadata.len(), &bytes)
+        } else if lang.language().is_some() {
             AstGuard::check_path(path, &metadata, &bytes)
         } else if AstGuard::looks_binary(&bytes) {
             Err(GuardRejection::Binary)
@@ -2069,6 +2075,101 @@ mod tests {
         assert_eq!(cold.fingerprint(), warm.fingerprint());
         assert_eq!(warm.contract_graph.node_count(), 4);
         assert_eq!(warm.doc_index.section_count(), 1);
+    }
+
+    /// SQL facts (9.0 T5) survive the parse cache: a warm build is byte-identical to the cold one,
+    /// a binary `.sql` file is a counted guard rejection, and a `.sql` file with a very long line
+    /// or a `-- (` banner (rules that only protect a tree-sitter parse) is still read.
+    #[test]
+    fn sql_sites_survive_the_parse_cache_and_a_hostile_sql_file_is_counted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(
+            root.join("001.sql"),
+            "INSERT INTO outbox (topic, payload) VALUES ('order.created', '{}');\nLISTEN order_ready;\n",
+        )
+        .expect("write sql");
+        std::fs::write(
+            root.join("repo.py"),
+            "def go(c):\n    c.execute(\"SELECT pg_notify('stock_changed', 'x')\")\n",
+        )
+        .expect("write py");
+        std::fs::write(root.join("binary.SQL"), b"NOTIFY hostile;\n\0\0").expect("write binary");
+        std::fs::write(
+            root.join("long.sql"),
+            format!(
+                "-- {}\n{}NOTIFY after_long;\n",
+                "x".repeat(1_500),
+                "-- (\n".repeat(70)
+            ),
+        )
+        .expect("write long");
+        let config =
+            Config::load_from_str("[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n")
+                .expect("config");
+        let roots = vec![root.clone()];
+        let cache = mesh_core::PersistentIndexCache::in_memory().expect("cache");
+
+        let cold = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
+        let warm = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
+        assert_eq!(cold.fingerprint(), warm.fingerprint());
+        let names = |snap: &MeshSnapshot| {
+            let mut v: Vec<(String, usize)> = snap
+                .contract_graph
+                .all_nodes()
+                .filter(|n| {
+                    n.signature
+                        .as_deref()
+                        .is_some_and(|s| s.starts_with("sql "))
+                })
+                .map(|n| (n.name.to_string(), n.line_start))
+                .collect();
+            v.sort();
+            v
+        };
+        let want = vec![
+            ("after_long".to_string(), 72),
+            ("order.created".to_string(), 1),
+            ("order_ready".to_string(), 2),
+            ("stock_changed".to_string(), 2),
+        ];
+        assert_eq!(names(&cold), want);
+        assert_eq!(names(&warm), want);
+        assert_eq!(cold.health.files_rejected_guard, 1);
+        assert_eq!(cold.health.files_sql_capped, 0);
+    }
+
+    /// Caps and unresolved keys are counted, never silent (CLAUDE.md), and the counters survive
+    /// the parse cache.
+    #[test]
+    fn sql_caps_and_unresolved_sites_reach_index_health() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::write(root.join("many.sql"), "NOTIFY c;\n".repeat(4_200)).expect("write many");
+        std::fs::write(
+            root.join("bind.sql"),
+            "INSERT INTO outbox (topic, payload) VALUES ($1, '{}'), ('ok', '{}'), ($2, '{}');\n",
+        )
+        .expect("write bind");
+        std::fs::write(
+            root.join("repo.ts"),
+            "q(\"INSERT INTO outbox (topic, payload) VALUES ($1, $2)\");\n",
+        )
+        .expect("write ts");
+        let config =
+            Config::load_from_str("[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n")
+                .expect("config");
+        let roots = vec![root.clone()];
+        let cache = mesh_core::PersistentIndexCache::in_memory().expect("cache");
+        for pass in ["cold", "warm"] {
+            let snap = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
+            assert_eq!(snap.health.files_sql_capped, 1, "{pass}");
+            assert_eq!(snap.health.sql_sites_unresolved, 3, "{pass}");
+            assert!(snap.health.sql_truncated(), "{pass}");
+            let summary = snap.health.render_summary(5);
+            assert!(summary.contains("SQL scan cap"), "{summary}");
+            assert!(summary.contains("3 SQL outbox insert"), "{summary}");
+        }
     }
 
     /// The path-driven `reload_paths` must produce the exact same result as the

@@ -1,0 +1,10 @@
+{
+  "name": "sql-outbox",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@nestjs/common": "^10.0.0",
+    "@nestjs/microservices": "^10.0.0",
+    "pg": "^8.11.0"
+  }
+}

@@ -12,6 +12,7 @@
 #                       examples/eda/layered-go examples/eda/layered-py
 #                       examples/eda/spring-monolith (calls layer, 9.0)
 #                       examples/eda/multi-broker (broker-qualified keys, 9.0 T7)
+#                       examples/eda/sql-outbox (SQL producers, 9.0)
 # env:
 #   MESH_MCP_BIN     binary to test (default: target/release/mesh-mcp, built if missing)
 #   SEQUENTIAL_RUNS  sequential runs per workspace (default: 5)
@@ -86,7 +87,8 @@ else
   WORKSPACES=("$REPO_ROOT/examples/polyglot-shop" "$REPO_ROOT/examples/volontariapp-fixture"
     "$REPO_ROOT/examples/eda/layered-ts" "$REPO_ROOT/examples/eda/nestjs-monolith-bus"
     "$REPO_ROOT/examples/eda/layered-go" "$REPO_ROOT/examples/eda/layered-py"
-    "$REPO_ROOT/examples/eda/spring-monolith" "$REPO_ROOT/examples/eda/multi-broker")
+    "$REPO_ROOT/examples/eda/spring-monolith" "$REPO_ROOT/examples/eda/multi-broker"
+    "$REPO_ROOT/examples/eda/sql-outbox")
 fi
 
 OUT_DIR="$(mktemp -d)"

@@ -40,6 +40,7 @@ type checker behind any of them.
 | Protobuf | contract source | [3.1](#31-protobuf) |
 | OpenAPI, AsyncAPI, Spring properties | contract source | [3.2](#32-openapi-asyncapi-spring-properties) |
 | Markdown | docs | [3.3](#33-markdown) |
+| SQL (`.sql`, and the SQL strings of TypeScript / JavaScript, Go, Java, Python) | events only: outbox inserts, `NOTIFY` / `pg_notify`, `LISTEN` | [3.4](#34-sql) |
 
 ---
 
@@ -227,13 +228,67 @@ are masked. `[engines.contracts.openapi|asyncapi|spring]` scope which files coun
 Split into sections for `search_docs`, with a per-file memory budget, YAML/TOML frontmatter kept out
 of the body, and prompt-injection phrases filtered. See [mcp-tools](mcp-tools.md#tool-5-search_docs).
 
+### 3.4 SQL
+
+No tree-sitter grammar: a bounded lexer (one pass, no regex, no recursion) over `.sql` files, and
+over the string literals of TypeScript / JavaScript, Go, Java and Python files. Declarations
+(tables, functions) are not indexed; only events that start or end in SQL are:
+
+| Statement | Registers | Key |
+| :--- | :--- | :--- |
+| `INSERT INTO <outbox> (<cols>) VALUES (...)` / `... SELECT ...` | producer | the single-quoted literal in the first column named `topic`, `topic_name`, `channel`, `event_type`, `event_name` or `routing_key` |
+| `NOTIFY ch` and `pg_notify('ch', ...)` | producer | `ch` |
+| `LISTEN ch` | consumer | `ch` |
+
+- An outbox table is one whose last name part (schema prefix and quoted identifiers are read,
+  case-insensitive) contains `outbox`, or is `event_queue` / `event_queues`. Every row of a
+  multi-row `VALUES` registers its own key.
+- A trigger needs no special rule: its function body is scanned, so the `INSERT` or `pg_notify`
+  inside it is the producer, on the line of its literal. A dollar-quoted body (`$$` or `$tag$`) is
+  read as code only after `AS` (a function body) or in a `DO` block; any other `$$..$$` text
+  (`COMMENT ON ... IS $$NOTIFY x$$`, `SELECT $$..$$`) is a string literal and registers nothing. The
+  trigger's own table is not read.
+- A key that is not a static literal (a bind parameter such as `$1` or `?`, `TG_TABLE_NAME || '.x'`,
+  a column, a missing column list, `pg_notify` on a variable) is not resolved: no producer is
+  registered and no key is made up. Each such site is COUNTED: `IndexHealth::sql_sites_unresolved`,
+  listed by `mesh-mcp doctor`. This is the usual shape of application code
+  (`INSERT INTO outbox (topic, payload) VALUES ($1, $2)` with the topic as an argument), which
+  therefore shows as unresolved, not as a producer. An unquoted channel is folded to lower case, as
+  Postgres does; a quoted one is kept.
+- Comments are skipped, and a host-language string literal is read as SQL only when it BEGINS with
+  `INSERT`, `NOTIFY`, `LISTEN`, `SELECT`, `PERFORM` or `BEGIN`: prose that mentions `INSERT INTO
+  outbox` is not a producer. In such a literal `NOTIFY` and `LISTEN` must be written in upper case
+  and the channel must start with a letter or `_` (`log.info("Notify admins")` and
+  `log.info("Listen 3000")` are log lines); a lower-case `listen orders` in code is therefore not
+  read, while `INSERT` and `pg_notify` stay case-insensitive. A `"NOTIFY stock"` string that is only
+  documentation cannot be told from a statement and is read. Host escapes (`\'`, `\n`) are decoded
+  before the scan. Adjacent literals (`"INSERT ..." + "VALUES ..."`) are not joined.
+- Sites go through the ordinary producer / consumer path (an `EventStream` node on the line of the
+  key), so `analyze_impact`, `trace_flow` and the topic matching see them like any broker call; a
+  SQL producer inside a service method is reached by the calls layer of its language.
+- Not covered: stored procedures called by name, `COPY`, CDC / Debezium, MySQL or SQL Server
+  queues, other host languages (Kotlin, C#, Ruby, PHP, Rust), and a topic taken from a bind
+  argument at the call site.
+- Known limits: a site is not deduplicated across files, so 300 migrations that each re-create the
+  same trigger function give 600 site nodes (nothing in `doctor` signals it: no cap is hit and each
+  site is a resolved literal); a file under `test/` or `tests/` gives nodes like any other file; a
+  regex literal holding a quote can desynchronise the host lexer for the rest of its line.
+- Bounds: a `.sql` file has its own guard, the 384 KB budget and the null-byte sniff (a lexer is
+  linear and capped, so the line-length and nesting rules of the tree-sitter guard do not apply: a
+  long comment line or a `-- (` banner does not drop the file). Caps: 200,000 tokens, 4,096 sites per
+  file, 512 rows per `VALUES`, 4,096 scanned literals per host file. Every cap is counted:
+  `IndexHealth::files_sql_capped`, listed by `mesh-mcp doctor` (a warning); the sites found before
+  the cut are kept.
+
+Fixture and ground truth: `examples/eda/sql-outbox` and `tests/golden/events/sql-outbox.expected.yaml`.
+
 ---
 
 ## 4. What every level shares
 
 - **Pattern-based.** A framework is recognised by a convention in the syntax tree, not by
-  resolving types. A project that wraps a library behind its own helper (an outbox, an event bus,
-  a base controller) is invisible until you declare it with `[[engines.contracts.patterns]]`.
+  resolving types. A project that wraps a library behind its own helper (an outbox client, an event
+  bus, a base controller) is invisible until you declare it with `[[engines.contracts.patterns]]`.
 - **Confidence is explicit.** Edges are `exact`, `heuristic` or `ambiguous`. A declarative
   pattern produces `heuristic` edges unless it sets `confidence = "exact"`.
 - **Zero means "not statically resolved in the indexed roots".** See the README for the

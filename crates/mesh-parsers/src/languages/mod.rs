@@ -16,6 +16,7 @@ pub mod rust_lang;
 pub mod scala;
 mod sfc;
 mod spec_shape;
+pub mod sql;
 pub mod swift;
 mod ts_calls;
 pub mod ts_config;
@@ -221,6 +222,18 @@ pub struct FileIndex {
     /// `IndexHealth`, so a chain through such a file is not silently absent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub calls_skipped_path: bool,
+    /// SQL outbox inserts and `pg_notify` calls of this file whose key is not a static literal
+    /// (no event is registered for them): counted in `IndexHealth::sql_sites_unresolved`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub sql_unresolved: u32,
+    /// A SQL scan cap (tokens, sites, `VALUES` rows, literals) dropped events of this file:
+    /// counted in `IndexHealth::files_sql_capped`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sql_capped: bool,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 impl FileIndex {
@@ -261,6 +274,8 @@ impl FileIndex {
         self.parse_failed |= other.parse_failed;
         self.calls.merge(other.calls);
         self.calls_skipped_path |= other.calls_skipped_path;
+        self.sql_unresolved = self.sql_unresolved.saturating_add(other.sql_unresolved);
+        self.sql_capped |= other.sql_capped;
     }
 
     /// Inserts the extracted nodes and relations into `graph`.
@@ -695,6 +710,10 @@ impl PolyglotIndexer {
         // the component itself is a declaration named after its file.
         if sfc::is_sfc(file_path) {
             return Self::extract_component(file_path, content, repo_id, cfg, timeout_micros);
+        }
+        // `.sql`: outbox inserts, NOTIFY and LISTEN (no grammar, a bounded scanner).
+        if sql::is_sql_path(file_path) {
+            return sql::extract_file(file_path, content, repo_id);
         }
         let lang_kind = LanguageKind::from_path(&file_path.to_string_lossy());
         Self::extract_as(file_path, content, repo_id, cfg, lang_kind, timeout_micros)
@@ -1167,6 +1186,20 @@ impl PolyglotIndexer {
             LanguageKind::Unknown => {}
         }
 
+        // SQL held in string literals (outbox inserts, NOTIFY, LISTEN) of the host languages.
+        let host = match lang_kind {
+            LanguageKind::TypeScript | LanguageKind::Tsx | LanguageKind::JavaScript => {
+                Some(sql::Host::Ts)
+            }
+            LanguageKind::Go => Some(sql::Host::Go),
+            LanguageKind::Java => Some(sql::Host::Java),
+            LanguageKind::Python => Some(sql::Host::Python),
+            _ => None,
+        };
+        if let Some(host) = host.filter(|_| !out.parse_failed) {
+            sql::add_embedded(&mut out, file_path, content, repo_id, host);
+        }
+
         out
     }
 
@@ -1592,6 +1625,8 @@ mod tests {
             parse_failed: false,
             calls: CallFacts::default(),
             calls_skipped_path: false,
+            sql_unresolved: 0,
+            sql_capped: false,
         };
         let before = format!("{index:?}");
         let anchored = index.relativize(&root_a).expect("all under root");

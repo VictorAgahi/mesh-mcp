@@ -1,0 +1,12 @@
+# Fixture: events produced from SQL (transactional outbox, NOTIFY / LISTEN) next to broker consumers.
+[workspace]
+name = "sql-outbox"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/node_modules/**", "**/.venv/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true

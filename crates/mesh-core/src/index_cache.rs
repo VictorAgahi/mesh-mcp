@@ -108,7 +108,10 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// same name, `CallReceiver::InheritedField`, `FileIndex::calls_skipped_path`.
 /// v16: broker-qualified topic keys (9.0 T7): `FileIndex::producer_brokers` /
 /// `consumer_brokers`, the broker each producer / consumer is statically known to talk to.
-const SCHEMA_VERSION: u8 = 16;
+/// v17: SQL producers and consumers (9.0 T5, on top of T7's 16): `.sql` files and the SQL string
+/// literals of TypeScript / JavaScript, Go, Java and Python files register `EventStream` nodes;
+/// `FileIndex::sql_unresolved` / `sql_capped`.
+const SCHEMA_VERSION: u8 = 17;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.
