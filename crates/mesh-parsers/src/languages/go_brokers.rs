@@ -66,6 +66,9 @@ enum Kind {
     Sqs,
     Sns,
     PubSub,
+    /// kafka-go and confluent-kafka-go (read by `go.rs`; typed here only to tell their calls from
+    /// the calls of an unknown receiver).
+    Kafka,
     /// sarama (`IBM/sarama`, `Shopify/sarama`).
     Sarama,
     /// franz-go (`kgo`).
@@ -96,6 +99,11 @@ fn import_kind(path: &str) -> Option<(Kind, &'static str)> {
         }
         "cloud.google.com/go/pubsub" | "cloud.google.com/go/pubsub/v2" => {
             return Some((Kind::PubSub, "pubsub"))
+        }
+        "github.com/segmentio/kafka-go"
+        | "github.com/confluentinc/confluent-kafka-go/kafka"
+        | "github.com/confluentinc/confluent-kafka-go/v2/kafka" => {
+            return Some((Kind::Kafka, "kafka"))
         }
         "github.com/IBM/sarama" | "github.com/Shopify/sarama" => {
             return Some((Kind::Sarama, "sarama"))
@@ -153,6 +161,8 @@ enum Ty {
     /// A Pub/Sub subscription and the ID it was opened with.
     PsSub(Option<String>),
     SaramaGroup,
+    /// A client of kafka-go, confluent-kafka-go, sarama or franz-go.
+    Kafka,
     /// A struct declared in the file.
     Local(String),
 }
@@ -232,6 +242,18 @@ const CALL_NAMES: &[&str] = &[
     "DefaultProduceTopic",
 ];
 
+/// The methods `go.rs` reads as Kafka calls whatever the receiver.
+const LEGACY_KAFKA_CALLS: &[&str] = &[
+    "WriteMessages",
+    "SendMessage",
+    "Produce",
+    "ReadMessage",
+    "FetchMessage",
+    "ConsumePartition",
+    "SubscribeTopics",
+    "Subscribe",
+];
+
 /// One broker fact before it becomes a node.
 struct Site {
     producer: bool,
@@ -248,7 +270,23 @@ pub(crate) struct Scan {
     /// Start bytes of the calls this pass owns, even when no name could be read: the older
     /// Kafka heuristics of `go.rs` skip them.
     pub(crate) claimed: HashSet<usize>,
+    /// Start bytes of the Kafka-shaped calls (`Subscribe("x")`, `Produce(..)`) of a file that
+    /// imports one of the other libraries, whose receiver is not shown to be a Kafka client: the
+    /// older heuristics still read them, but with an unknown broker, not as Kafka.
+    pub(crate) unsure: HashSet<usize>,
     capped: bool,
+}
+
+impl Scan {
+    /// Room for `n` more sites; a call that does not fit is not claimed (the older heuristics
+    /// keep reading it) and the file is counted as capped.
+    fn has_room(&mut self, n: usize) -> bool {
+        if self.sites.len() + n > MAX_GO_BROKER_SITES_PER_FILE {
+            self.capped = true;
+            return false;
+        }
+        true
+    }
 }
 
 fn text<'s>(node: Node, source: &'s [u8]) -> &'s str {
@@ -350,6 +388,10 @@ struct Ctx<'t> {
     funcs: HashMap<String, Node<'t>>,
     /// (receiver type, method) -> result node.
     methods: HashMap<(String, String), Node<'t>>,
+    /// Struct types holding a client of a broker library (`type Feed struct{ r *kafka.Reader }`):
+    /// (holds a Kafka client, holds a client of another library). Their methods are the file's
+    /// own wrappers, not foreign calls.
+    wrappers: HashMap<String, (bool, bool)>,
     /// Every (receiver type, method) the file declares: a call of one is the file's own, not a
     /// library's.
     local_methods: HashSet<(String, String)>,
@@ -670,6 +712,37 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// The broker library a field type is drawn from (`*kafka.Reader`, `[]*nats.Conn`).
+    fn field_library(&self, t: Node<'t>) -> Option<Kind> {
+        let mut node = t;
+        for _ in 0..6 {
+            match node.kind() {
+                "pointer_type" | "parenthesized_type" => node = node.named_child(0)?,
+                "slice_type" | "array_type" => node = node.child_by_field_name("element")?,
+                "map_type" => node = node.child_by_field_name("value")?,
+                "generic_type" => node = node.child_by_field_name("type")?,
+                "qualified_type" => {
+                    let pkg = text(node.child_by_field_name("package")?, self.source);
+                    return match self.imports.get(pkg)? {
+                        k @ (Kind::Kafka
+                        | Kind::Sarama
+                        | Kind::Franz
+                        | Kind::Amqp
+                        | Kind::Nats
+                        | Kind::Jetstream
+                        | Kind::Redis { .. }
+                        | Kind::Sqs
+                        | Kind::Sns
+                        | Kind::PubSub) => Some(*k),
+                        _ => None,
+                    };
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// `*T`, `T[K]`, `*T[K]` -> `T`.
     fn receiver_type_name(&self, t: Node<'t>) -> Option<String> {
         let mut node = t;
@@ -711,6 +784,14 @@ impl<'t> Ctx<'t> {
                         let Some(t) = f.child_by_field_name("type") else {
                             continue;
                         };
+                        if let Some(kind) = self.field_library(t) {
+                            let w = self.wrappers.entry(name.clone()).or_default();
+                            if matches!(kind, Kind::Kafka | Kind::Sarama | Kind::Franz) {
+                                w.0 = true;
+                            } else {
+                                w.1 = true;
+                            }
+                        }
                         let mut cc = f.walk();
                         let names: Vec<Node> = f.children_by_field_name("name", &mut cc).collect();
                         for n in names {
@@ -805,6 +886,7 @@ impl<'t> Ctx<'t> {
             (Kind::PubSub, "Topic" | "Publisher") => Ty::PsTopic(None),
             (Kind::PubSub, "Subscription" | "Subscriber") => Ty::PsSub(None),
             (Kind::Sarama, "ConsumerGroup") => Ty::SaramaGroup,
+            (Kind::Kafka | Kind::Sarama | Kind::Franz, _) => Ty::Kafka,
             _ => return None,
         })
     }
@@ -955,6 +1037,8 @@ impl<'t> Ctx<'t> {
                 (Kind::Sarama, "NewConsumerGroup" | "NewConsumerGroupFromClient") => {
                     Some(Ty::SaramaGroup)
                 }
+                (Kind::Kafka | Kind::Sarama, n) if n.starts_with("New") => Some(Ty::Kafka),
+                (Kind::Franz, "NewClient") => Some(Ty::Kafka),
                 _ => None,
             };
         }
@@ -1264,7 +1348,7 @@ fn franz_call<'t>(call: Node<'t>, method: &str, ctx: &mut Ctx<'t>, out: &mut Sca
         _ => return,
     };
     for key in names.into_iter().filter(|k| usable_name(k)) {
-        if producer && is_pattern(&key) {
+        if (producer && is_pattern(&key)) || !out.has_room(1) {
             continue;
         }
         out.sites.push(Site {
@@ -1299,6 +1383,9 @@ fn franz_record<'t>(lit: Node<'t>, ctx: &mut Ctx<'t>, out: &mut Scan) {
     else {
         return;
     };
+    if !out.has_room(1) {
+        return;
+    }
     out.sites.push(Site {
         producer: true,
         broker: Broker::Kafka,
@@ -1347,6 +1434,7 @@ pub(crate) fn scan(tree: &Tree, content: &str) -> Scan {
         funcs: HashMap::new(),
         methods: HashMap::new(),
         local_methods: HashSet::new(),
+        wrappers: HashMap::new(),
         assigned: HashSet::new(),
         binds: HashMap::new(),
         sub_topics: HashMap::new(),
@@ -1375,6 +1463,7 @@ pub(crate) fn scan(tree: &Tree, content: &str) -> Scan {
     // One pass: the calls of interest, and the names something assigns to.
     let mut calls: Vec<Node> = Vec::new();
     let mut records: Vec<Node> = Vec::new();
+    let mut legacy_calls: Vec<Node> = Vec::new();
     let mut capped = false;
     walk(root, |n| {
         match n.kind() {
@@ -1384,6 +1473,14 @@ pub(crate) fn scan(tree: &Tree, content: &str) -> Scan {
                     .filter(|f| f.kind() == "selector_expression")
                     .and_then(|f| f.child_by_field_name("field"))
                     .is_some_and(|f| CALL_NAMES.contains(&text(f, source)));
+                let legacy = n
+                    .child_by_field_name("function")
+                    .filter(|f| f.kind() == "selector_expression")
+                    .and_then(|f| f.child_by_field_name("field"))
+                    .is_some_and(|f| LEGACY_KAFKA_CALLS.contains(&text(f, source)));
+                if legacy && legacy_calls.len() < MAX_CALLS {
+                    legacy_calls.push(n);
+                }
                 if named {
                     if calls.len() >= MAX_CALLS {
                         capped = true;
@@ -1425,16 +1522,47 @@ pub(crate) fn scan(tree: &Tree, content: &str) -> Scan {
     }
     let mut out = Scan::default();
     for call in &calls {
-        if out.sites.len() > MAX_GO_BROKER_SITES_PER_FILE {
-            break;
-        }
         site_calls(*call, &mut ctx, &mut out);
     }
     for lit in &records {
         franz_record(*lit, &mut ctx, &mut out);
     }
-    out.capped = out.sites.len() > MAX_GO_BROKER_SITES_PER_FILE || ctx.capped || capped;
-    out.sites.truncate(MAX_GO_BROKER_SITES_PER_FILE);
+    out.capped |= ctx.capped || capped;
+    // In a file of the other libraries, a Kafka-shaped call on a receiver that is not shown to be
+    // a Kafka client has no known broker.
+    let others = ctx.imports.values().any(|k| {
+        matches!(
+            k,
+            Kind::Amqp
+                | Kind::Nats
+                | Kind::Jetstream
+                | Kind::Redis { .. }
+                | Kind::Sqs
+                | Kind::Sns
+                | Kind::PubSub
+        )
+    });
+    if others {
+        for call in &legacy_calls {
+            if out.claimed.contains(&call.start_byte()) {
+                continue;
+            }
+            let Some(operand) = call
+                .child_by_field_name("function")
+                .and_then(|f| f.child_by_field_name("operand"))
+            else {
+                continue;
+            };
+            let kafka = match ctx.ty_of(operand, 0, 0) {
+                Some(Ty::Kafka | Ty::SaramaGroup) => true,
+                Some(Ty::Local(s)) => ctx.wrappers.get(&s).is_some_and(|w| w.0),
+                _ => false,
+            };
+            if !kafka {
+                out.unsure.insert(call.start_byte());
+            }
+        }
+    }
     out
 }
 
@@ -1566,8 +1694,12 @@ fn site_calls<'t>(call: Node<'t>, ctx: &mut Ctx<'t>, out: &mut Scan) {
     };
     // A method of a type this file declares is the file's own call, whatever it is named: the
     // Kafka heuristics of `go.rs` must not read a `Subscribe("x")` of it.
+    // A wrapper of a broker client (a struct of the file holding one) keeps its older reading:
+    // its `Subscribe("x")` is the Kafka consumer it always was.
     if let Ty::Local(s) = &owner {
-        if ctx.local_methods.contains(&(s.clone(), method.to_string())) {
+        if ctx.local_methods.contains(&(s.clone(), method.to_string()))
+            && !ctx.wrappers.contains_key(s)
+        {
             out.claimed.insert(call.start_byte());
         }
         return;
@@ -1581,24 +1713,23 @@ fn site_calls<'t>(call: Node<'t>, ctx: &mut Ctx<'t>, out: &mut Scan) {
     else {
         return;
     };
+    let mut keys: Vec<String> = keys.into_iter().filter(|k| usable_name(k)).collect();
+    keys.sort();
+    keys.dedup();
+    keys.retain(|k| {
+        !(producer && is_pattern(k)) && !(broker == Broker::RabbitMq && k.contains('#'))
+    });
+    // A call the cap would cut is not claimed: the older heuristics keep what they read on base.
+    if !out.has_room(keys.len()) {
+        return;
+    }
     out.claimed.insert(call.start_byte());
     let via = CALL_NAMES
         .iter()
         .copied()
         .find(|m| *m == method)
         .unwrap_or("call");
-    let mut keys: Vec<String> = keys.into_iter().filter(|k| usable_name(k)).collect();
-    keys.sort();
-    keys.dedup();
     for key in keys {
-        // A producer never publishes to a pattern.
-        if producer && is_pattern(&key) {
-            continue;
-        }
-        // A `#` is no name in the dot dialect this graph matches wildcards in.
-        if broker == Broker::RabbitMq && key.contains('#') {
-            continue;
-        }
         out.sites.push(Site {
             producer,
             broker,

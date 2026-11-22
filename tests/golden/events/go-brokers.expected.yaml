@@ -17,6 +17,8 @@
 # string in a log line, a subject that is a parameter, a `fmt.Sprintf` subject, a pattern producer
 # key, a literal that an `os.Getenv` branch overrides (a default is never a name).
 # shadowed.go holds none: a local `Bus` and `Conn` have the method names of a NATS connection.
+# wrapper.go: a local type wrapping a kafka-go reader has its own Subscribe; `feed.updates` stays a
+# Kafka consumer (the older reading), the NATS connection beside it does not take it.
 # commented.go holds none: its import of the NATS client is commented out.
 # consumer_test.go holds a real-looking `nc.Publish`: the scorer ignores test files.
 corpus: go-brokers
@@ -54,6 +56,7 @@ consumers:
   - {id: c11, topic: refunds.requested, file: refunds.go, line: 16, language: go, tags: [go_broker, config_topic]}
   - {id: c12, topic: shipments.dispatched, file: shipments.go, line: 12, language: go, tags: [go_broker]}
   - {id: c13, topic: shipments.returned, file: shipments.go, line: 16, language: go, tags: [go_broker]}
+  - {id: c14, topic: feed.updates, file: wrapper.go, line: 17, language: go, tags: [kafka_basic]}
 
 hops:
   - id: h1

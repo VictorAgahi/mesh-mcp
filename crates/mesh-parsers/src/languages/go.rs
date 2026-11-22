@@ -23,6 +23,9 @@ pub struct GoRelations {
     /// which is what lets `find_dependents`/`analyze_grpc` resolve a real
     /// cross-service caller instead of only a package-string match.
     pub rpc_calls: Vec<(usize, CompactStr)>,
+    /// Indices into `producers` / `consumers` of the sites whose broker is not known to be Kafka.
+    pub unsure_producers: Vec<usize>,
+    pub unsure_consumers: Vec<usize>,
 }
 
 /// A raw `import_spec`, resolved to the identifier a Go source file would use to
@@ -40,6 +43,9 @@ struct RawEvent {
     /// Start byte of the call it was read from (none for a struct literal): a call another
     /// broker pass owns is dropped.
     call_start: Option<usize>,
+    /// The call is Kafka-shaped but its receiver is not shown to be a Kafka client, in a file of
+    /// the other broker libraries: the site is kept with an unknown broker.
+    unsure: bool,
     line_start: usize,
     line_end: usize,
     topic: CompactStr,
@@ -81,17 +87,27 @@ impl GoExtractor {
         repo_id: RepoId,
         tree: &Tree,
     ) -> (Vec<ContractNode>, GoRelations) {
-        Self::extract_claiming(file_path, content, repo_id, tree, &HashSet::new())
+        Self::extract_claiming(
+            file_path,
+            content,
+            repo_id,
+            tree,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
     }
 
     /// [`Self::extract_with_relations`] without the Kafka readings of the calls that start at
-    /// one of `claimed` (a `Subscribe("x")` of a NATS or Redis client is not a Kafka consumer).
+    /// one of `claimed` (a `Subscribe("x")` of a NATS or Redis client is not a Kafka consumer);
+    /// the calls that start at one of `unsure` keep their reading, flagged in the relations as
+    /// not known to be Kafka.
     pub(crate) fn extract_claiming(
         file_path: &Path,
         content: &str,
         repo_id: RepoId,
         tree: &Tree,
         claimed: &HashSet<usize>,
+        unsure: &HashSet<usize>,
     ) -> (Vec<ContractNode>, GoRelations) {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
@@ -132,6 +148,9 @@ impl GoExtractor {
         );
 
         raw_events.retain(|e| e.call_start.is_none_or(|s| !claimed.contains(&s)));
+        for e in raw_events.iter_mut() {
+            e.unsure = e.call_start.is_some_and(|s| unsure.contains(&s));
+        }
         Self::resolve_dependencies(content, &nodes, &raw_imports, &mut relations.dependencies);
         Self::resolve_events(
             &mut nodes,
@@ -523,6 +542,7 @@ impl GoExtractor {
             for lit in literals {
                 raw_events.push(RawEvent {
                     call_start: Some(node.start_byte()),
+                    unsure: false,
                     line_start,
                     line_end,
                     topic: CompactStr::new(lit.as_str()),
@@ -554,6 +574,7 @@ impl GoExtractor {
         };
         raw_events.push(RawEvent {
             call_start: None,
+            unsure: false,
             line_start: node.start_position().row + 1,
             line_end: node.end_position().row + 1,
             topic,
@@ -750,8 +771,14 @@ impl GoExtractor {
             };
 
             if event.is_producer {
+                if event.unsure {
+                    relations.unsure_producers.push(relations.producers.len());
+                }
                 relations.producers.push((idx, event.topic));
             } else {
+                if event.unsure {
+                    relations.unsure_consumers.push(relations.consumers.len());
+                }
                 relations.consumers.push((idx, event.topic));
             }
         }

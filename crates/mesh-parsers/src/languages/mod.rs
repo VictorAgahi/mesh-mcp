@@ -635,6 +635,33 @@ impl FileIndex {
         );
     }
 
+    /// [`Self::tag_brokers`] without the producers and consumers at the given indices, which stay
+    /// without a broker (they join every broker's channel of their topic, `heuristic`).
+    pub fn tag_brokers_except(&mut self, broker: Broker, producers: &[usize], consumers: &[usize]) {
+        let tagged: HashSet<usize> = self
+            .producer_brokers
+            .iter()
+            .map(|(i, _)| *i)
+            .chain(producers.iter().copied())
+            .collect();
+        self.producer_brokers.extend(
+            (0..self.producers.len())
+                .filter(|i| !tagged.contains(i))
+                .map(|i| (i, broker)),
+        );
+        let tagged: HashSet<usize> = self
+            .consumer_brokers
+            .iter()
+            .map(|(i, _)| *i)
+            .chain(consumers.iter().copied())
+            .collect();
+        self.consumer_brokers.extend(
+            (0..self.consumers.len())
+                .filter(|i| !tagged.contains(i))
+                .map(|i| (i, broker)),
+        );
+    }
+
     /// Whether any node carries `package`, the package [`PathContext::package_of`] infers
     /// from the file's directories. A node whose declared package merely equals it counts
     /// too: the record is then keyed by the inferred package, which can only cost a miss.
@@ -1304,6 +1331,7 @@ impl PolyglotIndexer {
                                 repo_id,
                                 tree,
                                 &brokers.claimed,
+                                &brokers.unsure,
                             ),
                             if with_calls {
                                 go_calls::extract(tree, content.as_bytes())
@@ -1320,11 +1348,14 @@ impl PolyglotIndexer {
                     out.producers = relations.producers;
                     out.consumers = relations.consumers;
                     out.rpc_calls = relations.rpc_calls;
+                    let (unsure_p, unsure_c) =
+                        (relations.unsure_producers, relations.unsure_consumers);
                     // RabbitMQ, NATS, Redis, SQS / SNS and Pub/Sub (9.0 T8b), each under its own
                     // broker.
                     go_brokers::apply(brokers, &mut out);
-                    // Whatever is left is kafka-go, sarama or confluent-kafka-go.
-                    out.tag_brokers(Broker::Kafka);
+                    // Whatever is left is kafka-go, sarama or confluent-kafka-go, except a
+                    // Kafka-shaped call of a receiver nothing shows to be one.
+                    out.tag_brokers_except(Broker::Kafka, &unsure_p, &unsure_c);
                 }
             }
             LanguageKind::Python => {

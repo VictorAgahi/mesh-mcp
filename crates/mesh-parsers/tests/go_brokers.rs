@@ -696,6 +696,99 @@ fn sarama_consumer_groups_and_franz_go_are_kafka() {
     assert!(sites(&extract(&other)).is_empty());
 }
 
+// ---- Kafka-shaped calls of receivers that are not clients of the new libraries (round 1) -------
+
+const KAFKA_GO: &str = "kafka \"github.com/segmentio/kafka-go\"";
+const CONFLUENT: &str = "\"github.com/confluentinc/confluent-kafka-go/kafka\"";
+
+#[test]
+fn a_wrapper_of_a_kafka_client_keeps_its_kafka_reading_and_a_foreign_type_stays_hidden() {
+    let code = file(
+        &[KAFKA_GO, NATS],
+        r#"type Consumer struct{ r *kafka.Reader }
+
+func (c *Consumer) Subscribe(topic string) error { return nil }
+
+type Bus struct{}
+
+func (Bus) Subscribe(topic string) {}
+
+type NatsFeed struct{ nc *nats.Conn }
+
+func (NatsFeed) Subscribe(topic string) {}
+
+func Wrap(nc *nats.Conn, r *kafka.Reader) {
+	c := &Consumer{r: r}
+	c.Subscribe("wrap.local.sub")
+	nc.Publish("wrap.nats", nil)
+	b := Bus{}
+	b.Subscribe("bus.hidden")
+	f := NatsFeed{nc: nc}
+	f.Subscribe("feed.unknown")
+}"#,
+    );
+    assert_eq!(
+        sites(&extract(&code)),
+        vec![
+            // A wrapper of a nats connection is not a Kafka consumer: no known broker.
+            s('C', "?", "feed.unknown"),
+            s('C', "kafka", "wrap.local.sub"),
+            s('P', "nats", "wrap.nats"),
+        ]
+    );
+}
+
+#[test]
+fn an_untyped_receiver_in_a_file_of_the_new_libraries_has_no_known_broker() {
+    let code = file(
+        &[NATS, CONFLUENT],
+        r#"type Sink interface{ Subscribe(string) }
+
+func run(nc *nats.Conn, s Sink, other any, c *kafka.Consumer) {
+	nc.Subscribe("typed.nats", nil)
+	s.Subscribe("untyped.iface")
+	c.SubscribeTopics([]string{"typed.kafka"}, nil)
+	p, _ := kafka.NewProducer(nil)
+	p.Produce(&kafka.Message{}, nil)
+}"#,
+    );
+    assert_eq!(
+        sites(&extract(&code)),
+        vec![
+            s('C', "?", "untyped.iface"),
+            s('C', "kafka", "typed.kafka"),
+            s('C', "nats", "typed.nats"),
+        ]
+    );
+    // Without a library of the new set the file reads as before: Kafka.
+    let plain = file(
+        &[CONFLUENT],
+        "type Sink interface{ Subscribe(string) }\nfunc run(s Sink) { s.Subscribe(\"untyped.iface\") }",
+    );
+    assert_eq!(
+        sites(&extract(&plain)),
+        vec![s('C', "kafka", "untyped.iface")]
+    );
+}
+
+#[test]
+fn calls_past_the_site_cap_are_not_claimed_so_no_edge_base_had_is_lost() {
+    let n = MAX_GO_BROKER_SITES_PER_FILE + 1000;
+    let mut body = String::from("func run(nc *nats.Conn) {\n");
+    for i in 0..n {
+        body.push_str(&format!("\tnc.Subscribe(\"s.{i}\", nil)\n"));
+    }
+    body.push_str("}\n");
+    let fi = extract(&file(&[NATS], &body));
+    assert!(fi.go_brokers_capped);
+    // Base read all of them (as Kafka); the head keeps every edge: the NATS ones the pass could
+    // register, the rest left to the older reading, without a broker.
+    assert_eq!(fi.consumers.len(), n);
+    let nats = sites(&fi).iter().filter(|(_, b, _)| b == "nats").count();
+    assert_eq!(nats, MAX_GO_BROKER_SITES_PER_FILE);
+    assert!(sites(&fi).iter().all(|(_, b, _)| b != "kafka"));
+}
+
 // ---- Bounds -----------------------------------------------------------------------------
 
 #[test]
