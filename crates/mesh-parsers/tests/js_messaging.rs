@@ -717,14 +717,22 @@ fn constants_respect_scope_and_mutability() {
          export function h(producer) { const V = process.env.V; producer.send({ topic: V }); }\n\
          export function k(producer) { producer.send({ topic: T }); }\n",
     );
-    // Only `k` sees the module-level `T`; `U` can change; `V` is shadowed.
+    // Only `k` sees the module-level `T`; `U` can change; `V` is shadowed by the local
+    // `const V = process.env.V` (not the module-level `'v-const'`), a config read: its
+    // `${V}` placeholder, resolved against the configuration when the file is folded.
     let sends: Vec<(String, String)> = fi
         .producers
         .iter()
         .map(|(i, t)| (fi.nodes[*i].line_start.to_string(), t.to_string()))
         .collect();
-    // The send inside `k`, on line 8.
-    assert_eq!(sends, vec![("8".to_string(), "a".to_string())], "{sends:?}");
+    assert_eq!(
+        sends,
+        vec![
+            ("7".to_string(), "${V}".to_string()),
+            ("8".to_string(), "a".to_string())
+        ],
+        "{sends:?}"
+    );
 }
 
 #[test]

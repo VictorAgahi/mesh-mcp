@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod config;
+pub mod config_values;
 pub mod config_watch;
 pub mod contracts;
 pub mod crawler;
@@ -36,6 +37,7 @@ pub use config::{
     ContractsConfig, CustomPatternConfig, GrpcConfig, OpenApiConfig, PatternConfidence,
     PatternKind, ReadGovernanceMode, WorkspaceConfig,
 };
+pub use config_values::{ConfigEntry, ConfigFile, ConfigValues};
 pub use contracts::{
     fold_rpc_name, normalize_topic_key, qualified_topic_key, service_from_client_field_name,
     split_qualified_topic_key, Broker, CallFact, CallFacts, CallReceiver, CallStats, CallableFact,

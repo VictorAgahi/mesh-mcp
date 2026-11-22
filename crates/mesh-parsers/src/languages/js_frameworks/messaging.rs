@@ -192,6 +192,8 @@ fn amqp_exchange(s: &Site) -> Vec<String> {
 fn sqs_queue(s: &Site) -> Vec<String> {
     object_keys(s, 0, &["QueueUrl"])
         .into_iter()
+        // A whole URL read from configuration (`process.env.QUEUE_URL`) is not a queue name.
+        .filter(|u| !(u.starts_with("${") && !u.contains('/')))
         .filter_map(|u| u.rsplit('/').next().map(str::to_string))
         .filter(|n| !n.is_empty())
         .collect()

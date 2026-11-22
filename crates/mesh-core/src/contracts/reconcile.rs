@@ -146,6 +146,17 @@ impl ContractGraph {
         self.derive_calls();
     }
 
+    /// Distinct topics still holding a `${key}` placeholder after the last fold: the ones no
+    /// configuration file resolved (`IndexHealth::config_topics_unresolved`).
+    pub fn unresolved_placeholder_topics(&self) -> usize {
+        self.topic_producers
+            .keys()
+            .chain(self.topic_consumers.keys())
+            .filter(|k| k.contains("${"))
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
     /// The `Imports` edges of `facts` (sorted by importer, then target): every
     /// fact of an importer must be in `facts` for its edges to be complete, since
     /// two targets resolving to one node give one edge, the first target's.

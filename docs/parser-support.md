@@ -72,7 +72,9 @@ blocks, with the original line numbers.
 
 > **If you run NestJS, read this.** Not resolved: the application's global prefix
 > (`setGlobalPrefix`) and `@Version` (set `http_prefix` for a constant prefix), inherited controller
-> bases, and any topic or queue name that comes from `ConfigService`, `process.env` or a config object.
+> bases, and a topic or queue name that comes from a config *object* or a registry. A name read
+> with `process.env.X`, `configService.get('X')` or `config.getOrThrow('X')` is resolved against the
+> workspace's configuration files (section 3.6); a name no file defines stays a visible `${X}` topic.
 > Expect missing routes and "not statically resolved" on topics wherever production code is
 > configuration-driven; the label "level 4" describes the extractor, not the recall on your code.
 
@@ -84,8 +86,9 @@ NestJS WebSocket gateways, Temporal, server-sent events, ORMs (Prisma, TypeORM).
 recognised.
 
 Where it stops (all listed in `CHANGELOG.md` 7.1.0 to 7.1.10):
-- A name taken from a parameter, `process.env`, a config object or a runtime registry is not a
-  name and records nothing. Declare the registry with a custom pattern.
+- A name taken from a parameter, a config object or a runtime registry is not a name and records
+  nothing. Declare the registry with a custom pattern. (`process.env.X` and `configService.get('X')`
+  record a `${X}` placeholder, section 3.6.)
 - NestJS global prefixes and `@Version`, Express/Koa mounts across files, a Fastify plugin passed
   as a named function, inherited controller bases, and HTTP client calls are not linked.
 - Template-only component usage (auto-imported Vue/Nuxt components with no `import`) is not seen.
@@ -113,7 +116,7 @@ a convention, and a convention the table lacks is invisible.
 | Declarations | classes, interfaces, methods |
 | Imports | `import` statements, for `find_dependents` |
 | gRPC | `*ImplBase` servers, `@GrpcService`, `newBlockingStub` / `newStub` / `newFutureStub` clients |
-| Events | `@KafkaListener` (consumers), `KafkaTemplate` (producers); topic names resolved through Spring `application*.yml` / `.properties` placeholders when `[engines.contracts.spring] resolve_placeholders` is on |
+| Events | `@KafkaListener` (consumers), `KafkaTemplate` (producers); a topic written `"${a.b}"` / `"${a.b:default}"`, or a field or parameter injected with `@Value("${a.b}")` and passed to `send`, is resolved against `application*.yml` / `.properties` and the other configuration files of section 3.6 |
 | In-process events | `@EventListener`, `@TransactionalEventListener`, `ApplicationListener<E>`, `publishEvent(new E(...))`, `@Scheduled`: [3.5](#35-in-process-buses-and-schedules) |
 | HTTP | Spring MVC mappings, JAX-RS annotations |
 
@@ -121,7 +124,10 @@ a convention, and a convention the table lacks is invisible.
 WebClient links to routes; WebFlux functional routes; a topic given as a constant or enum.
 
 Stops: this extractor has no constant propagation (a topic built in code is not resolved; use
-Spring properties), and it reads only the Kafka and HTTP idioms named above.
+Spring properties), and it reads only the Kafka and HTTP idioms named above. `@Value` is read by
+field or parameter name inside the declaring class (nested type declarations are not part of it;
+a parameter or local of the same name hides the field, `this.name` is the field); `@ConfigurationProperties` classes, SpEL
+(`#{...}`) and Spring's relaxed binding (`APP_TOPICS_ORDERS` for `app.topics.orders`) are not.
 
 ### 2.3 Go (level 3)
 
@@ -339,6 +345,62 @@ Fixtures and ground truth: `examples/eda/nestjs-monolith-bus` and `examples/eda/
 with `tests/golden/events/nestjs-monolith-bus.expected.yaml` and `spring-monolith.expected.yaml`.
 
 ---
+
+### 3.6 Config-driven topics
+
+A producer or consumer whose topic is read from configuration is recorded with a Spring-style
+placeholder, `${KEY}` or `${KEY:default}`, and resolved when the file is folded into the graph, so a
+config edit re-resolves it without the source file changing:
+
+| Source read | Placeholder |
+| :--- | :--- |
+| TypeScript / JavaScript `process.env.X`, `process.env['X']`, `<config>.get('X')`, `<config>.getOrThrow('X')` (receiver named `*config*`), with `?? 'd'` / `\|\| 'd'`, through local and module `const`s | `${X}` / `${X:d}` |
+| Go `os.Getenv("X")`, `viper.GetString("a.b")` / `viper.Get(...)`, directly or through `v := os.Getenv("X")` | `${X}` |
+| Python `os.environ["X"]`, `os.environ.get("X"[, "d"])`, `os.getenv("X"[, "d"])`, directly or through a module-level assignment | `${X}` / `${X:d}` |
+| Java `"${a.b}"` / `"${a.b:d}"` in `@KafkaListener`, or a field / parameter annotated `@Value("${a.b}")` passed to `kafkaTemplate.send` | as written |
+
+Values come from: Spring `application*.yml` / `*.properties` (dotted keys; honours
+`[engines.contracts.spring] property_files`), the four dotenv templates `.env.example`,
+`.env.sample`, `.env.template` and `.env.dist` (exact names; no other dotenv file is read), a compose
+`environment:` block (map or list form) and a Kubernetes `env:` list (`name` / `value`). Resolution:
+
+- one value for a key: the link is `exact`; a value that only a template (`.env.example`), a
+  multi-document yaml (only its first document is read) or the source's own `:default` supplies, or
+  two files that disagree (profiles, `.env` against an overlay), makes the link `heuristic` and
+  registers every candidate. A deployed value always wins over a template value.
+- a placeholder nothing resolves (no file defines it, a cycle, nesting beyond 8 hops, more than 8
+  candidates or more than 256 expansion steps, checked while expanding, so a wide chain of profiles
+  is abandoned early) stays a visible `${KEY}` topic, `heuristic`, counted in
+  `IndexHealth::config_topics_unresolved`. Producers and consumers of the same unresolved key meet on
+  it. No name is guessed; the env key is never recorded as a Go or Python topic.
+- secrets (commandment 5): a real dotenv file (`.env`, `.env.local`, `.env.production`,
+  `production.env`, `.env.distributor`, `.env.example.local`) is never read, whatever
+  `exclude_patterns` says; the default `**/.env*` pattern lets exactly the four template names
+  through, and only when `exclude_patterns` is absent from the config: an operator who lists
+  `**/.env*` (or any `exclude_patterns`) themselves keeps every `.env*` file excluded, templates
+  included (the loader rewrites the exact string to `.env*`, the same files). A template's values are weak. An entry is kept only if its value is
+  topic-shaped (ASCII letters, digits, `. _ - : / $ { } # * +`, at most 249 bytes, no `://`, no `@`,
+  no token-looking run such as `sk_live_`, `ghp_`, `AKIA`, a 32-char hex run or a long base64-ish
+  run) and its key is not a credential name (ending `_KEY`, `_DSN`, `_URL`, `_URI`, `_PASSWORD`,
+  `_PASSWD`, `_PWD`, `_CREDENTIALS`, `_AUTH`, or containing `dsn`, `stripe`, `secret`, `token`,
+  `password`, `credential`, `apikey`, ...). A placeholder DEFAULT is held to the same rule (`${k:postgres://u:pw@h/x}`,
+  `${k:sk_live_...}`, `${a:${b:x}}` lose their default at extraction, in the graph, in the parse
+  cache and in `smart_search` snippets). A topic site whose key is dropped stays a visible
+  `${KEY}`. By design, a topic-shaped value under a NON-secret key name is kept (a name is the
+  only signal available), and a legitimate topic of 24 or more alphanumeric characters with a digit
+  and no separator (`orders2024eventsV2Stream`) is taken for a token and dropped, known limit.
+- bounds, all counted (`IndexHealth::files_config_capped`, `config_entries_dropped`, `doctor`): 2,048
+  entries per file, 50,000 per workspace, values up to 249 bytes; config files go through the same
+  384 KB / binary guards as every file; symlinks are not followed outside the root. Also counted
+  (`files_config_parse_failed`, `files_config_lossy`): a yaml that does not parse (a profile file next
+  to it is read as weak, since the base may hold the active value) and a non-UTF-8 config file (read
+  with the invalid bytes replaced, only the lines that held them are lost). `doctor` warns on any of
+  them, and says when an unresolved placeholder may be due to a skipped (oversized) config file.
+
+Not resolved: Spring relaxed binding, `@ConfigurationProperties`, Helm / Kustomize templating,
+`env_file:` indirection, `docker-compose` `${VAR}` interpolation, a config object
+(`settings.KAFKA_TOPIC`, `config.kafka.topic`), NestJS `registerAs` factories, and any config file
+format other than the above (JSON, TOML, `.ini`).
 
 ## 4. What every level shares
 

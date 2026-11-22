@@ -652,6 +652,11 @@ impl GoExtractor {
         if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
             return;
         }
+        // `os.Getenv("KAFKA_TOPIC")` argument: the config key, never a topic literal.
+        if let Some(reference) = Self::config_ref(node, source) {
+            out.push(reference.to_string());
+            return;
+        }
         if node.kind() == "interpreted_string_literal" {
             if let Ok(text) = node.utf8_text(source) {
                 let unquoted = text.trim_matches('"');
@@ -862,6 +867,9 @@ impl GoExtractor {
         if node.kind() == "var_spec" || node.kind() == "const_spec" {
             Self::resolve_var_spec_getenv_default(node, root, source, out);
         }
+        if node.kind() == "short_var_declaration" {
+            Self::collect_short_decl_config_refs(node, source, out);
+        }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             Self::collect_getenv_default_consts(child, source, root, out, depth + 1);
@@ -891,6 +899,10 @@ impl GoExtractor {
             if value_node.kind() != "call_expression" {
                 continue;
             }
+            if let Some(reference) = Self::config_ref(value_node, source) {
+                out.insert(name.to_string(), reference);
+                continue;
+            }
             let Some(func) = value_node.child_by_field_name("function") else {
                 continue;
             };
@@ -912,6 +924,61 @@ impl GoExtractor {
                 }
             }
         }
+    }
+
+    /// `topic := os.Getenv("KAFKA_TOPIC")`: the local stands for that config key.
+    fn collect_short_decl_config_refs(
+        decl: Node,
+        source: &[u8],
+        out: &mut HashMap<String, CompactStr>,
+    ) {
+        let (Some(left), Some(right)) = (
+            decl.child_by_field_name("left"),
+            decl.child_by_field_name("right"),
+        ) else {
+            return;
+        };
+        let (mut left_cursor, mut right_cursor) = (left.walk(), right.walk());
+        let names = left.named_children(&mut left_cursor);
+        let values = right.named_children(&mut right_cursor);
+        for (name, value) in names.zip(values) {
+            let Ok(name) = name.utf8_text(source) else {
+                continue;
+            };
+            if let Some(reference) = Self::config_ref(value, source) {
+                out.entry(name.to_string()).or_insert(reference);
+            }
+        }
+    }
+
+    /// `os.Getenv("KEY")` or `viper.GetString("a.b")` as the `${KEY}` placeholder the
+    /// configuration files resolve; any other call is not a config read.
+    fn config_ref(call: Node, source: &[u8]) -> Option<CompactStr> {
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let func = call
+            .child_by_field_name("function")?
+            .utf8_text(source)
+            .ok()?;
+        if !matches!(func, "os.Getenv" | "viper.GetString" | "viper.Get") {
+            return None;
+        }
+        let args = call.child_by_field_name("arguments")?;
+        let first = args.named_child(0)?;
+        if args.named_child_count() != 1
+            || !matches!(
+                first.kind(),
+                "interpreted_string_literal" | "raw_string_literal"
+            )
+        {
+            return None;
+        }
+        let key = first
+            .utf8_text(source)
+            .ok()?
+            .trim_matches(|c: char| c == '"' || c == '`');
+        crate::config_ref::placeholder(key, None).map(CompactStr::new)
     }
 
     #[allow(clippy::manual_find)]

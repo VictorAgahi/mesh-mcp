@@ -88,7 +88,10 @@ pub struct WorkspaceConfig {
     #[serde(default = "default_workspace_root")]
     pub workspace_root: String,
     pub roots: Vec<String>,
-    #[serde(default = "default_exclude_patterns")]
+    #[serde(
+        default = "default_exclude_patterns",
+        deserialize_with = "explicit_exclude_patterns"
+    )]
     pub exclude_patterns: Vec<String>,
     #[serde(default)]
     pub mount_aliases: HashMap<String, String>,
@@ -122,6 +125,24 @@ fn default_version() -> String {
 
 fn default_workspace_root() -> String {
     ".".to_string()
+}
+
+/// The patterns an operator wrote (this runs only when `exclude_patterns` is present in the
+/// file; an absent key takes [`default_exclude_patterns`]). The built-in dotenv pattern is
+/// the one string the crawler lets `.env.example`-style templates through (ticket T6), so an
+/// operator who writes it themselves gets the equivalent spelling `.env*`: same files
+/// excluded, no carve-out.
+fn explicit_exclude_patterns<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut patterns = Vec::<String>::deserialize(deserializer)?;
+    for p in &mut patterns {
+        if p == crate::crawler::DEFAULT_ENV_PATTERN {
+            *p = ".env*".to_string();
+        }
+    }
+    Ok(patterns)
 }
 
 fn default_exclude_patterns() -> Vec<String> {

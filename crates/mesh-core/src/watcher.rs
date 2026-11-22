@@ -646,6 +646,13 @@ impl FileWatcherService {
             return true;
         }
 
+        // A `.env.example`-style template can hold the topic a source file reads from the
+        // environment (ticket T6): editing one re-resolves those topics. Real dotenv files
+        // are never read.
+        if crate::config_values::is_env_template_name(name) {
+            return true;
+        }
+
         // `.sql` in any case: the crawler indexes `UPPER.SQL`, so an edit must reload it.
         if path
             .extension()

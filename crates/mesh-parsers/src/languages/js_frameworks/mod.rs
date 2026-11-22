@@ -279,6 +279,7 @@ pub(crate) fn detect_call(call: Node, source: &[u8], fx: &FrameworkCtx) -> Vec<E
     }
     let built = fx.built();
     let names = Names {
+        config: true,
         source,
         consts: &built.consts,
         bindings: &built.bindings,
@@ -403,6 +404,7 @@ pub(crate) fn detect_new(node: Node, source: &[u8], fx: &FrameworkCtx) -> Vec<Ev
         return Vec::new();
     };
     let names = Names {
+        config: true,
         source,
         consts: &built.consts,
         bindings: &built.bindings,
@@ -479,6 +481,7 @@ pub(crate) fn detect_decorator(
         return Vec::new();
     };
     let names = Names {
+        config: true,
         source,
         consts: &built.consts,
         bindings: &built.bindings,

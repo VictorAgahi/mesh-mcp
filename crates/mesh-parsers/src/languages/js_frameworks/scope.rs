@@ -415,6 +415,10 @@ fn is_const_declaration(decl: Node) -> bool {
 #[derive(Debug, Default)]
 pub(crate) struct ConstTable {
     values: HashMap<String, String>,
+    /// Constants whose value is read from configuration (`const T = process.env.TOPIC`),
+    /// as `${KEY}` placeholders. Kept apart from `values`: only a messaging site reads
+    /// them (`Names::config`), never an HTTP route.
+    config_values: HashMap<String, String>,
 }
 
 impl ConstTable {
@@ -517,6 +521,8 @@ impl ConstTable {
             self.add_object(name, value, source, bindings, 0);
         } else if let Some(v) = self.resolve_literal(value, source, bindings) {
             self.values.insert(name.to_string(), v);
+        } else if let Some(v) = self.resolve_config(value, source, bindings) {
+            self.config_values.insert(name.to_string(), v);
         }
     }
 
@@ -548,6 +554,8 @@ impl ConstTable {
                 self.add_object(&path, value, source, bindings, depth + 1);
             } else if let Some(v) = self.resolve_literal(value, source, bindings) {
                 self.values.insert(path, v);
+            } else if let Some(v) = self.resolve_config(value, source, bindings) {
+                self.config_values.insert(path, v);
             }
         }
     }
@@ -562,12 +570,33 @@ impl ConstTable {
         // Module-level constants have no enclosing block to scan.
         let scopes = BlockCache::default();
         Names {
+            config: false,
             source,
             consts: self,
             bindings,
             scopes: &scopes,
         }
         .resolve_inner(node, 0, false)
+    }
+
+    /// A value that reads configuration (`process.env.X`, `config.get('X')`, possibly with a
+    /// literal default or around other constants): its `${KEY}` placeholder form.
+    fn resolve_config(
+        &self,
+        node: Node,
+        source: &[u8],
+        bindings: &ModuleBindings,
+    ) -> Option<String> {
+        let scopes = BlockCache::default();
+        Names {
+            config: true,
+            source,
+            consts: self,
+            bindings,
+            scopes: &scopes,
+        }
+        .resolve_inner(node, 0, false)
+        .filter(|v| v.contains("${"))
     }
 }
 
@@ -1087,6 +1116,7 @@ impl Receivers {
         let mut queue_names = HashMap::new();
         let scopes = BlockCache::default();
         let names = Names {
+            config: true,
             source,
             consts,
             bindings,
@@ -1146,6 +1176,10 @@ impl Receivers {
 
 /// Reads argument expressions as names (topics, queues, subjects).
 pub(crate) struct Names<'a> {
+    /// Also read a value that comes from configuration (`process.env.X`,
+    /// `configService.get('X')`) as its `${X}` placeholder. Set for messaging sites only:
+    /// an HTTP route or a path prefix is never a config-driven topic.
+    pub config: bool,
     pub source: &'a [u8],
     pub consts: &'a ConstTable,
     pub bindings: &'a ModuleBindings,
@@ -1190,7 +1224,11 @@ impl Names<'_> {
                     .utf8_text(self.source)
                     .ok()?;
                 if op != "+" {
-                    return None;
+                    return if self.config {
+                        self.config_default(node, depth)
+                    } else {
+                        None
+                    };
                 }
                 let left =
                     self.resolve_inner(node.child_by_field_name("left")?, depth + 1, false)?;
@@ -1198,11 +1236,17 @@ impl Names<'_> {
                     self.resolve_inner(node.child_by_field_name("right")?, depth + 1, false)?;
                 Some(left + &right)
             }
+            "call_expression" if self.config => self.config_call(node),
             "identifier"
             | "shorthand_property_identifier"
             | "member_expression"
             | "subscript_expression" => {
                 let path = dotted(node, self.source)?;
+                if self.config {
+                    if let Some(key) = path.strip_prefix("process.env.") {
+                        return crate::config_ref::placeholder(key, None);
+                    }
+                }
                 let first = path.split('.').next()?;
                 if first == "this" {
                     let field = path.strip_prefix("this.").filter(|f| !f.contains('.'))?;
@@ -1220,6 +1264,13 @@ impl Names<'_> {
                 if let Some(v) = self.consts.values.get(&path) {
                     return Some(v.clone());
                 }
+                if let Some(v) = self
+                    .config
+                    .then(|| self.consts.config_values.get(&path))
+                    .flatten()
+                {
+                    return Some(v.clone());
+                }
                 if !allow_imported {
                     return None;
                 }
@@ -1233,6 +1284,58 @@ impl Names<'_> {
             }
             _ => None,
         }
+    }
+
+    /// `configService.get('KEY')`, `config.getOrThrow<string>('KEY')`,
+    /// `this.config.get('KEY', 'default')`: a call of `get` / `getOrThrow` on a receiver whose
+    /// name says it is a config object, with a literal key. Any other call is not a name.
+    fn config_call(&self, call: Node) -> Option<String> {
+        let callee = call.child_by_field_name("function")?;
+        if callee.kind() != "member_expression" {
+            return None;
+        }
+        let method = callee
+            .child_by_field_name("property")?
+            .utf8_text(self.source)
+            .ok()?;
+        if !matches!(method, "get" | "getOrThrow") {
+            return None;
+        }
+        let receiver = callee
+            .child_by_field_name("object")?
+            .utf8_text(self.source)
+            .ok()?;
+        if !receiver.to_ascii_lowercase().contains("config") {
+            return None;
+        }
+        let args = call.child_by_field_name("arguments")?;
+        let mut cursor = args.walk();
+        let mut args = args.named_children(&mut cursor);
+        let key = unquote(args.next().filter(|a| a.kind() == "string")?, self.source)?;
+        let default = match args.next() {
+            None => None,
+            Some(d) if d.kind() == "string" => Some(unquote(d, self.source)?),
+            Some(_) => return None,
+        };
+        crate::config_ref::placeholder(&key, default.as_deref())
+    }
+
+    /// `process.env.X ?? 'orders'` / `|| 'orders'`: a config read with a literal fallback.
+    fn config_default(&self, node: Node, depth: usize) -> Option<String> {
+        let op = node
+            .child_by_field_name("operator")?
+            .utf8_text(self.source)
+            .ok()?;
+        if !matches!(op, "??" | "||") {
+            return None;
+        }
+        let left = self.resolve_inner(node.child_by_field_name("left")?, depth + 1, false)?;
+        let key = left.strip_prefix("${")?.strip_suffix('}')?;
+        if key.contains(':') {
+            return None;
+        }
+        let right = self.resolve_inner(node.child_by_field_name("right")?, depth + 1, false)?;
+        crate::config_ref::placeholder(key, Some(&right))
     }
 
     /// Every name in `node`: one for a scalar, one per element for an array.

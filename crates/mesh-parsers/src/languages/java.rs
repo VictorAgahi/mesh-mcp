@@ -1,4 +1,5 @@
 use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
@@ -12,6 +13,9 @@ type ExtractedRelations = (
     Vec<(usize, CompactStr)>,
     Vec<(usize, CompactStr)>,
 );
+
+/// `@Value` placeholder fields (`name -> "${key}"`) of each class declaration, by node id.
+type ClassValueFields = HashMap<usize, HashMap<String, String>>;
 
 pub struct JavaExtractor;
 
@@ -57,6 +61,8 @@ impl JavaExtractor {
         let root = tree.root_node();
         let source_bytes = content.as_bytes();
         let mut package_name = CompactStr::default();
+        let mut value_fields = HashMap::new();
+        Self::collect_class_value_fields(root, content, &mut value_fields, 0);
 
         Self::visit_node(
             root,
@@ -67,6 +73,7 @@ impl JavaExtractor {
             &mut nodes,
             &mut producers,
             &mut rpc_calls,
+            &value_fields,
             None,
             0,
         );
@@ -198,7 +205,11 @@ impl JavaExtractor {
     /// paren — so `kafkaTemplate.send(topicVar, msg); logger.info("...")`
     /// could walk straight past the call and pick up an unrelated string
     /// literal from a completely different statement as the "topic".
-    fn extract_kafka_producer_topic(text: &str) -> Option<String> {
+    fn extract_kafka_producer_topic(
+        text: &str,
+        value_fields: &HashMap<String, String>,
+        locals: &HashSet<String>,
+    ) -> Option<String> {
         let lower = text.to_lowercase();
         let mut search_start = 0;
         while let Some(rel_idx) = lower[search_start..].find(".send(") {
@@ -237,6 +248,18 @@ impl JavaExtractor {
                             return Some(rest[..q_end].to_string());
                         }
                     }
+                    // A field or parameter injected with `@Value("${...}")` in this file:
+                    // its placeholder, resolved against the configuration at fold time.
+                    let first = args.split(',').next().unwrap_or("").trim();
+                    // A bare name hidden by a parameter or local of the method is that
+                    // variable, not the field; `this.name` is always the field.
+                    let name = match first.strip_prefix("this.") {
+                        Some(field) => Some(field),
+                        None => (!locals.contains(first)).then_some(first),
+                    };
+                    if let Some(placeholder) = name.and_then(|n| value_fields.get(n)) {
+                        return Some(placeholder.clone());
+                    }
                 }
             }
             search_start = call_start;
@@ -254,6 +277,7 @@ impl JavaExtractor {
         nodes: &mut Vec<ContractNode>,
         producers: &mut Vec<(usize, CompactStr)>,
         rpc_calls: &mut Vec<(usize, CompactStr)>,
+        value_fields: &ClassValueFields,
         enclosing_class_idx: Option<usize>,
         depth: usize,
     ) {
@@ -385,7 +409,19 @@ impl JavaExtractor {
                 };
 
                 let method_text = node.utf8_text(source).unwrap_or("");
-                let producer_topic = Self::extract_kafka_producer_topic(method_text);
+                // `@Value` fields of the class the method sits in (scoped per class, so a
+                // same-named field of another class is not mistaken for it).
+                let no_fields = HashMap::new();
+                let class_fields = Self::enclosing_class(node)
+                    .and_then(|c| value_fields.get(&c.id()))
+                    .unwrap_or(&no_fields);
+                let locals = if class_fields.is_empty() {
+                    HashSet::new()
+                } else {
+                    Self::local_names(node, source)
+                };
+                let producer_topic =
+                    Self::extract_kafka_producer_topic(method_text, class_fields, &locals);
                 let grpc_client_services = Self::extract_grpc_client_services(method_text);
 
                 nodes.push(ContractNode {
@@ -438,6 +474,7 @@ impl JavaExtractor {
                 nodes,
                 producers,
                 rpc_calls,
+                value_fields,
                 child_enclosing_class_idx,
                 depth + 1,
             );
@@ -500,6 +537,162 @@ impl JavaExtractor {
             }
         }
         None
+    }
+
+    /// The parameters and local variables a method declares (bounded walk): a bare name among
+    /// them is not a field of the class.
+    fn local_names(method: Node, source: &[u8]) -> HashSet<String> {
+        fn walk(node: Node, source: &[u8], out: &mut HashSet<String>, depth: usize) {
+            if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH || out.len() > 512 {
+                return;
+            }
+            if matches!(
+                node.kind(),
+                "formal_parameter"
+                    | "variable_declarator"
+                    | "catch_formal_parameter"
+                    | "enhanced_for_statement"
+            ) {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                {
+                    out.insert(name.to_string());
+                }
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                walk(child, source, out, depth + 1);
+            }
+        }
+        let mut out = HashSet::new();
+        walk(method, source, &mut out, 0);
+        out
+    }
+
+    /// The nearest class or record declaration around `node`.
+    fn enclosing_class(node: Node) -> Option<Node> {
+        let mut cur = node.parent();
+        while let Some(n) = cur {
+            if matches!(n.kind(), "class_declaration" | "record_declaration") {
+                return Some(n);
+            }
+            cur = n.parent();
+        }
+        None
+    }
+
+    /// Fills `out` with [`Self::value_placeholder_fields`] of every class declaration's own
+    /// text, by node id. Nested classes are scanned in their own right (and their text is
+    /// part of the outer class's scan: an outer field read from an inner method is not
+    /// seen, an inner `@Value` field is also seen by outer methods of the same name).
+    fn collect_class_value_fields(
+        node: Node,
+        content: &str,
+        out: &mut ClassValueFields,
+        depth: usize,
+    ) {
+        if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
+            return;
+        }
+        if matches!(node.kind(), "class_declaration" | "record_declaration") {
+            // The class's own text: nested type declarations are scanned in their own right,
+            // their fields are not this class's.
+            let mut own = String::new();
+            let mut at = node.start_byte();
+            let mut nested: Vec<(usize, usize)> = Vec::new();
+            let mut cursor = node.walk();
+            for body in node
+                .children(&mut cursor)
+                .filter(|c| c.kind() == "class_body")
+            {
+                let mut inner = body.walk();
+                nested.extend(
+                    body.children(&mut inner)
+                        .filter(|m| {
+                            matches!(
+                                m.kind(),
+                                "class_declaration"
+                                    | "record_declaration"
+                                    | "interface_declaration"
+                                    | "enum_declaration"
+                            )
+                        })
+                        .map(|m| (m.start_byte(), m.end_byte())),
+                );
+            }
+            for (start, end) in nested {
+                own.push_str(content.get(at..start).unwrap_or(""));
+                at = end;
+            }
+            own.push_str(content.get(at..node.end_byte()).unwrap_or(""));
+            {
+                let text = own.as_str();
+                if text.contains("@Value(") {
+                    let fields = Self::value_placeholder_fields(text);
+                    if !fields.is_empty() {
+                        out.insert(node.id(), fields);
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            Self::collect_class_value_fields(child, content, out, depth + 1);
+        }
+    }
+
+    /// `name -> "${key}"` for every field or parameter of the file annotated
+    /// `@Value("${key}")` / `@Value("${key:default}")`: the Spring way to read a topic name
+    /// from `application.yml`. Bounded; a name injected twice with different keys is
+    /// ambiguous and left out.
+    fn value_placeholder_fields(content: &str) -> HashMap<String, String> {
+        const MAX_FIELDS: usize = 256;
+        let mut out: HashMap<String, String> = HashMap::new();
+        let mut dup: HashSet<String> = HashSet::new();
+        let mut from = 0;
+        while let Some(rel) = content[from..].find("@Value(") {
+            let open = from + rel + "@Value(".len();
+            from = open;
+            let Some(close_rel) = content[open..].find(')') else {
+                break;
+            };
+            let literal = content[open..open + close_rel].trim();
+            let Some(inner) = literal
+                .strip_prefix('"')
+                .and_then(|l| l.strip_suffix('"'))
+                .filter(|l| {
+                    l.starts_with("${") && l.ends_with('}') && l.matches("${").count() == 1
+                })
+            else {
+                continue;
+            };
+            // The declared name: the last identifier before the `;` `,` `)` `=` that ends
+            // the field or parameter.
+            let after = &content[open + close_rel + 1..];
+            let Some(end) = after.find([';', ',', ')', '=']) else {
+                continue;
+            };
+            let Some(name) = after[..end]
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .rfind(|w| !w.is_empty())
+            else {
+                continue;
+            };
+            if out.len() >= MAX_FIELDS && !out.contains_key(name) {
+                break;
+            }
+            match out.get(name) {
+                Some(prev) if prev != inner => {
+                    dup.insert(name.to_string());
+                }
+                _ => {
+                    out.insert(name.to_string(), inner.to_string());
+                }
+            }
+        }
+        out.retain(|k, _| !dup.contains(k));
+        out
     }
 
     fn extract_annotation_param(annotation: &str, param: &str) -> Option<String> {
@@ -837,14 +1030,17 @@ public class BillingListener {
     #[test]
     fn kafka_producer_topic_does_not_cross_into_later_statement() {
         let code = r#"kafkaTemplate.send(topicVar, payload); logger.info("database is down");"#;
-        assert_eq!(JavaExtractor::extract_kafka_producer_topic(code), None);
+        assert_eq!(
+            JavaExtractor::extract_kafka_producer_topic(code, &HashMap::new(), &HashSet::new()),
+            None
+        );
     }
 
     #[test]
     fn kafka_producer_topic_extracts_literal_first_argument() {
         let code = r#"kafkaTemplate.send("orders.created", payload);"#;
         assert_eq!(
-            JavaExtractor::extract_kafka_producer_topic(code),
+            JavaExtractor::extract_kafka_producer_topic(code, &HashMap::new(), &HashSet::new()),
             Some("orders.created".to_string())
         );
     }

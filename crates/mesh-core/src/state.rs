@@ -1,5 +1,6 @@
 use crate::audit::AuditLogger;
 use crate::config::Config;
+use crate::config_values::ConfigValues;
 use crate::contracts::ContractGraph;
 use crate::docs::DocIndex;
 use crate::governance::GovernanceEngine;
@@ -26,6 +27,10 @@ pub struct MeshSnapshot {
     pub contract_graph: ContractGraph,
     pub doc_index: DocIndex,
     pub property_registry: PropertyRegistry,
+    /// What the configuration files say about the `${key}` topics source files read from
+    /// configuration (ticket T6). Not part of `property_registry`: that one keeps one
+    /// value per key, this one every value, to tell a profile override from a certainty.
+    pub config_values: ConfigValues,
     /// Monotonic counter bumped on every install; lets callers detect a reload.
     pub generation: u64,
     /// Counts of what happened to every file since the last full rebuild.
@@ -123,7 +128,9 @@ impl MeshSnapshot {
         let roots = &self.roots;
         let graph = sha(&self.contract_graph.canonical_lines_rooted(roots));
         let docs = sha(&self.doc_index.canonical_lines_rooted(roots));
-        let properties = sha(&self.property_registry.canonical_lines_rooted(roots));
+        let mut property_lines = self.property_registry.canonical_lines_rooted(roots);
+        property_lines.extend(self.config_values.canonical_lines_rooted(roots));
+        let properties = sha(&property_lines);
         let combined =
             AuditLogger::compute_sha256(format!("{graph}\n{docs}\n{properties}").as_bytes());
         SnapshotFingerprint {

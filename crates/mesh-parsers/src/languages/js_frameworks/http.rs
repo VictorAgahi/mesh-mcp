@@ -617,6 +617,7 @@ pub(crate) fn detect_routes(call: Node, source: &[u8], fx: &FrameworkCtx) -> Vec
         return Vec::new();
     }
     let names = Names {
+        config: false,
         source,
         consts: &built.consts,
         bindings: &built.bindings,
@@ -854,6 +855,7 @@ pub(crate) fn decorator_route(method: Node, source: &[u8], fx: &FrameworkCtx) ->
         }
     }
     let names = Names {
+        config: false,
         source,
         consts: &built.consts,
         bindings: &built.bindings,

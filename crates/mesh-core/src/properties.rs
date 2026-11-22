@@ -217,6 +217,14 @@ impl PropertyRegistry {
         self.flat_properties.is_empty()
     }
 
+    /// Every `(key, literal value)` as ingested, before redaction and placeholder resolution.
+    /// For [`crate::config_values`] only, which drops secret keys itself.
+    pub(crate) fn raw_entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.raw_values
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
     #[inline]
     pub fn get(&self, key: &str) -> Option<&str> {
         self.flat_properties.get(key).map(|v| v.as_str())
