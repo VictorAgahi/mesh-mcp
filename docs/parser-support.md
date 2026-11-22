@@ -576,7 +576,7 @@ slugs are `rabbitmq`, `redis`, `nats`, `sqs`, `sns`, `pubsub` and `kafka`.
 | `nats` | nats-py `subscribe`; JetStream `subscribe` / `pull_subscribe` | `publish`, `request`, JetStream `publish` | the subject (a `*` / `>` wildcard as written) |
 | `sqs` | boto3 `receive_message(QueueUrl=...)` | `send_message`, `send_message_batch` | the last segment of the queue URL, or the queue named by a `get_queue_url(QueueName=...)["QueueUrl"]` / `create_queue` |
 | `sns` | none (SNS delivers to a queue: not followed) | `publish`, `publish_batch` (`TopicArn=...`) | the last segment of the ARN |
-| `pubsub` | `SubscriberClient.subscribe(subscription)` | `PublisherClient.publish(topic)` | the topic of `publisher.topic_path(project, topic)` or the last segment of a `projects/p/topics/t` literal. A consumer is keyed by its **subscription** id, which is not the topic: it joins a producer only when a topic is named alike |
+| `pubsub` | `SubscriberClient.subscribe(subscription)`, only for a subscription the same file creates on a topic (`create_subscription(name=sub, topic=topic)`); any other subscription registers no consumer (as in Java, and as in Go without a `CreateSubscription`) | `PublisherClient.publish(topic)` | the topic of `publisher.topic_path(project, topic)` or the last segment of a `projects/p/topics/t` literal; a consumer is keyed by the topic its subscription was created on, never by the subscription id |
 | `kafka` | gaps of the shape-based reader: `KafkaConsumer("a", "b")`, `subscribe(topics=[...])` | none new | the topic |
 
 What a name may be (nothing else is read, no name is guessed from an identifier): a plain string
@@ -586,9 +586,9 @@ of the name agrees on, a keyword argument literal, or an `os.environ[...]` / `os
 `${KEY}` placeholder resolved against the configuration (section 3.6, a compose `environment:` block;
 `.env` itself is never read). **A default is never a name**: `os.getenv("K", "d")` is read as `${K}`,
 resolved by the configuration or left a visible, counted `${K}` topic. A literal that looks like a
-credential (a token prefix, a long mixed run) is not a name either.
+credential (a token, a URL, `Bearer_...`, a password-like token, a random-looking run) is not a name either, and neither is a constant named like one (`API_KEY = "x"`): both use the TypeScript queue-constant predicate (`member_consts::constant_is_a_name`, section 3.8), and a refused literal registers no node.
 
-A call is a site only when its receiver is a value built from the library, in a file whose `import`
+A call is a site **of this pass** only when its receiver is a value built from the library, in a file whose `import`
 statements (parsed, never a comment or a docstring) bring it in, through any of `import x`,
 `import x as y`, `from x import y [as z]`:
 
@@ -601,9 +601,11 @@ statements (parsed, never a comment or a docstring) bring it in, through any of 
   lambda parameter, a `def` or a `class` of the same name hides an outer name, and a class body is not
   visible from its methods. A name bound twice to different things (a client and `None`, a client and
   a local class) is ambiguous and registers nothing. A plain parameter has no known type: its
-  `publish` is not a site;
+  `publish` is not a site of this pass (the generic reader may still read it, see below);
 - a call on an instance of a class the file declares is claimed too (it is nobody's producer), so a
-  local `Bus.publish("x")` no longer reaches the shape-based Kafka reader.
+  local `Bus.publish("x")` no longer reaches the shape-based Kafka reader, **unless the class holds a
+  client of a library itself** (a wrapper: `class KafkaBus: self.producer = Producer(...)`): its
+  callers' `bus.publish("topic")` then stays the generic reader's edge, as before this pass.
 
 A call this pass recognises is read once, under its own broker: the shape-based Kafka reader skips it
 unless the broker is Kafka, where it keeps reading it and the site now carries the `kafka` broker. A
@@ -613,9 +615,11 @@ before, with no broker.
 A producer never publishes to a pattern: a key with `*`, `#` or `>` registers no producer (a consumer
 may subscribe to one). Producers and call-site consumers are `EventStream` nodes on the call line.
 
-Bounds: at most 2,000 sites per file (`MAX_PY_BROKER_SITES_PER_FILE`) and 32,768 scope bindings; a file
-over a bound is counted in `IndexHealth::files_py_brokers_capped` and listed by `mesh-mcp doctor` (a
-warning). Every walk is iterative, a receiver or a dotted path is followed 8 / 12 links, and each scope's
+Bounds: at most 2,000 sites per file (`MAX_PY_BROKER_SITES_PER_FILE`; a call past it is not claimed, so
+the generic reader still reads it), 32,768 scope bindings, and an evaluation budget of 2,048 steps per
+call site and 400,000 per file (name resolution is memoised per scope and name, a cycle reads as
+nothing); a file over a bound is counted in `IndexHealth::files_py_brokers_capped` and listed by
+`mesh-mcp doctor` (a warning). Every walk is iterative, a receiver or a dotted path is followed 8 / 12 links, and each scope's
 bindings are built once, so a hostile file costs a bounded pass whatever it nests.
 
 **You will not get:** `queue_declare` / `exchange_declare` / `queue_bind` (declarations, not flow);
@@ -624,9 +628,16 @@ under another key or a fanout exchange does not link); `boto3.resource("sqs")` o
 results held in a function result, SQS `TargetArn`; Redis streams (`xadd` / `xread`); a Celery /
 kombu pool (`producers[conn].acquire()`); a client created in another module and imported, a client in
 a function parameter without an annotation, a name rebound with `global`; Pub/Sub `pull` /
-`streaming_pull` and the topic of a subscription. The shape-based Kafka reader is unchanged for an
-unbound receiver: it still reads a `.publish("literal")` / `.send("literal")` on an object the file
-does not show to be anything else (such as one imported from a project module).
+`streaming_pull`, and a Pub/Sub subscription the file does not create on a topic.
+
+**Pre-existing limits of the generic (shape-based) reader, unchanged and not guaranteed by this pass.**
+For a receiver this pass does not recognise, the older reader still registers an untagged event-bus
+producer or consumer for `x.publish("literal")`, `.send("literal")`, `.produce("literal")` and
+`.subscribe(["literal"])`. Known false positives of that reader: a parameter (`def f(obj):
+obj.publish("fp.param")`), a loop, comprehension, lambda, `with ... as` or `except ... as` variable or
+a `global` rebinding that hides a client, and an object from another package
+(`from other_pkg import Redis; Redis().publish("x")`). The matcher was deliberately not widened; this
+pass only guarantees that a call on a client it recognises is read once, under its broker.
 
 ## 4. What every level shares
 
