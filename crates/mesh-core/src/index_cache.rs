@@ -129,10 +129,13 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v22: a constant a queue name must not be (a token, a URL, a password-shaped value, a member named
 /// like a credential) is no longer recorded in a TypeScript / JavaScript file's `$` records, so it
 /// cannot reach this cache (9.0 T14 review).
-/// v23: Python brokers (9.0 T8c, after T14's 22): RabbitMQ, Redis, NATS, SQS / SNS, Pub/Sub and
+/// v23: Go brokers (9.0 T8b, after the T14 review's 22): RabbitMQ, NATS, Redis, SQS / SNS and
+/// Pub/Sub producers and consumers in Go (`EventStream` call-site nodes),
+/// `FileIndex::go_brokers_capped`.
+/// v24: Python brokers (9.0 T8c, after T8b's 23): RabbitMQ, Redis, NATS, SQS / SNS, Pub/Sub and
 /// Kafka-gap producers and consumers (`EventStream` call-site nodes), the broker of the Kafka calls
 /// whose client is bound in the file, `FileIndex::py_brokers_capped`.
-const SCHEMA_VERSION: u8 = 23;
+const SCHEMA_VERSION: u8 = 24;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

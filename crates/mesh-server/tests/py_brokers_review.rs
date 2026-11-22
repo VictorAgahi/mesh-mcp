@@ -249,3 +249,80 @@ def run():
         "the cache wrote nothing: the check is vacuous"
     );
 }
+
+#[tokio::test]
+async fn a_go_and_a_python_service_share_one_nats_hub_and_bleed_into_no_other_broker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = dunce::canonicalize(tmp.path()).unwrap();
+    write(
+        &root,
+        "svc-go/pub.go",
+        "package p\n\nimport \"github.com/nats-io/nats.go\"\n\nfunc Out(nc *nats.Conn) {\n\tnc.Publish(\"shared.subject\", nil)\n}\n",
+    );
+    write(
+        &root,
+        "svc-py/pub.py",
+        "import nats\n\nasync def out():\n    nc = await nats.connect(\"nats://h\")\n    await nc.publish(\"shared.subject\", b\"x\")\n",
+    );
+    write(
+        &root,
+        "svc-py/kafka_in.py",
+        "from confluent_kafka import Consumer\n\nc = Consumer({})\n\ndef watch():\n    c.subscribe([\"shared.subject\"])\n",
+    );
+    write(
+        &root,
+        "svc-py/sub.py",
+        "import nats\n\nasync def inbound(cb):\n    nc = await nats.connect(\"nats://h\")\n    await nc.subscribe(\"shared.subject\", cb=cb)\n",
+    );
+    let state = state_for(&root);
+    let snap = state.snapshot();
+    let hubs: Vec<String> = snap
+        .contract_graph
+        .all_nodes()
+        .filter(|n| n.package == "event-bus" && n.name.ends_with("shared.subject"))
+        .map(|n| n.name.to_string())
+        .collect();
+    drop(snap);
+    assert_eq!(
+        hubs.iter()
+            .filter(|h| h.as_str() == "nats:shared.subject")
+            .count(),
+        1,
+        "one nats hub: {hubs:?}"
+    );
+    assert_eq!(hubs.len(), 2, "a nats hub and a kafka hub only: {hubs:?}");
+    assert!(
+        hubs.contains(&"kafka:shared.subject".to_string()),
+        "{hubs:?}"
+    );
+    let nats = text(
+        &state,
+        "analyze_impact",
+        json!({"target": "nats:shared.subject", "depth": 3, "limit": 200}),
+    )
+    .await;
+    assert!(
+        nats.contains("pub.go:6"),
+        "the Go producer joins the hub: {nats}"
+    );
+    assert!(
+        nats.contains("pub.py:5"),
+        "the Python producer joins the hub: {nats}"
+    );
+    assert!(
+        nats.contains("sub.py:5"),
+        "the Python consumer joins the hub: {nats}"
+    );
+    assert!(!nats.contains("kafka_in.py"), "no bleed from Kafka: {nats}");
+    let kafka = text(
+        &state,
+        "analyze_impact",
+        json!({"target": "kafka:shared.subject", "depth": 3, "limit": 200}),
+    )
+    .await;
+    assert!(kafka.contains("kafka_in.py"), "{kafka}");
+    assert!(
+        !kafka.contains("pub.go") && !kafka.contains("pub.py"),
+        "no bleed from NATS: {kafka}"
+    );
+}

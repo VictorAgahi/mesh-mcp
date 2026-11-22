@@ -2447,6 +2447,26 @@ export class UserEvents {
         assert!(!out.text.contains("(on kafka)"), "{}", out.text);
     }
 
+    /// 9.0 T8b: the same for a Go site (`orders` removed from NATS is not `orders` of Kafka).
+    #[test]
+    fn a_removed_go_site_of_another_broker_names_its_broker() {
+        const OUT: &str = "package p\nimport \"github.com/nats-io/nats.go\"\nfunc Out(nc *nats.Conn) { nc.Publish(\"orders\", nil) }\n";
+        let repo = base_repo();
+        repo.write("go/out.go", OUT);
+        repo.commit("nats producer");
+        repo.write("go/out.go", &OUT.replace("\"orders\"", "\"orders.v2\""));
+        let state = indexed_state(&repo.root);
+        let out = run_with(&args(None, None), &state, &repo.runner(), Limits::DEFAULT)
+            .expect("diff_mesh ok");
+        assert!(
+            out.text
+                .contains("produces topic `orders` removed (on nats)"),
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("(on kafka)"), "{}", out.text);
+    }
+
     /// 9.0 T8c: the same heading for a Python site (`orders` removed from Redis).
     #[test]
     fn a_removed_python_site_of_another_broker_names_its_broker() {
