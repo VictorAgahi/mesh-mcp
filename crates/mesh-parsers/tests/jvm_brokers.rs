@@ -191,6 +191,7 @@ fn jms_listener_template_and_destination_objects() {
     let code = r#"package p;
 import org.springframework.jms.annotation.JmsListener;
 import org.springframework.jms.core.JmsTemplate;
+import org.apache.activemq.command.ActiveMQTopic;
 public class C {
     private JmsTemplate jms;
     @JmsListener(destination = "in.q") void on(String m) {}
@@ -390,7 +391,9 @@ fn an_unrelated_class_a_log_line_and_a_missing_import_are_not_sites() {
 }
 
 #[test]
-fn a_name_declared_with_two_types_is_read_as_nothing() {
+fn a_name_means_the_declaration_of_its_own_scope() {
+    // Two classes name their field `client`; only the one typed with the library's class is a
+    // broker client, and each call reads its own class's field.
     let code = r#"package p;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 public class C {
@@ -398,7 +401,7 @@ public class C {
     static class B { Bridge client; void go(Object m) { client.convertAndSend("b.q", m); } }
 }
 "#;
-    assert!(sites(&extract(code)).is_empty());
+    assert_eq!(sites(&extract(code)), vec![s('P', "rabbitmq", "a.q")]);
 }
 
 #[test]
@@ -521,4 +524,189 @@ fn hostile_files_cost_a_bounded_walk_on_a_small_stack() {
         })
         .unwrap();
     handle.join().unwrap();
+}
+
+// ---- 9.0 T8a review round 1 -------------------------------------------------------------
+
+/// Canary placeholder defaults: none of them may become a channel name (T6, commandment 5).
+const CANARIES: [&str; 6] = [
+    "rpw-DEFPW6",
+    "jpw-DEFPW7",
+    "hunter2-prod",
+    "credpw-DEFPW2",
+    "tok_DEFPW3_x",
+    "P@ssw0rd!",
+];
+
+#[test]
+fn a_placeholder_default_is_never_a_channel_name() {
+    let code = r##"package p;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.jms.annotation.JmsListener;
+import org.springframework.beans.factory.annotation.Value;
+import io.awspring.cloud.sqs.annotation.SqsListener;
+public class C {
+    @Value("${app.absent2:credpw-DEFPW2}") private String b;
+    @Value("${app.absent3:tok_DEFPW3_x}") private String d;
+    @Value("${app.present:fallback.topic}") private String c;
+    private static final String K = "${k.const:hunter2-prod}";
+    private RabbitTemplate rabbit;
+    void m() { rabbit.convertAndSend(b, "x"); rabbit.convertAndSend(d, "x"); rabbit.convertAndSend(c, "x"); rabbit.convertAndSend(K, "x"); }
+    @RabbitListener(queues = "${app.absent6:rpw-DEFPW6}") public void r(String m) {}
+    @JmsListener(destination = "${app.absent7:jpw-DEFPW7}") public void j(String m) {}
+    @RabbitListener(queues = "${app.absent10:hunter2-prod}") public void h(String m) {}
+    @RabbitListener(queues = "${app.absent9:P@ssw0rd!}") public void p(String m) {}
+    @SqsListener("${app.absent11:hunter2-prod}") public void q(String m) {}
+}
+"##;
+    let fi = extract(code);
+    let dump = format!("{fi:?}");
+    for canary in CANARIES {
+        assert!(
+            !dump.contains(canary),
+            "{canary} reached the file index: {dump}"
+        );
+    }
+    let got = sites(&fi);
+    // Every site stays a visible `${key}` for the configuration to resolve.
+    assert!(
+        got.contains(&s('C', "rabbitmq", "${app.absent6}")),
+        "{got:?}"
+    );
+    assert!(got.contains(&s('C', "jms", "${app.absent7}")), "{got:?}");
+    assert!(
+        got.contains(&s('P', "rabbitmq", "${app.present}")),
+        "{got:?}"
+    );
+    assert!(got.contains(&s('P', "rabbitmq", "${k.const}")), "{got:?}");
+    assert!(got.iter().all(|(_, _, t)| t.starts_with("${")), "{got:?}");
+}
+
+#[test]
+fn a_hostile_import_or_class_does_not_make_a_client() {
+    // Each file would register `fp.q` if its receiver were read as the Spring client.
+    let cases: [(&str, String); 8] = [
+        (
+            "an import in a comment",
+            "package p;\n// import org.springframework.amqp.rabbit.core.RabbitTemplate;\npublic class C { RabbitTemplate r; void a() { r.convertAndSend(\"fp.q\", \"x\"); } }\n".into(),
+        ),
+        (
+            "an import in a block comment",
+            "package p;\n/* import org.springframework.amqp.rabbit.core.RabbitTemplate; */\npublic class C { RabbitTemplate r; void a() { r.convertAndSend(\"fp.q\", \"x\"); } }\n".into(),
+        ),
+        (
+            "a same-named class of another library",
+            "package p;\nimport com.acme.legacy.RabbitTemplate;\nimport org.springframework.amqp.core.Message;\npublic class C { RabbitTemplate r; void a() { r.convertAndSend(\"fp.q\", \"x\"); } }\n".into(),
+        ),
+        (
+            "a nested class of the same name",
+            "package p;\nimport org.springframework.amqp.core.Message;\npublic class C { static class RabbitTemplate { void convertAndSend(String a, Object b) {} } RabbitTemplate r = new RabbitTemplate(); void a() { r.convertAndSend(\"fp.q\", \"x\"); } }\n".into(),
+        ),
+        (
+            "a for-each variable",
+            "package p;\nimport org.springframework.amqp.rabbit.core.RabbitTemplate;\nimport java.util.List;\npublic class C { RabbitTemplate r; interface Sink { void convertAndSend(String a, Object b); } void a(List<Sink> sinks) { for (Sink r : sinks) { r.convertAndSend(\"fp.q\", null); } } }\n".into(),
+        ),
+        (
+            "a lambda parameter",
+            "package p;\nimport org.springframework.amqp.rabbit.core.RabbitTemplate;\nimport java.util.List;\npublic class C { RabbitTemplate r; interface Sink { void convertAndSend(String a, Object b); } void a(List<Sink> sinks) { sinks.forEach(r -> r.convertAndSend(\"fp.q\", null)); } }\n".into(),
+        ),
+        (
+            "a local of another type",
+            "package p;\nimport org.springframework.amqp.rabbit.core.RabbitTemplate;\npublic class C { RabbitTemplate r; interface Sink { void convertAndSend(String a, Object b); } void a(Sink s) { Sink r = s; r.convertAndSend(\"fp.q\", null); } }\n".into(),
+        ),
+        (
+            "a catch variable",
+            "package p;\nimport org.springframework.amqp.rabbit.core.RabbitTemplate;\npublic class C { RabbitTemplate r; void a() { try { } catch (Sink r) { r.convertAndSend(\"fp.q\", null); } } interface Sink { void convertAndSend(String a, Object b); } }\n".into(),
+        ),
+    ];
+    for (name, code) in cases {
+        let got = sites(&extract(&code));
+        assert!(got.is_empty(), "{name}: {got:?}");
+    }
+    // The real thing still works next to the same shapes.
+    let real = "package p;\nimport org.springframework.amqp.rabbit.core.*;\npublic class C { RabbitTemplate r; void a() { r.convertAndSend(\"ok.q\", \"x\"); } }\n";
+    assert_eq!(sites(&extract(real)), vec![s('P', "rabbitmq", "ok.q")]);
+    let qualified = "package p;\npublic class C { org.springframework.amqp.rabbit.core.RabbitTemplate r; void a() { r.convertAndSend(\"ok.q\", \"x\"); } }\n";
+    assert_eq!(sites(&extract(qualified)), vec![s('P', "rabbitmq", "ok.q")]);
+}
+
+#[test]
+fn a_listener_annotation_needs_a_real_import_too() {
+    let hidden = "package p;\n// import org.springframework.amqp.rabbit.annotation.RabbitListener;\npublic class C { @RabbitListener(queues = \"fp.q\") void a(String m) {} }\n";
+    assert!(sites(&extract(hidden)).is_empty());
+    let own = "package p;\nimport com.acme.RabbitListener;\nimport org.springframework.amqp.core.Message;\npublic class C { @RabbitListener(queues = \"fp.q\") void a(String m) {} }\n";
+    assert!(sites(&extract(own)).is_empty());
+    let real = "package p;\nimport org.springframework.amqp.rabbit.annotation.RabbitListener;\npublic class C { @RabbitListener(queues = \"ok.q\") void a(String m) {} }\n";
+    assert_eq!(sites(&extract(real)), vec![s('C', "rabbitmq", "ok.q")]);
+}
+
+#[test]
+fn nats_types_need_a_real_nats_import() {
+    let comment = "package p;\n// import io.nats.client.Connection;\npublic class C { Connection nc; void a() { nc.publish(\"fp.s\", null); nc.subscribe(\"fp.t\"); } }\n";
+    assert!(sites(&extract(comment)).is_empty());
+    let sql = "package p;\nimport java.sql.Connection;\nimport io.nats.client.Message;\npublic class C { Connection db; void a() { db.publish(\"fp.s\", null); } }\n";
+    assert!(sites(&extract(sql)).is_empty());
+    let real = "package p;\nimport io.nats.client.Connection;\npublic class C { Connection nc; void a() { nc.publish(\"ok.s\", null); } }\n";
+    assert_eq!(sites(&extract(real)), vec![s('P', "nats", "ok.s")]);
+}
+
+#[test]
+fn an_ambiguous_three_argument_send_names_no_channel() {
+    let code = class(
+        &[
+            RABBIT,
+            "org.springframework.amqp.core.MessagePostProcessor",
+            "com.acme.Order",
+        ],
+        "  private RabbitTemplate rabbit;\n  private MessagePostProcessor pp;",
+        "Order order, MessagePostProcessor given, Mystery mystery",
+        r#"    rabbit.convertAndSend("q.pp", "body", pp);
+    rabbit.convertAndSend("q.given", "body", given);
+    rabbit.convertAndSend("q.new", "body", new MessagePostProcessor() { });
+    rabbit.convertAndSend("ex", "rk.order", order);
+    rabbit.convertAndSend("ex", "rk.literal", "payload");
+    rabbit.convertAndSend("q.unknown", "body", mystery);
+    rabbit.convertAndSend("q.undeclared", "body", inheritedField);
+    rabbit.convertAndSend("ex", "rk.four", order, pp);"#,
+    );
+    assert_eq!(
+        sites(&extract(&code)),
+        vec![
+            // `mystery` is declared with a type that is not named like a post-processor: read as
+            // the message, so `body` is taken as the routing key (a documented residual).
+            s('P', "rabbitmq", "body"),
+            s('P', "rabbitmq", "q.given"),
+            s('P', "rabbitmq", "q.new"),
+            s('P', "rabbitmq", "q.pp"),
+            s('P', "rabbitmq", "rk.four"),
+            s('P', "rabbitmq", "rk.literal"),
+            s('P', "rabbitmq", "rk.order"),
+        ]
+    );
+}
+
+#[test]
+fn a_producer_never_publishes_to_a_pattern() {
+    let code = r#"package p;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import io.nats.client.Connection;
+public class C {
+    RabbitTemplate rabbit; StringRedisTemplate redis; Connection nats;
+    void a(Object m) {
+        rabbit.convertAndSend("ex", "x.#", m);
+        rabbit.convertAndSend("x.*", m);
+        redis.convertAndSend("r.*", m);
+        nats.publish("n.>", null);
+        nats.publish("n.ok", null);
+    }
+    @RabbitListener(queues = "c.*") void on(String m) {}
+}
+"#;
+    assert_eq!(
+        sites(&extract(code)),
+        vec![s('C', "rabbitmq", "c.*"), s('P', "nats", "n.ok")]
+    );
 }
