@@ -460,6 +460,22 @@ fn defaults_are_plain(value: &str) -> bool {
 /// written as a default never becomes a node name, a topic or a cached string. Text with no
 /// placeholder, or only plain defaults, is returned as is.
 pub fn mask_placeholder_defaults(text: &str) -> std::borrow::Cow<'_, str> {
+    rewrite_placeholder_defaults(text, |d| !d.is_empty() && !plain_topic(d))
+}
+
+/// `text` with EVERY placeholder default removed (`${k:anything}` -> `${k}`). For a site whose
+/// extractor never takes a default as a name (the JVM brokers of 9.0 T8a): a default that merely
+/// looks like a topic (`hunter2-prod`) is as likely a secret as a name, so the placeholder
+/// stays unresolved unless its key resolves through the configuration.
+pub fn strip_placeholder_defaults(text: &str) -> std::borrow::Cow<'_, str> {
+    rewrite_placeholder_defaults(text, |_| true)
+}
+
+/// [`mask_placeholder_defaults`] with the rule that decides which defaults go.
+fn rewrite_placeholder_defaults(
+    text: &str,
+    drop: impl Fn(&str) -> bool,
+) -> std::borrow::Cow<'_, str> {
     if !text.contains("${") {
         return std::borrow::Cow::Borrowed(text);
     }
@@ -475,8 +491,7 @@ pub fn mask_placeholder_defaults(text: &str) -> std::borrow::Cow<'_, str> {
         match inner.split_once(':') {
             // Only a placeholder-shaped key: `${a ? b : c}` of a template literal is code.
             Some((k, d))
-                if !d.is_empty()
-                    && !plain_topic(d)
+                if drop(d)
                     && !k.is_empty()
                     && k.chars()
                         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')) =>

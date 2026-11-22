@@ -41,6 +41,8 @@ use tree_sitter::{Node, Tree};
 const MAX_SEARCH_NODES: usize = 256;
 /// Declared names the type table remembers; past it the file is counted as capped.
 const MAX_DECLARED_NAMES: usize = 16_384;
+/// Parameters of a method, lambda or resource list one lookup looks at.
+const MAX_PARAMS: usize = 256;
 /// Links of a `x.getTopic()` chain one name resolution follows.
 const MAX_RESOLVE_DEPTH: usize = 4;
 
@@ -99,24 +101,135 @@ impl Fam {
     }
 }
 
-/// A library a file must import for its annotations and clients to count, as substrings of
-/// the file (an import, or a fully qualified name).
-fn gate(fam: Fam) -> &'static [&'static str] {
-    match fam {
-        Fam::Rabbit => &["springframework.amqp"],
-        Fam::Jms => &["springframework.jms", "jakarta.jms", "javax.jms"],
-        Fam::SqsTemplate | Fam::SnsTemplate | Fam::SqsClient | Fam::SnsClient => &[
-            "awspring.cloud",
-            "springframework.cloud.aws",
-            "software.amazon.awssdk",
-            "com.amazonaws",
-        ],
-        Fam::RedisTemplate | Fam::RedisContainer => &["springframework.data.redis"],
-        Fam::Nats => &["io.nats.client"],
-        Fam::PubSub => &[
-            "com.google.cloud.spring.pubsub",
-            "springframework.cloud.gcp.pubsub",
-        ],
+/// A library whose classes a file must import (by a real import declaration, or by writing
+/// the fully qualified name) for its annotations and clients to count.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lib {
+    Amqp,
+    Jms,
+    Aws,
+    Redis,
+    Nats,
+    PubSub,
+}
+
+impl Lib {
+    const ALL: [Lib; 6] = [
+        Lib::Amqp,
+        Lib::Jms,
+        Lib::Aws,
+        Lib::Redis,
+        Lib::Nats,
+        Lib::PubSub,
+    ];
+
+    /// The packages (and their sub-packages) the library's classes live in.
+    fn packages(self) -> &'static [&'static str] {
+        match self {
+            Lib::Amqp => &["org.springframework.amqp"],
+            Lib::Jms => &[
+                "org.springframework.jms",
+                "jakarta.jms",
+                "javax.jms",
+                "org.apache.activemq",
+            ],
+            Lib::Aws => &[
+                "io.awspring.cloud",
+                "org.springframework.cloud.aws",
+                "software.amazon.awssdk",
+                "com.amazonaws",
+            ],
+            Lib::Redis => &["org.springframework.data.redis"],
+            Lib::Nats => &["io.nats.client"],
+            Lib::PubSub => &[
+                "com.google.cloud.spring.pubsub",
+                "org.springframework.cloud.gcp.pubsub",
+                "com.google.cloud.pubsub",
+            ],
+        }
+    }
+
+    /// Whether `package` is one of the library's.
+    fn owns(self, package: &str) -> bool {
+        self.packages().iter().any(|p| {
+            package == *p
+                || package
+                    .strip_prefix(p)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
+    }
+}
+
+impl Fam {
+    fn lib(self) -> Lib {
+        match self {
+            Fam::Rabbit => Lib::Amqp,
+            Fam::Jms => Lib::Jms,
+            Fam::SqsTemplate | Fam::SnsTemplate | Fam::SqsClient | Fam::SnsClient => Lib::Aws,
+            Fam::RedisTemplate | Fam::RedisContainer => Lib::Redis,
+            Fam::Nats => Lib::Nats,
+            Fam::PubSub => Lib::PubSub,
+        }
+    }
+}
+
+/// The destination classes a name may be read from, and the library each belongs to.
+fn destination_lib(class: &str) -> Option<Lib> {
+    match class {
+        "ChannelTopic" | "PatternTopic" => Some(Lib::Redis),
+        "ActiveMQQueue" | "ActiveMQTopic" => Some(Lib::Jms),
+        _ => None,
+    }
+}
+
+/// The import declarations of a file (never comments or strings: they come off the tree).
+#[derive(Default)]
+struct Imports {
+    /// Simple class name -> package of a single-type import.
+    single: HashMap<String, String>,
+    /// Packages of `import a.b.*;`.
+    wildcard: Vec<String>,
+}
+
+impl Imports {
+    fn of(root: Node, source: &[u8]) -> Imports {
+        let mut out = Imports::default();
+        let mut cursor = root.walk();
+        for node in root.named_children(&mut cursor) {
+            if node.kind() != "import_declaration" {
+                continue;
+            }
+            let mut words = text(node, source).split_whitespace();
+            let _import = words.next();
+            let rest: String = words.collect::<Vec<_>>().join("");
+            if rest.starts_with("static") {
+                continue;
+            }
+            let name = rest.trim_end_matches(';');
+            match name.strip_suffix(".*") {
+                Some(pkg) => out.wildcard.push(pkg.to_string()),
+                None => {
+                    if let Some((pkg, simple)) = name.rsplit_once('.') {
+                        out.single.insert(simple.to_string(), pkg.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether any import is of `lib`.
+    fn has(&self, lib: Lib) -> bool {
+        self.single.values().any(|p| lib.owns(p)) || self.wildcard.iter().any(|p| lib.owns(p))
+    }
+
+    /// Whether the simple name `class` is `lib`'s: imported from one of its packages, or (when
+    /// not imported by name) reachable through a wildcard import of one.
+    fn is_lib_class(&self, class: &str, lib: Lib) -> bool {
+        match self.single.get(class) {
+            Some(pkg) => lib.owns(pkg),
+            None => self.wildcard.iter().any(|p| lib.owns(p)),
+        }
     }
 }
 
@@ -161,54 +274,43 @@ fn usable_name(s: &str) -> bool {
     !s.is_empty() && !s.contains("#{") && !s.chars().any(char::is_whitespace)
 }
 
-/// What a name of the file resolves to.
+/// What a constant name of the file resolves to.
 enum Entry {
-    /// A type: `Some(family)` of a broker client, `None` of anything else.
-    Typed(Option<Fam>),
     /// A string constant or destination object of the file.
     Value(String),
     /// Declared twice with differing meanings: read as nothing.
     Conflict,
 }
 
+/// What a declaration says about a variable: the client family of its type, and the simple
+/// name of the type.
+#[derive(Clone)]
+struct Decl {
+    fam: Option<Fam>,
+    ty: Option<String>,
+}
+
 /// Per-file tables the call sites are resolved against.
 struct Ctx<'a> {
     source: &'a [u8],
-    /// Variable name to type family; constant name to value. Separate key spaces.
-    vars: HashMap<String, Entry>,
+    imports: Imports,
     consts: HashMap<String, Entry>,
-    /// Names of the types the file declares.
+    /// Names of the types the file declares: they hide an imported class of the same name.
     classes: HashSet<String>,
     /// `@Value("${key}")` fields (`JavaExtractor::value_placeholder_fields`).
     placeholders: HashMap<String, String>,
     /// Parameters and locals of a method, by node id.
     locals: HashMap<usize, HashSet<String>>,
-    /// Bit per [`Fam`] whose library the file imports.
-    gates: u16,
+    /// Local variable declarations of a block, by block node id: name -> (start byte, decl).
+    blocks: HashMap<usize, HashMap<String, Vec<(usize, Decl)>>>,
+    /// Fields of a class body, by node id.
+    members: HashMap<usize, HashMap<String, Decl>>,
+    /// Names recorded in `members` and `blocks`, against [`MAX_DECLARED_NAMES`].
+    declared: usize,
     capped: bool,
 }
 
 impl<'a> Ctx<'a> {
-    fn gated(&self, fam: Fam) -> bool {
-        self.gates & (1 << fam as u16) != 0
-    }
-
-    fn declare_var(&mut self, name: &str, fam: Option<Fam>) {
-        match self.vars.get(name) {
-            Some(Entry::Typed(prev)) if *prev == fam => {}
-            Some(_) => {
-                self.vars.insert(name.to_string(), Entry::Conflict);
-            }
-            None => {
-                if self.vars.len() >= MAX_DECLARED_NAMES {
-                    self.capped = true;
-                    return;
-                }
-                self.vars.insert(name.to_string(), Entry::Typed(fam));
-            }
-        }
-    }
-
     fn declare_const(&mut self, name: &str, value: String) {
         match self.consts.get(name) {
             Some(Entry::Value(prev)) if *prev == value => {}
@@ -225,10 +327,306 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn family_of(&self, name: &str) -> Option<Fam> {
-        match self.vars.get(name) {
-            Some(Entry::Typed(Some(f))) if self.gated(*f) => Some(*f),
+    /// The client family a type node stands for: its class is the library's (imported by a
+    /// real import declaration, or written fully qualified) and no type of the file hides it.
+    fn fam_of_type_node(&self, ty: Node) -> Option<Fam> {
+        let source = self.source;
+        let mut node = ty;
+        while node.kind() == "generic_type" {
+            node = node.named_child(0)?;
+        }
+        match node.kind() {
+            "type_identifier" => {
+                let name = text(node, source);
+                if self.classes.contains(name) {
+                    return None;
+                }
+                let fam = Fam::of_type(name)?;
+                self.imports.is_lib_class(name, fam.lib()).then_some(fam)
+            }
+            "scoped_type_identifier" => {
+                let full: String = text(node, source).split_whitespace().collect();
+                let (package, simple) = full.rsplit_once('.')?;
+                let fam = Fam::of_type(simple)?;
+                fam.lib().owns(package).then_some(fam)
+            }
             _ => None,
+        }
+    }
+
+    /// What a declaration (`T x`, `var x = new T()`) says about its variable.
+    fn decl_of(&self, decl: Node, declarator: Option<Node>) -> Decl {
+        let none = Decl {
+            fam: None,
+            ty: None,
+        };
+        let source = self.source;
+        let Some(ty) = decl.child_by_field_name("type") else {
+            return none;
+        };
+        let simple = simple_type(ty, source);
+        if simple.as_deref() != Some("var") {
+            return Decl {
+                fam: self.fam_of_type_node(ty),
+                ty: simple,
+            };
+        }
+        match declarator
+            .and_then(|d| d.child_by_field_name("value"))
+            .filter(|v| v.kind() == "object_creation_expression")
+            .and_then(|v| v.child_by_field_name("type"))
+        {
+            Some(t) => Decl {
+                fam: self.fam_of_type_node(t),
+                ty: simple_type(t, source),
+            },
+            None => none,
+        }
+    }
+
+    /// The declaration the variable `name` read at `at` refers to, innermost scope first:
+    /// lambda and method parameters, locals declared earlier in an enclosing block, loop,
+    /// `try` resource and `catch` variables, then the fields of the enclosing classes
+    /// (`this_only`: the nearest class's fields only, for `this.name`). `None` when nothing
+    /// in the file declares it.
+    fn lookup(&mut self, at: Node, name: &str, this_only: bool) -> Option<Decl> {
+        let source = self.source;
+        let none = Decl {
+            fam: None,
+            ty: None,
+        };
+        let mut child = at;
+        let mut cur = at.parent();
+        while let Some(p) = cur {
+            let kind = p.kind();
+            if kind == "class_body" {
+                if !self.members.contains_key(&p.id()) {
+                    let mut map: HashMap<String, Decl> = HashMap::new();
+                    let mut cursor = p.walk();
+                    let fields: Vec<Node> = p
+                        .named_children(&mut cursor)
+                        .filter(|m| m.kind() == "field_declaration")
+                        .collect();
+                    for f in fields {
+                        let mut c = f.walk();
+                        let declarators: Vec<Node> =
+                            f.children_by_field_name("declarator", &mut c).collect();
+                        for d in declarators {
+                            if self.declared >= MAX_DECLARED_NAMES {
+                                self.capped = true;
+                                break;
+                            }
+                            if let Some(n) = d.child_by_field_name("name") {
+                                self.declared += 1;
+                                map.insert(text(n, source).to_string(), self.decl_of(f, Some(d)));
+                            }
+                        }
+                    }
+                    self.members.insert(p.id(), map);
+                }
+                if let Some(d) = self.members.get(&p.id()).and_then(|m| m.get(name)) {
+                    return Some(d.clone());
+                }
+                if this_only {
+                    return None;
+                }
+            } else if kind == "record_declaration" {
+                if let Some(params) = p.child_by_field_name("parameters") {
+                    if let Some(d) = self.param_decl(params, name) {
+                        return Some(d);
+                    }
+                }
+                if this_only {
+                    return None;
+                }
+            } else if !this_only {
+                match kind {
+                    "lambda_expression" => {
+                        if let Some(params) = p.child_by_field_name("parameters") {
+                            match params.kind() {
+                                "identifier" if text(params, source) == name => return Some(none),
+                                "inferred_parameters" => {
+                                    let mut c = params.walk();
+                                    let hit = params
+                                        .named_children(&mut c)
+                                        .take(MAX_PARAMS)
+                                        .any(|i| text(i, source) == name);
+                                    if hit {
+                                        return Some(none);
+                                    }
+                                }
+                                "formal_parameters" => {
+                                    if let Some(d) = self.param_decl(params, name) {
+                                        return Some(d);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    "method_declaration" | "constructor_declaration" => {
+                        if let Some(params) = p.child_by_field_name("parameters") {
+                            if let Some(d) = self.param_decl(params, name) {
+                                return Some(d);
+                            }
+                        }
+                    }
+                    "block" | "constructor_body" | "switch_block_statement_group" => {
+                        if !self.blocks.contains_key(&p.id()) {
+                            let mut map: HashMap<String, Vec<(usize, Decl)>> = HashMap::new();
+                            let mut cursor = p.walk();
+                            let locals: Vec<Node> = p
+                                .named_children(&mut cursor)
+                                .filter(|m| m.kind() == "local_variable_declaration")
+                                .collect();
+                            for l in locals {
+                                let mut c = l.walk();
+                                let declarators: Vec<Node> =
+                                    l.children_by_field_name("declarator", &mut c).collect();
+                                for d in declarators {
+                                    if self.declared >= MAX_DECLARED_NAMES {
+                                        self.capped = true;
+                                        break;
+                                    }
+                                    if let Some(n) = d.child_by_field_name("name") {
+                                        self.declared += 1;
+                                        let decl = self.decl_of(l, Some(d));
+                                        map.entry(text(n, source).to_string())
+                                            .or_default()
+                                            .push((l.start_byte(), decl));
+                                    }
+                                }
+                            }
+                            self.blocks.insert(p.id(), map);
+                        }
+                        let before = child.start_byte();
+                        let hit = self
+                            .blocks
+                            .get(&p.id())
+                            .and_then(|m| m.get(name))
+                            .and_then(|v| v.iter().rev().find(|(at, _)| *at < before));
+                        if let Some((_, d)) = hit {
+                            return Some(d.clone());
+                        }
+                    }
+                    "enhanced_for_statement" => {
+                        let in_body = p
+                            .child_by_field_name("body")
+                            .is_some_and(|b| b.id() == child.id());
+                        if in_body
+                            && p.child_by_field_name("name")
+                                .is_some_and(|n| text(n, source) == name)
+                        {
+                            return Some(self.decl_of(p, None));
+                        }
+                    }
+                    "for_statement" => {
+                        let mut c = p.walk();
+                        let inits: Vec<Node> = p
+                            .named_children(&mut c)
+                            .filter(|m| m.kind() == "local_variable_declaration")
+                            .collect();
+                        for l in inits {
+                            let mut cc = l.walk();
+                            let declarators: Vec<Node> =
+                                l.children_by_field_name("declarator", &mut cc).collect();
+                            for d in declarators {
+                                if d.child_by_field_name("name")
+                                    .is_some_and(|n| text(n, source) == name)
+                                {
+                                    return Some(self.decl_of(l, Some(d)));
+                                }
+                            }
+                        }
+                    }
+                    "try_with_resources_statement" => {
+                        if let Some(specs) = p.child_by_field_name("resources") {
+                            let mut c = specs.walk();
+                            let resources: Vec<Node> = specs
+                                .named_children(&mut c)
+                                .filter(|r| r.kind() == "resource")
+                                .take(MAX_PARAMS)
+                                .collect();
+                            for r in resources {
+                                if r.child_by_field_name("name")
+                                    .is_some_and(|n| text(n, source) == name)
+                                {
+                                    return Some(self.decl_of(r, None));
+                                }
+                            }
+                        }
+                    }
+                    "catch_clause" => {
+                        let mut c = p.walk();
+                        let hit = p
+                            .named_children(&mut c)
+                            .filter(|x| x.kind() == "catch_formal_parameter")
+                            .any(|x| {
+                                x.child_by_field_name("name")
+                                    .is_some_and(|n| text(n, source) == name)
+                            });
+                        if hit {
+                            return Some(none);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            child = p;
+            cur = p.parent();
+        }
+        None
+    }
+
+    /// The parameter `name` of a `formal_parameters` node.
+    fn param_decl(&self, params: Node, name: &str) -> Option<Decl> {
+        let mut cursor = params.walk();
+        let found = params
+            .named_children(&mut cursor)
+            .filter(|c| c.kind() == "formal_parameter" || c.kind() == "spread_parameter")
+            .take(MAX_PARAMS)
+            .find(|c| {
+                let own = c.child_by_field_name("name");
+                // A spread parameter holds its name in a declarator.
+                let own = own.or_else(|| {
+                    let mut cc = c.walk();
+                    let d = c
+                        .named_children(&mut cc)
+                        .find(|x| x.kind() == "variable_declarator");
+                    d.and_then(|d| d.child_by_field_name("name"))
+                });
+                own.is_some_and(|n| text(n, self.source) == name)
+            });
+        found.map(|c| {
+            if c.kind() == "formal_parameter" {
+                self.decl_of(c, None)
+            } else {
+                Decl {
+                    fam: None,
+                    ty: None,
+                }
+            }
+        })
+    }
+
+    /// Whether the destination class `class` is the library's (imported, not hidden by a type of
+    /// the file).
+    fn destination_ok(&self, class: &str) -> bool {
+        destination_lib(class)
+            .is_some_and(|l| !self.classes.contains(class) && self.imports.is_lib_class(class, l))
+    }
+
+    /// Whether an annotation is `lib`'s: imported from one of its packages (or written fully
+    /// qualified) and not hidden by an annotation type of the file.
+    fn annotation_is_lib(&self, annotation: Node, lib: Lib) -> bool {
+        let raw: String = annotation
+            .child_by_field_name("name")
+            .map_or("", |n| text(n, self.source))
+            .split_whitespace()
+            .collect();
+        match raw.rsplit_once('.') {
+            Some((package, _)) => lib.owns(package),
+            None => !self.classes.contains(&raw) && self.imports.is_lib_class(&raw, lib),
         }
     }
 
@@ -284,7 +682,7 @@ impl<'a> Ctx<'a> {
             }
             "object_creation_expression" => {
                 let ty = simple_type(node.child_by_field_name("type")?, source)?;
-                if !is_destination_type(&ty) {
+                if !self.destination_ok(&ty) {
                     return None;
                 }
                 let args = node.child_by_field_name("arguments")?;
@@ -297,7 +695,7 @@ impl<'a> Ctx<'a> {
                 match (object, method) {
                     // `ChannelTopic.of("x")`
                     (Some(o), "of")
-                        if o.kind() == "identifier" && is_destination_type(text(o, source)) =>
+                        if o.kind() == "identifier" && self.destination_ok(text(o, source)) =>
                     {
                         string_literal(args.named_child(0)?, source)?
                     }
@@ -321,6 +719,13 @@ impl<'a> Ctx<'a> {
             }
             _ => return None,
         };
+        // A placeholder default is never taken as a name (it may be a secret): `${k:d}` reads
+        // as `${k}`, resolved by the configuration or left visibly unresolved.
+        let name = if name.contains("${") {
+            mesh_core::config_values::strip_placeholder_defaults(&name).into_owned()
+        } else {
+            name
+        };
         usable_name(&name).then_some(name)
     }
 
@@ -333,13 +738,6 @@ impl<'a> Ctx<'a> {
         }
         self.placeholders.get(id).cloned()
     }
-}
-
-fn is_destination_type(name: &str) -> bool {
-    matches!(
-        name,
-        "ChannelTopic" | "PatternTopic" | "ActiveMQQueue" | "ActiveMQTopic"
-    )
 }
 
 /// Pre-order walk of `root` without recursion; `visit` returns `false` to stop.
@@ -405,6 +803,26 @@ fn has_modifier(decl: Node, word: &str, source: &[u8]) -> bool {
 /// Fills the variable-type and constant tables of the file.
 fn declare(root: Node, ctx: &mut Ctx) {
     let source = ctx.source;
+    // The types the file declares first: they hide an imported class of the same name.
+    walk(root, |node| {
+        if matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "annotation_type_declaration"
+                | "record_declaration"
+        ) {
+            if let Some(name) = node.child_by_field_name("name") {
+                if ctx.classes.len() < MAX_DECLARED_NAMES {
+                    ctx.classes.insert(text(name, source).to_string());
+                } else {
+                    ctx.capped = true;
+                }
+            }
+        }
+        true
+    });
     walk(root, |node| {
         match node.kind() {
             "field_declaration" | "local_variable_declaration" => {
@@ -418,7 +836,6 @@ fn declare(root: Node, ctx: &mut Ctx) {
                         continue;
                     };
                     let ty = declared_type(node, Some(d), source);
-                    ctx.declare_var(name, ty.as_deref().and_then(Fam::of_type));
                     let Some(value) = d.child_by_field_name("value") else {
                         continue;
                     };
@@ -427,28 +844,12 @@ fn declare(root: Node, ctx: &mut Ctx) {
                             ctx.declare_const(name, lit);
                         }
                     } else if value.kind() == "object_creation_expression"
-                        && ty.as_deref().is_some_and(is_destination_type)
+                        && ty.as_deref().is_some_and(|t| ctx.destination_ok(t))
                     {
                         if let Some(v) = ctx.resolve(value) {
                             ctx.declare_const(name, v);
                         }
                     }
-                }
-            }
-            "class_declaration"
-            | "interface_declaration"
-            | "enum_declaration"
-            | "record_declaration" => {
-                if let Some(name) = node.child_by_field_name("name") {
-                    if ctx.classes.len() < MAX_DECLARED_NAMES {
-                        ctx.classes.insert(text(name, source).to_string());
-                    }
-                }
-            }
-            "formal_parameter" => {
-                if let Some(name) = node.child_by_field_name("name").map(|n| text(n, source)) {
-                    let ty = declared_type(node, None, source);
-                    ctx.declare_var(name, ty.as_deref().and_then(Fam::of_type));
                 }
             }
             // `@Bean ChannelTopic topic() { return new ChannelTopic("x"); }`
@@ -465,7 +866,7 @@ fn declare(root: Node, ctx: &mut Ctx) {
                     node.child_by_field_name("name").map(|n| text(n, source)),
                     node.child_by_field_name("body"),
                 ) {
-                    if is_destination_type(&ty) && body.named_child_count() == 1 {
+                    if ctx.destination_ok(&ty) && body.named_child_count() == 1 {
                         if let Some(ret) = body
                             .named_child(0)
                             .filter(|r| r.kind() == "return_statement")
@@ -532,30 +933,18 @@ const CALL_NAMES: &[&str] = &[
 
 /// Reads the broker facts of a Java file. Cheap for a file that names none of the libraries.
 pub(crate) fn scan(tree: &Tree, content: &str) -> Scan {
-    let mut gates: u16 = 0;
-    for fam in [
-        Fam::Rabbit,
-        Fam::Jms,
-        Fam::SqsTemplate,
-        Fam::SnsTemplate,
-        Fam::SqsClient,
-        Fam::SnsClient,
-        Fam::RedisTemplate,
-        Fam::RedisContainer,
-        Fam::Nats,
-        Fam::PubSub,
-    ] {
-        if gate(fam).iter().any(|g| content.contains(g)) {
-            gates |= 1 << fam as u16;
-        }
-    }
-    if gates == 0 {
+    // A cheap filter before the precise one (the import declarations).
+    if !Lib::ALL
+        .iter()
+        .any(|l| l.packages().iter().any(|p| content.contains(p)))
+    {
         return Scan::default();
     }
     let source = content.as_bytes();
+    let root = tree.root_node();
     let mut ctx = Ctx {
         source,
-        vars: HashMap::new(),
+        imports: Imports::of(root, source),
         consts: HashMap::new(),
         classes: HashSet::new(),
         placeholders: if content.contains("@Value(") {
@@ -564,10 +953,11 @@ pub(crate) fn scan(tree: &Tree, content: &str) -> Scan {
             HashMap::new()
         },
         locals: HashMap::new(),
-        gates,
+        blocks: HashMap::new(),
+        members: HashMap::new(),
+        declared: 0,
         capped: false,
     };
-    let root = tree.root_node();
     declare(root, &mut ctx);
 
     let mut found: Vec<Site> = Vec::new();
@@ -724,13 +1114,13 @@ fn decl_owner(decl: Node, source: &[u8]) -> Option<(usize, String)> {
 fn listener_sites(annotation: Node, ctx: &mut Ctx, found: &mut Vec<Site>) {
     let source = ctx.source;
     let name = annotation_name(annotation, source);
-    let (fam, is_rabbit) = match name {
-        "RabbitListener" => (Fam::Rabbit, true),
-        "JmsListener" => (Fam::Jms, false),
-        "SqsListener" => (Fam::SqsTemplate, false),
+    let (lib, is_rabbit) = match name {
+        "RabbitListener" => (Lib::Amqp, true),
+        "JmsListener" => (Lib::Jms, false),
+        "SqsListener" => (Lib::Aws, false),
         _ => return,
     };
-    if !ctx.gated(fam) {
+    if !ctx.annotation_is_lib(annotation, lib) {
         return;
     }
     let Some(decl) = decorated(annotation) else {
@@ -775,28 +1165,86 @@ fn listener_sites(annotation: Node, ctx: &mut Ctx, found: &mut Vec<Site>) {
     }
 }
 
-/// The receiver family of a call: a declared client variable, `this.client`, or a NATS
-/// `createDispatcher(...)` result.
-fn receiver_family(call: Node, ctx: &Ctx) -> Option<Fam> {
+/// The receiver family of a call: a variable (or `this.field`) declared with a client class,
+/// as the nearest declaration in scope says, or a NATS `createDispatcher(...)` result.
+fn receiver_family(call: Node, ctx: &mut Ctx) -> Option<Fam> {
     let object = call.child_by_field_name("object")?;
     let source = ctx.source;
     match object.kind() {
-        "identifier" => ctx.family_of(text(object, source)),
+        "identifier" => ctx.lookup(call, text(object, source), false)?.fam,
         "field_access" => {
             let target = object.child_by_field_name("object")?;
             if target.kind() != "this" {
                 return None;
             }
-            ctx.family_of(text(object.child_by_field_name("field")?, source))
+            let field = text(object.child_by_field_name("field")?, source);
+            ctx.lookup(call, field, true)?.fam
         }
         "method_invocation" => {
             let is_dispatcher = object
                 .child_by_field_name("name")
                 .is_some_and(|n| text(n, source) == "createDispatcher");
-            (is_dispatcher && ctx.gated(Fam::Nats)).then_some(Fam::Nats)
+            (is_dispatcher && ctx.imports.has(Lib::Nats)).then_some(Fam::Nats)
         }
         _ => None,
     }
+}
+
+/// What the argument that follows a message in a `RabbitTemplate` send is.
+enum Trailing {
+    /// A `MessagePostProcessor` / `CorrelationData`: the call is `(routingKey, message, it)`.
+    Extra,
+    /// The message itself: the call is `(exchange, routingKey, message)`.
+    Message,
+    /// Nothing the file shows tells which.
+    Unknown,
+}
+
+fn trailing_role(arg: Node, ctx: &mut Ctx) -> Trailing {
+    let is_extra = |t: &str| t.ends_with("PostProcessor") || t.ends_with("CorrelationData");
+    match arg.kind() {
+        "lambda_expression" | "method_reference" => Trailing::Extra,
+        "object_creation_expression" => {
+            match arg
+                .child_by_field_name("type")
+                .and_then(|t| simple_type(t, ctx.source))
+            {
+                Some(t) if is_extra(&t) => Trailing::Extra,
+                _ => Trailing::Message,
+            }
+        }
+        "identifier" => match ctx.lookup(arg, text(arg, ctx.source), false) {
+            Some(Decl { ty: Some(t), .. }) if is_extra(&t) => Trailing::Extra,
+            Some(Decl { ty: Some(_), .. }) => Trailing::Message,
+            _ => Trailing::Unknown,
+        },
+        _ => Trailing::Message,
+    }
+}
+
+/// The routing-key argument of a `RabbitTemplate` send: `(exchange, routingKey, message[, ...])`
+/// or `(routingKey, message[, postProcessor])`. A three-argument call is told apart by what its
+/// last argument is; when the file does not show it, no key is guessed.
+fn rabbit_routing<'t>(args: &[Node<'t>], ctx: &mut Ctx) -> Option<Node<'t>> {
+    match args.len() {
+        0 | 1 => None,
+        2 => match trailing_role(args[1], ctx) {
+            Trailing::Extra => None,
+            _ => Some(args[0]),
+        },
+        3 => match trailing_role(args[2], ctx) {
+            Trailing::Extra => Some(args[0]),
+            Trailing::Message => Some(args[1]),
+            Trailing::Unknown => None,
+        },
+        _ => Some(args[1]),
+    }
+}
+
+/// Whether a key is a pattern (`orders.*`, `orders.#`, NATS `orders.>`): a consumer may
+/// subscribe to one, a producer never publishes to one.
+fn is_pattern(key: &str) -> bool {
+    key.contains(['*', '#', '>'])
 }
 
 /// The first string passed to a call of one of `names` inside `root`'s subtree
@@ -875,7 +1323,6 @@ fn call_sites(call: Node, ctx: &mut Ctx, found: &mut Vec<Site>) {
     };
     let mut cursor = arglist.walk();
     let args: Vec<Node> = arglist.named_children(&mut cursor).collect();
-    let is_callback = |n: Node| matches!(n.kind(), "lambda_expression" | "method_reference");
 
     // (producer, key, via)
     let hit: Option<(bool, String)> = match (fam, method) {
@@ -887,18 +1334,9 @@ fn call_sites(call: Node, ctx: &mut Ctx, found: &mut Vec<Site>) {
             | "sendAndReceive"
             | "convertSendAndReceiveAsType"
             | "sendAndReceiveAsType",
-        ) => {
-            // (exchange, routingKey, message[, ...]) or (routingKey, message[, postProcessor]):
-            // a trailing lambda marks the second form. The routing key names the channel.
-            let routing = if args.len() >= 3 && !is_callback(args[2]) {
-                args.get(1)
-            } else if args.len() >= 2 && !is_callback(args[1]) {
-                args.first()
-            } else {
-                None
-            };
-            routing.and_then(|a| ctx.resolve(*a)).map(|k| (true, k))
-        }
+        ) => rabbit_routing(&args, ctx)
+            .and_then(|a| ctx.resolve(a))
+            .map(|k| (true, k)),
         (Fam::Jms, "convertAndSend" | "send" | "sendAndReceive" | "convertSendAndReceive")
             if args.len() >= 2 =>
         {
@@ -967,6 +1405,9 @@ fn call_sites(call: Node, ctx: &mut Ctx, found: &mut Vec<Site>) {
     let Some((producer, key)) = hit else {
         return;
     };
+    if producer && is_pattern(&key) {
+        return;
+    }
     found.push(Site::Call {
         producer,
         broker: fam.broker(),
@@ -998,6 +1439,28 @@ pub(crate) fn apply(scan: Scan, out: &mut FileIndex) {
         .enumerate()
         .map(|(i, n)| ((n.line_start, n.name.to_string()), i))
         .collect();
+    // The Java extractor keeps the first line of a declaration as its signature: a listener
+    // annotation or a one-line method holding `${key:default}` would carry the default into the
+    // graph. Defaults never become names here, so they do not stay as text either.
+    let mut site_lines: HashSet<usize> = HashSet::new();
+    for site in &scan.sites {
+        match site {
+            Site::Listener { owner, .. } => {
+                site_lines.insert(owner.0);
+            }
+            Site::Call { lines, .. } => site_lines.extend(lines.0..=lines.1),
+        }
+    }
+    for node in out
+        .nodes
+        .iter_mut()
+        .filter(|n| site_lines.contains(&n.line_start))
+    {
+        if let Some(sig) = node.signature.as_deref().filter(|s| s.contains("${")) {
+            let stripped = mesh_core::config_values::strip_placeholder_defaults(sig).into_owned();
+            node.signature = Some(CompactStr::new(stripped));
+        }
+    }
     for site in scan.sites {
         match site {
             Site::Listener { owner, broker, key } => {
