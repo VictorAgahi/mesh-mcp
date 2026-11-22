@@ -617,8 +617,15 @@ What makes a call a site (nothing else is read):
   nothing;
 - a call this pass owns is not also read by the Kafka heuristics of the Go extractor, which read any
   `Subscribe("x")` / `Produce(...)` of a file: a `Subscribe("orders")` of a NATS or Redis client is not a
-  Kafka consumer of `orders`, nor is the `Subscribe` of a method a type of the file declares, when the
-  file imports one of these libraries. A call on a receiver this pass cannot type keeps the old reading.
+  Kafka consumer of `orders`, nor is the `Subscribe` of a method of a type the file declares and that
+  holds no broker client (`type Bus struct{}`). A call the 2,000-site cap would cut is not claimed
+  either, so the older reading keeps it. A struct of the file that holds a Kafka client
+  (`type Consumer struct{ r *kafka.Reader }`) keeps the older reading of its own `Subscribe("x")`: a
+  Kafka consumer. In a file that imports one of the new libraries, a Kafka-shaped call (`Subscribe`,
+  `Produce`, `WriteMessages`, ...) on a receiver that is not shown to be a Kafka client (an interface
+  parameter, a type of another library, a wrapper of a NATS connection) is still read, but with no
+  known broker, not as Kafka: it joins the channel of its name on every broker (`heuristic`), like a
+  SQL site. Outside such files nothing changed;
 
 Every site is a node on its call line, like the Java ones; its broker travels with the producer or
 consumer, so the same-file fallback of `trace_flow` / `analyze_impact` never links two sites that know
@@ -626,7 +633,7 @@ different brokers (3.7). `diff_mesh` names the broker of a removed site that is 
 
 Bounds: at most 2,000 sites per file (`MAX_GO_BROKER_SITES_PER_FILE`) and 16,384 declared names; a file
 over a bound is counted in `IndexHealth::files_go_brokers_capped` and listed by `mesh-mcp doctor` (a
-warning). Every walk is iterative, a type or name resolution follows at most 8 links, and the scope
+warning). Every walk is iterative, a type or name resolution follows at most 8 links (a constant chain: a plain alias `A1 = A0` costs one link per hop and resolves through 7 hops; a concatenation `X1 = X0 + "x"` costs two per hop and resolves through 3; a longer chain registers no site), and the scope
 tables are built once per scope, so a hostile file costs a bounded pass whatever it nests.
 
 **You will not get:** `redigo` (`conn.Do("PUBLISH", ...)`), `rueidis`, `nsq`, `asynq`, `machinery`, MQTT,

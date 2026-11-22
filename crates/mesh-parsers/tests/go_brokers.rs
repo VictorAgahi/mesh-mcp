@@ -789,6 +789,24 @@ fn calls_past_the_site_cap_are_not_claimed_so_no_edge_base_had_is_lost() {
     assert!(sites(&fi).iter().all(|(_, b, _)| b != "kafka"));
 }
 
+#[test]
+fn constant_chains_resolve_to_a_bounded_depth() {
+    // `X{n} = X{n-1} + "x"`: two resolution links per hop, a plain alias one.
+    let mut body = String::from("const X0 = \"a\"\n");
+    for i in 1..=8 {
+        body.push_str(&format!("const X{i} = X{} + \"x\"\n", i - 1));
+    }
+    body.push_str("const A0 = \"alias\"\n");
+    for i in 1..=12 {
+        body.push_str(&format!("const A{i} = A{}\n", i - 1));
+    }
+    body.push_str(
+        "func run(nc *nats.Conn) {\n\tnc.Publish(X3, nil)\n\tnc.Publish(X4, nil)\n\tnc.Publish(X5, nil)\n\tnc.Publish(A7, nil)\n\tnc.Publish(A8, nil)\n\tnc.Publish(A9, nil)\n}\n",
+    );
+    let got = sites(&extract(&file(&[NATS], &body)));
+    assert_eq!(got, vec![s('P', "nats", "alias"), s('P', "nats", "axxx")]);
+}
+
 // ---- Bounds -----------------------------------------------------------------------------
 
 #[test]

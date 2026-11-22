@@ -126,7 +126,7 @@ impl DoctorCommand {
             DoctorCheck::warn(
                 "Index health",
                 format!(
-                    "{summary}\n    Some SQL events, in-process bus sites, schedules or JVM broker sites of these files are not registered."
+                    "{summary}\n    Some SQL events, in-process bus sites, schedules or broker sites (Java, Go) of these files are not registered."
                 ),
             )
         } else if health.config_degraded()
