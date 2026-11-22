@@ -719,3 +719,65 @@ fn hostile_files_cost_a_bounded_walk_on_a_small_stack() {
         .unwrap();
     handle.join().unwrap();
 }
+
+// ---- 9.0 T8c fix round 1 ------------------------------------------------------------------
+
+/// `X0 = "exp.q"` then `depth` copies of `Xk = Xk-1` for each of `levels` levels: a name resolved
+/// per path costs `depth ^ levels`.
+fn chain_of_copies(levels: usize, depth: usize) -> String {
+    let mut code = String::from("import redis\nr = redis.Redis()\nX0 = \"exp.q\"\n");
+    for k in 1..=levels {
+        for _ in 0..depth {
+            code.push_str(&format!("X{k} = X{}\n", k - 1));
+        }
+    }
+    code.push_str(&format!("r.publish(X{levels}, 1)\n"));
+    code
+}
+
+#[test]
+fn a_chain_of_name_copies_is_resolved_once_not_once_per_path() {
+    let started = std::time::Instant::now();
+    for (levels, depth) in [(4, 50), (6, 30), (7, 50)] {
+        let fi = extract(&chain_of_copies(levels, depth));
+        assert_eq!(
+            sites(&fi),
+            vec![s('P', "redis", "exp.q")],
+            "{levels}x{depth}"
+        );
+        assert!(!fi.py_brokers_capped, "{levels}x{depth}");
+    }
+    // The same shape for a receiver: a client copied through a long chain.
+    let mut client = String::from("import redis\nC0 = redis.Redis()\n");
+    for k in 1..=6 {
+        for _ in 0..40 {
+            client.push_str(&format!("C{k} = C{}\n", k - 1));
+        }
+    }
+    client.push_str("C6.publish(\"copied.client\", 1)\n");
+    assert_eq!(read(&client), vec![s('P', "redis", "copied.client")]);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "name resolution is not bounded: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_cycle_of_name_copies_reads_as_nothing_and_stays_bounded() {
+    let mut code = String::from("import redis\nr = redis.Redis()\n");
+    for _ in 0..40 {
+        for level in 0..6 {
+            code.push_str(&format!("A{level} = A{}\n", (level + 1) % 6));
+        }
+    }
+    code.push_str("r.publish(A0, 1)\n");
+    let started = std::time::Instant::now();
+    let fi = extract(&code);
+    assert!(sites(&fi).is_empty(), "{:?}", sites(&fi));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+}

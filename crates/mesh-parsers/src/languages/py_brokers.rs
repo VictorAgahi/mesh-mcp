@@ -42,7 +42,7 @@
 use super::python::PythonExtractor;
 use super::{FileIndex, MAX_PY_BROKER_SITES_PER_FILE};
 use mesh_core::{Broker, CompactStr, ContractNode, NodeKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Tree};
 
 /// Bindings a file's scope tables remember; past it the pass stops reading (and says so).
@@ -188,9 +188,32 @@ const CALL_NAMES: &[&str] = &[
     "send_and_wait",
 ];
 
+/// Evaluation steps one call site may take; a call past it reads as nothing and counts the file
+/// as capped.
+const MAX_CALL_STEPS: usize = 2_048;
+/// Evaluation steps one file may take in all (a backstop: the memo keeps real files far below).
+const MAX_FILE_STEPS: usize = 400_000;
+
+/// What a memo or an in-progress mark is keyed by: (names, not receivers; a `self.x` attribute,
+/// not a scope name; the scope or class node id; the name).
+type MemoKey = (bool, bool, usize, String);
+
 /// Per-file state the scan evaluates receivers and names against.
 struct Ctx<'t> {
     source: &'t [u8],
+    /// Receiver values by (scope, name): a chain of `Xk = Xk-1` is walked once, not once per path.
+    eval_memo: HashMap<MemoKey, Option<Value>>,
+    name_memo: HashMap<MemoKey, Option<String>>,
+    /// Names being resolved right now: a cycle (`a = b`, `b = a`) reads as nothing at once.
+    busy: HashSet<MemoKey>,
+    /// Times a depth bound or a cycle cut a resolution short: such a result depends on where it
+    /// started, so it is never memoised.
+    cuts: usize,
+    steps: usize,
+    call_steps: usize,
+    exhausted: bool,
+    /// A per-call or per-file evaluation budget tripped (counted like the site cap).
+    over: bool,
     /// Names bound in each scope, by scope node id.
     tables: HashMap<usize, Table<'t>>,
     /// `self.x` / `cls.x` assignments of each class, by class node id.
@@ -271,6 +294,14 @@ impl<'t> Ctx<'t> {
     fn new(source: &'t [u8]) -> Ctx<'t> {
         Ctx {
             source,
+            eval_memo: HashMap::new(),
+            name_memo: HashMap::new(),
+            busy: HashSet::new(),
+            cuts: 0,
+            steps: 0,
+            call_steps: 0,
+            exhausted: false,
+            over: false,
             tables: HashMap::new(),
             attrs: HashMap::new(),
             bindings: 0,
@@ -538,13 +569,18 @@ impl<'t> Ctx<'t> {
     /// What `name` read at `at` is bound to, innermost scope first (a class scope is visible
     /// only from its own body, never from a method). Empty when nothing in the file binds it.
     fn bounds(&mut self, at: Node<'t>, name: &str) -> Vec<Bound<'t>> {
+        self.bounds_k(at, name).1
+    }
+
+    /// [`Self::bounds`] with the id of the scope that binds the name (its memo key).
+    fn bounds_k(&mut self, at: Node<'t>, name: &str) -> (usize, Vec<Bound<'t>>) {
         let mut in_function = false;
         let mut cur = Some(at);
         while let Some(p) = cur {
             let kind = p.kind();
             if is_scope(kind) && !(kind == "class_definition" && in_function) {
                 if let Some(b) = self.table(p).get(name) {
-                    return b.clone();
+                    return (p.id(), b.clone());
                 }
             }
             if is_scope(kind) && kind != "class_definition" && kind != "module" {
@@ -552,17 +588,18 @@ impl<'t> Ctx<'t> {
             }
             cur = p.parent();
         }
-        Vec::new()
+        (0, Vec::new())
     }
 
-    /// The `self.x` assignments of the class around `at`, with its class-level names.
-    fn class_attr(&mut self, at: Node<'t>, attr: &str) -> Vec<Bound<'t>> {
+    /// The `self.x` assignments of the class around `at`, with its class-level names, and the id
+    /// of that class (its memo key).
+    fn class_attr(&mut self, at: Node<'t>, attr: &str) -> (usize, Vec<Bound<'t>>) {
         let mut cur = at.parent();
         let class = loop {
             match cur {
                 Some(p) if p.kind() == "class_definition" => break p,
                 Some(p) => cur = p.parent(),
-                None => return Vec::new(),
+                None => return (0, Vec::new()),
             }
         };
         if !self.attrs.contains_key(&class.id()) {
@@ -600,7 +637,7 @@ impl<'t> Ctx<'t> {
             .cloned()
             .unwrap_or_default();
         out.extend(self.table(class).get(attr).cloned().unwrap_or_default());
-        out
+        (class.id(), out)
     }
 
     /// The qualified path an identifier / attribute chain stands for through the imports.
@@ -638,35 +675,111 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// The single value every binding of a name gives, or `None` when they differ.
-    fn fold<T: PartialEq>(
-        &mut self,
-        bounds: Vec<Bound<'t>>,
-        depth: usize,
-        mut one: impl FnMut(&mut Self, &Bound<'t>, usize) -> Option<T>,
-    ) -> Option<T> {
-        let mut out: Option<T> = None;
+    /// One evaluation step: `false` once the call site or the file spent its budget.
+    fn tick(&mut self) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        self.steps += 1;
+        self.call_steps += 1;
+        if self.steps > MAX_FILE_STEPS {
+            self.exhausted = true;
+            self.over = true;
+            self.cuts += 1;
+            return false;
+        }
+        if self.call_steps > MAX_CALL_STEPS {
+            self.over = true;
+            self.cuts += 1;
+            return false;
+        }
+        true
+    }
+
+    /// The value every binding of a name gives, or `None` when they differ. Memoised by
+    /// (scope, name); a name being resolved already, or a result cut short by a bound, is not.
+    fn eval_named(&mut self, key: MemoKey, bounds: Vec<Bound<'t>>, depth: usize) -> Option<Value> {
+        if let Some(v) = self.eval_memo.get(&key) {
+            return v.clone();
+        }
+        if !self.busy.insert(key.clone()) {
+            self.cuts += 1;
+            return None;
+        }
+        let cuts = self.cuts;
+        let mut out: Option<Value> = None;
+        let mut result = None;
         for b in &bounds {
-            let v = one(self, b, depth)?;
+            let Some(v) = self.eval_bound(b, depth) else {
+                out = None;
+                result = Some(None);
+                break;
+            };
             match &out {
-                Some(prev) if *prev != v => return None,
+                Some(prev) if *prev != v => {
+                    result = Some(None);
+                    break;
+                }
                 _ => out = Some(v),
             }
         }
-        out
+        let value = result.unwrap_or(out);
+        self.busy.remove(&key);
+        if self.cuts == cuts {
+            self.eval_memo.insert(key, value.clone());
+        }
+        value
+    }
+
+    /// [`Self::eval_named`] for channel names.
+    fn name_named(&mut self, key: MemoKey, bounds: Vec<Bound<'t>>, depth: usize) -> Option<String> {
+        if let Some(v) = self.name_memo.get(&key) {
+            return v.clone();
+        }
+        if !self.busy.insert(key.clone()) {
+            self.cuts += 1;
+            return None;
+        }
+        let cuts = self.cuts;
+        let mut out: Option<String> = None;
+        let mut result = None;
+        for b in &bounds {
+            let Some(v) = self.name_of_bound(b, depth) else {
+                result = Some(None);
+                break;
+            };
+            match &out {
+                Some(prev) if *prev != v => {
+                    result = Some(None);
+                    break;
+                }
+                _ => out = Some(v),
+            }
+        }
+        let value = result.unwrap_or(out);
+        self.busy.remove(&key);
+        if self.cuts == cuts {
+            self.name_memo.insert(key, value.clone());
+        }
+        value
     }
 
     /// What `node` is, when it is one of the clients this pass reads.
     fn eval(&mut self, node: Node<'t>, depth: usize) -> Option<Value> {
-        if depth > MAX_EVAL_DEPTH || self.capped {
+        if depth > MAX_EVAL_DEPTH {
+            self.cuts += 1;
+            return None;
+        }
+        if self.capped || !self.tick() {
             return None;
         }
         match node.kind() {
             "parenthesized_expression" | "await" => self.eval(node.named_child(0)?, depth + 1),
             "assignment" => self.eval(node.child_by_field_name("right")?, depth + 1),
             "identifier" => {
-                let bounds = self.bounds(node, text(node, self.source));
-                self.fold(bounds, depth, Self::eval_bound)
+                let name = text(node, self.source);
+                let (id, bounds) = self.bounds_k(node, name);
+                self.eval_named((false, false, id, name.to_string()), bounds, depth)
             }
             "attribute" => {
                 let object = node.child_by_field_name("object")?;
@@ -674,8 +787,8 @@ impl<'t> Ctx<'t> {
                 if object.kind() == "identifier"
                     && matches!(text(object, self.source), "self" | "cls")
                 {
-                    let bounds = self.class_attr(node, attr);
-                    return self.fold(bounds, depth, Self::eval_bound);
+                    let (id, bounds) = self.class_attr(node, attr);
+                    return self.eval_named((false, true, id, attr.to_string()), bounds, depth);
                 }
                 let v = self.eval(object, depth + 1)?;
                 match (v.kind, attr) {
@@ -859,15 +972,20 @@ impl<'t> Ctx<'t> {
 
     /// The channel name a node stands for, if the file shows it (before any name filtering).
     fn name_of(&mut self, node: Node<'t>, depth: usize) -> Option<String> {
-        if depth > MAX_EVAL_DEPTH || self.capped {
+        if depth > MAX_EVAL_DEPTH {
+            self.cuts += 1;
+            return None;
+        }
+        if self.capped || !self.tick() {
             return None;
         }
         match node.kind() {
             "string" => self.literal(node),
             "parenthesized_expression" => self.name_of(node.named_child(0)?, depth + 1),
             "identifier" => {
-                let bounds = self.bounds(node, text(node, self.source));
-                self.fold(bounds, depth, Self::name_of_bound)
+                let name = text(node, self.source);
+                let (id, bounds) = self.bounds_k(node, name);
+                self.name_named((true, false, id, name.to_string()), bounds, depth)
             }
             "attribute" => {
                 let object = node.child_by_field_name("object")?;
@@ -875,8 +993,8 @@ impl<'t> Ctx<'t> {
                     && matches!(text(object, self.source), "self" | "cls")
                 {
                     let attr = text(node.child_by_field_name("attribute")?, self.source);
-                    let bounds = self.class_attr(node, attr);
-                    return self.fold(bounds, depth, Self::name_of_bound);
+                    let (id, bounds) = self.class_attr(node, attr);
+                    return self.name_named((true, true, id, attr.to_string()), bounds, depth);
                 }
                 None
             }
@@ -1044,6 +1162,7 @@ impl<'t> Ctx<'t> {
     }
 
     fn call(&mut self, call: Node<'t>, out: &mut Out) {
+        self.call_steps = 0;
         let Some(f) = call.child_by_field_name("function") else {
             return;
         };
@@ -1301,7 +1420,7 @@ pub(crate) fn scan(tree: &Tree, content: &str) -> Scan {
             }
         }
     }
-    let capped = out.sites.len() > MAX_PY_BROKER_SITES_PER_FILE || ctx.capped;
+    let capped = out.sites.len() > MAX_PY_BROKER_SITES_PER_FILE || ctx.capped || ctx.over;
     out.sites.truncate(MAX_PY_BROKER_SITES_PER_FILE);
     Scan {
         sites: out.sites,
