@@ -119,7 +119,11 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// `process.env` / `ConfigService`, Go `os.Getenv` / viper, Python `os.environ`, Java `@Value`),
 /// resolved when the index is folded; the extractors no longer record the env key itself as a
 /// Go / Python topic.
-const SCHEMA_VERSION: u8 = 19;
+/// v20: enum-member queue and stream names (9.0 T14): an imported `Enum.MEMBER` messaging topic
+/// is recorded as the placeholder `${Enum.MEMBER:member}` (resolved against the workspace's
+/// string constants when the index is folded) instead of the bare member path;
+/// `FileIndex::const_capped`.
+const SCHEMA_VERSION: u8 = 20;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

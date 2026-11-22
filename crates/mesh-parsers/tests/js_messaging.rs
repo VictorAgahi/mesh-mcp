@@ -1175,3 +1175,92 @@ fn redis_move_spellings_all_link_source_and_destination() {
         );
     }
 }
+
+// ---- enum-member queue names (9.0 T14) --------------------------------------------------
+
+#[test]
+fn queue_names_given_as_enum_members_are_placeholders_and_other_names_are_not() {
+    let fi = index(
+        "svc/queues.ts",
+        "import { Processor, InjectQueue } from '@nestjs/bullmq';\n\
+         import { Queue, Worker } from 'bullmq';\n\
+         import { JobQueue, LegacyQueue } from './queues';\n\
+         @Processor(JobQueue.EMAIL) class A {}\n\
+         @Processor({ name: LegacyQueue.EMAIL }) class B {}\n\
+         class S { constructor(@InjectQueue(JobQueue.AUDIT) private q: Queue) {} }\n\
+         const w = new Worker(JobQueue.REPORTS, async () => {});\n\
+         const q = new Queue(JobQueue.REPORTS);\n\
+         export function dyn(name: string) { return new Queue(name); }\n\
+         export function tpl(t: string) { return new Queue(`${t}-jobs`); }\n",
+    );
+    assert_eq!(
+        events(&fi),
+        vec![
+            ev('C', "${JobQueue.EMAIL:email}"),
+            ev('C', "${JobQueue.REPORTS:reports}"),
+            ev('C', "${LegacyQueue.EMAIL:email}"),
+            ev('P', "${JobQueue.AUDIT:audit}"),
+            ev('P', "${JobQueue.REPORTS:reports}"),
+        ]
+    );
+}
+
+#[test]
+fn a_member_naming_a_kafka_topic_keeps_its_member_key() {
+    // Only queues are named by their value: an event or stream member keeps the link it always
+    // had with the same member of another enum (Volontariapp: `Streams.X` and `XEventType.X`).
+    let fi = index(
+        "svc/kafka.ts",
+        "import { Kafka } from 'kafkajs';\nimport { Topics } from './topics';\n\
+         const producer = new Kafka({}).producer();\n\
+         export async function run() { await producer.send({ topic: Topics.ORDER_PLACED }); }\n",
+    );
+    assert_eq!(events(&fi), vec![ev('P', "Topics.ORDER_PLACED")]);
+}
+
+#[test]
+fn string_constants_are_recorded_and_capped_visibly() {
+    let mut code = String::from("export enum Big {\n");
+    for i in 0..4100 {
+        code.push_str(&format!("  M{i} = 'q-{i}',\n"));
+    }
+    code.push_str("}\n");
+    let big = index("svc/big.ts", &code);
+    assert!(big.const_capped);
+    assert_eq!(big.const_records().count(), 4000);
+    let small = index("svc/small.ts", "export enum Q {\n  A = 'a-q',\n}\n");
+    assert!(!small.const_capped);
+    assert_eq!(small.const_records().collect::<Vec<_>>(), vec!["Q.A=a-q"]);
+}
+
+#[test]
+fn hostile_enums_neither_overflow_the_stack_nor_resolve_a_cycle() {
+    // 3000 members, an alias cycle between enums, a value that is itself placeholder syntax.
+    let mut code = String::from(
+        "export enum A { X = B.Y, Z = '${A.W}', W = '${A.Z}' }\nexport enum B { Y = A.X }\n",
+    );
+    code.push_str("export enum Many {\n");
+    for i in 0..3000 {
+        code.push_str(&format!("  M{i} = 'many-{i}',\n"));
+    }
+    code.push_str("}\n");
+    let fi = on_small_stack(move || index("svc/hostile-enums.ts", &code));
+    assert!(!fi.const_capped);
+    // Only string literals are constants: the aliases record nothing; the placeholder-looking
+    // values are recorded as text and refused when they become entries.
+    let records: Vec<&str> = fi.const_records().collect();
+    assert!(
+        records.contains(&"Many.M2999=many-2999"),
+        "{}",
+        records.len()
+    );
+    assert!(!records
+        .iter()
+        .any(|r| r.starts_with("A.X=") || r.starts_with("B.Y=")));
+    let entries = mesh_core::config_values::from_const_records(fi.const_records());
+    assert!(
+        !entries.entries.iter().any(|e| e.key.starts_with("A.")),
+        "no placeholder value"
+    );
+    assert_eq!(entries.entries.len(), 3000);
+}

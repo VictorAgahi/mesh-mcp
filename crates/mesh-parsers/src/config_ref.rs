@@ -27,6 +27,12 @@ pub fn placeholder(key: &str, default: Option<&str>) -> Option<String> {
     }
 }
 
+/// The topic key a member reference (`UserQueue.USER`) has when no string constant resolves it:
+/// the member, lower-cased (`mesh_core::normalize_topic_key`).
+pub fn member_default(path: &str) -> Option<String> {
+    mesh_core::is_member_ref(path).then(|| mesh_core::normalize_topic_key(path))
+}
+
 fn valid_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= MAX_PART_LEN

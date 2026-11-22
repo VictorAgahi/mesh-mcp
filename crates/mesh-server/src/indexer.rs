@@ -238,6 +238,9 @@ const SCAN_CHUNK_FILES: usize = 2_048;
 
 /// Label of the pass that restores the call sites of files that came onto a call path.
 const CALLS_REFRESH_LABEL: &str = "Calls refresh";
+/// The label of the pass that folds again the files whose `${Enum.MEMBER}` topics a reload moved
+/// the string constants of (9.0 T14).
+const CONST_REFRESH_LABEL: &str = "Constants refresh";
 
 pub struct WorkspaceIndexer;
 
@@ -695,6 +698,7 @@ impl WorkspaceIndexer {
             );
             health.record_sql(frag.code.sql_capped, frag.code.sql_unresolved);
             health.record_inproc(frag.code.inproc_capped);
+            health.record_const(frag.code.const_capped);
             if frag.code.calls.capped {
                 tracing::warn!(
                     target: "mesh::indexer",
@@ -1210,14 +1214,31 @@ impl WorkspaceIndexer {
             .collect();
         snapshot.doc_index.remove_files(&stale_files);
         snapshot.property_registry.remove_files(&stale_files);
+        let constants_before = snapshot.config_values.index_digest();
         snapshot.config_values.remove_files(&stale_files);
         drop(stale_files);
         let changed_count = changed.len();
         let mut changed = changed;
         Self::fold_config(&mut changed, &mut snapshot);
+        let changed_paths: HashSet<PathBuf> = changed.iter().map(|f| f.path.clone()).collect();
         for frag in changed {
             Self::fold(frag, &mut snapshot);
         }
+        // An enum or constant this batch added, removed or edited moves how the unchanged files
+        // naming it as a topic resolve: they are folded again below, once.
+        let const_refresh: Vec<(RepoId, PathBuf)> =
+            if snapshot.config_values.index_digest() == constants_before {
+                Vec::new()
+            } else {
+                snapshot
+                    .config_values
+                    .ref_files()
+                    .filter(|p| !changed_paths.contains(*p))
+                    .filter_map(|p| {
+                        Self::most_specific_root(p, roots).map(|(r, _)| (r, p.to_path_buf()))
+                    })
+                    .collect()
+            };
         if spring.resolve_placeholders {
             snapshot.property_registry.resolve_all_placeholders();
         }
@@ -1274,6 +1295,30 @@ impl WorkspaceIndexer {
             "{label} reload (gen {generation}): {changed_count} re-indexed, {} removed, {node_count} contract nodes.",
             deleted.len()
         );
+
+        // The files holding an enum-member topic whose constants moved, folded again against the
+        // new table. The table does not move in this pass, so it is the last one.
+        if !const_refresh.is_empty() && label != CONST_REFRESH_LABEL {
+            tracing::debug!(
+                target: "mesh::watcher",
+                "{} file(s) hold a topic named by a constant that changed: folding them again",
+                const_refresh.len()
+            );
+            {
+                let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
+                for (_, path) in &const_refresh {
+                    vfs.remove(path);
+                }
+            }
+            Self::apply_incremental(
+                state,
+                CONST_REFRESH_LABEL,
+                const_refresh,
+                Vec::new(),
+                None,
+                None,
+            );
+        }
 
         // One restoring pass, never a loop: a file that cannot be re-extracted (gone, no
         // longer parses) stays counted in `IndexHealth::call_files_missing_sites`. The files
@@ -1884,8 +1929,16 @@ impl WorkspaceIndexer {
     /// against the files folded so far.
     fn fold_config(fragments: &mut [FileFragment], snapshot: &mut MeshSnapshot) {
         for frag in fragments.iter_mut() {
-            let config = frag.config.take().unwrap_or_default();
+            let mut config = frag.config.take().unwrap_or_default();
+            // The string constants a source file declares answer the enum members other files
+            // use as a topic (9.0 T14).
+            config
+                .entries
+                .extend(config_values::from_const_records(frag.code.const_records()).entries);
             snapshot.config_values.set_file(&frag.path, config.entries);
+            snapshot
+                .config_values
+                .set_queue_enums(&frag.path, frag.code.queue_enums());
             if config.failed {
                 snapshot.config_values.mark_failed(&frag.path);
             }
@@ -3674,5 +3727,249 @@ resolve_placeholders = true
             "{rows:?}"
         );
         assert_eq!(view.health.config_topics_unresolved, 1);
+    }
+
+    // ---- 9.0 T14: enum-member queue names -----------------------------------------------------
+
+    const QUEUES_TS: &str = "export enum JobQueue {\n  EMAIL = 'email-jobs',\n}\nexport enum LegacyQueue {\n  EMAIL = 'legacy-email-jobs',\n}\n";
+    const PRODUCER_TS: &str = "import { InjectQueue } from '@nestjs/bullmq';\nimport { Queue } from 'bullmq';\nimport { JobQueue } from './queues';\nexport class S {\n  constructor(@InjectQueue(JobQueue.EMAIL) private q: Queue) {}\n}\n";
+    const CONSUMER_TS: &str = "import { Processor } from '@nestjs/bullmq';\nimport { JobQueue } from './queues';\n@Processor(JobQueue.EMAIL)\nexport class C {}\n";
+    const LEGACY_TS: &str = "import { Processor } from '@nestjs/bullmq';\nimport { LegacyQueue } from './queues';\n@Processor(LegacyQueue.EMAIL)\nexport class L {}\n";
+
+    /// An enum member naming a queue resolves to the member's value across files, two enums with
+    /// one member name are two queues, a constant edit re-folds the unchanged files naming it,
+    /// and every state equals a cold rebuild (graph fingerprint and constants).
+    #[test]
+    fn an_enum_member_queue_resolves_across_files_and_a_constant_edit_refolds_its_users() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        write(&root, "src/queues.ts", QUEUES_TS);
+        write(&root, "src/producer.ts", PRODUCER_TS);
+        write(&root, "src/consumer.ts", CONSUMER_TS);
+        write(&root, "src/legacy.ts", LEGACY_TS);
+        let state = make_state(&root);
+        build_and_install(&state);
+        assert_eq!(
+            topic_rows(&state.snapshot()),
+            [
+                "Consumes exact email-jobs consumer.ts",
+                "Consumes exact legacy-email-jobs legacy.ts",
+                "Produces exact email-jobs producer.ts"
+            ]
+        );
+        let converges = |state: &Arc<AppState>| {
+            let inc = state.snapshot();
+            let cold = WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(inc.fingerprint().graph, cold.fingerprint().graph, "graph");
+            assert_eq!(
+                inc.config_values.canonical_lines_rooted(&inc.roots),
+                cold.config_values.canonical_lines_rooted(&cold.roots),
+                "constants"
+            );
+        };
+        converges(&state);
+
+        // An agent names the queue by its member, its value or the placeholder an extractor
+        // records: one topic, never the other enum's.
+        {
+            let view = state.snapshot();
+            let g = &view.contract_graph;
+            for target in ["JobQueue.EMAIL", "email-jobs", "${JobQueue.EMAIL:email}"] {
+                let flow = g.analyze_impact(target);
+                assert_eq!(flow.key.as_str(), "email-jobs", "{target}");
+                assert_eq!(flow.upstream_producers.len(), 1, "{target}");
+                assert_eq!(flow.downstream_consumers.len(), 1, "{target}");
+            }
+            let legacy = g.analyze_impact("LegacyQueue.EMAIL");
+            assert_eq!(legacy.key.as_str(), "legacy-email-jobs");
+            assert!(legacy.upstream_producers.is_empty());
+            assert_eq!(legacy.downstream_consumers.len(), 1);
+        }
+
+        // The value changes in the enum file alone: both unchanged users follow it.
+        write(
+            &root,
+            "src/queues.ts",
+            &QUEUES_TS.replace("'email-jobs'", "'mail-jobs'"),
+        );
+        WorkspaceIndexer::reload(&state);
+        assert_eq!(
+            topic_rows(&state.snapshot()),
+            [
+                "Consumes exact legacy-email-jobs legacy.ts",
+                "Consumes exact mail-jobs consumer.ts",
+                "Produces exact mail-jobs producer.ts"
+            ]
+        );
+        converges(&state);
+
+        // The enum file is deleted: the members keep their own key (as before this feature).
+        std::fs::remove_file(root.join("src/queues.ts")).expect("rm");
+        WorkspaceIndexer::reload(&state);
+        let view = state.snapshot();
+        assert_eq!(
+            topic_rows(&view),
+            [
+                "Consumes exact email consumer.ts",
+                "Consumes exact email legacy.ts",
+                "Produces exact email producer.ts"
+            ]
+        );
+        drop(view);
+        converges(&state);
+
+        // The enum comes back: the users resolve again.
+        write(&root, "src/queues.ts", QUEUES_TS);
+        WorkspaceIndexer::reload(&state);
+        assert_eq!(
+            topic_rows(&state.snapshot()),
+            [
+                "Consumes exact email-jobs consumer.ts",
+                "Consumes exact legacy-email-jobs legacy.ts",
+                "Produces exact email-jobs producer.ts"
+            ]
+        );
+        converges(&state);
+    }
+
+    /// A custom pattern that captures a member of an enum some file names a queue by joins the
+    /// queue on its value, whichever file it reads; a member of any other enum keeps its member
+    /// key (the stream / event-type link of a codebase naming both alike). The registry follows
+    /// the sources: it equals a cold rebuild after each edit.
+    #[test]
+    fn a_pattern_capture_of_a_queue_enum_member_joins_the_queue_by_value() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        write(&root, "src/queues.ts", QUEUES_TS);
+        write(&root, "src/consumer.ts", CONSUMER_TS);
+        write(
+            &root,
+            "src/streams.ts",
+            "export enum Streams {\n  EMAIL = 'stream:email',\n}\n",
+        );
+        write(
+            &root,
+            "src/outbox.ts",
+            "export const job = { target: JobQueue.EMAIL, stream: Streams.EMAIL };\n",
+        );
+        let cfg = Config::load_from_str(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n\
+             [engines.contracts]\nenabled = true\n\
+             [[engines.contracts.patterns]]\nname = \"queue-target\"\nkind = \"topic_producer\"\n\
+             confidence = \"exact\"\nfile_pattern = \"/src/\"\nregex = 'target:\\s*(\\w+\\.\\w+)'\n\
+             target_group = 1\n\
+             [[engines.contracts.patterns]]\nname = \"stream-ref\"\nkind = \"topic_producer\"\n\
+             confidence = \"exact\"\nfile_pattern = \"/src/\"\nregex = 'stream:\\s*(\\w+\\.\\w+)'\n\
+             target_group = 1\n",
+        )
+        .expect("config");
+        let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+        let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+        let state = Arc::new(AppState::new(cfg, vec![root.clone()], audit, rescan));
+        build_and_install(&state);
+        // `outbox.ts` names no queue itself: the enum is one because `consumer.ts` names it.
+        assert_eq!(
+            topic_rows(&state.snapshot()),
+            [
+                "Consumes exact email-jobs consumer.ts",
+                "Produces exact email outbox.ts",
+                "Produces exact email-jobs outbox.ts"
+            ]
+        );
+        let converges = |state: &Arc<AppState>| {
+            let inc = state.snapshot();
+            let cold = WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(inc.fingerprint().graph, cold.fingerprint().graph, "graph");
+            assert_eq!(
+                inc.config_values.canonical_lines_rooted(&inc.roots),
+                cold.config_values.canonical_lines_rooted(&cold.roots),
+                "registry"
+            );
+        };
+        converges(&state);
+
+        // The only queue site goes: the enum is no queue enum any more, the capture falls back to
+        // the member key without `outbox.ts` changing.
+        std::fs::remove_file(root.join("src/consumer.ts")).expect("rm");
+        WorkspaceIndexer::reload(&state);
+        assert_eq!(
+            topic_rows(&state.snapshot()),
+            [
+                "Produces exact email outbox.ts",
+                "Produces exact email outbox.ts"
+            ]
+        );
+        converges(&state);
+
+        // It comes back.
+        write(&root, "src/consumer.ts", CONSUMER_TS);
+        WorkspaceIndexer::reload(&state);
+        assert_eq!(
+            topic_rows(&state.snapshot()),
+            [
+                "Consumes exact email-jobs consumer.ts",
+                "Produces exact email outbox.ts",
+                "Produces exact email-jobs outbox.ts"
+            ]
+        );
+        converges(&state);
+    }
+
+    /// An enum file past the per-file constant cap is counted in `IndexHealth` and named by the
+    /// `doctor` summary, a member past it keeps its member key, and none of it needs more than
+    /// the 2 MB stack of an indexing thread.
+    #[test]
+    fn the_constant_cap_is_counted_and_a_hostile_enum_is_bounded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let mut big = String::from("export enum Big {\n");
+        for i in 0..4100 {
+            big.push_str(&format!("  M{i} = 'big-{i}',\n"));
+        }
+        big.push_str("}\nexport enum A { X = B.Y }\nexport enum B { Y = A.X }\n");
+        write(&root, "src/big.ts", &big);
+        write(
+            &root,
+            "src/use.ts",
+            "import { Processor } from '@nestjs/bullmq';\nimport { Big } from './big';\n\
+             @Processor(Big.M0)\nexport class First {}\n\
+             @Processor(Big.M4099)\nexport class Last {}\n",
+        );
+        let state = make_state(&root);
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn({
+                let state = Arc::clone(&state);
+                move || build_and_install(&state)
+            })
+            .expect("spawn")
+            .join()
+            .expect("a hostile enum must not overflow the stack");
+        let view = state.snapshot();
+        assert_eq!(view.health.files_const_capped, 1);
+        assert!(view.health.const_truncated());
+        assert!(view
+            .health
+            .render_summary(10)
+            .contains("more string constants than the per-file cap"));
+        // The first member is inside the cap and resolves; the last one is past it and keeps its
+        // member key, visibly different, never a guess.
+        let rows = topic_rows(&view);
+        assert_eq!(
+            rows,
+            ["Consumes exact big-0 use.ts", "Consumes exact m4099 use.ts"]
+        );
     }
 }

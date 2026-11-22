@@ -75,7 +75,7 @@ struct HandlerSite {
 }
 
 /// Records per file at most for string constants (a generated constants file).
-const MAX_CONST_RECORDS_PER_FILE: usize = 4000;
+pub(crate) const MAX_CONST_RECORDS_PER_FILE: usize = 4000;
 
 /// Per-file invariants threaded through the recursive `visit_node` walk,
 /// bundled to keep its argument count down.

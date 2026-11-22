@@ -209,6 +209,11 @@ pub struct IndexHealth {
     /// past the cap are not registered. Counted like `files_scanned`.
     #[serde(default)]
     pub files_inproc_capped: usize,
+    /// Files with more string constants (enum members, `as const` keys, top-level `const`s) than
+    /// the per-file cap (9.0 T14): the members past the cap cannot resolve an enum-member queue
+    /// or stream name, which then keeps the member's own name. Counted like `files_scanned`.
+    #[serde(default)]
+    pub files_const_capped: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -347,6 +352,18 @@ impl IndexHealth {
     #[inline]
     pub fn record_inproc(&mut self, capped: bool) {
         self.files_inproc_capped += usize::from(capped);
+    }
+
+    /// One file's string-constant cap (`FileIndex::const_capped`).
+    #[inline]
+    pub fn record_const(&mut self, capped: bool) {
+        self.files_const_capped += usize::from(capped);
+    }
+
+    /// Whether the string-constant cap dropped members: some enum-member names stay unresolved.
+    #[inline]
+    pub fn const_truncated(&self) -> bool {
+        self.files_const_capped > 0
     }
 
     /// Whether the in-process site cap dropped events: some bus sites or schedules are missing.
@@ -598,6 +615,15 @@ impl IndexHealth {
                 self.files_inproc_capped
             );
         }
+        if self.files_const_capped > 0 {
+            let _ = writeln!(
+                out,
+                "    {} file(s) with more string constants than the per-file cap (enum members, \
+                 `as const` keys; docs/parser-support.md, section 3.7): a queue or stream named by a \
+                 member past the cap keeps the member's own name instead of its value",
+                self.files_const_capped
+            );
+        }
         if self.sql_sites_unresolved > 0 {
             let _ = writeln!(
                 out,
@@ -687,6 +713,7 @@ impl IndexHealth {
         self.files_config_parse_failed += other.files_config_parse_failed;
         self.files_config_lossy += other.files_config_lossy;
         self.files_inproc_capped += other.files_inproc_capped;
+        self.files_const_capped += other.files_const_capped;
         self.files_skipped_non_source += other.files_skipped_non_source;
         // The calls-layer counters are the graph's, set after the reconcile.
     }
