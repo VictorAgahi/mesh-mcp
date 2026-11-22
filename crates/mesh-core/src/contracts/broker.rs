@@ -46,11 +46,15 @@ pub enum Broker {
     /// "broker" is the application itself, so an in-process event named like a Kafka topic is
     /// never the same channel (9.0 ticket T4).
     InProc,
+    /// The JMS API (Spring JMS, ActiveMQ, Artemis, IBM MQ): the provider behind it is not
+    /// statically known, so it is one channel space of its own (9.0 ticket T8a). Declared last
+    /// so no earlier broker's hub order moves.
+    Jms,
 }
 
 impl Broker {
     /// Every broker, in declaration order.
-    pub const ALL: [Broker; 17] = [
+    pub const ALL: [Broker; 18] = [
         Broker::Kafka,
         Broker::RabbitMq,
         Broker::Redis,
@@ -68,6 +72,7 @@ impl Broker {
         Broker::Bull,
         Broker::BeeQueue,
         Broker::InProc,
+        Broker::Jms,
     ];
 
     /// The lower-case qualifier written in a hub name and accepted in a query target.
@@ -90,6 +95,7 @@ impl Broker {
             Broker::Bull => "bull",
             Broker::BeeQueue => "beequeue",
             Broker::InProc => "inproc",
+            Broker::Jms => "jms",
         }
     }
 

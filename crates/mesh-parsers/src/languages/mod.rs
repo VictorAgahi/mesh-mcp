@@ -7,6 +7,7 @@ mod inproc_java;
 pub mod java;
 mod java_calls;
 mod js_frameworks;
+mod jvm_brokers;
 pub mod kotlin;
 pub mod php;
 pub mod proto;
@@ -235,6 +236,11 @@ pub struct FileIndex {
     /// events of this file: counted in `IndexHealth::files_inproc_capped`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inproc_capped: bool,
+    /// The per-file cap on JVM broker sites (`MAX_JVM_BROKER_SITES_PER_FILE`: RabbitMQ, JMS,
+    /// SQS / SNS, Redis, NATS, Pub/Sub in Java) cut sites of this file: counted in
+    /// `IndexHealth::files_jvm_brokers_capped`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub jvm_brokers_capped: bool,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -282,6 +288,7 @@ impl FileIndex {
         self.sql_unresolved = self.sql_unresolved.saturating_add(other.sql_unresolved);
         self.sql_capped |= other.sql_capped;
         self.inproc_capped |= other.inproc_capped;
+        self.jvm_brokers_capped |= other.jvm_brokers_capped;
     }
 
     /// Inserts the extracted nodes and relations into `graph`. A `${key}` topic is resolved
@@ -677,6 +684,11 @@ impl CompiledPattern {
 /// `IndexHealth::files_inproc_capped` (never silent).
 pub const MAX_INPROC_SITES_PER_FILE: usize = 2_000;
 
+/// Most JVM broker sites (Java RabbitMQ, JMS, SQS / SNS, Redis, NATS and Pub/Sub listeners,
+/// producers and consumers) one file registers; the rest are dropped and the file is counted
+/// in `IndexHealth::files_jvm_brokers_capped` (never silent).
+pub const MAX_JVM_BROKER_SITES_PER_FILE: usize = 2_000;
+
 pub struct PolyglotIndexer;
 
 impl PolyglotIndexer {
@@ -1019,23 +1031,27 @@ impl PolyglotIndexer {
             LanguageKind::Java => {
                 let with_calls = Self::wants_call_facts(cfg, file_path);
                 out.calls_skipped_path = !with_calls;
-                if let Some((((nodes, dependencies, producers, rpc_calls), calls), inproc)) =
-                    parsed!(|tree| {
+                if let Some((
+                    ((nodes, dependencies, producers, rpc_calls), calls),
+                    (inproc, brokers),
+                )) = parsed!(|tree| {
+                    (
                         (
-                            (
-                                java::JavaExtractor::extract_relations(
-                                    file_path, content, repo_id, tree,
-                                ),
-                                if with_calls {
-                                    java_calls::extract(tree, content.as_bytes())
-                                } else {
-                                    CallFacts::default()
-                                },
+                            java::JavaExtractor::extract_relations(
+                                file_path, content, repo_id, tree,
                             ),
+                            if with_calls {
+                                java_calls::extract(tree, content.as_bytes())
+                            } else {
+                                CallFacts::default()
+                            },
+                        ),
+                        (
                             inproc_java::scan(tree, content),
-                        )
-                    })
-                {
+                            jvm_brokers::scan(tree, content),
+                        ),
+                    )
+                }) {
                     out.calls = calls;
                     for (i, node) in nodes.iter().enumerate() {
                         if node.kind == NodeKind::KafkaTopic {
@@ -1049,7 +1065,10 @@ impl PolyglotIndexer {
                     // Spring application events and schedules, tagged `InProc` before the
                     // Kafka default below reaches them.
                     inproc_java::apply(inproc, &mut out);
-                    // Spring Kafka and `kafka-clients` are the only other brokers detected.
+                    // RabbitMQ, JMS, SQS / SNS, Redis, NATS and Pub/Sub (9.0 T8a), each under its
+                    // own broker.
+                    jvm_brokers::apply(brokers, &mut out);
+                    // Whatever is left is Spring Kafka or `kafka-clients`.
                     out.tag_brokers(Broker::Kafka);
                 }
             }
@@ -1773,6 +1792,7 @@ mod tests {
             sql_unresolved: 0,
             sql_capped: false,
             inproc_capped: false,
+            jvm_brokers_capped: false,
         };
         let before = format!("{index:?}");
         let anchored = index.relativize(&root_a).expect("all under root");

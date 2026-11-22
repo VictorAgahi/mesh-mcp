@@ -294,14 +294,13 @@ struct FlowIndex<'g> {
 }
 
 impl FlowIndex<'_> {
-    /// Whether linking `a` and `b` through the legacy same-file fallback would cross the
-    /// in-process boundary: one is known to be an in-process site (`Broker::InProc` only) and
-    /// the other is known to talk to another broker. A site whose broker is unknown links as
-    /// before.
-    fn crosses_inproc(&self, a: NodeId, b: NodeId) -> bool {
-        let inproc = Broker::InProc.bit();
+    /// Whether linking `a` and `b` through the legacy same-file fallback would cross a broker
+    /// boundary: both are known to talk to a broker and no broker is common to them (an
+    /// in-process event and a Kafka producer, a RabbitMQ listener and a JMS producer). A site
+    /// whose broker is unknown links as before, `heuristic`.
+    fn crosses_brokers(&self, a: NodeId, b: NodeId) -> bool {
         match (self.site_brokers.get(&a), self.site_brokers.get(&b)) {
-            (Some(&x), Some(&y)) => (x == inproc) != (y == inproc),
+            (Some(&x), Some(&y)) => x != 0 && y != 0 && x & y == 0,
             _ => false,
         }
     }
@@ -854,7 +853,9 @@ impl ContractGraph {
                 .get_nodes_for_file(&s.file_path)
                 .iter()
                 .filter(|id| {
-                    **id != s.id && idx.produces.contains_key(id) && !idx.crosses_inproc(s.id, **id)
+                    **id != s.id
+                        && idx.produces.contains_key(id)
+                        && !idx.crosses_brokers(s.id, **id)
                 })
                 .filter_map(|id| self.nodes.get(id))
                 .collect();
@@ -943,7 +944,9 @@ impl ContractGraph {
                 .get_nodes_for_file(&p.file_path)
                 .iter()
                 .filter(|id| {
-                    **id != p.id && idx.consumer_ids.contains(id) && !idx.crosses_inproc(p.id, **id)
+                    **id != p.id
+                        && idx.consumer_ids.contains(id)
+                        && !idx.crosses_brokers(p.id, **id)
                 })
                 .filter_map(|id| self.nodes.get(id))
                 .collect();

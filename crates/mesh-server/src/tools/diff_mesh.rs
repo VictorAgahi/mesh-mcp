@@ -1437,8 +1437,14 @@ fn render_impact<'g>(
         } else {
             "signature changed"
         };
+        // The channel is the broker's: `orders` removed from JMS is not `orders` of Kafka.
+        // Kafka, the historic default, keeps the unqualified heading.
+        let on = match lookup {
+            Lookup::Topic(_, _, Some(b)) if *b != Broker::Kafka => format!(" (on {})", b.slug()),
+            _ => String::new(),
+        };
         let mut item = format!(
-            "\n#### {} {what} — `{}`\n",
+            "\n#### {} {what}{on} — `{}`\n",
             clip_line(&ch.fact.describe()),
             r.display
         );
@@ -2417,6 +2423,28 @@ export class UserEvents {
             "{}",
             out.text
         );
+    }
+
+    /// 9.0 T8a: the impact heading of a removed site names its broker when it is not Kafka
+    /// (`orders` removed from JMS is not `orders` of Kafka); a Kafka site keeps the old heading.
+    #[test]
+    fn a_removed_site_of_another_broker_names_its_broker() {
+        const OUT: &str = "package p;\nimport org.springframework.jms.core.JmsTemplate;\npublic class Out {\n    private JmsTemplate jms;\n    void a() { jms.convertAndSend(\"orders\", \"x\"); }\n}\n";
+        let repo = base_repo();
+        repo.write("jms/Out.java", OUT);
+        repo.commit("jms producer");
+        repo.write("jms/Out.java", &OUT.replace("\"orders\"", "\"orders.v2\""));
+        let state = indexed_state(&repo.root);
+        let out = run_with(&args(None, None), &state, &repo.runner(), Limits::DEFAULT)
+            .expect("diff_mesh ok");
+        assert!(
+            out.text
+                .contains("produces topic `orders` removed (on jms)"),
+            "{}",
+            out.text
+        );
+        // The Kafka heading of the same shape is unchanged.
+        assert!(!out.text.contains("(on kafka)"), "{}", out.text);
     }
 
     #[test]

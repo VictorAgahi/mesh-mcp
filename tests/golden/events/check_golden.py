@@ -40,7 +40,7 @@ NEG_KINDS = {"producer", "consumer"}
 # Broker qualifiers of a topic key (mesh_core::Broker::slug; a Rust test keeps the two in sync).
 BROKER_SLUGS = (
     "kafka", "rabbitmq", "redis", "nats", "mqtt", "sqs", "sns", "kinesis", "eventbridge",
-    "pubsub", "pulsar", "servicebus", "eventhubs", "stomp", "bull", "beequeue", "inproc",
+    "pubsub", "pulsar", "servicebus", "eventhubs", "stomp", "bull", "beequeue", "inproc", "jms",
 )
 
 

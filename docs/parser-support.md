@@ -117,14 +117,17 @@ a convention, and a convention the table lacks is invisible.
 | Imports | `import` statements, for `find_dependents` |
 | gRPC | `*ImplBase` servers, `@GrpcService`, `newBlockingStub` / `newStub` / `newFutureStub` clients |
 | Events | `@KafkaListener` (consumers), `KafkaTemplate` (producers); a topic written `"${a.b}"` / `"${a.b:default}"`, or a field or parameter injected with `@Value("${a.b}")` and passed to `send`, is resolved against `application*.yml` / `.properties` and the other configuration files of section 3.6 |
+| Other brokers | RabbitMQ, JMS, SQS / SNS, Redis, NATS and Google Pub/Sub, each under its own broker key: [3.7](#37-jvm-brokers-in-java) |
 | In-process events | `@EventListener`, `@TransactionalEventListener`, `ApplicationListener<E>`, `publishEvent(new E(...))`, `@Scheduled`: [3.5](#35-in-process-buses-and-schedules) |
 | HTTP | Spring MVC mappings, JAX-RS annotations |
 
-**You will not get:** JMS, RabbitMQ, Spring Cloud Stream, Kafka Streams or SQS; Feign / RestTemplate /
-WebClient links to routes; WebFlux functional routes; a topic given as a constant or enum.
+**You will not get:** Spring Cloud Stream, Kafka Streams, ActiveMQ / Artemis native clients, Kinesis,
+EventBridge, Pulsar or Service Bus; Feign / RestTemplate / WebClient links to routes; WebFlux
+functional routes; a Kafka topic given as a constant or enum (the other brokers of 3.7 do read a
+constant of the same file).
 
-Stops: this extractor has no constant propagation (a topic built in code is not resolved; use
-Spring properties), and it reads only the Kafka and HTTP idioms named above. `@Value` is read by
+Stops: the Kafka extractor has no constant propagation (a topic built in code is not resolved; use
+Spring properties), and it reads only the Kafka, HTTP, in-process and 3.7 idioms named above. `@Value` is read by
 field or parameter name inside the declaring class (nested type declarations are not part of it;
 a parameter or local of the same name hides the field, `this.name` is the field); `@ConfigurationProperties` classes, SpEL
 (`#{...}`) and Spring's relaxed binding (`APP_TOPICS_ORDERS` for `app.topics.orders`) are not.
@@ -401,6 +404,92 @@ Not resolved: Spring relaxed binding, `@ConfigurationProperties`, Helm / Kustomi
 `env_file:` indirection, `docker-compose` `${VAR}` interpolation, a config object
 (`settings.KAFKA_TOPIC`, `config.kafka.topic`), NestJS `registerAs` factories, and any config file
 format other than the above (JSON, TOML, `.ini`).
+
+### 3.7 JVM brokers in Java
+
+Java reads the brokers below besides Kafka (9.0 T8a, tag `jvm_broker`). Each site is recorded under its
+own broker, so a queue named like a Kafka topic is another channel (`rabbitmq:orders`,
+`sqs:orders`, `jms:orders`; [architecture 3.4](architecture.md#34-broker-qualified-topic-keys)).
+`jms` is a broker key added by this ticket: the JMS API hides the provider (ActiveMQ, Artemis,
+IBM MQ), which no call site shows.
+
+| Broker | Consumers | Producers | Key of a site |
+| :--- | :--- | :--- | :--- |
+| `rabbitmq` | `@RabbitListener(queues = ...)`, `queuesToDeclare = @Queue(...)`, `bindings = @QueueBinding(...)` (on a method; at class level, with `@RabbitHandler` methods, the class is the consumer) | `RabbitTemplate` / `AmqpTemplate` / `RabbitMessagingTemplate` `convertAndSend`, `send`, `convertSendAndReceive` | the queue; for a binding its routing `key` (else its queue); for a producer the routing key of `(exchange, key, msg)`, or the queue of `(queue, msg)` |
+| `jms` | `@JmsListener(destination = ...)`, `JmsTemplate.receive` / `receiveAndConvert` | `JmsTemplate` / `JmsMessagingTemplate` `convertAndSend`, `send`, `sendAndReceive` | the destination name, or the literal of `new ActiveMQQueue("x")` / `new ActiveMQTopic("x")` |
+| `sqs` | `@SqsListener("q")` / `value` / `queueNames`, `SqsClient.receiveMessage` | `SqsTemplate.send` / `sendAsync`, `QueueMessagingTemplate`, `SqsClient.sendMessage` | the queue name, or the last segment of a queue URL |
+| `sns` | none (SNS delivers to a queue: not followed) | `SnsTemplate` / `NotificationMessagingTemplate`, `SnsClient.publish` | the topic name, or the last segment of a topic ARN |
+| `redis` | `RedisMessageListenerContainer.addMessageListener(l, topic)` with a `ChannelTopic` / `PatternTopic` | `RedisTemplate` / `StringRedisTemplate.convertAndSend` | the channel or pattern |
+| `nats` | `Connection` / `Dispatcher` / `JetStream` `.subscribe`, `createDispatcher(h).subscribe` | `.publish`, `.request`, `publish(NatsMessage.builder().subject("x")...)` | the subject (a `*` / `>` wildcard as written) |
+| `pubsub` | none | `PubSubTemplate.publish("topic", ...)` | the topic |
+
+What a name may be (nothing else is read, no name is guessed from an identifier):
+
+- a string literal, a `final` string field of the same file (`static final String Q = "q"`,
+  `Q`, `this.Q`, `Queues.Q` of a class declared in the file), a destination object of the file
+  (`new ChannelTopic("x")`, `ChannelTopic.of("x")`, a field or a no-argument method returning one,
+  then `.getTopic()`; the class must be imported from the library), or an `@Value("${a.b}")` field
+  or parameter. A placeholder is resolved against the configuration like a `@KafkaListener` topic
+  (section 3.6), with one difference: **its default is never taken as a name**. `${a.b:d}` is read as
+  `${a.b}`: the configuration resolves the key, or the site stays a visible `${a.b}` topic
+  (`heuristic`, counted in `config_topics_unresolved`). A default that merely looks like a topic
+  (`hunter2-prod`) may be a secret. The one-line signature of the node that holds the site has its
+  defaults removed too. (The `@KafkaListener` path of 3.6 keeps taking a plain default as a name; the
+  change would alter documented T6 behaviour and is a follow-up.)
+- a call is a site only when its receiver is a variable declared, in scope, with the client class
+  (`T x`, `var x = new T()`, `this.x` for the field), in a file that really imports it. The
+  imports are the `import` declarations of the parse tree (a commented-out or quoted import counts for
+  nothing): the class is imported by name from one of the library's packages, or by a wildcard of
+  one (`org.springframework.amqp.*`, `io.nats.client.*`), or written fully qualified
+  (`springframework.amqp`, `springframework.jms` / `jakarta.jms` / `javax.jms` /
+  `org.apache.activemq`, `awspring.cloud` / `software.amazon.awssdk` / `com.amazonaws`,
+  `springframework.data.redis`, `io.nats.client`, `com.google.cloud.spring.pubsub`; a wildcard is
+  trusted for any type name of the table). The nearest declaration wins: a parameter, a lambda
+  parameter, a local declared earlier in an enclosing block, a for / for-each / `try` / `catch`
+  variable, then the fields of the enclosing classes. A class of the file with the client's simple name
+  (a nested `RabbitTemplate`), or an import of that simple name from another package, makes it not the
+  library's. Listener annotations (`@RabbitListener`, `@JmsListener`, `@SqsListener`) follow the same
+  rule. A `convertAndSend` of any other class is not a site;
+- an AWS SDK request names its channel when the `queueUrl` / `topicArn` literal is inside the call or
+  inside the initializer of a local variable the call passes; a request built by another method is not
+  read;
+- a producer never publishes to a pattern: a key with `*`, `#` or `>` registers no producer (a
+  consumer may subscribe to one);
+- RabbitMQ sends: `(exchange, routingKey, message[, ...])` is keyed on the routing key,
+  `(routingKey, message[, postProcessor])` on its first argument. A three-argument call is told apart
+  by its last argument: a lambda, a method reference, a `new ...PostProcessor(...)` or a variable
+  declared with a type named `...PostProcessor` / `...CorrelationData` is the post-processor; a
+  variable declared with another type, a literal, a `new` or a call is the message; a variable the
+  file does not declare (an inherited field) leaves the call without a name.
+
+Producers and call-site consumers (NATS, Redis, `receive`, `receiveMessage`) are nodes on the call line;
+listener annotations sit on their method.
+
+Bounds: at most 2,000 sites per file (`MAX_JVM_BROKER_SITES_PER_FILE`) and 16,384 declared names; a
+file over a bound is counted in `IndexHealth::files_jvm_brokers_capped` and listed by `mesh-mcp doctor`
+(a warning). The walk is iterative, a search of one argument or initializer visits at most 256 nodes
+and a `getTopic()` chain is followed 4 links, so a hostile file costs a bounded pass whatever it nests.
+
+**You will not get:** Kotlin (its extractor is a separate, text-level grammar: not extended);
+exchange-to-queue wiring (a `convertAndSend(exchange, key, msg)` is keyed on the routing key, so a
+queue bound under another key, a fanout exchange, a topic-exchange `#` pattern or a queue declared as a
+`@Bean` never links); `@RabbitListener(queues = "#{...}")` SpEL; a constant, enum or `application.yml` value
+reached through another file's class; string concatenation; Redis streams (`opsForStream`) and
+`opsForList` queues; `redisTemplate.convertAndSend` with a `ChannelTopic` held only in another file;
+Kinesis, EventBridge and `SnsClient.publish` with a `PublishRequest` built by a helper method; Google
+Pub/Sub subscriptions (a subscription is not a topic name) and `Publisher.newBuilder(TopicName.of(...))`;
+SQS FIFO deduplication or message groups; JMS `Destination` beans and `JndiTemplate` lookups.
+A three-argument `convertAndSend(queue, "literal payload", processor)` whose `processor` is
+declared with a type not named `...PostProcessor` reads its payload as the routing key.
+
+Chains: the same-file fallback of `analyze_impact` / `trace_flow` (a handler that re-emits, with no call
+path to a publish) never links two sites that are each known to talk to a broker when they share none:
+a RabbitMQ listener does not "re-emit" to a Kafka or JMS producer of its file. A site whose broker is
+unknown links as before, `heuristic`. `diff_mesh` names the broker of a removed site that is not Kafka
+(`produces topic \`orders\` removed (on jms)`) and looks up its other side on that broker.
+
+Golden: `tests/golden/events/jvm-brokers.expected.yaml` (31 sites, 3 hops, 2 chains, shadowing and
+pattern decoys).
 
 ## 4. What every level shares
 
