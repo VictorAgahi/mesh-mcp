@@ -30,7 +30,7 @@ type checker behind any of them.
 | :--- | :---: | :--- |
 | TypeScript, JavaScript (and `.vue` / `.svelte` / `.astro` scripts) | 4 | [2.1](#21-typescript-and-javascript-level-4) |
 | Java | 3 | [2.2](#22-java-level-3) |
-| Go | 3- (Kafka only; no gRPC beyond `Register*`/`New*Client`) | [2.3](#23-go-level-3) |
+| Go | 3- (no gRPC beyond `Register*`/`New*Client`; brokers in [3.9](#39-go-brokers)) | [2.3](#23-go-level-3) |
 | Python | 3 | [2.4](#24-python-level-3) |
 | Rust | 3- (no gRPC clients) | [2.5](#25-rust-level-3) |
 | C++ | 3- (includes and gRPC servers only) | [2.6](#26-c-level-3-narrow) |
@@ -42,6 +42,7 @@ type checker behind any of them.
 | Markdown | docs | [3.3](#33-markdown) |
 | SQL (`.sql`, and the SQL strings of TypeScript / JavaScript, Go, Java, Python) | events only: outbox inserts, `NOTIFY` / `pg_notify`, `LISTEN` | [3.4](#34-sql) |
 | In-process buses and schedules (NestJS EventEmitter2 / CQRS / `@nestjs/schedule`, Spring application events / `@Scheduled`) | events and chain entries | [3.5](#35-in-process-buses-and-schedules) |
+| Go brokers (RabbitMQ, NATS, Redis, SQS / SNS, Pub/Sub) | events and chain entries | [3.9](#39-go-brokers) |
 
 ---
 
@@ -139,10 +140,10 @@ a parameter or local of the same name hides the field, `this.name` is the field)
 | Declarations | structs/types as classes, interfaces, funcs and methods |
 | Imports | import paths |
 | gRPC | `Register*Server` servers, `New*Client` clients (receivers `redis`, `http`, `mongo`, `s3`, `sqs`, `vault`, `elastic`, `sql`, `db`, `kafka`, `sarama` are excluded) |
-| Events | Kafka via `sarama`, `kafka-go`, `confluent-kafka-go`; string constants in the file are resolved |
+| Events | Kafka via `sarama`, `kafka-go`, `confluent-kafka-go`; string constants in the file are resolved. RabbitMQ, NATS, Redis, SQS / SNS and Pub/Sub, plus sarama consumer groups and franz-go, by receiver type: [3.9](#39-go-brokers) |
 | HTTP | any `.Get/.Post/...("/literal", handler)` call with two or more arguments, whatever the receiver (chi, gin, echo shapes); a non-router call of that shape also matches |
 
-Stops: no broker other than Kafka is read by the Go extractor; only the router-style route calls
+Stops: the brokers of 3.9 are the only ones read besides Kafka; only the router-style route calls
 above are read; constants are resolved within the file, not across packages.
 
 ### 2.4 Python (level 3)
@@ -561,6 +562,96 @@ method, so the calls layer sees no callable that publishes.
 Bounds, all counted (`IndexHealth::files_const_capped`, `doctor` warns; the member past a cap keeps its
 qualified key): at most 4,000 string constants and 512 enum-like imports per file, 249-byte values, no
 recursive walk.
+
+### 3.9 Go brokers
+
+Go reads the brokers below besides Kafka (9.0 T8b, tag `go_broker`). Each site is recorded under its
+own broker, so a queue named like a Kafka topic is another channel (`rabbitmq:orders`, `sqs:orders`;
+[architecture 3.4](architecture.md#34-broker-qualified-topic-keys)). The broker keys are the existing
+ones; the ticket adds none.
+
+| Broker | Library | Consumers | Producers | Key of a site |
+| :--- | :--- | :--- | :--- | :--- |
+| `rabbitmq` | `rabbitmq/amqp091-go`, `streadway/amqp` | `Channel.Consume`, `ConsumeWithContext`, `Get` | `Channel.Publish`, `PublishWithContext`, `PublishWithDeferredConfirm[WithContext]` | the queue; for a queue the file binds (`QueueBind(q.Name, key, exchange, ...)`) its routing key (the exchange when the key is empty); for a producer the routing key (the exchange when it is empty: a fanout publish) |
+| `nats` | `nats-io/nats.go`, `.../jetstream` | `Subscribe`, `QueueSubscribe`, `ChanSubscribe`, `ChanQueueSubscribe`, `SubscribeSync`, `QueueSubscribeSync`, `BindRecvChan` (connection); the same and `PullSubscribe` (`nats.JetStreamContext`) | `Publish`, `PublishMsg`, `Request`, `RequestMsg`, `PublishRequest`, `BindSendChan` (connection); `Publish`, `PublishAsync`, `PublishMsg[Async]` (both JetStream APIs) | the subject (a `*` / `>` wildcard as written, for a consumer) |
+| `redis` | `redis/go-redis` v9, `go-redis/redis` v6 to v9 | `Subscribe`, `PSubscribe`, `SSubscribe` on a client or a `*redis.PubSub` | `Publish`, `SPublish` | the channel or pattern |
+| `sqs` | `aws-sdk-go-v2/service/sqs`, `aws-sdk-go/service/sqs` | `ReceiveMessage[WithContext]` | `SendMessage[Batch][WithContext]` | the last segment of the `QueueUrl` of the request literal |
+| `sns` | `aws-sdk-go-v2/service/sns`, `aws-sdk-go/service/sns` | none | `Publish[Batch][WithContext]` | the last segment of the `TopicArn` of the request literal |
+| `pubsub` | `cloud.google.com/go/pubsub` (and `/v2`) | `Receive` of a subscription whose topic the file shows | `Topic("t").Publish`, a `*pubsub.Topic` holding it | the topic |
+| `kafka` | `sarama` (`IBM`, `Shopify`), `franz-go/pkg/kgo` | `ConsumerGroup.Consume(ctx, []string{"t"}, h)`, `kgo.ConsumeTopics("t")` | `kgo.Record{Topic: "t"}`, `kgo.DefaultProduceTopic("t")` | the topic |
+
+The Kafka row adds the two variants the Go extractor did not read; `kafka-go`, `sarama` producers and
+`confluent-kafka-go` are unchanged.
+
+What makes a call a site (nothing else is read):
+
+- the receiver is a variable, parameter, struct field (`p.ch` of `type P struct { ch *amqp.Channel }`,
+  through the receiver) or call result whose type the file shows to be the library's client: a declared
+  type (`ch *amqp.Channel`, `var nc *nats.Conn`), a constructor (`nats.Connect`, `redis.NewClient`,
+  `sqs.NewFromConfig`, `pubsub.NewClient`, `sarama.NewConsumerGroup`, `jetstream.New`), an accessor
+  (`conn.Channel()`, `nc.JetStream()`, `client.Topic("t")`, `client.Subscription("s")`), or a function or
+  method of the file with a declared result (`func connect() (*nats.Conn, error)`). The file must hold a
+  parsed `import` of the library (a commented-out or quoted import counts for nothing), under the package
+  name it gives (`amqp "github.com/rabbitmq/amqp091-go"`, the default `amqp091`, `redis` for any `/vN`);
+  `_` and `.` imports are not read. A local type of the same name, a package name hidden by a
+  parameter, a local, a range, `if` / `switch` / `select` or closure variable, and an import of another
+  library never make a client; the nearest declaration wins, a name declared after the call is not
+  seen. `type X = amqp.Channel` aliases are followed;
+- a name is a string literal, a `const` or `var` of the same file that nothing assigns again, a `+`
+  concatenation of those, `aws.String(x)` of one, the `Name` of a queue the file declared
+  (`q, _ := ch.QueueDeclare("hello", ...)` then `q.Name`), the `QueueUrl` / `TopicArn` of a
+  `GetQueueUrl` / `CreateQueue` / `CreateTopic` result the file asked for by name, the field of a
+  request literal (`&sqs.SendMessageInput{QueueUrl: ...}`, directly or through a local initialized with
+  one, `&nats.Msg{Subject: ...}`, `nats.NewMsg("s")`), or a configuration read, `os.Getenv("K")` /
+  `viper.GetString("k")`, which is the `${K}` placeholder of 3.6 resolved against the configuration.
+  **A default is never a name**: a literal that anything in the file assigns over (the
+  `if v := os.Getenv(...); v != "" { topic = v }` idiom) is not read, and a function that returns a
+  fallback is not followed; the site is simply not registered. A parameter, a call result, a
+  `fmt.Sprintf` and a name of another package register nothing;
+- a producer never publishes to a pattern: a key with `*`, `#` or `>` registers no producer; a
+  consumer may subscribe to one (a RabbitMQ `#` key is no name in the dot dialect the graph matches and
+  is dropped);
+- a Pub/Sub subscription is not a topic: `Receive` is a consumer of the topic only when the file creates
+  the subscription on it (`client.CreateSubscription(ctx, "id", pubsub.SubscriptionConfig{Topic: t})`
+  with `t` a topic of the file); a subscription opened by `client.Subscription("id")` alone registers
+  nothing;
+- a call this pass owns is not also read by the Kafka heuristics of the Go extractor, which read any
+  `Subscribe("x")` / `Produce(...)` of a file: a `Subscribe("orders")` of a NATS or Redis client is not a
+  Kafka consumer of `orders`, nor is the `Subscribe` of a method of a type the file declares and that
+  holds no broker client (`type Bus struct{}`). A call the 2,000-site cap would cut is not claimed
+  either, so the older reading keeps it. A struct of the file that holds a Kafka client
+  (`type Consumer struct{ r *kafka.Reader }`) keeps the older reading of its own `Subscribe("x")`: a
+  Kafka consumer. In a file that imports one of the new libraries, a Kafka-shaped call (`Subscribe`,
+  `Produce`, `WriteMessages`, ...) on a receiver that is not shown to be a Kafka client (an interface
+  parameter, a type of another library, a wrapper of a NATS connection) is still read, but with no
+  known broker, not as Kafka: it joins the channel of its name on every broker (`heuristic`), like a
+  SQL site. Outside such files nothing changed;
+
+Every site is a node on its call line, like the Java ones; its broker travels with the producer or
+consumer, so the same-file fallback of `trace_flow` / `analyze_impact` never links two sites that know
+different brokers (3.7). `diff_mesh` names the broker of a removed site that is not Kafka.
+
+Bounds: at most 2,000 sites per file (`MAX_GO_BROKER_SITES_PER_FILE`) and 16,384 declared names; a file
+over a bound is counted in `IndexHealth::files_go_brokers_capped` and listed by `mesh-mcp doctor` (a
+warning). Every walk is iterative, a type or name resolution follows at most 8 links (a constant chain: a plain alias `A1 = A0` costs one link per hop and resolves through 7 hops; a concatenation `X1 = X0 + "x"` costs two per hop and resolves through 3; a longer chain registers no site), and the scope
+tables are built once per scope, so a hostile file costs a bounded pass whatever it nests.
+
+**You will not get:** `redigo` (`conn.Do("PUBLISH", ...)`), `rueidis`, `nsq`, `asynq`, `machinery`, MQTT,
+Kinesis, EventBridge, Azure Service Bus; the new `jetstream` consumers (`stream.Consumer(...)`,
+`Consume`, which name a stream and a durable, not a subject); embedded fields (`type P struct{
+*amqp.Channel }`, `p.Publish(...)`); a receiver typed only by an interface of the file or passed through
+`any`; a client built by a function of another file or package; a name from another file or package
+(a `const` of a sibling file, `config.Orders`), a `switch` or a map lookup, a name built with
+`fmt.Sprintf`; a request struct built by a helper function or by field assignment
+(`in.QueueUrl = ...`); `PublishMsg` with a message built by a helper; RabbitMQ exchange-to-queue wiring
+other than a `QueueBind` literal of the same file (a topic-exchange `#` binding, a binding made by an
+admin script); SNS-to-SQS subscriptions; a Pub/Sub subscription whose topic is only named by an
+administrative tool or `pubsubpb`. A literal holding a *plain* default (`topic := "orders"` never
+reassigned) is read, since the file shows it.
+
+Golden: `tests/golden/events/go-brokers.expected.yaml` (27 sites, 4 hops, 3 chains; unrelated-method,
+log-line, parameter, `fmt.Sprintf`, pattern, overridden-default, shadowing, commented-import and
+test-file decoys).
 
 ## 4. What every level shares
 

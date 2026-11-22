@@ -225,6 +225,10 @@ pub struct IndexHealth {
     /// `files_scanned`.
     #[serde(default)]
     pub files_jvm_brokers_capped: usize,
+    /// Files where the per-file cap on Go broker sites (RabbitMQ, NATS, Redis, SQS / SNS, Pub/Sub)
+    /// dropped sites: the sites past the cap are not registered. Counted like `files_scanned`.
+    #[serde(default)]
+    pub files_go_brokers_capped: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -394,6 +398,18 @@ impl IndexHealth {
     #[inline]
     pub fn jvm_brokers_truncated(&self) -> bool {
         self.files_jvm_brokers_capped > 0
+    }
+
+    /// One file's Go broker site cap (`FileIndex::go_brokers_capped`).
+    #[inline]
+    pub fn record_go_brokers(&mut self, capped: bool) {
+        self.files_go_brokers_capped += usize::from(capped);
+    }
+
+    /// Whether the Go broker site cap dropped events: some broker sites of Go files are missing.
+    #[inline]
+    pub fn go_brokers_truncated(&self) -> bool {
+        self.files_go_brokers_capped > 0
     }
 
     /// Whether the in-process site cap dropped events: some bus sites or schedules are missing.
@@ -672,6 +688,15 @@ impl IndexHealth {
                 self.files_jvm_brokers_capped
             );
         }
+        if self.files_go_brokers_capped > 0 {
+            let _ = writeln!(
+                out,
+                "    {} file(s) cut by the Go broker site cap (Go RabbitMQ / NATS / Redis / SQS / SNS / \
+                 Pub/Sub; docs/parser-support.md, section 3.9): the sites past the cap are not \
+                 registered",
+                self.files_go_brokers_capped
+            );
+        }
         if self.sql_sites_unresolved > 0 {
             let _ = writeln!(
                 out,
@@ -763,6 +788,7 @@ impl IndexHealth {
         self.files_inproc_capped += other.files_inproc_capped;
         self.files_const_capped += other.files_const_capped;
         self.files_jvm_brokers_capped += other.files_jvm_brokers_capped;
+        self.files_go_brokers_capped += other.files_go_brokers_capped;
         self.files_skipped_non_source += other.files_skipped_non_source;
         // The calls-layer counters are the graph's, set after the reconcile.
     }

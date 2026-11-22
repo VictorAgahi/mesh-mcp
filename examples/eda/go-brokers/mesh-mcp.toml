@@ -1,0 +1,12 @@
+# Fixture: a Go service on RabbitMQ, NATS, Redis, SQS / SNS, Pub/Sub and kafka-go (9.0 T8b).
+[workspace]
+name = "go-brokers"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/vendor/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true
