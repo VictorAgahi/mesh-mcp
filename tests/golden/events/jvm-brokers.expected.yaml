@@ -1,0 +1,100 @@
+# Hand-annotated from the source of examples/eda/jvm-brokers. Never generated from tool output.
+# Java only: a Spring service on RabbitMQ, JMS, SQS / SNS, Redis, NATS and Pub/Sub (9.0 T8a).
+# The channel key of each site is the name the call site shows:
+#  - RabbitMQ: the queue of `@RabbitListener(queues = ...)`, the routing key of a
+#    `@QueueBinding` (else its queue), the routing key of `convertAndSend(exchange, key, msg)`
+#    or the queue of `convertAndSend(queue, msg)` (the default exchange);
+#  - SQS / SNS: the last segment of a queue URL or topic ARN, or the queue name;
+#  - JMS, Redis, NATS, Pub/Sub: the destination, channel, subject or topic.
+# `orders` is a RabbitMQ queue and an SQS queue, `audit.events` a RabbitMQ queue and a NATS
+# subject: two channels each, so `<broker>:<name>` (SCHEMA.md). Every other name is used on one
+# broker only and keeps its plain spelling.
+# `refunds.requested` is `app.queues.refunds` of src/main/resources/application.yml.
+# `ShipmentHandlers` listens at class level (`@RabbitListener` + `@RabbitHandler` methods): the
+# class is the one consumer of `shipments`.
+# Decoys.java holds no site: a `convertAndSend` of an unrelated class, a string in a log line, a
+# queue name that is a parameter, a destination that is a method result, a request built
+# elsewhere. src/test/... holds a real-looking `convertAndSend`: the scorer ignores test files.
+corpus: jvm-brokers
+root: examples/eda/jvm-brokers
+config: mesh-mcp.toml
+languages: [java]
+
+producers:
+  - {id: p1, topic: invoices.issued, file: src/main/java/com/acme/jvm/BillingService.java, line: 16, language: java, tags: [jvm_broker]}
+  - {id: p2, topic: refunds.requested, file: src/main/java/com/acme/jvm/RefundGateway.java, line: 21, language: java, tags: [jvm_broker, config_topic]}
+  - {id: p3, topic: shipments.ack, file: src/main/java/com/acme/jvm/ShipmentHandlers.java, line: 20, language: java, tags: [jvm_broker]}
+  - {id: p4, topic: mail.outbox, file: src/main/java/com/acme/jvm/MailService.java, line: 16, language: java, tags: [jvm_broker]}
+  - {id: p5, topic: legacy.queue, file: src/main/java/com/acme/jvm/LegacyOutbox.java, line: 18, language: java, tags: [jvm_broker]}
+  - {id: p6, topic: "sqs:orders", file: src/main/java/com/acme/jvm/OrderQueues.java, line: 19, language: java, tags: [jvm_broker, broker_key]}
+  - {id: p7, topic: order-events, file: src/main/java/com/acme/jvm/NotificationService.java, line: 17, language: java, tags: [jvm_broker, broker_key]}
+  - {id: p8, topic: payments, file: src/main/java/com/acme/jvm/PaymentsQueue.java, line: 18, language: java, tags: [jvm_broker]}
+  - {id: p9, topic: price.updates, file: src/main/java/com/acme/jvm/PriceFeed.java, line: 20, language: java, tags: [jvm_broker]}
+  - {id: p10, topic: alerts.fired, file: src/main/java/com/acme/jvm/PriceFeed.java, line: 24, language: java, tags: [jvm_broker]}
+  - {id: p11, topic: telemetry.cpu, file: src/main/java/com/acme/jvm/TelemetryBus.java, line: 17, language: java, tags: [jvm_broker]}
+  - {id: p12, topic: telemetry-events, file: src/main/java/com/acme/jvm/TelemetryExport.java, line: 16, language: java, tags: [jvm_broker]}
+
+consumers:
+  - {id: c1, topic: "rabbitmq:orders", file: src/main/java/com/acme/jvm/OrderRabbitListener.java, line: 15, language: java, tags: [jvm_broker, broker_key]}
+  - {id: c2, topic: invoices.issued, file: src/main/java/com/acme/jvm/InvoiceMailListener.java, line: 18, language: java, tags: [jvm_broker]}
+  - {id: c3, topic: mail.outbox, file: src/main/java/com/acme/jvm/MailOutboxListener.java, line: 9, language: java, tags: [jvm_broker]}
+  - {id: c4, topic: "rabbitmq:audit.events", file: src/main/java/com/acme/jvm/AuditListener.java, line: 11, language: java, tags: [jvm_broker, broker_key]}
+  - {id: c5, topic: shipments, file: src/main/java/com/acme/jvm/ShipmentHandlers.java, line: 9, language: java, tags: [jvm_broker]}
+  - {id: c6, topic: refunds.requested, file: src/main/java/com/acme/jvm/RefundGateway.java, line: 24, language: java, tags: [jvm_broker, config_topic]}
+  - {id: c7, topic: legacy.queue, file: src/main/java/com/acme/jvm/LegacyOutbox.java, line: 22, language: java, tags: [jvm_broker]}
+  - {id: c8, topic: "sqs:orders", file: src/main/java/com/acme/jvm/OrderQueues.java, line: 22, language: java, tags: [jvm_broker, broker_key]}
+  - {id: c9, topic: payments, file: src/main/java/com/acme/jvm/PaymentsQueue.java, line: 22, language: java, tags: [jvm_broker]}
+  - {id: c10, topic: price.updates, file: src/main/java/com/acme/jvm/PriceFeed.java, line: 28, language: java, tags: [jvm_broker]}
+  - {id: c11, topic: "metrics.*", file: src/main/java/com/acme/jvm/PriceFeed.java, line: 29, language: java, tags: [jvm_broker]}
+  - {id: c12, topic: telemetry.cpu, file: src/main/java/com/acme/jvm/TelemetryBus.java, line: 22, language: java, tags: [jvm_broker]}
+  - {id: c13, topic: "nats:audit.events", file: src/main/java/com/acme/jvm/TelemetryBus.java, line: 23, language: java, tags: [jvm_broker, broker_key]}
+
+hops:
+  - id: h1
+    from: {symbol: OrderRabbitListener.onOrder, file: src/main/java/com/acme/jvm/OrderRabbitListener.java, line: 17}
+    to: {symbol: BillingService.charge, file: src/main/java/com/acme/jvm/BillingService.java, line: 15}
+    via: injected_field
+    tags: [layered_calls, jvm_broker]
+  - id: h2
+    from: {symbol: InvoiceMailListener.onInvoice, file: src/main/java/com/acme/jvm/InvoiceMailListener.java, line: 20}
+    to: {symbol: MailService.send, file: src/main/java/com/acme/jvm/MailService.java, line: 15}
+    via: injected_field
+    tags: [layered_calls, jvm_broker]
+  - id: h3
+    from: {symbol: OrderQueues.onQueued, file: src/main/java/com/acme/jvm/OrderQueues.java, line: 24}
+    to: {symbol: NotificationService.announce, file: src/main/java/com/acme/jvm/NotificationService.java, line: 16}
+    via: injected_field
+    tags: [layered_calls, jvm_broker]
+
+chains:
+  # RabbitMQ `orders` -> billing -> routing key `invoices.issued` -> mail -> JMS `mail.outbox`.
+  # It must not start from the SQS `orders` producer.
+  - id: ch1
+    entry: {kind: topic, value: "rabbitmq:orders"}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/main/java/com/acme/jvm/OrderRabbitListener.java, line: 15, topic: "rabbitmq:orders"}
+      - {kind: call, file: src/main/java/com/acme/jvm/BillingService.java, line: 15}
+      - {kind: produce, file: src/main/java/com/acme/jvm/BillingService.java, line: 16, topic: invoices.issued}
+      - {kind: consume, file: src/main/java/com/acme/jvm/InvoiceMailListener.java, line: 18, topic: invoices.issued}
+      - {kind: call, file: src/main/java/com/acme/jvm/MailService.java, line: 15}
+      - {kind: produce, file: src/main/java/com/acme/jvm/MailService.java, line: 16, topic: mail.outbox}
+      - {kind: consume, file: src/main/java/com/acme/jvm/MailOutboxListener.java, line: 9, topic: mail.outbox}
+    tags: [layered_calls, jvm_broker, broker_key]
+    min_hops: 2
+  # SQS `orders` -> notification -> SNS `order-events`.
+  - id: ch2
+    entry: {kind: topic, value: "sqs:orders"}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/main/java/com/acme/jvm/OrderQueues.java, line: 22, topic: "sqs:orders"}
+      - {kind: call, file: src/main/java/com/acme/jvm/NotificationService.java, line: 16}
+      - {kind: produce, file: src/main/java/com/acme/jvm/NotificationService.java, line: 17, topic: order-events}
+    tags: [layered_calls, jvm_broker, broker_key]
+    min_hops: 1
+
+negatives:
+  - {kind: producer, file: src/main/java/com/acme/jvm/Decoys.java, line: 34, note: "convertAndSend of an unrelated LegacyBridge"}
+  - {kind: producer, file: src/main/java/com/acme/jvm/Decoys.java, line: 36, note: "queue name is a parameter"}
+  - {kind: producer, file: src/main/java/com/acme/jvm/Decoys.java, line: 37, note: "destination is a method result"}
+  - {kind: producer, file: src/main/java/com/acme/jvm/Decoys.java, line: 38, note: "request built elsewhere, no literal topic ARN"}
