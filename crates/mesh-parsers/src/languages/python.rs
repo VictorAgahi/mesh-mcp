@@ -1,4 +1,5 @@
-use mesh_core::{CompactStr, ContractNode, FilePath, NodeKind, RepoId};
+use super::py_brokers::{self, Claim};
+use mesh_core::{Broker, CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -40,6 +41,20 @@ pub struct PythonRelations {
     /// `find_dependents`/`analyze_grpc` even when the service it called was
     /// indexed correctly on the server side.
     pub rpc_calls: Vec<(usize, CompactStr)>,
+    /// The broker a `producers` / `consumers` entry is statically known to talk to (the Kafka
+    /// calls whose receiver is bound to a Kafka client; the rest is not known).
+    pub producer_brokers: Vec<(usize, Broker)>,
+    pub consumer_brokers: Vec<(usize, Broker)>,
+    /// RabbitMQ, Redis, NATS, SQS / SNS, Pub/Sub and the Kafka gaps (9.0 T8c), registered by
+    /// `py_brokers::apply` once the nodes are in the file index.
+    pub(crate) brokers: py_brokers::Scan,
+}
+
+/// The broker of the producers / consumers the shape-based reader registered on a claimed call.
+#[derive(Default)]
+struct BrokerTags {
+    producers: Vec<(usize, Broker)>,
+    consumers: Vec<(usize, Broker)>,
 }
 
 pub struct PythonExtractor;
@@ -81,6 +96,8 @@ impl PythonExtractor {
         let package_name = mesh_core::detect_service_package(&file_path, None);
 
         let mut module_idx: Option<usize> = None;
+        let brokers = py_brokers::scan(tree, content);
+        let mut tags = BrokerTags::default();
         Self::visit_node(
             root,
             source_bytes,
@@ -95,8 +112,13 @@ impl PythonExtractor {
             &mut relations.consumers,
             &mut relations.rpc_calls,
             &mut module_idx,
+            &brokers,
+            &mut tags,
             0,
         );
+        relations.producer_brokers = tags.producers;
+        relations.consumer_brokers = tags.consumers;
+        relations.brokers = brokers;
 
         if nodes.is_empty() && !content.trim().is_empty() {
             let stem = file_path
@@ -137,6 +159,8 @@ impl PythonExtractor {
         consumers: &mut Vec<(usize, CompactStr)>,
         rpc_calls: &mut Vec<(usize, CompactStr)>,
         module_idx: &mut Option<usize>,
+        brokers: &py_brokers::Scan,
+        tags: &mut BrokerTags,
         depth: usize,
     ) {
         if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH {
@@ -288,7 +312,17 @@ impl PythonExtractor {
             "call" => {
                 let idx = enclosing.unwrap_or(0);
                 if !nodes.is_empty() {
-                    Self::detect_event_call(node, source, idx, producers, consumers, root);
+                    let claim = brokers.claim(node);
+                    let (p0, c0) = (producers.len(), consumers.len());
+                    // A call `py_brokers` reads (another broker) or knows is no producer (a
+                    // class of this file) is not the shape-based Kafka reader's.
+                    if matches!(claim, None | Some(Claim::Broker(Broker::Kafka))) {
+                        Self::detect_event_call(node, source, idx, producers, consumers, root);
+                    }
+                    if let Some(Claim::Broker(b)) = claim {
+                        tags.producers.extend((p0..producers.len()).map(|i| (i, b)));
+                        tags.consumers.extend((c0..consumers.len()).map(|i| (i, b)));
+                    }
                 }
                 // Deliberately NOT gated by `!nodes.is_empty()` like the event
                 // detection above: a gRPC client is very often wired up at
@@ -327,6 +361,8 @@ impl PythonExtractor {
                 consumers,
                 rpc_calls,
                 module_idx,
+                brokers,
+                tags,
                 depth + 1,
             );
         }
@@ -749,7 +785,7 @@ impl PythonExtractor {
     /// `os.environ["KEY"]`, `os.environ.get("KEY"[, "def"])`, `os.getenv("KEY"[, "def"])`
     /// as the `${KEY}` placeholder the configuration files resolve; anything else is not a
     /// config read.
-    fn config_value(node: Node, source: &[u8]) -> Option<String> {
+    pub(super) fn config_value(node: Node, source: &[u8]) -> Option<String> {
         let string_arg =
             |n: Node| (n.kind() == "string").then(|| Self::string_literal_value(n, source))?;
         match node.kind() {

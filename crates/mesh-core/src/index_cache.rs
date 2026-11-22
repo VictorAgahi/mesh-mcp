@@ -132,7 +132,10 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v23: Go brokers (9.0 T8b, after the T14 review's 22): RabbitMQ, NATS, Redis, SQS / SNS and
 /// Pub/Sub producers and consumers in Go (`EventStream` call-site nodes),
 /// `FileIndex::go_brokers_capped`.
-const SCHEMA_VERSION: u8 = 23;
+/// v24: Python brokers (9.0 T8c, after T8b's 23): RabbitMQ, Redis, NATS, SQS / SNS, Pub/Sub and
+/// Kafka-gap producers and consumers (`EventStream` call-site nodes), the broker of the Kafka calls
+/// whose client is bound in the file, `FileIndex::py_brokers_capped`.
+const SCHEMA_VERSION: u8 = 24;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

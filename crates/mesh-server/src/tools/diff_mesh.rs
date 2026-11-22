@@ -2467,6 +2467,25 @@ export class UserEvents {
         assert!(!out.text.contains("(on kafka)"), "{}", out.text);
     }
 
+    /// 9.0 T8c: the same heading for a Python site (`orders` removed from Redis).
+    #[test]
+    fn a_removed_python_site_of_another_broker_names_its_broker() {
+        const OUT: &str = "import redis\nr = redis.Redis()\n\n\ndef announce():\n    r.publish(\"orders\", \"x\")\n";
+        let repo = base_repo();
+        repo.write("py/out.py", OUT);
+        repo.commit("redis producer");
+        repo.write("py/out.py", &OUT.replace("\"orders\"", "\"orders.v2\""));
+        let state = indexed_state(&repo.root);
+        let out = run_with(&args(None, None), &state, &repo.runner(), Limits::DEFAULT)
+            .expect("diff_mesh ok");
+        assert!(
+            out.text
+                .contains("produces topic `orders` removed (on redis)"),
+            "{}",
+            out.text
+        );
+    }
+
     #[test]
     fn scope_restricts_the_diff_and_an_outside_scope_is_refused() {
         let repo = changed_repo();

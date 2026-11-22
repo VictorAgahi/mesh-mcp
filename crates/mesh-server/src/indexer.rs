@@ -700,6 +700,7 @@ impl WorkspaceIndexer {
             health.record_inproc(frag.code.inproc_capped);
             health.record_const(frag.code.const_capped);
             health.record_jvm_brokers(frag.code.jvm_brokers_capped);
+            health.record_py_brokers(frag.code.py_brokers_capped);
             health.record_go_brokers(frag.code.go_brokers_capped);
             if frag.code.calls.capped {
                 tracing::warn!(
@@ -2451,6 +2452,39 @@ import \"github.com/nats-io/nats.go\"\nfunc Hostile(nc *nats.Conn) {\n",
             assert!(snap.health.go_brokers_truncated(), "{pass}");
             let summary = snap.health.render_summary(5);
             assert!(summary.contains("Go broker site cap"), "{summary}");
+            prints.push(snap.fingerprint());
+        }
+        assert_eq!(prints[0], prints[1]);
+    }
+
+    /// The Python broker site cap (9.0 T8c) is counted, listed by the summary and survives the
+    /// parse cache; a file under the cap is not counted.
+    #[test]
+    fn py_broker_site_cap_reaches_index_health_and_survives_the_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let mut hostile = String::from("import redis\nr = redis.Redis()\n");
+        for i in 0..2_100 {
+            hostile.push_str(&format!("def m{i}():\n    r.publish(\"q{i}\", 1)\n"));
+        }
+        std::fs::write(root.join("hostile.py"), hostile).expect("write hostile");
+        std::fs::write(
+            root.join("ok.py"),
+            "import redis\nr = redis.Redis()\nr.publish(\"q\", 1)\n",
+        )
+        .expect("write ok");
+        let config =
+            Config::load_from_str("[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n")
+                .expect("config");
+        let roots = vec![root.clone()];
+        let cache = mesh_core::PersistentIndexCache::in_memory().expect("cache");
+        let mut prints = Vec::new();
+        for pass in ["cold", "warm"] {
+            let snap = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
+            assert_eq!(snap.health.files_py_brokers_capped, 1, "{pass}");
+            assert!(snap.health.py_brokers_truncated(), "{pass}");
+            let summary = snap.health.render_summary(5);
+            assert!(summary.contains("Python broker site cap"), "{summary}");
             prints.push(snap.fingerprint());
         }
         assert_eq!(prints[0], prints[1]);
