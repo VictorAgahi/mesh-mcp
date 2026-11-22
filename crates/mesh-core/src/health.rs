@@ -219,6 +219,11 @@ pub struct IndexHealth {
     /// qualified member key, `heuristic`. Distinct member paths, set after every fold.
     #[serde(default)]
     pub const_members_conflicting: usize,
+    /// Files where the per-file cap on JVM broker sites (Java RabbitMQ, JMS, SQS / SNS, Redis,
+    /// NATS, Pub/Sub) dropped sites: the sites past the cap are not registered. Counted like
+    /// `files_scanned`.
+    #[serde(default)]
+    pub files_jvm_brokers_capped: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -376,6 +381,18 @@ impl IndexHealth {
     #[inline]
     pub fn const_degraded(&self) -> bool {
         self.files_const_capped > 0 || self.const_members_conflicting > 0
+    }
+
+    /// One file's JVM broker site cap (`FileIndex::jvm_brokers_capped`).
+    #[inline]
+    pub fn record_jvm_brokers(&mut self, capped: bool) {
+        self.files_jvm_brokers_capped += usize::from(capped);
+    }
+
+    /// Whether the JVM broker site cap dropped events: some broker sites of Java files are missing.
+    #[inline]
+    pub fn jvm_brokers_truncated(&self) -> bool {
+        self.files_jvm_brokers_capped > 0
     }
 
     /// Whether the in-process site cap dropped events: some bus sites or schedules are missing.
@@ -631,8 +648,8 @@ impl IndexHealth {
             let _ = writeln!(
                 out,
                 "    {} file(s) with more string constants than the per-file cap (enum members, \
-                 `as const` keys; docs/parser-support.md, section 3.7): a queue or stream named by a \
-                 member past the cap keeps the member's own name instead of its value",
+                 `as const` keys; docs/parser-support.md, section 3.8): a queue named by a member past \
+                 the cap keeps its qualified member key instead of its value",
                 self.files_const_capped
             );
         }
@@ -640,9 +657,18 @@ impl IndexHealth {
             let _ = writeln!(
                 out,
                 "    {} enum member(s) declared with different values in different files \
-                 (docs/parser-support.md, section 3.7): a queue site that cannot tell which \
+                 (docs/parser-support.md, section 3.8): a queue site that cannot tell which \
                  declaration it imports resolves to neither and keeps its qualified member key",
                 self.const_members_conflicting
+            );
+        }
+        if self.files_jvm_brokers_capped > 0 {
+            let _ = writeln!(
+                out,
+                "    {} file(s) cut by the JVM broker site cap (Java RabbitMQ / JMS / SQS / SNS / Redis / \
+                 NATS / Pub/Sub; docs/parser-support.md, section 3.7): the sites past the cap are not \
+                 registered",
+                self.files_jvm_brokers_capped
             );
         }
         if self.sql_sites_unresolved > 0 {
@@ -735,6 +761,7 @@ impl IndexHealth {
         self.files_config_lossy += other.files_config_lossy;
         self.files_inproc_capped += other.files_inproc_capped;
         self.files_const_capped += other.files_const_capped;
+        self.files_jvm_brokers_capped += other.files_jvm_brokers_capped;
         self.files_skipped_non_source += other.files_skipped_non_source;
         // The calls-layer counters are the graph's, set after the reconcile.
     }
