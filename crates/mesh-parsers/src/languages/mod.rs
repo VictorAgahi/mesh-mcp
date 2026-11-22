@@ -2,6 +2,7 @@ mod call_support;
 pub mod cpp;
 pub mod csharp;
 pub mod go;
+mod go_brokers;
 mod go_calls;
 mod inproc_java;
 pub mod java;
@@ -253,6 +254,11 @@ pub struct FileIndex {
     /// `IndexHealth::files_jvm_brokers_capped`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub jvm_brokers_capped: bool,
+    /// The per-file cap on Go broker sites (`MAX_GO_BROKER_SITES_PER_FILE`: RabbitMQ, NATS, Redis,
+    /// SQS / SNS, Pub/Sub in Go) cut sites of this file: counted in
+    /// `IndexHealth::files_go_brokers_capped`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub go_brokers_capped: bool,
 }
 
 /// A producer or consumer whose topic is an enum member reference.
@@ -330,6 +336,7 @@ impl FileIndex {
         self.inproc_capped |= other.inproc_capped;
         self.const_capped |= other.const_capped;
         self.jvm_brokers_capped |= other.jvm_brokers_capped;
+        self.go_brokers_capped |= other.go_brokers_capped;
     }
 
     /// Inserts the extracted nodes and relations into `graph`. A `${key}` topic is resolved
@@ -875,6 +882,11 @@ pub const MAX_INPROC_SITES_PER_FILE: usize = 2_000;
 /// in `IndexHealth::files_jvm_brokers_capped` (never silent).
 pub const MAX_JVM_BROKER_SITES_PER_FILE: usize = 2_000;
 
+/// Most Go broker sites (RabbitMQ, NATS, Redis, SQS / SNS and Pub/Sub producers and consumers)
+/// one file registers; the rest are dropped and the file is counted in
+/// `IndexHealth::files_go_brokers_capped` (never silent).
+pub const MAX_GO_BROKER_SITES_PER_FILE: usize = 2_000;
+
 pub struct PolyglotIndexer;
 
 impl PolyglotIndexer {
@@ -1280,14 +1292,26 @@ impl PolyglotIndexer {
             LanguageKind::Go => {
                 let with_calls = Self::wants_call_facts(cfg, file_path);
                 out.calls_skipped_path = !with_calls;
-                if let Some(((nodes, relations), calls)) = parsed!(|tree| {
+                if let Some((((nodes, relations), calls), brokers)) = parsed!(|tree| {
+                    // The other brokers first: their calls are not Kafka for the heuristics of
+                    // the Go extractor.
+                    let brokers = go_brokers::scan(tree, content);
                     (
-                        go::GoExtractor::extract_with_relations(file_path, content, repo_id, tree),
-                        if with_calls {
-                            go_calls::extract(tree, content.as_bytes())
-                        } else {
-                            CallFacts::default()
-                        },
+                        (
+                            go::GoExtractor::extract_claiming(
+                                file_path,
+                                content,
+                                repo_id,
+                                tree,
+                                &brokers.claimed,
+                            ),
+                            if with_calls {
+                                go_calls::extract(tree, content.as_bytes())
+                            } else {
+                                CallFacts::default()
+                            },
+                        ),
+                        brokers,
                     )
                 }) {
                     out.calls = calls;
@@ -1296,7 +1320,10 @@ impl PolyglotIndexer {
                     out.producers = relations.producers;
                     out.consumers = relations.consumers;
                     out.rpc_calls = relations.rpc_calls;
-                    // kafka-go, sarama and confluent-kafka-go are the only brokers detected.
+                    // RabbitMQ, NATS, Redis, SQS / SNS and Pub/Sub (9.0 T8b), each under its own
+                    // broker.
+                    go_brokers::apply(brokers, &mut out);
+                    // Whatever is left is kafka-go, sarama or confluent-kafka-go.
                     out.tag_brokers(Broker::Kafka);
                 }
             }
@@ -2035,6 +2062,7 @@ mod tests {
             member_imports: Vec::new(),
             member_sites: Vec::new(),
             jvm_brokers_capped: false,
+            go_brokers_capped: false,
         };
         let before = format!("{index:?}");
         let anchored = index.relativize(&root_a).expect("all under root");

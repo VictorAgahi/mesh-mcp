@@ -118,7 +118,8 @@ impl DoctorCommand {
             )
         } else if (health.sql_truncated()
             || health.inproc_truncated()
-            || health.jvm_brokers_truncated())
+            || health.jvm_brokers_truncated()
+            || health.go_brokers_truncated())
             && health.rejected.is_empty()
             && health.rejected_overflow == 0
         {

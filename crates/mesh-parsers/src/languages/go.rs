@@ -37,6 +37,9 @@ struct RawImport {
 /// in a `ReaderConfig`/`WriterConfig`-shaped struct literal, or from a
 /// `ReadMessage`/`WriteMessages`-shaped call with no literal topic in scope.
 struct RawEvent {
+    /// Start byte of the call it was read from (none for a struct literal): a call another
+    /// broker pass owns is dropped.
+    call_start: Option<usize>,
     line_start: usize,
     line_end: usize,
     topic: CompactStr,
@@ -78,6 +81,18 @@ impl GoExtractor {
         repo_id: RepoId,
         tree: &Tree,
     ) -> (Vec<ContractNode>, GoRelations) {
+        Self::extract_claiming(file_path, content, repo_id, tree, &HashSet::new())
+    }
+
+    /// [`Self::extract_with_relations`] without the Kafka readings of the calls that start at
+    /// one of `claimed` (a `Subscribe("x")` of a NATS or Redis client is not a Kafka consumer).
+    pub(crate) fn extract_claiming(
+        file_path: &Path,
+        content: &str,
+        repo_id: RepoId,
+        tree: &Tree,
+        claimed: &HashSet<usize>,
+    ) -> (Vec<ContractNode>, GoRelations) {
         let file_path: FilePath = Arc::from(file_path);
         let mut nodes = Vec::new();
         let mut relations = GoRelations::default();
@@ -116,6 +131,7 @@ impl GoExtractor {
             0,
         );
 
+        raw_events.retain(|e| e.call_start.is_none_or(|s| !claimed.contains(&s)));
         Self::resolve_dependencies(content, &nodes, &raw_imports, &mut relations.dependencies);
         Self::resolve_events(
             &mut nodes,
@@ -506,6 +522,7 @@ impl GoExtractor {
             let line_end = node.end_position().row + 1;
             for lit in literals {
                 raw_events.push(RawEvent {
+                    call_start: Some(node.start_byte()),
                     line_start,
                     line_end,
                     topic: CompactStr::new(lit.as_str()),
@@ -536,6 +553,7 @@ impl GoExtractor {
             return;
         };
         raw_events.push(RawEvent {
+            call_start: None,
             line_start: node.start_position().row + 1,
             line_end: node.end_position().row + 1,
             topic,
