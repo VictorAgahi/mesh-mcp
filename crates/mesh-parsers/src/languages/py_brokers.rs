@@ -1179,6 +1179,7 @@ fn finish(key: String) -> Option<String> {
 }
 
 struct Out {
+    overflow: bool,
     sites: Vec<Site>,
     claims: HashMap<(usize, usize), Claim>,
 }
@@ -1201,9 +1202,11 @@ impl<'t> Ctx<'t> {
         if producer && is_pattern(&key) {
             return;
         }
-        // One past the cap is kept to tell "capped" from "exactly full"; the walk goes on so every
-        // call this pass recognises stays claimed.
-        if out.sites.len() > MAX_PY_BROKER_SITES_PER_FILE {
+        // Past the cap the site is not registered and its call is not claimed either: the
+        // generic reader keeps reading it (the file is counted as capped).
+        if out.sites.len() >= MAX_PY_BROKER_SITES_PER_FILE {
+            out.overflow = true;
+            out.claims.remove(&(call.start_byte(), call.end_byte()));
             return;
         }
         out.sites.push(Site {
@@ -1476,6 +1479,7 @@ pub(crate) fn scan(tree: &Tree, content: &str) -> Scan {
     }
     let mut ctx = Ctx::new(content.as_bytes());
     let mut out = Out {
+        overflow: false,
         sites: Vec::new(),
         claims: HashMap::new(),
     };
@@ -1497,7 +1501,7 @@ pub(crate) fn scan(tree: &Tree, content: &str) -> Scan {
             }
         }
     }
-    let capped = out.sites.len() > MAX_PY_BROKER_SITES_PER_FILE || ctx.capped || ctx.over;
+    let capped = out.overflow || ctx.capped || ctx.over;
     out.sites.truncate(MAX_PY_BROKER_SITES_PER_FILE);
     Scan {
         sites: out.sites,

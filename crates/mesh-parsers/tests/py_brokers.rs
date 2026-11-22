@@ -667,15 +667,25 @@ fn a_file_past_the_site_cap_is_cut_and_flagged_never_silently() {
     }
     let fi = extract(&code);
     assert!(fi.py_brokers_capped);
-    assert_eq!(fi.producers.len(), MAX_PY_BROKER_SITES_PER_FILE);
+    // The first sites in source order are registered under their broker; the calls past the cap
+    // are not claimed, so the generic reader still reads them (no broker): no edge is lost.
+    let tagged = sites(&fi).iter().filter(|(_, b, _)| b == "redis").count();
+    assert_eq!(tagged, MAX_PY_BROKER_SITES_PER_FILE);
+    assert_eq!(fi.producers.len(), MAX_PY_BROKER_SITES_PER_FILE + 50);
     assert!(sites(&fi).contains(&s('P', "redis", "q0")));
+    let last = format!("q{}", MAX_PY_BROKER_SITES_PER_FILE + 49);
+    assert!(sites(&fi).contains(&s('P', "?", &last)));
 
     let small = extract("import redis\nr = redis.Redis()\nr.publish(\"q\", 1)\n");
     assert!(!small.py_brokers_capped);
 }
 
-/// The hostile shapes of the ticket: 4000 defs and 3000 nested brackets / lambdas, read on a
-/// 2 MB stack (the size of a Rayon worker thread's stack here). Nothing recurses on the nesting.
+/// The hostile shapes of the ticket, read on a 2 MB stack (the size of a Rayon worker thread's
+/// stack here). Honest scope: the 4000-def file reaches `py_brokers` through indexing and its cap
+/// and counter are asserted; the 3000 nested brackets / lambdas, the 50 000-link attribute chain
+/// and 300 kB literals are rejected or flattened by the lexical guards (1024-byte lines, nesting)
+/// before the broker pass, so they only prove that `PolyglotIndexer::extract` does not overflow;
+/// the deep-chain bound itself is covered by the `MAX_QUAL_DEPTH` / `MAX_EVAL_DEPTH` toggle run.
 #[test]
 fn hostile_files_cost_a_bounded_walk_on_a_small_stack() {
     let defs = {
@@ -713,7 +723,13 @@ fn hostile_files_cost_a_bounded_walk_on_a_small_stack() {
             for code in [&defs, &brackets, &lambdas, &attrs] {
                 // The lexical guard may reject the file outright; either way no overflow.
                 let fi = PolyglotIndexer::extract(Path::new("src/svc/app.py"), code, 0);
-                assert!(fi.producers.len() <= MAX_PY_BROKER_SITES_PER_FILE + 4000);
+                assert!(fi.producers.len() <= 4000);
+                if code.starts_with("import redis\nr = redis.Redis()\ndef m0") {
+                    assert!(fi.py_brokers_capped);
+                    let tagged = sites(&fi).iter().filter(|(_, b, _)| b == "redis").count();
+                    assert_eq!(tagged, MAX_PY_BROKER_SITES_PER_FILE);
+                    assert_eq!(fi.producers.len(), 4000);
+                }
             }
         })
         .unwrap();
