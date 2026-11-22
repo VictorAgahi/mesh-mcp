@@ -280,9 +280,33 @@ fn walk<'t>(root: Node<'t>, mut visit: impl FnMut(Node<'t>) -> bool) {
     }
 }
 
-/// A string usable as a channel name: non-empty, bounded, no whitespace.
+/// A string usable as a channel name. The gate is the workspace's one (commandment 5,
+/// `mesh_core::member_consts::constant_is_a_name`, the T14 rule): a plain name, not a URL, a
+/// token, `Bearer_...`, a password-shaped word nor a random-looking run. A `*` / `>` wildcard is a
+/// name character here; a configuration placeholder (`${KEY}`, built by `config_ref`) stands for
+/// itself and the rest of the key must still be a name.
 fn usable_name(s: &str) -> bool {
-    !s.is_empty() && s.len() <= MAX_NAME_LEN && !s.chars().any(char::is_whitespace)
+    if s.is_empty() || s.len() > MAX_NAME_LEN || s.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let mut plain = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        plain.push_str(&rest[..start]);
+        let Some(len) = rest[start..].find('}') else {
+            return false;
+        };
+        plain.push('x');
+        rest = &rest[start + len + 1..];
+    }
+    plain.push_str(rest);
+    mesh_core::member_consts::constant_is_a_name("", &plain.replace('>', "*"))
+}
+
+/// Whether a constant or variable may give a name: not named like a credential (`apiKey`,
+/// `DB_PASSWORD`). Asks the shared gate with a value that is a name.
+fn member_may_name(id: &str) -> bool {
+    mesh_core::member_consts::constant_is_a_name(id, "q")
 }
 
 /// Whether a key is a pattern (`orders.*`, `orders.>`, `orders.#`): a consumer may subscribe to
@@ -291,12 +315,14 @@ fn is_pattern(key: &str) -> bool {
     key.contains(['*', '#', '>'])
 }
 
-/// A queue or topic name from an ARN or URL: its last segment (`.../123456789012/orders`).
+/// A queue or topic name from an ARN or URL: its last segment (`.../123456789012/orders`), the
+/// query string and fragment of a URL cut off first (`.../orders?token=x` is `orders`).
 fn aws_name(s: &str) -> String {
     if s.contains("${") {
         return s.to_string();
     }
-    s.rsplit(['/', ':']).next().unwrap_or(s).to_string()
+    let path = s.split(['?', '#']).next().unwrap_or(s);
+    path.rsplit(['/', ':']).next().unwrap_or(path).to_string()
 }
 
 /// The named children of an argument list (comments left out), bounded.
@@ -977,13 +1003,19 @@ impl<'t> Ctx<'t> {
     /// The content of a plain string literal (no escape).
     fn literal(&self, node: Node<'t>) -> Option<String> {
         let t = text(node, self.source);
-        match node.kind() {
+        let inner = match node.kind() {
             "interpreted_string_literal" if !t.contains('\\') => {
-                Some(t.strip_prefix('"')?.strip_suffix('"')?.to_string())
+                t.strip_prefix('"')?.strip_suffix('"')?
             }
-            "raw_string_literal" => Some(t.strip_prefix('`')?.strip_suffix('`')?.to_string()),
-            _ => None,
-        }
+            "raw_string_literal" => t.strip_prefix('`')?.strip_suffix('`')?,
+            _ => return None,
+        };
+        // A default of a placeholder written in a literal is never a name (T6).
+        Some(if inner.contains("${") {
+            mesh_core::config_values::strip_placeholder_defaults(inner).into_owned()
+        } else {
+            inner.to_string()
+        })
     }
 
     /// The channel name `node` stands for, if the file shows it. May be empty (`""`).
@@ -1008,6 +1040,10 @@ impl<'t> Ctx<'t> {
                 let id = text(node, self.source);
                 let b = self.lookup(node, id)?;
                 let value = b.value?;
+                // A constant named like a credential (`apiKey`) is no channel name.
+                if !member_may_name(id) {
+                    return None;
+                }
                 let name = self.name_of(value, depth + 1)?;
                 // A literal that something assigns to again may be a default the program
                 // overrides: not a name. A configuration placeholder stays.

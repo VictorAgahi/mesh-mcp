@@ -413,6 +413,97 @@ fn a_producer_never_publishes_to_a_pattern() {
     );
 }
 
+// ---- Names that must never reach the graph (9.0 T8b review round 1) ---------------------------
+
+#[test]
+fn a_query_string_or_fragment_of_a_queue_url_or_arn_is_never_part_of_the_name() {
+    let tok = canary("qs-token");
+    let code = file(
+        &[SQS, SNS, AWS],
+        &format!(
+            r#"func run(ctx context.Context, q *sqs.Client, n *sns.Client) {{
+	q.SendMessage(ctx, &sqs.SendMessageInput{{QueueUrl: aws.String("https://sqs.eu-west-1.amazonaws.com/123456789012/orders?token={tok}")}})
+	q.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{{QueueUrl: aws.String("https://sqs.x/1/inbox#{tok}")}})
+	n.Publish(ctx, &sns.PublishInput{{TopicArn: aws.String("arn:aws:sns:eu-west-1:123456789012:events?sig={tok}")}})
+	q.SendMessage(ctx, &sqs.SendMessageInput{{QueueUrl: aws.String("https://sqs.x/1/?token={tok}")}})
+}}"#
+        ),
+    );
+    let fi = extract(&code);
+    let dump = format!("{fi:?}");
+    assert!(!dump.contains(&tok), "{tok} reached the file index: {dump}");
+    assert_eq!(
+        sites(&fi),
+        vec![
+            s('C', "sqs", "inbox"),
+            s('P', "sns", "events"),
+            s('P', "sqs", "orders"),
+        ]
+    );
+}
+
+#[test]
+fn a_literal_that_is_no_name_is_never_a_channel_name() {
+    let pw = canary("hunter2-prod");
+    let url_pw = canary("hunter2-prod");
+    let bearer = canary("Bearer_x");
+    let tok = canary("tok_live");
+    let random = "a3f9c1e7b2d4";
+    let code = file(
+        &[NATS, AMQP],
+        &format!(
+            r#"var defaultSubj = "{pw}"
+const amqpURL = "amqp://u:{url_pw}@h/"
+const apiKey = "orders.created"
+
+func run(nc *nats.Conn, ch *amqp.Channel) {{
+	nc.Publish(defaultSubj, nil)
+	nc.Publish("{bearer}", nil)
+	nc.Subscribe("{tok}", nil)
+	nc.Subscribe("{random}", nil)
+	nc.Publish(apiKey, nil)
+	ch.Publish("", amqpURL, false, false, amqp.Publishing{{}})
+	ch.Publish("", "amqp://u:{url_pw}@h/", false, false, amqp.Publishing{{}})
+	nc.Publish("${{k.absent:{pw}}}", nil)
+}}"#
+        ),
+    );
+    let fi = extract(&code);
+    let dump = format!("{fi:?}");
+    for c in [&pw, &url_pw, &bearer, &tok] {
+        assert!(
+            !dump.contains(c.as_str()),
+            "{c} reached the file index: {dump}"
+        );
+    }
+    // Only the placeholder survives, without its default.
+    assert_eq!(sites(&fi), vec![s('P', "nats", "${k.absent}")]);
+}
+
+#[test]
+fn legitimate_names_stay_names() {
+    let names = [
+        "orders.created",
+        "password-reset-jobs",
+        "queue-v2",
+        "user_signed_up",
+        "orders2024",
+        "audit.events",
+        "devices.>",
+        "metrics.*",
+        "mail-invoices",
+    ];
+    let mut body = String::from("func run(nc *nats.Conn) {\n");
+    for n in names {
+        body.push_str(&format!("\tnc.Subscribe(\"{n}\", nil)\n"));
+    }
+    body.push_str("}\n");
+    let got = sites(&extract(&file(&[NATS], &body)));
+    let mut want: Vec<_> = names.iter().map(|n| s('C', "nats", n)).collect();
+    want.sort();
+    assert_eq!(got, want);
+}
+
 // ---- Gating -----------------------------------------------------------------------------
 
 #[test]
