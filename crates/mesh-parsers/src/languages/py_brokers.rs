@@ -769,7 +769,11 @@ impl<'t> Ctx<'t> {
                 _ => out = Some(v),
             }
         }
-        let value = result.unwrap_or(out);
+        // A constant named like a credential (`API_KEY = "x"`) is never a channel name (the T14
+        // predicate on the member; the value is checked once the name is final, see `finish`).
+        let value = result
+            .unwrap_or(out)
+            .filter(|_| mesh_core::member_consts::constant_is_a_name(&key.3, "ok"));
         self.busy.remove(&key);
         if self.cuts == cuts {
             self.name_memo.insert(key, value.clone());
@@ -1167,7 +1171,9 @@ fn finish(key: String) -> Option<String> {
     let ok = if key.starts_with("${") {
         !key.chars().any(char::is_whitespace)
     } else {
-        mesh_core::config_values::plain_topic(&key.replace(['#', '>'], "*"))
+        // The predicate of the queue constants of TypeScript (9.0 T14): not a token, a URL,
+        // `Bearer_...`, a password; a wildcard is read as `*` for it.
+        mesh_core::member_consts::constant_is_a_name("", &key.replace(['#', '>'], "*"))
     };
     ok.then_some(key)
 }

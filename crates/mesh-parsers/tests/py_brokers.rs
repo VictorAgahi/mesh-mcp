@@ -823,3 +823,55 @@ def run():
     let bare = "class Bus:\n    def publish(self, t, m): pass\n\nbus = Bus()\n\ndef run():\n    bus.publish(\"hidden.topic\", 1)\n";
     assert!(read(bare).is_empty(), "{:?}", read(bare));
 }
+
+#[test]
+fn a_credential_shaped_literal_is_not_a_name_and_a_real_name_is() {
+    let token = format!("sk_{}_{}", "live", "ABCDEF0123456789");
+    let code = format!(
+        r#"
+import pika
+import redis
+
+r = redis.Redis()
+ch = pika.BlockingConnection(p).channel()
+API_KEY = "api.queue"
+SECRETARY = "secretary.queue"
+
+def run():
+    ch.basic_publish(exchange="", routing_key="Bearer_CANARYB", body=b"x")
+    ch.basic_publish(exchange="", routing_key="hunter2-prod-CANARYL", body=b"x")
+    ch.basic_publish(exchange="", routing_key="{token}", body=b"x")
+    ch.basic_consume(queue="tok_CANARYT", on_message_callback=None)
+    r.publish(API_KEY, 1)
+    r.publish("orders.created", 1)
+    r.publish("password-reset-jobs", 1)
+    r.publish("queue-v2", 1)
+    r.publish("user_signed_up", 1)
+    r.publish(SECRETARY, 1)
+"#
+    );
+    let fi = extract(&code);
+    let dump = format!("{fi:?}");
+    for canary in [
+        "Bearer_CANARYB",
+        "hunter2-prod-CANARYL",
+        token.as_str(),
+        "tok_CANARYT",
+        "api.queue",
+    ] {
+        assert!(
+            !dump.contains(canary),
+            "{canary} reached the file index: {dump}"
+        );
+    }
+    assert_eq!(
+        sites(&fi),
+        vec![
+            s('P', "redis", "orders.created"),
+            s('P', "redis", "password-reset-jobs"),
+            s('P', "redis", "queue-v2"),
+            s('P', "redis", "secretary.queue"),
+            s('P', "redis", "user_signed_up"),
+        ]
+    );
+}

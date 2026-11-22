@@ -177,3 +177,75 @@ async fn a_same_file_reemit_never_crosses_from_one_broker_to_another() {
         assert!(!kafka.contains("redis:audit.redis"), "{tool}: {kafka}");
     }
 }
+
+#[tokio::test]
+async fn a_credential_shaped_name_reaches_no_graph_tool_answer_or_cache_file() {
+    let token = secret_like();
+    let canaries = [
+        "Bearer_CANARYB".to_string(),
+        "hunter2-prod-CANARYL".to_string(),
+        token.clone(),
+    ];
+    let tmp = tempfile::tempdir().unwrap();
+    let root = dunce::canonicalize(tmp.path().join("ws")).unwrap_or_else(|_| {
+        std::fs::create_dir_all(tmp.path().join("ws")).unwrap();
+        dunce::canonicalize(tmp.path().join("ws")).unwrap()
+    });
+    let code = format!(
+        r#"import pika
+
+ch = pika.BlockingConnection(None).channel()
+
+def run():
+    ch.basic_publish(exchange="", routing_key="Bearer_CANARYB", body=b"x")
+    ch.basic_publish(exchange="", routing_key="hunter2-prod-CANARYL", body=b"x")
+    ch.basic_publish(exchange="", routing_key="{token}", body=b"x")
+    ch.basic_publish(exchange="", routing_key="orders.created", body=b"x")
+"#
+    );
+    write(&root, "src/svc/secrets.py", &code);
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let db = cache_dir.join("index-cache.db");
+    {
+        let cache = mesh_core::PersistentIndexCache::open(db.clone(), 64 * 1024 * 1024).unwrap();
+        let cfg =
+            Config::load_from_str("[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n")
+                .unwrap();
+        let audit = Arc::new(AuditLogger::new_in_memory().unwrap());
+        let rescan = Arc::new(BackgroundRescanEngine::new().unwrap());
+        let state = Arc::new(AppState::new(cfg, vec![root.clone()], audit, rescan));
+        let snap = mesh_server::WorkspaceIndexer::build_snapshot(
+            &state.config,
+            &state.allowed_roots,
+            None,
+            None,
+            Some(&cache),
+        );
+        state.install_snapshot(snap);
+        let all = everything(&state, &["orders.created"]).await;
+        assert!(
+            all.contains("orders.created"),
+            "a real name is kept:\n{all}"
+        );
+        for canary in &canaries {
+            assert!(!all.contains(canary.as_str()), "{canary} leaked:\n{all}");
+        }
+    }
+    // The cache files (database, write-ahead log, shared memory) hold none of them either.
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&cache_dir).unwrap() {
+        let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+        checked += 1;
+        for canary in &canaries {
+            assert!(
+                !bytes.windows(canary.len()).any(|w| w == canary.as_bytes()),
+                "{canary} reached a cache file"
+            );
+        }
+    }
+    assert!(
+        checked >= 1,
+        "the cache wrote nothing: the check is vacuous"
+    );
+}
