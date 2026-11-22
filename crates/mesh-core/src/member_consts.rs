@@ -11,7 +11,7 @@
 //! a member named like a credential, or a value that is a token, a URL, a password-shaped word
 //! or a random-looking run, is dropped, so the site keeps its qualified member key.
 
-use crate::config_values::{name_shaped, plain_topic, secret_key};
+use crate::config_values::{name_shaped, plain_topic};
 use crate::contracts::is_member_ref;
 use crate::test_paths::is_test_path;
 use crate::types::{CompactStr, RepoId};
@@ -42,6 +42,7 @@ pub enum MemberResolution {
 #[derive(Debug, Clone)]
 struct FileConsts {
     repo: RepoId,
+    package: CompactStr,
     records: Vec<(CompactStr, CompactStr)>,
 }
 
@@ -56,6 +57,7 @@ struct FileSites {
 struct Decl {
     file: PathBuf,
     repo: RepoId,
+    package: CompactStr,
     value: CompactStr,
 }
 
@@ -73,45 +75,125 @@ pub struct MemberTable {
     ref_files: HashSet<PathBuf>,
 }
 
-/// Whether a constant may become a topic name (commandment 5): the member is not named like a
-/// credential and the value is a plain name, not a token, a URL, a password-shaped word or a
-/// random-looking run.
-pub fn constant_is_a_name(member: &str, value: &str) -> bool {
-    let last = member.rsplit('.').next().unwrap_or(member);
-    if secret_key(last) || !name_shaped(value) || !plain_topic(value) {
+/// Words that, as a whole word of a member name (`API_KEY`, `DB_PASSWORD`), mark it as naming a
+/// credential.
+const CREDENTIAL_WORDS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "pass",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+    "key",
+    "apikey",
+    "credential",
+    "credentials",
+    "dsn",
+    "jwt",
+    "passphrase",
+];
+
+/// Whole tokens that make a value a password, whatever surrounds them.
+const WEAK_SECRET_TOKENS: &[&str] = &["hunter2", "passw0rd", "p4ssw0rd", "letmein", "changeme"];
+
+/// Values that are a credential word and nothing else.
+const BARE_SECRET_VALUES: &[&str] = &[
+    "secret",
+    "password",
+    "passwd",
+    "token",
+    "apikey",
+    "credential",
+    "credentials",
+    "passphrase",
+    "jwt",
+];
+
+/// Whether a member is named like a credential (`API_KEY`, `DB_PASSWORD`): whole words of its
+/// last segment, so `SECRETARY` is not one.
+fn member_is_credential_named(member: &str) -> bool {
+    let last = member
+        .rsplit('.')
+        .next()
+        .unwrap_or(member)
+        .to_ascii_lowercase();
+    last.split('_').any(|w| CREDENTIAL_WORDS.contains(&w))
+}
+
+/// Whether a string value may become a topic name (commandment 5): a plain name that is not a
+/// token, a URL, `Bearer_...`, a password, nor a random-looking run. `password-reset-jobs`,
+/// `private-events` and `orders2024` are names; `hunter2-prod-x`, `tok_...` and `a3f9c1e7b2d4`
+/// are not.
+fn value_is_a_name(value: &str) -> bool {
+    if !name_shaped(value) || !plain_topic(value) {
         return false;
     }
     let lower = value.to_ascii_lowercase();
-    const WORDS: &[&str] = &[
-        "secret",
-        "token",
-        "password",
-        "passwd",
-        "credential",
-        "apikey",
-        "api_key",
-        "api-key",
-        "bearer",
-        "jwt",
-        "passphrase",
-        "private",
-        "dsn",
-    ];
-    if WORDS.iter().any(|w| lower.contains(w))
-        || lower.starts_with("basic_")
-        || lower.starts_with("basic:")
+    if ["bearer", "basic_", "basic:", "tok_"]
+        .iter()
+        .any(|p| lower.starts_with(p))
     {
         return false;
     }
-    // `hunter2`, `eyJhbGci...`, `a1b2c3d4e5`: a run of six or more letters and digits that has
-    // both is random-looking, not a word.
+    let words: Vec<&str> = lower
+        .split(['-', '_', '.', ':', '/'])
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.iter().any(|w| WEAK_SECRET_TOKENS.contains(w))
+        || (words.len() == 1 && BARE_SECRET_VALUES.contains(&words[0]))
+    {
+        return false;
+    }
+    // A run of six or more letters and digits with a digit anywhere but a trailing run of at most
+    // four (`orders2024`, `v2`) is random-looking, not a word.
     !value
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|seg| {
+            let body = {
+                let trailing = seg.chars().rev().take_while(char::is_ascii_digit).count();
+                if trailing <= 4 {
+                    &seg[..seg.len() - trailing]
+                } else {
+                    seg
+                }
+            };
             seg.len() >= 6
-                && seg.chars().any(|c| c.is_ascii_digit())
                 && seg.chars().any(|c| c.is_ascii_alphabetic())
+                && body.chars().any(|c| c.is_ascii_digit())
         })
+}
+
+/// Whether a constant may be recorded and may name a topic: the member (or constant) is not
+/// named like a credential and the value is a name. Applied where the constants are extracted, so
+/// a refused value never reaches the graph or the parse cache.
+pub fn constant_is_a_name(member: &str, value: &str) -> bool {
+    !member_is_credential_named(member) && value_is_a_name(value)
+}
+
+/// Whether `path` is build output (`dist/`, `out/`, `.next/`, `coverage/`, ...): a copy of
+/// sources that must not resolve a queue.
+fn is_build_output(path: &Path) -> bool {
+    path.components().any(|c| match c {
+        Component::Normal(n) => n.to_str().is_some_and(|n| {
+            matches!(
+                n,
+                "dist" | "out" | "build" | ".next" | ".nuxt" | ".output" | "coverage" | "target"
+            )
+        }),
+        _ => false,
+    })
+}
+
+/// The package a non-relative import specifier names, as the graph spells package names (npm
+/// scope stripped, subpath dropped): `@org/queues/src/q` is `queues`.
+fn specifier_package(module: &str) -> &str {
+    let rest = match module.strip_prefix('@') {
+        Some(scoped) => scoped.split_once('/').map_or("", |(_, name)| name),
+        None => module,
+    };
+    rest.split('/').next().unwrap_or("")
 }
 
 fn strip_script_ext(path: &Path) -> PathBuf {
@@ -156,15 +238,17 @@ impl MemberTable {
         self.files.is_empty() && self.sites.is_empty()
     }
 
-    /// Sets (or clears) the constants `path` declares: `Enum.MEMBER=value` records. A test file
-    /// contributes nothing.
+    /// Sets (or clears) the constants `path` declares: `Enum.MEMBER=value` records, and the
+    /// `package` its nodes belong to. A test file or a build-output file contributes nothing.
     pub fn set_file<'a>(
         &mut self,
         path: &Path,
         repo: RepoId,
+        package: &str,
         records: impl Iterator<Item = &'a str>,
     ) {
-        let records: Vec<(CompactStr, CompactStr)> = if is_test_path(path) {
+        let records: Vec<(CompactStr, CompactStr)> = if is_test_path(path) || is_build_output(path)
+        {
             Vec::new()
         } else {
             records
@@ -176,8 +260,14 @@ impl MemberTable {
         if records.is_empty() {
             self.files.remove(path);
         } else {
-            self.files
-                .insert(path.to_path_buf(), FileConsts { repo, records });
+            self.files.insert(
+                path.to_path_buf(),
+                FileConsts {
+                    repo,
+                    package: CompactStr::new(package),
+                    records,
+                },
+            );
         }
     }
 
@@ -223,8 +313,9 @@ impl MemberTable {
         self.ref_files.iter().map(PathBuf::as_path)
     }
 
-    /// Distinct member paths declared with different values in different files (counted in
-    /// `IndexHealth`): a site that cannot tell which one it imports keeps its member key.
+    /// Distinct member paths a queue site could not choose between, because the declarations it
+    /// can mean give different values (counted in `IndexHealth`): the site keeps its qualified
+    /// member key.
     pub fn conflicts(&self) -> usize {
         self.conflicts
     }
@@ -238,32 +329,32 @@ impl MemberTable {
                 self.index.entry(key.clone()).or_default().push(Decl {
                     file: path.clone(),
                     repo: f.repo,
+                    package: f.package.clone(),
                     value: value.clone(),
                 });
             }
         }
-        self.conflicts = self
-            .index
-            .values()
-            .filter(|decls| {
-                decls
+        let mut queue_decls = HashSet::new();
+        let mut conflicting: HashSet<CompactStr> = HashSet::new();
+        for (path, s) in &self.sites {
+            for member in &s.members {
+                let (decls, enum_name) = self.candidates(path, s.repo, &s.imports, member);
+                if decls
                     .iter()
                     .map(|d| d.value.as_str())
                     .collect::<HashSet<_>>()
                     .len()
                     > 1
-            })
-            .count();
-        let mut queue_decls = HashSet::new();
-        for (path, s) in &self.sites {
-            for member in &s.members {
-                let (decls, enum_name) = self.candidates(path, s.repo, &s.imports, member);
+                {
+                    conflicting.insert(member.clone());
+                }
                 if let Some(enum_name) = enum_name {
                     queue_decls.extend(decls.iter().map(|d| (d.file.clone(), enum_name.clone())));
                 }
             }
         }
         self.queue_decls = queue_decls;
+        self.conflicts = conflicting.len();
     }
 
     /// The declarations `member` (`Enum.MEMBER`, as written in `importer`) can be, and the
@@ -309,12 +400,23 @@ impl MemberTable {
                 };
                 if !by_path.is_empty() {
                     by_path
+                } else if m.starts_with('.') || m.starts_with('/') {
+                    // A relative path that names no file declaring the enum (a barrel that
+                    // re-exports it): the declarations of the importer's own repository.
+                    decls.iter().filter(|d| d.repo == repo).collect()
                 } else {
-                    // A package, a barrel, an unresolved path: the declarations of the
-                    // importer's own repository, else every one there is.
-                    let same_repo: Vec<&Decl> = decls.iter().filter(|d| d.repo == repo).collect();
+                    // A package specifier binds only to the declarations of the package it
+                    // names (the package.json name the graph already gives every node), never
+                    // to a homonymous enum of the importer's own repository.
+                    let package = specifier_package(m);
+                    let named: Vec<&Decl> = decls
+                        .iter()
+                        .filter(|d| !package.is_empty() && d.package == package)
+                        .collect();
+                    let same_repo: Vec<&Decl> =
+                        named.iter().copied().filter(|d| d.repo == repo).collect();
                     if same_repo.is_empty() {
-                        decls.iter().collect()
+                        named
                     } else {
                         same_repo
                     }
@@ -417,7 +519,13 @@ mod tests {
     fn table(files: &[(&str, &[&str])], sites: &[SiteSpec]) -> MemberTable {
         let mut t = MemberTable::default();
         for (p, records) in files {
-            t.set_file(Path::new(p), 0, records.iter().copied());
+            // The package of a fixture file is its directory's name (`/w/a/q.ts` is `a`).
+            let package = Path::new(p)
+                .parent()
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            t.set_file(Path::new(p), 0, package, records.iter().copied());
         }
         for (p, members, imports) in sites {
             let imports = imports
@@ -464,16 +572,160 @@ mod tests {
             t.resolve(Path::new("/w/c/w.ts"), 0, &[], "JobQueue.EMAIL"),
             MemberResolution::Unknown
         );
-        let pkg = [ImportBinding {
+        // A package specifier names a package: `@acme/q` is no package of this workspace, so
+        // the homonymous `JobQueue` of the importer's own repository is not a guess.
+        let pkg = |m: &str| {
+            [ImportBinding {
+                local: "JobQueue".into(),
+                exported: "JobQueue".into(),
+                module: m.into(),
+            }]
+        };
+        let by_pkg =
+            |importer: &str, m: &str| t.resolve(Path::new(importer), 0, &pkg(m), "JobQueue.EMAIL");
+        assert_eq!(by_pkg("/w/c/w.ts", "@acme/q"), MemberResolution::Unknown);
+        assert_eq!(
+            by_pkg("/w/a/w.ts", "legacy-queue-lib"),
+            MemberResolution::Unknown
+        );
+        // The package it names: `@org/b` (npm scope stripped, subpath dropped) is package `b`.
+        assert_eq!(
+            by_pkg("/w/a/w.ts", "@org/b/src/queues"),
+            MemberResolution::Value("b-email".into())
+        );
+        assert_eq!(
+            by_pkg("/w/c/w.ts", "a"),
+            MemberResolution::Value("a-email".into())
+        );
+    }
+
+    #[test]
+    fn a_member_two_declarations_of_one_package_disagree_on_is_ambiguous_and_counted() {
+        let t = table(
+            &[
+                ("/w/a/one.ts", &["JobQueue.EMAIL=one-email"]),
+                ("/w/a/two.ts", &["JobQueue.EMAIL=two-email"]),
+            ],
+            &[(
+                "/w/c/w.ts",
+                &["JobQueue.EMAIL"],
+                &[("JobQueue", "JobQueue", "@org/a")],
+            )],
+        );
+        let imp = [ImportBinding {
             local: "JobQueue".into(),
             exported: "JobQueue".into(),
-            module: "@acme/q".into(),
+            module: "@org/a".into(),
         }];
         assert_eq!(
-            t.resolve(Path::new("/w/c/w.ts"), 0, &pkg, "JobQueue.EMAIL"),
+            t.resolve(Path::new("/w/c/w.ts"), 0, &imp, "JobQueue.EMAIL"),
             MemberResolution::Ambiguous
         );
         assert_eq!(t.conflicts(), 1);
+        // Two files each with their own enum, every site resolved: no conflict to report.
+        let t = table(
+            &[
+                ("/w/a/queues.ts", &["JobQueue.EMAIL=a-email"]),
+                ("/w/b/queues.ts", &["JobQueue.EMAIL=b-email"]),
+            ],
+            &[
+                (
+                    "/w/a/w.ts",
+                    &["JobQueue.EMAIL"],
+                    &[("JobQueue", "JobQueue", "./queues")],
+                ),
+                (
+                    "/w/b/w.ts",
+                    &["JobQueue.EMAIL"],
+                    &[("JobQueue", "JobQueue", "./queues")],
+                ),
+            ],
+        );
+        assert_eq!(t.conflicts(), 0);
+    }
+
+    #[test]
+    fn build_output_declarations_never_resolve() {
+        let mut t = MemberTable::default();
+        t.set_file(
+            Path::new("/w/packages/queues/dist/queues.ts"),
+            0,
+            "queues",
+            ["DistQ.EMAIL=dist-email"].into_iter(),
+        );
+        t.set_file(
+            Path::new("/w/packages/queues/src/queues.ts"),
+            0,
+            "queues",
+            ["JobQueue.EMAIL=pkg-email"].into_iter(),
+        );
+        t.rebuild();
+        let imp = |local: &str, m: &str| {
+            [ImportBinding {
+                local: local.into(),
+                exported: local.into(),
+                module: m.into(),
+            }]
+        };
+        assert_eq!(
+            t.resolve(
+                Path::new("/w/app/s.ts"),
+                0,
+                &imp("DistQ", "@org/queues/dist/queues"),
+                "DistQ.EMAIL"
+            ),
+            MemberResolution::Unknown
+        );
+        assert_eq!(
+            t.resolve(
+                Path::new("/w/app/s.ts"),
+                0,
+                &imp("JobQueue", "@org/queues"),
+                "JobQueue.EMAIL"
+            ),
+            MemberResolution::Value("pkg-email".into())
+        );
+    }
+
+    #[test]
+    fn names_and_credentials_as_values() {
+        for ok in [
+            "email-jobs",
+            "user-queue",
+            "fallback-user-queue",
+            "send_welcome_email",
+            "mailbox",
+            "queue-v2",
+            "invoice-batch-v2024",
+            "deadletter-q",
+            "password-reset-jobs",
+            "token-refresh-jobs",
+            "private-events",
+            "secretary-jobs",
+            "orders2024",
+            "tenant-sync",
+        ] {
+            assert!(constant_is_a_name("Q.ANY", ok), "{ok}");
+        }
+        for bad in [
+            "Bearer_CANARYB1",
+            "hunter2-prod-CANARYX",
+            concat!("sk_", "live_CANARYSKabcdefgh"),
+            "postgres://u:CANARYPW@h",
+            "dGhpcyBpcyBhIHNlY3JldA==",
+            "tok_CANARYJ123",
+            "eyJhbGciOiJIUzI1NiJ9.CANARYK.sig",
+            "a3f9c1e7b2d4",
+            "password",
+            "two words",
+            "Bearer_CANARY_F_eyJhbGciOiJIUzI1NiJ9",
+        ] {
+            assert!(!constant_is_a_name("Q.ANY", bad), "{bad}");
+        }
+        // Whole words of the member: `API_KEY` is a credential, `SECRETARY` is not.
+        assert!(!constant_is_a_name("Sec.API_KEY", "legit-api-jobs"));
+        assert!(!constant_is_a_name("Sec.DB_PASSWORD", "db-jobs"));
+        assert!(constant_is_a_name("Q.SECRETARY", "secretary-jobs"));
     }
 
     #[test]

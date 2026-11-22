@@ -378,6 +378,7 @@ impl FileIndex {
     /// the extractor keeps at most (the records past the cap were dropped). Idempotent.
     pub fn finish_member_facts(&mut self) {
         let mut imports = Vec::new();
+        let mut cap_marker = false;
         self.rpc_calls
             .retain(|(_, r)| match r.strip_prefix(IMPORT_RECORD_PREFIX) {
                 Some(rest) => {
@@ -385,6 +386,11 @@ impl FileIndex {
                     if let (Some(local), Some(exported), Some(module)) =
                         (parts.next(), parts.next(), parts.next())
                     {
+                        // The marker the extractor leaves when it kept only part of the imports.
+                        if local.is_empty() {
+                            cap_marker = true;
+                            return false;
+                        }
                         imports.push(mesh_core::ImportBinding {
                             local: local.into(),
                             exported: exported.into(),
@@ -400,7 +406,8 @@ impl FileIndex {
                 self.member_imports.push(import);
             }
         }
-        self.const_capped |= self.const_records().count() >= typescript::MAX_CONST_RECORDS_PER_FILE;
+        self.const_capped |=
+            cap_marker || self.const_records().count() >= typescript::MAX_CONST_RECORDS_PER_FILE;
     }
 
     /// Whether this file names an enum member as a topic (a queue site or a pattern capture):
@@ -1395,6 +1402,23 @@ impl PolyglotIndexer {
                     if symbol.is_empty() {
                         if let Some(relative) = cfg.ts_aliases.rewrite(file_path, module) {
                             *module = relative;
+                        }
+                    }
+                }
+                // The same for the module of a member import (`%local|exported|module`).
+                let mut rpc_calls = rpc_calls;
+                for (_, record) in &mut rpc_calls {
+                    let Some(rest) = record.strip_prefix(IMPORT_RECORD_PREFIX) else {
+                        continue;
+                    };
+                    let mut parts = rest.splitn(3, '|');
+                    if let (Some(local), Some(exported), Some(module)) =
+                        (parts.next(), parts.next(), parts.next())
+                    {
+                        if let Some(relative) = cfg.ts_aliases.rewrite(file_path, module) {
+                            *record = CompactStr::new(format!(
+                                "{IMPORT_RECORD_PREFIX}{local}|{exported}|{relative}"
+                            ));
                         }
                     }
                 }

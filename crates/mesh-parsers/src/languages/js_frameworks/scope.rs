@@ -15,6 +15,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use tree_sitter::Node;
 
+/// Most enum-like imports kept per file (a file past it is counted in `IndexHealth`).
+const MAX_MEMBER_IMPORTS: usize = 512;
+
 /// Expression depth beyond which a name is not resolved (`'a' + 'b' + …` chains).
 const MAX_RESOLVE_DEPTH: usize = 24;
 
@@ -306,7 +309,7 @@ impl ModuleBindings {
     /// `(local, exported, module)`, sorted and bounded: what binds an `Enum.MEMBER` topic to the
     /// file that declares the enum (9.0 T14). A type-only import and a default one name no value
     /// member.
-    pub(crate) fn member_imports(&self) -> Vec<(String, String, String)> {
+    pub(crate) fn member_imports(&self) -> (Vec<(String, String, String)>, bool) {
         let mut out: Vec<(String, String, String)> = self
             .locals
             .iter()
@@ -318,8 +321,9 @@ impl ModuleBindings {
             .map(|(local, b)| (local.clone(), b.imported.clone(), b.module.clone()))
             .collect();
         out.sort();
-        out.truncate(512);
-        out
+        let capped = out.len() > MAX_MEMBER_IMPORTS;
+        out.truncate(MAX_MEMBER_IMPORTS);
+        (out, capped)
     }
 
     /// Whether the file declares `name` itself at module level.

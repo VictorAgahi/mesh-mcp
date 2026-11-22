@@ -206,7 +206,14 @@ impl TypeScriptExtractor {
         Self::record_string_constants(root, source_bytes, &nodes, rpc_calls);
         // The imports that bind an `Enum.MEMBER` topic to its declaring file (9.0 T14): passed
         // through `rpc_calls` and moved into `FileIndex::member_imports` right after extraction.
-        for (local, exported, module) in js_frameworks::member_imports(root, source_bytes) {
+        let (member_imports, imports_capped) = js_frameworks::member_imports(root, source_bytes);
+        if imports_capped {
+            rpc_calls.push((
+                0,
+                CompactStr::new(format!("{}|cap|", super::IMPORT_RECORD_PREFIX)),
+            ));
+        }
+        for (local, exported, module) in member_imports {
             rpc_calls.push((
                 0,
                 CompactStr::new(format!(
@@ -1796,7 +1803,15 @@ impl TypeScriptExtractor {
                         ) else {
                             continue;
                         };
-                        found.push((idx, format!("{name}.{key}={value}")));
+                        // A value that is no name (a token, a URL, a password-shaped word) or a
+                        // member named like a credential is never recorded: not in the graph, not
+                        // in the parse cache (9.0 T14).
+                        if mesh_core::member_consts::constant_is_a_name(
+                            &format!("{name}.{key}"),
+                            &value,
+                        ) {
+                            found.push((idx, format!("{name}.{key}={value}")));
+                        }
                     }
                 }
                 _ => {}
@@ -1859,7 +1874,9 @@ impl TypeScriptExtractor {
         match value.kind() {
             "string" => {
                 if let Some(literal) = Self::extract_value_text(value, source) {
-                    found.push((idx, format!("{path}={literal}")));
+                    if mesh_core::member_consts::constant_is_a_name(path, &literal) {
+                        found.push((idx, format!("{path}={literal}")));
+                    }
                 }
             }
             "object" => {

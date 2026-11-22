@@ -1936,9 +1936,10 @@ impl WorkspaceIndexer {
             // The string constants a source file declares, and the queue sites that name an
             // enum member, resolve each other across files (9.0 T14).
             let repo = frag.code.nodes.first().map_or(0, |n| n.repo_id);
+            let package = frag.code.nodes.first().map_or("", |n| n.package.as_str());
             snapshot
                 .member_table
-                .set_file(&frag.path, repo, frag.code.const_records());
+                .set_file(&frag.path, repo, package, frag.code.const_records());
             snapshot.member_table.set_sites(
                 &frag.path,
                 repo,
@@ -4079,16 +4080,19 @@ resolve_placeholders = true
         assert_eq!(view.health.const_members_conflicting, 0);
     }
 
-    /// Two declarations of one member with different values, and an import that cannot choose
-    /// between them: neither is chosen, the qualified key is `heuristic`, and it is counted.
+    /// Two declarations of one member with different values in the package an import names: neither
+    /// is chosen, the qualified key is `heuristic`, and it is counted. A site its relative import
+    /// binds to one declaration is not a conflict.
     #[test]
     fn a_member_two_declarations_disagree_on_resolves_to_neither_and_is_counted() {
         let (_t, _r, state) = queue_state(&[
+            ("shared/package.json", "{\"name\": \"@org/shared\"}"),
+            ("shared/one.ts", "export enum JobQueue { EMAIL = 'one-email' }\n"),
+            ("shared/two.ts", "export enum JobQueue { EMAIL = 'two-email' }\n"),
             ("a/queues.ts", "export enum JobQueue { EMAIL = 'a-email' }\n"),
-            ("b/queues.ts", "export enum JobQueue { EMAIL = 'b-email' }\n"),
             (
                 "c/worker.ts",
-                "import { Processor } from '@nestjs/bullmq';\nimport { JobQueue } from '@acme/queues';\n\
+                "import { Processor } from '@nestjs/bullmq';\nimport { JobQueue } from '@org/shared';\n\
                  @Processor(JobQueue.EMAIL)\nexport class W {}\n",
             ),
             (
@@ -4110,7 +4114,110 @@ resolve_placeholders = true
         assert!(view
             .health
             .render_summary(10)
-            .contains("declared with different values"));
+            .contains("a queue site cannot choose between"));
+    }
+
+    /// Many files each declaring their own `JobQueue.EMAIL`, every site bound by a relative
+    /// import: nothing is ambiguous, nothing is reported.
+    #[test]
+    fn declarations_that_differ_but_are_all_bound_are_not_a_conflict() {
+        let mut files: Vec<(String, String)> = Vec::new();
+        for i in 0..20 {
+            files.push((
+                format!("s{i}/queues.ts"),
+                format!("export enum JobQueue {{ EMAIL = 'email-{i}' }}\n"),
+            ));
+            files.push((
+                format!("s{i}/w.ts"),
+                "import { Processor } from '@nestjs/bullmq';\nimport { JobQueue } from './queues';\n\
+                 @Processor(JobQueue.EMAIL)\nexport class W {}\n"
+                    .to_string(),
+            ));
+        }
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let (_t, _r, state) = queue_state(&refs);
+        let view = state.snapshot();
+        assert_eq!(view.health.const_members_conflicting, 0);
+        assert!(!view.health.const_degraded());
+        assert_eq!(topic_rows(&view).len(), 20);
+    }
+
+    /// A non-relative import binds only to the package it names: never to a homonymous enum of
+    /// the importer's own repository (silent wrong answer at `exact`), never to build output.
+    #[test]
+    fn a_package_import_binds_to_its_package_and_never_to_the_importers_own_enum() {
+        let (_t, _r, state) = queue_state(&[
+            ("src/queues.ts", "export enum JobQueue { EMAIL = 'in-repo-email' }\n"),
+            (
+                "src/worker.ts",
+                "import { Processor } from '@nestjs/bullmq';\nimport { JobQueue } from 'legacy-queue-lib';\n\
+                 @Processor(JobQueue.EMAIL)\nexport class ExtW {}\n",
+            ),
+            ("packages/queues/package.json", "{\"name\": \"@org/queues\"}"),
+            (
+                "packages/queues/src/queues.ts",
+                "export enum PkgQ { EMAIL = 'pkg-email' }\n",
+            ),
+            (
+                "packages/queues/dist/queues.ts",
+                "export enum DistQ { EMAIL = 'dist-email' }\n",
+            ),
+            (
+                "packages/app/src/svc.ts",
+                "import { Processor } from '@nestjs/bullmq';\nimport { PkgQ } from '@org/queues';\n\
+                 @Processor(PkgQ.EMAIL)\nexport class PkgW {}\n",
+            ),
+            (
+                "packages/app/src/dist.ts",
+                "import { Queue } from 'bullmq';\nimport { DistQ } from '@org/queues/dist/queues';\n\
+                 export const d = new Queue(DistQ.EMAIL);\n",
+            ),
+        ]);
+        assert_eq!(
+            topic_rows(&state.snapshot()),
+            [
+                "Consumes exact pkg-email svc.ts",
+                "Consumes heuristic jobqueue.email worker.ts",
+                "Produces heuristic distq.email dist.ts"
+            ]
+        );
+    }
+
+    /// A value that is no name, and a member named like a credential, never enter the index
+    /// record, so they cannot reach the parse cache either. (The first source line of a `const`
+    /// declaration is a node signature: a known, separate limit.)
+    #[test]
+    fn refused_constants_never_enter_the_index_record() {
+        let code = "export enum Sec {\n  A_BEARER = 'Bearer_CANARYB1',\n  B_HUNTER = 'hunter2-prod-CANARYX',\n  \
+                    C_SKLIVE = 'tok_CANARYSKabcdefgh',\n  D_PGURL = 'postgres://u:CANARYPW@h',\n  \
+                    API_KEY = 'legit-api-jobs',\n  OK = 'ok-jobs',\n}\n";
+        let fi = mesh_parsers::PolyglotIndexer::extract(Path::new("/w/sec.ts"), code, 0);
+        let record = serde_json::to_string(&fi).expect("serialize");
+        assert!(
+            !record.contains("CANARY") && !record.contains("legit-api-jobs"),
+            "{record}"
+        );
+        assert!(fi.const_records().any(|r| r == "Sec.OK=ok-jobs"));
+        // A top-level constant too (its declaration line is a node signature, a separate limit,
+        // so the constant records are what is checked).
+        let bare = mesh_parsers::PolyglotIndexer::extract(
+            Path::new("/w/bare.ts"),
+            &format!(
+                "export const TOK = 'sk_{}_CANARYBARE1234567890abcd';\nexport const URL_C = 'postgres://u:CANARYPW@h/x';\n\
+                 export const objs = {{ A: 'Bearer_CANARYOBJ1' }} as const;\n",
+                "live"
+            ),
+            0,
+        );
+        assert_eq!(
+            bare.const_records().count(),
+            0,
+            "{:?}",
+            bare.const_records().collect::<Vec<_>>()
+        );
     }
 
     /// An aliased import and a namespace import bind to the declaring file; a member named like a
@@ -4215,7 +4322,7 @@ resolve_placeholders = true
         assert!(view
             .health
             .render_summary(10)
-            .contains("more string constants than the per-file cap"));
+            .contains("more string constants or enum imports"));
         // The first member is inside the cap and resolves; the last one is past it and keeps its
         // qualified member key, heuristic, never a guess.
         let rows = topic_rows(&view);

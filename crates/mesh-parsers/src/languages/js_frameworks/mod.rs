@@ -262,7 +262,7 @@ fn receiver_is_client(libs: &[&str], site: &Site) -> bool {
 
 /// The value imports of enum-like names of a file, `(local, exported, module)`: what binds an
 /// `Enum.MEMBER` topic to its declaring file (9.0 T14).
-pub(crate) fn member_imports(root: Node, source: &[u8]) -> Vec<(String, String, String)> {
+pub(crate) fn member_imports(root: Node, source: &[u8]) -> (Vec<(String, String, String)>, bool) {
     ModuleBindings::collect(root, source).member_imports()
 }
 

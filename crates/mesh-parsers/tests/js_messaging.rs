@@ -1244,6 +1244,20 @@ fn string_constants_are_recorded_and_capped_visibly() {
 }
 
 #[test]
+fn enum_imports_past_the_cap_are_counted() {
+    let mut code = String::new();
+    for i in 0..600 {
+        code.push_str(&format!("import {{ Q{i} }} from './q{i}';\n"));
+    }
+    let big = index("svc/imports.ts", &code);
+    assert!(big.const_capped);
+    assert_eq!(big.member_imports.len(), 512);
+    let small = index("svc/few.ts", "import { Q1 } from './q1';\n");
+    assert!(!small.const_capped);
+    assert_eq!(small.member_imports.len(), 1);
+}
+
+#[test]
 fn hostile_enums_neither_overflow_the_stack_nor_resolve_a_cycle() {
     // 3000 members, an alias cycle between enums, a value that is itself placeholder syntax.
     let mut code = String::from(
@@ -1269,7 +1283,7 @@ fn hostile_enums_neither_overflow_the_stack_nor_resolve_a_cycle() {
         .any(|r| r.starts_with("A.X=") || r.starts_with("B.Y=")));
     // Placeholder-looking values are refused when they become names.
     let mut table = mesh_core::MemberTable::default();
-    table.set_file(Path::new("/w/hostile-enums.ts"), 0, fi.const_records());
+    table.set_file(Path::new("/w/hostile-enums.ts"), 0, "w", fi.const_records());
     table.rebuild();
     let imp = [mesh_core::ImportBinding {
         local: "A".into(),
