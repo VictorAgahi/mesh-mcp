@@ -11,6 +11,7 @@ mod jvm_brokers;
 pub mod kotlin;
 pub mod php;
 pub mod proto;
+mod py_brokers;
 mod py_calls;
 pub mod python;
 pub mod ruby;
@@ -253,6 +254,11 @@ pub struct FileIndex {
     /// `IndexHealth::files_jvm_brokers_capped`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub jvm_brokers_capped: bool,
+    /// The per-file cap on Python broker sites (`MAX_PY_BROKER_SITES_PER_FILE`: RabbitMQ, Redis,
+    /// NATS, SQS / SNS, Pub/Sub in Python) cut sites of this file: counted in
+    /// `IndexHealth::files_py_brokers_capped`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub py_brokers_capped: bool,
 }
 
 /// A producer or consumer whose topic is an enum member reference.
@@ -330,6 +336,7 @@ impl FileIndex {
         self.inproc_capped |= other.inproc_capped;
         self.const_capped |= other.const_capped;
         self.jvm_brokers_capped |= other.jvm_brokers_capped;
+        self.py_brokers_capped |= other.py_brokers_capped;
     }
 
     /// Inserts the extracted nodes and relations into `graph`. A `${key}` topic is resolved
@@ -875,6 +882,11 @@ pub const MAX_INPROC_SITES_PER_FILE: usize = 2_000;
 /// in `IndexHealth::files_jvm_brokers_capped` (never silent).
 pub const MAX_JVM_BROKER_SITES_PER_FILE: usize = 2_000;
 
+/// Most Python broker sites (RabbitMQ, Redis, NATS, SQS / SNS, Pub/Sub producers and consumers)
+/// one file registers; the rest are dropped and the file is counted in
+/// `IndexHealth::files_py_brokers_capped` (never silent).
+pub const MAX_PY_BROKER_SITES_PER_FILE: usize = 2_000;
+
 pub struct PolyglotIndexer;
 
 impl PolyglotIndexer {
@@ -1321,6 +1333,13 @@ impl PolyglotIndexer {
                     out.producers = relations.producers;
                     out.consumers = relations.consumers;
                     out.rpc_calls = relations.rpc_calls;
+                    // Kafka calls on a client bound in the file carry their broker; the others
+                    // of the shape-based reader do not (9.0 T8c).
+                    out.producer_brokers = relations.producer_brokers;
+                    out.consumer_brokers = relations.consumer_brokers;
+                    // RabbitMQ, Redis, NATS, SQS / SNS, Pub/Sub and the Kafka gaps, each under
+                    // its own broker.
+                    py_brokers::apply(relations.brokers, &mut out);
                 }
             }
             LanguageKind::TypeScript | LanguageKind::Tsx | LanguageKind::JavaScript => {
@@ -2035,6 +2054,7 @@ mod tests {
             member_imports: Vec::new(),
             member_sites: Vec::new(),
             jvm_brokers_capped: false,
+            py_brokers_capped: false,
         };
         let before = format!("{index:?}");
         let anchored = index.relativize(&root_a).expect("all under root");

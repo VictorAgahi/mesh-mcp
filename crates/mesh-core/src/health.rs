@@ -225,6 +225,11 @@ pub struct IndexHealth {
     /// `files_scanned`.
     #[serde(default)]
     pub files_jvm_brokers_capped: usize,
+    /// Files where the per-file cap on Python broker sites (RabbitMQ, Redis, NATS, SQS / SNS,
+    /// Pub/Sub) dropped sites: the sites past the cap are not registered. Counted like
+    /// `files_scanned`.
+    #[serde(default)]
+    pub files_py_brokers_capped: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -394,6 +399,19 @@ impl IndexHealth {
     #[inline]
     pub fn jvm_brokers_truncated(&self) -> bool {
         self.files_jvm_brokers_capped > 0
+    }
+
+    /// One file's Python broker site cap (`FileIndex::py_brokers_capped`).
+    #[inline]
+    pub fn record_py_brokers(&mut self, capped: bool) {
+        self.files_py_brokers_capped += usize::from(capped);
+    }
+
+    /// Whether the Python broker site cap dropped events: some broker sites of Python files are
+    /// missing.
+    #[inline]
+    pub fn py_brokers_truncated(&self) -> bool {
+        self.files_py_brokers_capped > 0
     }
 
     /// Whether the in-process site cap dropped events: some bus sites or schedules are missing.
@@ -672,6 +690,15 @@ impl IndexHealth {
                 self.files_jvm_brokers_capped
             );
         }
+        if self.files_py_brokers_capped > 0 {
+            let _ = writeln!(
+                out,
+                "    {} file(s) cut by the Python broker site cap (RabbitMQ / Redis / NATS / SQS / SNS / \
+                 Pub/Sub; docs/parser-support.md, section 3.10): the sites past the cap are not \
+                 registered",
+                self.files_py_brokers_capped
+            );
+        }
         if self.sql_sites_unresolved > 0 {
             let _ = writeln!(
                 out,
@@ -763,6 +790,7 @@ impl IndexHealth {
         self.files_inproc_capped += other.files_inproc_capped;
         self.files_const_capped += other.files_const_capped;
         self.files_jvm_brokers_capped += other.files_jvm_brokers_capped;
+        self.files_py_brokers_capped += other.files_py_brokers_capped;
         self.files_skipped_non_source += other.files_skipped_non_source;
         // The calls-layer counters are the graph's, set after the reconcile.
     }
