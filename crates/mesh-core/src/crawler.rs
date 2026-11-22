@@ -9,7 +9,7 @@ use std::sync::Arc;
 pub struct FilesystemCrawler;
 
 /// The default exclude pattern for dotenv files (`Config`'s `exclude_patterns`).
-const DEFAULT_ENV_PATTERN: &str = "**/.env*";
+pub(crate) const DEFAULT_ENV_PATTERN: &str = "**/.env*";
 
 /// Compiled exclusion matcher built once per crawl from the workspace `exclude_patterns`.
 ///
@@ -617,6 +617,48 @@ mod tests {
             names(&[".env*".to_string()]),
             ["a.ts"],
             "an explicit pattern is honoured"
+        );
+    }
+
+    /// Round 2: an operator who writes the built-in pattern string themselves keeps templates
+    /// excluded; only an absent `exclude_patterns` key gets the carve-out.
+    #[test]
+    fn an_explicit_default_looking_pattern_is_not_the_built_in_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ws = temp.path();
+        std::fs::write(ws.join(".env.example"), "K=v").expect("write");
+        std::fs::write(ws.join("a.ts"), "x").expect("write");
+        let allowed = dunce::canonicalize(ws).expect("canon");
+        let scope =
+            ValidatedScope::resolve(&allowed.to_string_lossy(), std::slice::from_ref(&allowed))
+                .expect("scope");
+        let crawl = |extra: &str| {
+            let cfg = crate::config::Config::load_from_str(&format!(
+                "[workspace]\nname = \"t\"\nversion = \"1\"\nroots = [\".\"]\n{extra}"
+            ))
+            .expect("config");
+            let mut v: Vec<String> =
+                FilesystemCrawler::crawl_scope(&scope, &cfg.workspace.exclude_patterns, Some(3))
+                    .iter()
+                    .map(|f| {
+                        f.strip_prefix(&allowed)
+                            .expect("rel")
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            crawl(""),
+            [".env.example", "a.ts"],
+            "absent key: built-in default"
+        );
+        assert_eq!(crawl("exclude_patterns = [\"**/.env*\"]\n"), ["a.ts"]);
+        assert_eq!(
+            crawl("exclude_patterns = [\"**/.env*\", \"**/secrets/**\"]\n"),
+            ["a.ts"]
         );
     }
 

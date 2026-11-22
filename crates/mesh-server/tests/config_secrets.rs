@@ -172,3 +172,87 @@ async fn secrets_in_read_config_files_never_reach_the_graph_or_a_tool() {
     }
     assert!(all.contains("good.topic"));
 }
+
+/// Round 2: a credential written as a placeholder DEFAULT (in a yaml value, a compose variable,
+/// a source site or a nested default) never becomes a node name, a topic or a tool answer.
+#[tokio::test]
+async fn credentials_in_placeholder_defaults_never_reach_the_graph_or_a_tool() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = dunce::canonicalize(tmp.path()).unwrap();
+    write(
+        &root,
+        "src/Svc.java",
+        "package a;\npublic class Svc {\n\
+         \x20 @KafkaListener(topics = \"${app.topics.b}\")\n  public void a(String m) {}\n\
+         \x20 @KafkaListener(topics = \"${kafka.dflt:postgres://uR1:pwR1leak@db.internal/app}\")\n  public void b(String m) {}\n\
+         \x20 @KafkaListener(topics = \"${n1:${n2:sk_live_SITENESTx0123456789abc}}\")\n  public void c(String m) {}\n\
+         \x20 @KafkaListener(topics = \"${app.topics.nested}\")\n  public void d(String m) {}\n\
+         \x20 @KafkaListener(topics = \"${plain.dflt:fallback.topic}\")\n  public void e(String m) {}\n}\n",
+    );
+    write(
+        &root,
+        "src/main/resources/application.yml",
+        "app:\n  topics:\n    b: \"${KEY_B:sk_live_CFGLEAKabcdef0123}\"\n    nested: \"${a:${b:sk_live_NESTEDLEAKx0123456789}}\"\n",
+    );
+    write(
+        &root,
+        "docker-compose.yml",
+        "services:\n  api:\n    environment:\n      LIVE_TOPIC: \"${LIVE_X:sk_live_DEFAULTLEAK0123abcd}\"\n",
+    );
+    write(
+        &root,
+        "svc.ts",
+        "import { Kafka } from 'kafkajs';\nconst k = new Kafka({ brokers: ['b'] });\nconst producer = k.producer();\nexport async function run() {\n  await producer.send({ topic: process.env.LIVE_TOPIC, messages: [] });\n  await producer.send({ topic: process.env.TSDEF ?? 'sk_live_TSDEFAULTLEAK0123456789', messages: [] });\n}\n",
+    );
+    let state = state_for(&root);
+    let all = everything(
+        &state,
+        &[
+            "${app.topics.b}",
+            "${kafka.dflt}",
+            "${live_topic}",
+            "${tsdef}",
+            "${app.topics.nested}",
+            "${n1}",
+        ],
+    )
+    .await;
+    for canary in [
+        "sk_live_CFGLEAK",
+        "uR1",
+        "pwR1leak",
+        "sk_live_SITENEST",
+        "sk_live_NESTEDLEAK",
+        "sk_live_DEFAULTLEAK",
+        "sk_live_TSDEFAULTLEAK",
+        "db.internal",
+    ] {
+        if let Some(at) = all.find(canary) {
+            panic!(
+                "{canary} leaked: ...{}...",
+                &all[at.saturating_sub(80)..(at + 80).min(all.len())]
+            );
+        }
+    }
+    // The sites stay visible under their placeholder; a plain default is still used.
+    assert!(all.contains("${app.topics.b}"), "{all}");
+    assert!(all.contains("${kafka.dflt}"), "{all}");
+    assert!(all.contains("fallback.topic"), "{all}");
+    assert!(state.snapshot().health.config_topics_unresolved >= 4);
+}
+
+/// Round 2: the parse cache stores the extracted index; it must not carry the credential either.
+#[test]
+fn the_cached_file_index_carries_no_default_credential() {
+    let fi = mesh_parsers::PolyglotIndexer::extract(
+        Path::new("src/Svc.java"),
+        "package a;\npublic class Svc {\n  @KafkaListener(topics = \"${k:postgres://u:pwcache@h/x}\")\n  public void b(String m) {}\n}\n",
+        0,
+    );
+    let cached = serde_json::to_string(&fi).unwrap();
+    assert!(
+        !cached.contains("pwcache") && !cached.contains("postgres"),
+        "{cached}"
+    );
+    assert!(cached.contains("${k}"));
+}

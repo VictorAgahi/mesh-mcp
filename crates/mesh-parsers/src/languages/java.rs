@@ -208,6 +208,7 @@ impl JavaExtractor {
     fn extract_kafka_producer_topic(
         text: &str,
         value_fields: &HashMap<String, String>,
+        locals: &HashSet<String>,
     ) -> Option<String> {
         let lower = text.to_lowercase();
         let mut search_start = 0;
@@ -250,8 +251,13 @@ impl JavaExtractor {
                     // A field or parameter injected with `@Value("${...}")` in this file:
                     // its placeholder, resolved against the configuration at fold time.
                     let first = args.split(',').next().unwrap_or("").trim();
-                    let name = first.strip_prefix("this.").unwrap_or(first);
-                    if let Some(placeholder) = value_fields.get(name) {
+                    // A bare name hidden by a parameter or local of the method is that
+                    // variable, not the field; `this.name` is always the field.
+                    let name = match first.strip_prefix("this.") {
+                        Some(field) => Some(field),
+                        None => (!locals.contains(first)).then_some(first),
+                    };
+                    if let Some(placeholder) = name.and_then(|n| value_fields.get(n)) {
                         return Some(placeholder.clone());
                     }
                 }
@@ -409,7 +415,13 @@ impl JavaExtractor {
                 let class_fields = Self::enclosing_class(node)
                     .and_then(|c| value_fields.get(&c.id()))
                     .unwrap_or(&no_fields);
-                let producer_topic = Self::extract_kafka_producer_topic(method_text, class_fields);
+                let locals = if class_fields.is_empty() {
+                    HashSet::new()
+                } else {
+                    Self::local_names(node, source)
+                };
+                let producer_topic =
+                    Self::extract_kafka_producer_topic(method_text, class_fields, &locals);
                 let grpc_client_services = Self::extract_grpc_client_services(method_text);
 
                 nodes.push(ContractNode {
@@ -527,6 +539,37 @@ impl JavaExtractor {
         None
     }
 
+    /// The parameters and local variables a method declares (bounded walk): a bare name among
+    /// them is not a field of the class.
+    fn local_names(method: Node, source: &[u8]) -> HashSet<String> {
+        fn walk(node: Node, source: &[u8], out: &mut HashSet<String>, depth: usize) {
+            if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH || out.len() > 512 {
+                return;
+            }
+            if matches!(
+                node.kind(),
+                "formal_parameter"
+                    | "variable_declarator"
+                    | "catch_formal_parameter"
+                    | "enhanced_for_statement"
+            ) {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                {
+                    out.insert(name.to_string());
+                }
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                walk(child, source, out, depth + 1);
+            }
+        }
+        let mut out = HashSet::new();
+        walk(method, source, &mut out, 0);
+        out
+    }
+
     /// The nearest class or record declaration around `node`.
     fn enclosing_class(node: Node) -> Option<Node> {
         let mut cur = node.parent();
@@ -553,7 +596,38 @@ impl JavaExtractor {
             return;
         }
         if matches!(node.kind(), "class_declaration" | "record_declaration") {
-            if let Some(text) = content.get(node.start_byte()..node.end_byte()) {
+            // The class's own text: nested type declarations are scanned in their own right,
+            // their fields are not this class's.
+            let mut own = String::new();
+            let mut at = node.start_byte();
+            let mut nested: Vec<(usize, usize)> = Vec::new();
+            let mut cursor = node.walk();
+            for body in node
+                .children(&mut cursor)
+                .filter(|c| c.kind() == "class_body")
+            {
+                let mut inner = body.walk();
+                nested.extend(
+                    body.children(&mut inner)
+                        .filter(|m| {
+                            matches!(
+                                m.kind(),
+                                "class_declaration"
+                                    | "record_declaration"
+                                    | "interface_declaration"
+                                    | "enum_declaration"
+                            )
+                        })
+                        .map(|m| (m.start_byte(), m.end_byte())),
+                );
+            }
+            for (start, end) in nested {
+                own.push_str(content.get(at..start).unwrap_or(""));
+                at = end;
+            }
+            own.push_str(content.get(at..node.end_byte()).unwrap_or(""));
+            {
+                let text = own.as_str();
                 if text.contains("@Value(") {
                     let fields = Self::value_placeholder_fields(text);
                     if !fields.is_empty() {
@@ -957,7 +1031,7 @@ public class BillingListener {
     fn kafka_producer_topic_does_not_cross_into_later_statement() {
         let code = r#"kafkaTemplate.send(topicVar, payload); logger.info("database is down");"#;
         assert_eq!(
-            JavaExtractor::extract_kafka_producer_topic(code, &HashMap::new()),
+            JavaExtractor::extract_kafka_producer_topic(code, &HashMap::new(), &HashSet::new()),
             None
         );
     }
@@ -966,7 +1040,7 @@ public class BillingListener {
     fn kafka_producer_topic_extracts_literal_first_argument() {
         let code = r#"kafkaTemplate.send("orders.created", payload);"#;
         assert_eq!(
-            JavaExtractor::extract_kafka_producer_topic(code, &HashMap::new()),
+            JavaExtractor::extract_kafka_producer_topic(code, &HashMap::new(), &HashSet::new()),
             Some("orders.created".to_string())
         );
     }

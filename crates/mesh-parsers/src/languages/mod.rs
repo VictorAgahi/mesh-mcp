@@ -290,6 +290,32 @@ impl FileIndex {
         self.apply_with(graph, &ConfigValues::default());
     }
 
+    /// Removes every placeholder default that is not a plain topic name from the topics, node
+    /// names and signatures of this file (`@KafkaListener(topics = "${k:postgres://u:pw@h/x}")`
+    /// becomes `${k}`): a credential written as a default must reach neither the graph, a tool
+    /// answer nor the parse cache.
+    pub fn mask_placeholder_defaults(&mut self) {
+        use mesh_core::config_values::mask_placeholder_defaults as mask;
+        let masked = |s: &str| {
+            (s.contains("${"))
+                .then(|| mask(s).into_owned())
+                .filter(|m| m != s)
+        };
+        for (_, topic) in self.producers.iter_mut().chain(self.consumers.iter_mut()) {
+            if let Some(m) = masked(topic) {
+                *topic = CompactStr::new(m);
+            }
+        }
+        for node in &mut self.nodes {
+            if let Some(m) = masked(&node.name) {
+                node.name = CompactStr::new(m);
+            }
+            if let Some(sig) = node.signature.as_deref().and_then(masked) {
+                node.signature = Some(CompactStr::new(sig));
+            }
+        }
+    }
+
     /// Whether a producer or consumer topic of this file is a `${key}` config placeholder.
     pub fn has_config_topic(&self) -> bool {
         self.producers
@@ -303,7 +329,10 @@ impl FileIndex {
     /// profiles disagree), and the site is linked `heuristic` unless exactly one strong
     /// value says so. A placeholder nothing resolves stays registered as the `${key}` topic
     /// itself, `heuristic`: visible, never guessed.
-    pub fn apply_with(self, graph: &mut ContractGraph, config: &ConfigValues) {
+    pub fn apply_with(mut self, graph: &mut ContractGraph, config: &ConfigValues) {
+        // Also masked here: an index built by hand, merged from custom patterns, or read from a
+        // cache written before the rule existed.
+        self.mask_placeholder_defaults();
         // Call facts are keyed by the file their nodes live in: a file with call
         // facts always has the declaration nodes they were read from.
         if let Some(first) = self.nodes.first() {
@@ -822,7 +851,10 @@ impl PolyglotIndexer {
             return sql::extract_file(file_path, content, repo_id);
         }
         let lang_kind = LanguageKind::from_path(&file_path.to_string_lossy());
-        Self::extract_as(file_path, content, repo_id, cfg, lang_kind, timeout_micros)
+        let mut index =
+            Self::extract_as(file_path, content, repo_id, cfg, lang_kind, timeout_micros);
+        index.mask_placeholder_defaults();
+        index
     }
 
     /// `.vue` / `.svelte` / `.astro`: the script is extracted (line numbers are the file's),

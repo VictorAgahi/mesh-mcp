@@ -690,6 +690,17 @@ fn doctor_warns_when_configuration_is_degraded() {
             "not valid UTF-8",
         ),
         (
+            "degraded and skipped",
+            vec![
+                ("application.properties", b"a=good\nb=\xff\xfe\n".to_vec()),
+                (
+                    "application.yml",
+                    format!("k: {}\n", "v".repeat(400_000)).into_bytes(),
+                ),
+            ],
+            "configuration files above",
+        ),
+        (
             "skipped oversized",
             vec![(
                 "application.yml",

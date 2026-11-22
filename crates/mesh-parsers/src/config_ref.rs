@@ -20,9 +20,10 @@ pub fn placeholder(key: &str, default: Option<&str>) -> Option<String> {
         return None;
     }
     match default {
-        None => Some(format!("${{{key}}}")),
         Some(d) if valid_default(d) => Some(format!("${{{key}:{d}}}")),
-        Some(_) => None,
+        // A default that is not a plain topic name (a credential, a URL with userinfo, prose)
+        // is dropped, never recorded: the site stays visible as `${key}`.
+        _ => Some(format!("${{{key}}}")),
     }
 }
 
@@ -37,7 +38,7 @@ fn valid_key(key: &str) -> bool {
 fn valid_default(default: &str) -> bool {
     !default.is_empty()
         && default.len() <= MAX_PART_LEN
-        && !default.contains(['$', '{', '}', ' ', '\n', '\t', '"', '\'', '`'])
+        && mesh_core::config_values::plain_topic(default)
 }
 
 #[cfg(test)]
@@ -61,8 +62,21 @@ mod tests {
         assert!(placeholder("a b", None).is_none());
         assert!(placeholder("${x}", None).is_none());
         assert!(placeholder("", None).is_none());
-        assert!(placeholder("K", Some("a b")).is_none());
-        assert!(placeholder("K", Some("${y}")).is_none());
+        // A default that is not a plain topic name is dropped, the key stays.
+        for bad in [
+            "a b",
+            "${y}",
+            "sk_live_abcdef0123456789",
+            "postgres://u:pw@h/x",
+            "u@h",
+            "x#y",
+        ] {
+            assert_eq!(
+                placeholder("K", Some(bad)).as_deref(),
+                Some("${K}"),
+                "{bad}"
+            );
+        }
         assert!(placeholder(&"k".repeat(200), None).is_none());
     }
 }

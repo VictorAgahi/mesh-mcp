@@ -125,8 +125,8 @@ WebClient links to routes; WebFlux functional routes; a topic given as a constan
 
 Stops: this extractor has no constant propagation (a topic built in code is not resolved; use
 Spring properties), and it reads only the Kafka and HTTP idioms named above. `@Value` is read by
-field or parameter name inside the declaring class (a parameter or local that shadows the field is
-still taken for it); `@ConfigurationProperties` classes, SpEL
+field or parameter name inside the declaring class (nested type declarations are not part of it;
+a parameter or local of the same name hides the field, `this.name` is the field); `@ConfigurationProperties` classes, SpEL
 (`#{...}`) and Spring's relaxed binding (`APP_TOPICS_ORDERS` for `app.topics.orders`) are not.
 
 ### 2.3 Go (level 3)
@@ -376,15 +376,19 @@ Values come from: Spring `application*.yml` / `*.properties` (dotted keys; honou
 - secrets (commandment 5): a real dotenv file (`.env`, `.env.local`, `.env.production`,
   `production.env`, `.env.distributor`, `.env.example.local`) is never read, whatever
   `exclude_patterns` says; the default `**/.env*` pattern lets exactly the four template names
-  through, and only that default pattern is carved out (an operator pattern written exactly
-  `**/.env*` is indistinguishable from the default and gets the same carve-out; write `.env*` to
-  exclude templates too). A template's values are weak. An entry is kept only if its value is
+  through, and only when `exclude_patterns` is absent from the config: an operator who lists
+  `**/.env*` (or any `exclude_patterns`) themselves keeps every `.env*` file excluded, templates
+  included (the loader rewrites the exact string to `.env*`, the same files). A template's values are weak. An entry is kept only if its value is
   topic-shaped (ASCII letters, digits, `. _ - : / $ { } # * +`, at most 249 bytes, no `://`, no `@`,
   no token-looking run such as `sk_live_`, `ghp_`, `AKIA`, a 32-char hex run or a long base64-ish
   run) and its key is not a credential name (ending `_KEY`, `_DSN`, `_URL`, `_URI`, `_PASSWORD`,
   `_PASSWD`, `_PWD`, `_CREDENTIALS`, `_AUTH`, or containing `dsn`, `stripe`, `secret`, `token`,
-  `password`, `credential`, `apikey`, ...). A topic site whose key is dropped stays a visible
-  `${KEY}`.
+  `password`, `credential`, `apikey`, ...). A placeholder DEFAULT is held to the same rule (`${k:postgres://u:pw@h/x}`,
+  `${k:sk_live_...}`, `${a:${b:x}}` lose their default at extraction, in the graph, in the parse
+  cache and in `smart_search` snippets). A topic site whose key is dropped stays a visible
+  `${KEY}`. By design, a topic-shaped value under a NON-secret key name is kept (a name is the
+  only signal available), and a legitimate topic of 24 or more alphanumeric characters with a digit
+  and no separator (`orders2024eventsV2Stream`) is taken for a token and dropped, known limit.
 - bounds, all counted (`IndexHealth::files_config_capped`, `config_entries_dropped`, `doctor`): 2,048
   entries per file, 50,000 per workspace, values up to 249 bytes; config files go through the same
   384 KB / binary guards as every file; symlinks are not followed outside the root. Also counted

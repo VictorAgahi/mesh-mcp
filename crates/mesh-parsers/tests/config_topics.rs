@@ -174,8 +174,8 @@ fn java_value_injected_fields_and_listener_placeholders_are_recorded() {
 }
 
 /// F10: `@Value` fields are scoped to the class that declares them. The same name on a plain
-/// field of another class of the same file is not a config read. Documented limit: inside the
-/// declaring class a parameter or local that shadows the field is still taken for it.
+/// field of another class of the same file is not a config read, and a parameter that shadows
+/// the field (class `Third`) hides it.
 #[test]
 fn java_value_fields_are_scoped_to_their_own_class() {
     let fi = index(
@@ -195,17 +195,73 @@ fn java_value_fields_are_scoped_to_their_own_class() {
          }\n",
     );
     let got = recorded(&fi);
-    // First and Third (the documented shadowing limit); Second records nothing.
-    assert_eq!(
-        got,
-        vec![p("${app.topics.orders}"), p("${app.topics.orders}")]
-    );
+    // Only First: Second has a plain field, Third's send uses its parameter.
+    assert_eq!(got, vec![p("${app.topics.orders}")]);
     let lines: Vec<usize> = fi
         .producers
         .iter()
         .map(|(i, _)| fi.nodes[*i].line_start)
         .collect();
-    assert_eq!(lines, vec![4, 12], "{lines:?}");
+    assert_eq!(lines, vec![4], "{lines:?}");
+}
+
+/// Round 2: nested type declarations are not part of the enclosing class's `@Value` scope, and a
+/// parameter or local with the field's name hides it (`this.name` stays the field).
+#[test]
+fn java_value_fields_ignore_nested_classes_and_are_hidden_by_parameters_and_locals() {
+    let fi = index(
+        "src/Nest.java",
+        "package a;\n\
+         public class Outer {\n\
+         \x20 private String topic = compute();\n\
+         \x20 public void plainSend() { kafkaTemplate.send(topic, \"a\"); }\n\
+         \x20 static class Inner {\n\
+         \x20   @Value(\"${inner.topic}\") private String topic;\n\
+         \x20   public void innerSend() { kafkaTemplate.send(topic, \"b\"); }\n\
+         \x20 }\n\
+         }\n\
+         class Holder {\n\
+         \x20 @Value(\"${cfg.topic}\") private String topic;\n\
+         \x20 public void viaField() { kafkaTemplate.send(topic, \"c\"); }\n\
+         \x20 public void viaThis(String topic) { kafkaTemplate.send(this.topic, \"d\"); }\n\
+         \x20 public void viaParam(String topic) { kafkaTemplate.send(topic, \"e\"); }\n\
+         \x20 public void viaLocal() { String topic = compute(); kafkaTemplate.send(topic, \"f\"); }\n\
+         }\n",
+    );
+    let lines: Vec<(usize, String)> = fi
+        .producers
+        .iter()
+        .map(|(i, t)| (fi.nodes[*i].line_start, t.to_string()))
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            (7, "${inner.topic}".to_string()),
+            (12, "${cfg.topic}".to_string()),
+            (13, "${cfg.topic}".to_string()),
+        ],
+        "{lines:?}"
+    );
+}
+
+/// Round 2: a default that is a credential or a URL is dropped at extraction; a plain one stays.
+#[test]
+fn placeholder_defaults_that_are_not_plain_names_are_dropped_at_extraction() {
+    let ts = index(
+        "svc/d.ts",
+        "import { Kafka } from 'kafkajs';\n\
+         const k = new Kafka({ brokers: ['b'] });\n\
+         const producer = k.producer();\n\
+         export async function run(config: any) {\n\
+           await producer.send({ topic: process.env.A ?? 'sk_live_abcdef0123456789xyz' });\n\
+           await producer.send({ topic: config.get('B', 'postgres://u:pw@h/x') });\n\
+           await producer.send({ topic: process.env.C ?? 'orders.default' });\n\
+         }\n",
+    );
+    assert_eq!(
+        recorded(&ts),
+        vec![p("${A}"), p("${B}"), p("${C:orders.default}")]
+    );
 }
 
 fn entry(key: &str, value: &str, weak: bool) -> ConfigEntry {

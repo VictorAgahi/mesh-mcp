@@ -1035,6 +1035,10 @@ impl SmartSearchTool {
     /// space was "not a key"), and masked non-secrets (Volontariapp report):
     /// see [`Self::is_not_a_secret`].
     fn redact_sensitive_line(line: &str, is_code: bool) -> String {
+        // A credential written as a `${key:default}` placeholder default (a connection string,
+        // a token) is shown as `${key}`: the same rule the graph applies to topic names.
+        let masked = mesh_core::config_values::mask_placeholder_defaults(line);
+        let line: &str = &masked;
         let Some(sep_pos) = line.find([':', '=']) else {
             return line.to_string();
         };

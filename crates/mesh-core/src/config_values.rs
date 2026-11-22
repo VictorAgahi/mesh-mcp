@@ -217,10 +217,17 @@ impl ConfigValues {
         let mut work = Work::default();
         let mut visiting: Vec<&str> = Vec::new();
         let topics = self.expand(topic, 0, &mut visiting, &mut work);
+        // Every candidate, whatever produced it, must be a plain topic name.
         let resolved = if work.over {
             None
         } else {
-            topics.map(|topics| Resolved { topics })
+            topics
+                .map(|mut topics| {
+                    topics.retain(|(t, _)| plain_topic(t));
+                    topics
+                })
+                .filter(|topics| !topics.is_empty())
+                .map(|topics| Resolved { topics })
         };
         (resolved, work.steps)
     }
@@ -282,6 +289,9 @@ impl ConfigValues {
         if inner.contains("${") || visiting.contains(&key) {
             return None; // a nested placeholder or a cycle
         }
+        // A default that is not a plain topic name (a credential, a URL with userinfo, ...)
+        // is never used: the placeholder stays unresolved and visible as `${key}`.
+        let default = default.filter(|d| plain_topic(d));
         if let Some(values) = self.index.get(key) {
             let ambiguous = values.len() > 1;
             visiting.push(key);
@@ -390,13 +400,102 @@ fn name_shaped(value: &str) -> bool {
         && value.len() <= MAX_VALUE_LEN
         && value.chars().all(|c| {
             c.is_ascii_alphanumeric()
-                || matches!(
-                    c,
-                    '.' | '_' | '-' | ':' | '/' | '$' | '{' | '}' | '#' | '*' | '+'
-                )
+                || matches!(c, '.' | '_' | '-' | ':' | '/' | '$' | '{' | '}' | '*' | '+')
         })
         && !value.contains("://")
         && !looks_like_token(value)
+        && defaults_are_plain(value)
+}
+
+/// A topic name with no placeholder syntax left: what a resolved topic or a default must be.
+pub fn plain_topic(value: &str) -> bool {
+    name_shaped(value) && !value.contains(['$', '{', '}'])
+}
+
+/// The `(start, end)` of every outermost `${...}` of `text` (`end` is past the closing brace);
+/// `None` when one is unterminated.
+fn placeholder_spans(text: &str) -> Option<Vec<(usize, usize)>> {
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("${") {
+        let start = from + rel;
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, c) in text[start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(start + i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        spans.push((start, end));
+        from = end;
+    }
+    Some(spans)
+}
+
+/// Whether every `${key:default}` of `value` has a plain default (a nested placeholder or a
+/// credential as a default is not).
+fn defaults_are_plain(value: &str) -> bool {
+    let Some(spans) = placeholder_spans(value) else {
+        return false;
+    };
+    spans
+        .into_iter()
+        .all(|(s, e)| match value[s + 2..e - 1].split_once(':') {
+            Some((_, d)) => d.is_empty() || plain_topic(d),
+            None => true,
+        })
+}
+
+/// `text` with every placeholder default that is not a plain topic name removed
+/// (`${k:postgres://u:pw@h/x}` -> `${k}`, `${a:${b:sk_live_x}}` -> `${a}`): a credential
+/// written as a default never becomes a node name, a topic or a cached string. Text with no
+/// placeholder, or only plain defaults, is returned as is.
+pub fn mask_placeholder_defaults(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("${") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let Some(spans) = placeholder_spans(text) else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut changed = false;
+    for (s, e) in spans {
+        out.push_str(&text[last..s]);
+        let inner = &text[s + 2..e - 1];
+        match inner.split_once(':') {
+            // Only a placeholder-shaped key: `${a ? b : c}` of a template literal is code.
+            Some((k, d))
+                if !d.is_empty()
+                    && !plain_topic(d)
+                    && !k.is_empty()
+                    && k.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')) =>
+            {
+                out.push_str("${");
+                out.push_str(k);
+                out.push('}');
+                changed = true;
+            }
+            _ => out.push_str(&text[s..e]),
+        }
+        last = e;
+    }
+    out.push_str(&text[last..]);
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
 }
 
 /// Well-known credential prefixes, a long hex run, or a long mixed-case / digit run with no
@@ -416,13 +515,22 @@ fn looks_like_token(value: &str) -> bool {
         "xoxb-",
         "xoxp-",
         "xoxa-",
-        "akia",
-        "asia",
-        "aiza",
-        "eyj",
     ];
     let lower = value.to_ascii_lowercase();
     if PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return true;
+    }
+    let upper_run = |min: usize| {
+        value.len() >= min
+            && value
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    };
+    // AWS access key ids, Google API keys, JWTs.
+    if ((lower.starts_with("akia") || lower.starts_with("asia")) && upper_run(20))
+        || (value.starts_with("AIza") && value.len() >= 35)
+        || (value.starts_with("eyJ") && value.len() >= 30)
+    {
         return true;
     }
     let compact = value.len() >= 24
@@ -455,6 +563,18 @@ fn secret_key(key: &str) -> bool {
         "_password",
         "_passwd",
         "_pwd",
+        "_pass",
+        "-pass",
+        ".pass",
+        "_passphrase",
+        "_pin",
+        "_salt",
+        "_seed",
+        "_signature",
+        "_private",
+        "_cert",
+        "_cookie",
+        "_session",
         "-password",
         ".password",
         "_credentials",
@@ -480,7 +600,26 @@ fn secret_key(key: &str) -> bool {
         "jwt",
         "cert",
     ];
+    // `pass` as a whole word (`DB_PASS`, `db.pass.value`, `dbPass`), not inside `passenger`.
+    let word_pass = key
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .flat_map(|w| {
+            let mut words: Vec<String> = Vec::new();
+            let mut cur = String::new();
+            let mut prev_lower = false;
+            for c in w.chars() {
+                if c.is_ascii_uppercase() && prev_lower {
+                    words.push(std::mem::take(&mut cur));
+                }
+                prev_lower = c.is_ascii_lowercase();
+                cur.push(c.to_ascii_lowercase());
+            }
+            words.push(cur);
+            words
+        })
+        .any(|w| matches!(w.as_str(), "pass" | "pwd" | "pin" | "salt" | "pw"));
     lower == "key"
+        || word_pass
         || SUFFIXES.iter().any(|x| lower.ends_with(x))
         || PARTS.iter().any(|x| lower.contains(x))
 }
@@ -527,10 +666,20 @@ pub fn from_registry(reg: &PropertyRegistry, weak: bool, env_only: bool) -> Conf
             push_entry(&mut file, &secrets, key, value, weak);
         }
         if let Some((_, name)) = key.rsplit_once(".environment.") {
-            push_entry(&mut file, &secrets, name, value, weak);
+            // Compose reads shell semantics: `${VAR:-default}` is `${VAR:default}`.
+            push_entry(&mut file, &secrets, name, &shell_defaults(value), weak);
         }
     }
     file
+}
+
+/// `${A:-x}` (shell / compose) as `${A:x}` (the placeholder syntax of this module).
+fn shell_defaults(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.contains("${") && value.contains(":-") {
+        std::borrow::Cow::Owned(value.replace(":-", ":"))
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    }
 }
 
 /// Whether a yaml text holds more than one document (`---` profile sections after the first).
@@ -645,11 +794,23 @@ pub fn from_env_lists(content: &str, weak: bool) -> ConfigFile {
             pending_name = Some(unquote(name).to_string());
         } else if let Some(value) = body.strip_prefix("value:") {
             if let Some(name) = pending_name.take() {
-                push_entry(&mut file, &secrets, &name, unquote(value), weak);
+                push_entry(
+                    &mut file,
+                    &secrets,
+                    &name,
+                    &shell_defaults(unquote(value)),
+                    weak,
+                );
             }
         } else if is_item {
             if let Some((key, value)) = body.split_once('=') {
-                push_entry(&mut file, &secrets, key.trim(), unquote(value), weak);
+                push_entry(
+                    &mut file,
+                    &secrets,
+                    key.trim(),
+                    &shell_defaults(unquote(value)),
+                    weak,
+                );
             }
         }
     }
@@ -903,6 +1064,78 @@ mod tests {
         let f = from_registry(&reg, false, false);
         let got: Vec<&str> = f.entries.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(got, ["ok.topic"]);
+    }
+
+    /// Round 2: a credential used as a default (or reached through a value) is never a topic.
+    #[test]
+    fn credentials_as_placeholder_defaults_are_never_candidates() {
+        let mut reg = PropertyRegistry::new();
+        reg.ingest_properties_str(
+            "a=${KEY_B:sk_live_CFGLEAKabcdef0123}\nn=${x:${y:sk_live_NESTEDx0123456789}}\n\
+             u=${U:postgres://u:pw@h/x}\nok=${OK:fine.default}\nh=${H:0123456789abcdef0123456789abcdef}\n",
+        );
+        let mut v = ConfigValues::default();
+        v.set_file(
+            Path::new("a.properties"),
+            from_registry(&reg, false, false).entries,
+        );
+        v.rebuild();
+        for t in [
+            "${a}",
+            "${n}",
+            "${u}",
+            "${h}",
+            "${nokey:sk_live_abcdef0123456789}",
+            "${nokey:a@b}",
+        ] {
+            assert!(v.resolve(t).is_none(), "{t}");
+        }
+        assert_eq!(
+            v.resolve("${nokey:plain.dflt}").unwrap().topics,
+            [("plain.dflt".to_string(), true)]
+        );
+        // The stored entries themselves never keep a placeholder with an unsafe default.
+        let stored = from_registry(&reg, false, false);
+        let keys: Vec<&str> = stored.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, ["ok"]);
+    }
+
+    #[test]
+    fn masking_removes_unsafe_defaults_only() {
+        assert_eq!(
+            mask_placeholder_defaults("${k:postgres://u:pw@h/x}"),
+            "${k}"
+        );
+        assert_eq!(mask_placeholder_defaults("${a:${b:sk_live_x}}"), "${a}");
+        assert_eq!(
+            mask_placeholder_defaults("${k:orders.v1}"),
+            "${k:orders.v1}"
+        );
+        assert_eq!(
+            mask_placeholder_defaults("p.${k:sk_live_abcdef0123}.s"),
+            "p.${k}.s"
+        );
+        assert_eq!(mask_placeholder_defaults("${a ? b : c}"), "${a ? b : c}");
+        assert_eq!(mask_placeholder_defaults("plain"), "plain");
+    }
+
+    /// Round 2 items 4, 5, 6.
+    #[test]
+    fn shell_defaults_extra_secret_keys_and_hash_values() {
+        let compose = "services:\n  a:\n    environment:\n      - T=${X:-orders}\n";
+        let f = from_env_lists(compose, false);
+        assert_eq!(f.entries[0].value, "${X:orders}");
+        let mut reg = PropertyRegistry::new();
+        reg.ingest_yaml_str("services:\n  a:\n    environment:\n      T: \"${X:-orders2}\"\n")
+            .unwrap();
+        let f = from_registry(&reg, false, true);
+        assert_eq!(f.entries[0].value, "${X:orders2}");
+        let text = "DB_PASS=Tr0ubador3xyz\nPASS=abcdef\nDB_PIN=1234\nX_SALT=ab\nX_SEED=ab\n\
+            X_SIGNATURE=ab\nX_PRIVATE=ab\nX_CERT=ab\nX_COOKIE=ab\nX_SESSION=ab\ndbPass=ab\n\
+            NOSP_TOPIC=orders#hashLEAKnosp\nPASSENGER_TOPIC=passenger.events\nOK_TOPIC=orders\n";
+        let f = from_dotenv(text, false);
+        let got: Vec<&str> = f.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(got, ["PASSENGER_TOPIC", "OK_TOPIC"]);
     }
 
     #[test]

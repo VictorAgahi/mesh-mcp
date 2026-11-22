@@ -139,9 +139,16 @@ impl DoctorCommand {
         } else if health.rejected.is_empty() && health.rejected_overflow == 0 {
             DoctorCheck::ok("Index health", summary)
         } else {
+            let config_note = if health.config_degraded() {
+                "\n    Some ${key} topics may stay unresolved or resolve weakly because of the configuration files above."
+            } else {
+                ""
+            };
             DoctorCheck::warn(
                 "Index health",
-                format!("{summary}\n    Searches cannot return these files; read them directly."),
+                format!(
+                    "{summary}\n    Searches cannot return these files; read them directly.{config_note}"
+                ),
             )
         }
     }
