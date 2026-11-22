@@ -781,3 +781,45 @@ fn a_cycle_of_name_copies_reads_as_nothing_and_stays_bounded() {
         started.elapsed()
     );
 }
+
+#[test]
+fn a_wrapper_class_that_owns_a_client_keeps_its_callers_edge() {
+    // `KafkaBus` and `Wrapped` hold a client of their own: `bus.publish("literal")` is read by the
+    // generic reader (no broker known), as before this pass; the wrapper's own produce is Kafka.
+    let code = r#"
+import pika
+from confluent_kafka import Producer
+
+class KafkaBus:
+    def __init__(self):
+        self.producer = Producer({})
+    def publish(self, topic, v):
+        self.producer.produce(topic, v)
+    def emit(self, v):
+        self.producer.produce("wrap.topic", v)
+
+class Wrapped:
+    def __init__(self):
+        self.ch = pika.BlockingConnection(None).channel()
+    def publish(self, queue, body):
+        self.ch.basic_publish("", routing_key=queue, body=body)
+
+bus = KafkaBus()
+w = Wrapped()
+
+def run():
+    bus.publish("bus.topic", 1)
+    w.publish("rabbit.wrapped", b"x")
+"#;
+    assert_eq!(
+        read(code),
+        vec![
+            s('P', "?", "bus.topic"),
+            s('P', "?", "rabbit.wrapped"),
+            s('P', "kafka", "wrap.topic"),
+        ]
+    );
+    // A class that owns no client stays hidden (the decoy of the corpus).
+    let bare = "class Bus:\n    def publish(self, t, m): pass\n\nbus = Bus()\n\ndef run():\n    bus.publish(\"hidden.topic\", 1)\n";
+    assert!(read(bare).is_empty(), "{:?}", read(bare));
+}

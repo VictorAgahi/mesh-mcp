@@ -18,6 +18,9 @@
 # that are a parameter, an f-string or a concatenation. shadowed.py holds one site, `shadow.nats.real`:
 # its commented-out imports, a parameter, a comprehension variable, a lambda parameter, a loop
 # variable and a local class all hide the boto3 client, and `pika` is never imported.
+# wrapper.py holds a wrapper class per broker (`KafkaBus`, `RabbitBus`) that owns a client: the topic
+# of `bus.publish("bus.topic", 1)` is a producer on the calling function (the wrapper's own
+# `produce(topic, ...)` names nothing), unlike the `Bus` of decoys.py, which owns no client.
 # tests/test_publish.py holds a real-looking publish: the scorer ignores test files.
 corpus: py-brokers
 root: examples/eda/py-brokers
@@ -43,6 +46,9 @@ producers:
   - {id: p16, topic: tasks.new, file: src/pybrk/worker.py, line: 12, language: python, tags: [py_broker]}
   - {id: p17, topic: "kafka:payments.settled", file: src/pybrk/mixed.py, line: 10, language: python, tags: [py_broker, broker_key]}
   - {id: p18, topic: shadow.nats.real, file: src/pybrk/shadowed.py, line: 40, language: python, tags: [py_broker]}
+  - {id: p19, topic: wrap.topic, file: src/pybrk/wrapper.py, line: 13, language: python, tags: [py_broker, kafka_basic]}
+  - {id: p20, topic: bus.topic, file: src/pybrk/wrapper.py, line: 29, language: python, tags: [py_broker, kafka_basic]}
+  - {id: p21, topic: rabbit.wrapped, file: src/pybrk/wrapper.py, line: 31, language: python, tags: [py_broker]}
 
 consumers:
   - {id: c1, topic: "rabbitmq:orders", file: src/pybrk/rabbit_pika.py, line: 35, language: python, tags: [py_broker, broker_key]}

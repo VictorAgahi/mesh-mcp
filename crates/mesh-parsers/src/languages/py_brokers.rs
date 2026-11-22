@@ -89,10 +89,16 @@ enum Kind {
 struct Value {
     kind: Kind,
     name: Option<String>,
+    /// For a `LocalClass`: the id of the class node (0 otherwise).
+    class: usize,
 }
 
 fn val(kind: Kind) -> Option<Value> {
-    Some(Value { kind, name: None })
+    Some(Value {
+        kind,
+        name: None,
+        class: 0,
+    })
 }
 
 /// What the shape-based reader must do with a call this pass recognised.
@@ -141,8 +147,8 @@ enum Bound<'t> {
     Expr(Node<'t>),
     /// A parameter or variable annotated with a type.
     Annot(Node<'t>),
-    /// A class the file declares.
-    Class,
+    /// A class the file declares (its node).
+    Class(Node<'t>),
     /// Anything else (a parameter, a loop variable, a function, a pattern target).
     Other,
 }
@@ -190,6 +196,8 @@ const CALL_NAMES: &[&str] = &[
 
 /// Evaluation steps one call site may take; a call past it reads as nothing and counts the file
 /// as capped.
+/// Calls of a class one wrapper check looks at.
+const MAX_CLASS_CALLS: usize = 256;
 const MAX_CALL_STEPS: usize = 2_048;
 /// Evaluation steps one file may take in all (a backstop: the memo keeps real files far below).
 const MAX_FILE_STEPS: usize = 400_000;
@@ -212,6 +220,9 @@ struct Ctx<'t> {
     steps: usize,
     call_steps: usize,
     exhausted: bool,
+    /// Classes the file declares by node id, and whether each holds a client of its own.
+    classes: HashMap<usize, Node<'t>>,
+    owns: HashMap<usize, bool>,
     /// A per-call or per-file evaluation budget tripped (counted like the site cap).
     over: bool,
     /// Names bound in each scope, by scope node id.
@@ -301,6 +312,8 @@ impl<'t> Ctx<'t> {
             steps: 0,
             call_steps: 0,
             exhausted: false,
+            classes: HashMap::new(),
+            owns: HashMap::new(),
             over: false,
             tables: HashMap::new(),
             attrs: HashMap::new(),
@@ -462,7 +475,7 @@ impl<'t> Ctx<'t> {
                 }
                 "class_definition" => {
                     if let Some(name) = n.child_by_field_name("name") {
-                        self.add(&mut table, text(name, self.source), Bound::Class);
+                        self.add(&mut table, text(name, self.source), Bound::Class(n));
                     }
                 }
                 "lambda"
@@ -805,11 +818,60 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// An instance of the class `class` of this file.
+    fn local_class(&mut self, class: Node<'t>) -> Option<Value> {
+        self.classes.insert(class.id(), class);
+        Some(Value {
+            kind: Kind::LocalClass,
+            name: None,
+            class: class.id(),
+        })
+    }
+
+    /// Whether a class of the file holds a client of a library of its own (a wrapper such as
+    /// `class KafkaBus: self.producer = Producer(...)`): its `publish` is then the generic
+    /// reader's to read, not "nobody's producer".
+    fn class_owns_client(&mut self, id: usize) -> bool {
+        if let Some(v) = self.owns.get(&id) {
+            return *v;
+        }
+        let Some(class) = self.classes.get(&id).copied() else {
+            return false;
+        };
+        let mut calls: Vec<Node<'t>> = Vec::new();
+        let mut stack: Vec<Node<'t>> = vec![class];
+        while let Some(n) = stack.pop() {
+            if n.kind() == "call" {
+                calls.push(n);
+                if calls.len() >= MAX_CLASS_CALLS {
+                    break;
+                }
+            }
+            let mut c = n.walk();
+            stack.extend(n.named_children(&mut c));
+        }
+        let saved = self.call_steps;
+        let mut owns = false;
+        for call in calls {
+            self.call_steps = 0;
+            if self
+                .eval(call, 1)
+                .is_some_and(|v| v.kind != Kind::LocalClass)
+            {
+                owns = true;
+                break;
+            }
+        }
+        self.call_steps = saved;
+        self.owns.insert(id, owns);
+        owns
+    }
+
     fn eval_bound(&mut self, b: &Bound<'t>, depth: usize) -> Option<Value> {
         match b {
             Bound::Expr(e) => self.eval(*e, depth + 1),
             Bound::Annot(t) => self.eval(*t, depth + 1),
-            Bound::Class => val(Kind::LocalClass),
+            Bound::Class(c) => self.local_class(*c),
             Bound::Import(_) | Bound::Other => None,
         }
     }
@@ -829,8 +891,8 @@ impl<'t> Ctx<'t> {
         }
         if f.kind() == "identifier" {
             let bounds = self.bounds(f, text(f, self.source));
-            if !bounds.is_empty() && bounds.iter().all(|b| matches!(b, Bound::Class)) {
-                return val(Kind::LocalClass);
+            if let [Bound::Class(c)] = bounds.as_slice() {
+                return self.local_class(*c);
             }
         }
         None
@@ -856,6 +918,7 @@ impl<'t> Ctx<'t> {
                 return Some(Value {
                     kind: Kind::KombuQueue,
                     name,
+                    class: 0,
                 });
             }
             "redis.Redis"
@@ -922,7 +985,11 @@ impl<'t> Ctx<'t> {
             let name = args
                 .and_then(|a| a.get(Some(pos), kw))
                 .and_then(|n| ctx.name_of(n, 0));
-            Some(Value { kind, name })
+            Some(Value {
+                kind,
+                name,
+                class: 0,
+            })
         };
         match (v.kind, method) {
             (Kind::PikaConn, "channel") => val(Kind::PikaChannel),
@@ -1254,6 +1321,7 @@ impl<'t> Ctx<'t> {
                 if let Some(Value {
                     kind: Kind::KombuQueue,
                     name: Some(n),
+                    ..
                 }) = self.eval(e, 0)
                 {
                     found.push(n);
@@ -1283,8 +1351,11 @@ impl<'t> Ctx<'t> {
         };
         match (v.kind, method) {
             (Kind::LocalClass, "produce" | "send" | "send_and_wait" | "publish" | "subscribe") => {
-                out.claims
-                    .insert((call.start_byte(), call.end_byte()), Claim::Foreign);
+                // A wrapper that holds a client of its own stays the generic reader's.
+                if !self.class_owns_client(v.class) {
+                    out.claims
+                        .insert((call.start_byte(), call.end_byte()), Claim::Foreign);
+                }
             }
             (Kind::PikaChannel, "basic_publish") => {
                 let k = name(self, Some(1), "routing_key");
