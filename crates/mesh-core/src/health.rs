@@ -209,6 +209,17 @@ pub struct IndexHealth {
     /// past the cap are not registered. Counted like `files_scanned`.
     #[serde(default)]
     pub files_inproc_capped: usize,
+    /// Files with more string constants (enum members, `as const` keys, top-level `const`s) than
+    /// the per-file cap, or more enum imports than the import cap (9.0 T14): the members past the
+    /// cap cannot resolve an enum-member queue name, which then keeps its qualified member key.
+    /// Counted like `files_scanned`.
+    #[serde(default)]
+    pub files_const_capped: usize,
+    /// Enum members a queue site cannot choose between, because the declarations its import can
+    /// mean give different values: the site resolves to neither and keeps its qualified member key,
+    /// `heuristic`. Distinct member paths, set after every fold.
+    #[serde(default)]
+    pub const_members_conflicting: usize,
     /// Files where the per-file cap on JVM broker sites (Java RabbitMQ, JMS, SQS / SNS, Redis,
     /// NATS, Pub/Sub) dropped sites: the sites past the cap are not registered. Counted like
     /// `files_scanned`.
@@ -352,6 +363,25 @@ impl IndexHealth {
     #[inline]
     pub fn record_inproc(&mut self, capped: bool) {
         self.files_inproc_capped += usize::from(capped);
+    }
+
+    /// One file's string-constant cap (`FileIndex::const_capped`).
+    #[inline]
+    pub fn record_const(&mut self, capped: bool) {
+        self.files_const_capped += usize::from(capped);
+    }
+
+    /// Whether the string-constant cap dropped members: some enum-member names stay unresolved.
+    #[inline]
+    pub fn const_truncated(&self) -> bool {
+        self.files_const_capped > 0
+    }
+
+    /// Whether queue names given as enum members may be unresolved (a cap, or members declared
+    /// with different values): `doctor` warns.
+    #[inline]
+    pub fn const_degraded(&self) -> bool {
+        self.files_const_capped > 0 || self.const_members_conflicting > 0
     }
 
     /// One file's JVM broker site cap (`FileIndex::jvm_brokers_capped`).
@@ -615,6 +645,24 @@ impl IndexHealth {
                 self.files_inproc_capped
             );
         }
+        if self.files_const_capped > 0 {
+            let _ = writeln!(
+                out,
+                "    {} file(s) with more string constants or enum imports than the per-file cap (enum \
+                 members, `as const` keys; docs/parser-support.md, section 3.8): a queue named by a \
+                 member past the cap keeps its qualified member key instead of its value",
+                self.files_const_capped
+            );
+        }
+        if self.const_members_conflicting > 0 {
+            let _ = writeln!(
+                out,
+                "    {} enum member(s) a queue site cannot choose between, the declarations its \
+                 import can mean giving different values (docs/parser-support.md, section 3.8): the \
+                 site resolves to neither and keeps its qualified member key",
+                self.const_members_conflicting
+            );
+        }
         if self.files_jvm_brokers_capped > 0 {
             let _ = writeln!(
                 out,
@@ -713,6 +761,7 @@ impl IndexHealth {
         self.files_config_parse_failed += other.files_config_parse_failed;
         self.files_config_lossy += other.files_config_lossy;
         self.files_inproc_capped += other.files_inproc_capped;
+        self.files_const_capped += other.files_const_capped;
         self.files_jvm_brokers_capped += other.files_jvm_brokers_capped;
         self.files_skipped_non_source += other.files_skipped_non_source;
         // The calls-layer counters are the graph's, set after the reconcile.

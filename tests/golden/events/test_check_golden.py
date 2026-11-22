@@ -171,5 +171,28 @@ class CheckGolden(unittest.TestCase):
         self.assertTrue(cg.has_topic(arn, "orders", arn=True))
 
 
+class EnumTopicTests(unittest.TestCase):
+    """`enum_topic_ok` (T14): the value must be on the declaration of the member the line names."""
+
+    def check(self, line, topic, files):
+        with tempfile.TemporaryDirectory() as d:
+            for name, text in files.items():
+                (Path(d) / name).write_text(text)
+            return cg.enum_topic_ok(d, line, topic)
+
+    def test_the_value_of_the_named_member_passes(self):
+        files = {"q.ts": "export enum Q {\n  A = 'a-jobs',\n  B = 'b-jobs',\n}\n"}
+        self.assertTrue(self.check("@Processor(Q.A)", "a-jobs", files))
+
+    def test_a_value_of_another_member_is_rejected(self):
+        files = {"q.ts": "export enum Q {\n  A = 'a-jobs',\n  B = 'b-jobs',\n}\n"}
+        self.assertFalse(self.check("@Processor(Q.A)", "b-jobs", files))
+        self.assertFalse(self.check("@Processor(Q.A)", "elsewhere", {"x.ts": "const t = 'elsewhere';"}))
+
+    def test_the_member_key_and_the_qualified_key_pass(self):
+        self.assertTrue(self.check("@EventPattern(JobQueue.EMAIL)", "email", {}))
+        self.assertTrue(self.check("@InjectQueue(ExternalQueue.BILLING)", "externalqueue.billing", {}))
+
+
 if __name__ == "__main__":
     unittest.main()

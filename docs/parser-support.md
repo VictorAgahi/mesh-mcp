@@ -491,6 +491,77 @@ unknown links as before, `heuristic`. `diff_mesh` names the broker of a removed 
 Golden: `tests/golden/events/jvm-brokers.expected.yaml` (31 sites, 3 hops, 2 chains, shadowing and
 pattern decoys).
 
+### 3.8 Queue names given as enum members
+
+A BullMQ / Bull / bee-queue site that names its queue by an imported enum member
+(`@Processor(JobQueue.EMAIL)`, `@Processor({ name: JobQueue.EMAIL })`, `@InjectQueue(JobQueue.EMAIL)`,
+`new Queue(JobQueue.EMAIL)`, `new Worker(JobQueue.EMAIL, ...)`, the `bull` constructor) is resolved, when
+the file is folded into the graph, against the string constants of the workspace: `JobQueue.EMAIL =
+'email-jobs'` makes the topic `email-jobs`, so the consumer and the producer meet on the value. A
+constant edit re-folds the unchanged files naming it (one extra pass after the reload, never a loop),
+and an incremental reload equals a cold rebuild.
+
+Which declaration a site means is decided by its own imports, never by the bare enum name:
+
+- the import binds the enum's local name to a module. A relative path (`./queues`, `../a/queues.js`,
+  `./queues/index`) selects the declaring file; a tsconfig / package.json alias is rewritten to the
+  relative path it stands for first; an alias (`import { JobQueue as Q }`) and a namespace import
+  (`Qs.JobQueue.REPORTS`) bind the same way. A relative path that matches no declaring file (a barrel
+  that re-exports it) selects the declarations of the importer's own repository.
+- a package specifier (`@org/queues`, `@org/queues/src/q`) binds ONLY to the declarations of the
+  package it names, by the `package.json` name the graph already gives every node (npm scope stripped,
+  subpath dropped). It never binds to a homonymous enum of the importer's own repository: with no such
+  package in the workspace (`import { JobQueue } from 'legacy-queue-lib'`) the site is unresolved, not
+  guessed.
+- a site with no import for the enum (declared in the same file) binds to that file's own declaration.
+- the declared string literals of the candidates are the answer when they all agree (`exact`). Two
+  candidates that give the member different values (two files of one package) resolve to NEITHER: the
+  topic is the qualified member key (`jobqueue.email`), `heuristic`, and
+  `IndexHealth::const_members_conflicting` counts the members a queue site could not choose between
+  (`doctor` warns; twenty files each declaring and importing their own enum are no conflict).
+- a member no candidate declares (an enum of a package outside the roots, a non-literal value, a
+  member named like a credential, a value that is no name) keeps the QUALIFIED member key
+  (`externalqueue.billing`), `heuristic`. Never the bare member (`billing`): two enums with a
+  `BILLING` member are two queues. Sites of that qualified key still meet each other.
+- the constants of test files (`*.spec.ts`, `__tests__/`, `test/`, ...) and of build output
+  (`dist/`, `out/`, `build/`, `.next/`, `coverage/`, `target/`) are never recorded.
+- what may be a name (commandment 5), applied where the constants are extracted, so a refused value
+  never reaches the graph or the parse cache: the member is not named like a credential (a whole word
+  `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `DSN`, ... of its name: `API_KEY`, not `SECRETARY`), and the
+  value is a plain name, not a URL or a base64 text, not `Bearer_...`, `Basic_...`, `tok_...`, `sk_...`
+  and the other token prefixes, not a known weak password (`hunter2`), not a lone `password` / `secret` /
+  `token`, and has no random-looking run (six or more letters and digits with a digit anywhere but a
+  trailing run of at most four). `password-reset-jobs`, `token-refresh-jobs`, `private-events`,
+  `secretary-jobs`, `orders2024` and `invoice-batch-v2024` are names. Not caught, by design: a
+  passphrase made of words (`correct-horse-battery-staple`) and a five-character code.
+
+Only queue sites are resolved by value. An event, a stream, a Kafka topic or any other site naming a
+member (`@EventPattern(Streams.USER_CREATED)`) keeps the member key it always had, so the same member of
+two enums stays one flow in a codebase that names a stream and its event type alike (Volontariapp:
+`Streams.USER_CREATED = 'user:created'`, `UserEventMessagingType.USER_CREATED = 'user.created'`).
+A custom pattern's capture of a member (`target:\s*(\w+Queue\.\w+)`) joins a queue by value only when
+it binds, through the importing file's own imports, to a declaration some queue site names a queue by.
+
+What is read: string-literal `enum` members and `as const` / plain object keys whose last segment is
+ALL-CAPS (`Topics.ORDERS`, not `Topics.orders`). Not read, silently (no site, no counter): camelCase
+members, an alias of the enum (`const q = JobQueue; q.EMAIL`), `await import(...)` and CommonJS
+`require(...)` bindings, `static` class fields (`Names.EMAIL` keeps its qualified key), template
+literals, enum aliases, `FlowProducer` / `@InjectFlowProducer`, `Enum[kind]` and queues built at
+runtime, an aliased `bee-queue` constructor. Resolved to the qualified key (the declaration is not
+found): a default import, a re-export under another name (`export { JobQueue as JQ }`), an enum
+nested in a namespace, a declaration in a `.d.ts`. `BullModule.registerQueue({ name })` only makes a
+queue injectable (every worker app registers the queues it consumes): it is not a producer. The
+producer of an injected queue is its `@InjectQueue(...)` injection point, that of a `new Queue(...)`
+its construction. A chain (`trace_flow`) does not continue through such a site: it is outside any
+method, so the calls layer sees no callable that publishes.
+
+`analyze_impact` and `trace_flow` accept the member as written (`JobQueue.EMAIL`), its value
+(`email-jobs`) or the qualified key.
+
+Bounds, all counted (`IndexHealth::files_const_capped`, `doctor` warns; the member past a cap keeps its
+qualified key): at most 4,000 string constants and 512 enum-like imports per file, 249-byte values, no
+recursive walk.
+
 ## 4. What every level shares
 
 - **Pattern-based.** A framework is recognised by a convention in the syntax tree, not by

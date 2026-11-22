@@ -109,6 +109,18 @@ pub fn normalize_topic_key(raw: &str) -> String {
         .trim_matches(|c| c == '\'' || c == '"' || c == '`')
         .trim();
     let expr = trimmed.strip_prefix("typeof ").map_or(trimmed, str::trim);
+    let key = if is_member_ref(expr) {
+        expr.rsplit('.').next().unwrap_or(expr)
+    } else {
+        expr
+    };
+    key.to_lowercase()
+}
+
+/// Whether `expr` is spelled like a code reference to an enum or constant member
+/// (`Streams.EVENT_CREATED`): a dotted path of identifiers whose first segment starts with an
+/// uppercase letter and whose last is CONSTANT_CASE.
+pub fn is_member_ref(expr: &str) -> bool {
     let is_ident = |seg: &str| {
         let mut chars = seg.chars();
         chars
@@ -116,22 +128,28 @@ pub fn normalize_topic_key(raw: &str) -> String {
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
             && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
     };
-    let segments: Vec<&str> = expr.split('.').collect();
-    let is_member_ref = segments.len() >= 2
-        && segments.iter().all(|s| is_ident(s))
-        && segments[0].starts_with(|c: char| c.is_ascii_uppercase())
-        && segments.last().is_some_and(|last| {
-            last.chars().any(|c| c.is_ascii_alphabetic())
-                && last
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        });
-    let key = if is_member_ref {
-        segments.last().copied().unwrap_or(expr)
-    } else {
-        expr
-    };
-    key.to_lowercase()
+    let mut segments = expr.split('.').peekable();
+    let mut count = 0usize;
+    let mut first_upper = false;
+    let mut last = "";
+    while let Some(seg) = segments.next() {
+        if !is_ident(seg) {
+            return false;
+        }
+        if count == 0 {
+            first_upper = seg.starts_with(|c: char| c.is_ascii_uppercase());
+        }
+        count += 1;
+        if segments.peek().is_none() {
+            last = seg;
+        }
+    }
+    count >= 2
+        && first_upper
+        && last.chars().any(|c| c.is_ascii_alphabetic())
+        && last
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Prefix of a recorded RPC call target naming one method (`=UserService.signUp`):

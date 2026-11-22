@@ -395,7 +395,7 @@ impl Memo {
 /// ever retained, so nothing else a config file holds can reach the graph): a bounded token of
 /// ASCII name characters and `${key:default}` placeholder syntax, with no URL scheme, no
 /// userinfo (`@`), and nothing that looks like a credential token.
-fn name_shaped(value: &str) -> bool {
+pub(crate) fn name_shaped(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_VALUE_LEN
         && value.chars().all(|c| {
@@ -560,7 +560,7 @@ fn looks_like_token(value: &str) -> bool {
 
 /// A key that names a credential, a connection string or a secret: never kept, whatever the
 /// value looks like. Stricter than `PropertyRegistry::is_sensitive_key` on purpose.
-fn secret_key(key: &str) -> bool {
+pub(crate) fn secret_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     const SUFFIXES: &[&str] = &[
         "_key",

@@ -1,0 +1,11 @@
+{
+  "name": "bullmq-enum-queues",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@nestjs/bullmq": "^10.0.0",
+    "@nestjs/common": "^10.0.0",
+    "@nestjs/microservices": "^10.0.0",
+    "bullmq": "^5.0.0"
+  }
+}

@@ -1,0 +1,14 @@
+# Fixture: BullMQ queues named by string-enum members declared in another file
+# (9.0 T14). Consumers use `@Processor(Enum.X)` / `new Worker(Enum.X)`, producers an injected
+# queue (`@InjectQueue(Enum.X)`) or `new Queue(Enum.X)`.
+[workspace]
+name = "bullmq-enum-queues"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/node_modules/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true

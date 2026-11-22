@@ -32,6 +32,7 @@ LANGS = {"ts", "js", "java", "go", "python", "csharp", "rust", "sql"}
 TAGS = {
     "kafka_basic", "layered_calls", "inproc_bus", "cqrs", "cron", "sql", "config_topic",
     "broker_key", "jvm_broker", "go_broker", "py_broker", "cs_broker", "declared_pattern",
+    "enum_topic",
 }
 VIA = {"this", "injected_field", "imported_function", "same_module", "interface_impl"}
 ENTRY_KINDS = {"topic", "route", "handler", "cron"}
@@ -219,6 +220,29 @@ def has_topic(line, topic, arn=False):
     return re.search(before + re.escape(str(topic)) + _TOPIC_AFTER, line, re.I) is not None
 
 
+def enum_topic_ok(root, line, topic):
+    """Tag `enum_topic` (T14): the line names the topic through an enum member, so the line need
+    not carry the topic. The member the line names must say it: `Enum.MEMBER` where the topic is
+    that member's own key (`externalqueue.billing`, `email`), or where some source file of the
+    corpus declares `MEMBER = '<topic>'` (the member's value, found on that member's own
+    declaration, not anywhere in the corpus)."""
+    topic = str(topic)
+    members = re.findall(r"\b([A-Za-z_]\w*)\.([A-Z][A-Z0-9_]*)\b", line or "")
+    for enum, member in members:
+        if topic.lower() in (member.lower(), f"{enum}.{member}".lower()):
+            return True
+    declared = [
+        re.compile(r"\b" + re.escape(member) + r"\s*=\s*(['\"`])" + re.escape(topic) + r"\1")
+        for _, member in members
+    ]
+    for p in sorted(Path(root).rglob("*")):
+        if p.is_file() and p.suffix in {".ts", ".js"} and "node_modules" not in p.parts:
+            text = p.read_text(errors="replace")
+            if any(d.search(text) for d in declared):
+                return True
+    return False
+
+
 def has_symbol(line, name):
     return re.search(r"(?<![A-Za-z0-9_])" + re.escape(str(name)) + r"(?![A-Za-z0-9_])", line) is not None
 
@@ -335,8 +359,11 @@ class Checker:
                 # function), so its line need not carry the topic.
                 self.need(w, text, lambda t, tp=source_topic(topic, tags): has_topic(t, tp, "broker_key" in tags),
                           f"topic {topic!r}",
-                          "config_topic" in tags or "declared_pattern" in tags
+                          "config_topic" in tags or "declared_pattern" in tags or "enum_topic" in tags
                           or (text is not None and "${" in text))
+                if "enum_topic" in tags and text is not None and not enum_topic_ok(root, text, topic):
+                    self.err(w, f"topic {topic!r} is neither a string constant of the corpus nor a "
+                                f"member named on the line: {text.strip()!r}")
                 sites[kind].setdefault((it.get("file"), str(topic).lower()), []).append(
                     (it.get("line"), it.get("optional") is True))
         hop_targets = set()
@@ -404,7 +431,8 @@ class Checker:
                     tags = it.get("tags") or []
                     self.need(sw, text, lambda t: has_topic(t, source_topic(topic, tags), "broker_key" in tags),
                               f"topic {topic!r}",
-                              "config_topic" in tags or (text is not None and "${" in text))
+                              "config_topic" in tags or "enum_topic" in tags
+                              or (text is not None and "${" in text))
                     pool = sites["producers" if kind == "produce" else "consumers"]
                     hits = [o for ln, o in pool.get((st.get("file"), str(topic).lower()), [])
                             if ln == st.get("line")]

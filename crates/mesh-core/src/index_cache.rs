@@ -122,7 +122,14 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v20: JVM brokers in Java (9.0 T8a): RabbitMQ, JMS, SQS / SNS, Redis, NATS and Pub/Sub
 /// listeners, producers and consumers (`EventStream` call-site nodes, `Broker::Jms`),
 /// `FileIndex::jvm_brokers_capped`.
-const SCHEMA_VERSION: u8 = 20;
+/// v21: enum-member queue names (9.0 T14, after T8a's 20): a BullMQ / Bull queue named by an
+/// imported `Enum.MEMBER` is a `FileIndex::member_sites` entry resolved by declaration against the
+/// workspace's string constants when the index is folded (`FileIndex::member_imports`,
+/// `FileIndex::const_capped`).
+/// v22: a constant a queue name must not be (a token, a URL, a password-shaped value, a member named
+/// like a credential) is no longer recorded in a TypeScript / JavaScript file's `$` records, so it
+/// cannot reach this cache (9.0 T14 review).
+const SCHEMA_VERSION: u8 = 22;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

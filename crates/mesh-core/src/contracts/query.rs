@@ -613,16 +613,59 @@ impl ContractGraph {
     /// `rabbitmq:orders`) while RabbitMQ also uses `orders`. Such a target is ambiguous and
     /// [`Self::analyze_impact`] lists both readings.
     pub fn target_literal_clash(&self, target: &str) -> Option<CompactStr> {
-        let norm = normalize_topic_key(target);
+        let norm = self.topic_target_key(target);
         let (broker, bare) = split_qualified_topic_key(&norm)?;
         let literal = self.topic_producers.contains_key(norm.as_str())
             || self.topic_consumers.contains_key(norm.as_str());
         (literal && self.known_brokers(bare) & broker.bit() != 0).then(|| CompactStr::new(&norm))
     }
 
+    /// The registry key a query `target` names: [`normalize_topic_key`], except that an enum
+    /// member spelled as written in code (`JobQueue.EMAIL`) names the queue its string constant
+    /// is (or its qualified key `jobqueue.email` when no single value is known), when such a
+    /// queue is a topic of the graph; otherwise the member's own key (9.0 T14).
+    pub fn topic_target_key(&self, target: &str) -> String {
+        let norm = normalize_topic_key(target);
+        let known = |key: &str| {
+            self.topic_producers.contains_key(key) || self.topic_consumers.contains_key(key)
+        };
+        let expr = target.trim().trim_matches(['\'', '"', '`']).trim();
+        let expr = expr.strip_prefix("typeof ").map_or(expr, str::trim);
+        if !is_member_ref(expr) {
+            return norm;
+        }
+        // Distinct values only (copies that agree are one value, two that disagree are not a
+        // guess); the constants of test files do not count.
+        let mut values: Vec<String> = self
+            .rpc_calls
+            .iter()
+            .filter_map(|(id, r)| Some((id, r.strip_prefix(CONST_VALUE_PREFIX)?)))
+            .filter_map(|(id, c)| Some((id, c.split_once('=')?)))
+            .filter(|(_, (path, _))| *path == expr)
+            .filter(|(id, _)| {
+                self.nodes
+                    .get(id)
+                    .is_some_and(|n| !crate::test_paths::is_test_path(&n.file_path))
+            })
+            .map(|(_, (_, value))| normalize_topic_key(value))
+            .collect();
+        values.sort_unstable();
+        values.dedup();
+        if let [only] = values.as_slice() {
+            if known(only) {
+                return only.clone();
+            }
+        }
+        let qualified = expr.to_lowercase();
+        if known(&qualified) {
+            return qualified;
+        }
+        norm
+    }
+
     /// Asynchronous causal impact flow resolution
     pub fn analyze_impact(&self, target: &str) -> ImpactFlow<'_> {
-        let norm = normalize_topic_key(target);
+        let norm = self.topic_target_key(target);
         // A qualified target (`kafka:orders`, the name of a broker hub) selects one broker's
         // channel of the name: its sites, the unknown-broker ones included (they join every
         // channel of the name). A key that literally is the target (a Redis key spelled

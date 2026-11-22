@@ -1,0 +1,48 @@
+# Hand-annotated from the source of examples/eda/bullmq-enum-queues. Never generated from tool output.
+# Every queue name is a string-enum member declared in src/queues.ts and imported elsewhere, so the
+# topic is the member's VALUE (tag enum_topic, SCHEMA.md): `JobQueue.EMAIL` is `email-jobs`,
+# `LegacyQueue.EMAIL` is `legacy-email-jobs` (the decoy: the same member name EMAIL in two enums is
+# two queues and must never share a topic).
+# Producers are injected queues (`@InjectQueue(Enum.X)`, the topic-bearing line is the decorator
+# argument) and `new Queue(Enum.X)` (the line that builds the queue, as for a Go `kafka.Writer`);
+# consumers are `@Processor(Enum.X)` and `new Worker(Enum.X)`.
+# `ExternalQueue.BILLING` is named by an enum of a package that is not part of the workspace
+# (`@acme/queues`): its value is not known, so the topic is the QUALIFIED member key,
+# `externalqueue.billing`, on both sides (heuristic); the bare member `billing` is shared by every
+# enum with a BILLING member and is never used for a queue.
+# Decoys: `src/events/enums.ts` declares another `JobQueue` whose EMAIL names an event, used by an
+# `@EventPattern`: not a queue site, so it keeps its member key `email` and never takes a queue's
+# value; `src/__tests__/queues.spec.ts` declares a third `JobQueue.EMAIL`, a test constant that
+# never resolves a production queue; `src/alias.service.ts` imports the enum as `Q`.
+# Not sites: `BullModule.registerQueue({ name: JobQueue.EMAIL })` only makes a queue injectable (every
+# worker app of a NestJS workspace registers the queues it consumes), and the two queues built from a
+# runtime name (`${tenant}-jobs`, a parameter) have no name any file declares: nothing is
+# registered, nothing is guessed (see `negatives`).
+# No chain is annotated: the report worker is reached from the email worker through a call
+# (EmailProcessor.process -> ReportService.request, a real flow), but a producer bound to an
+# injected or field queue sits on the line that builds the queue, outside any method, and the calls
+# layer links a chain only through a callable that holds the publish: that limit is out of scope here.
+corpus: bullmq-enum-queues
+root: examples/eda/bullmq-enum-queues
+config: mesh-mcp.toml
+languages: [ts]
+
+producers:
+  - {id: p1, topic: email-jobs, file: src/email.service.ts, line: 8, language: ts, tags: [enum_topic]}
+  - {id: p2, topic: report-jobs, file: src/report.service.ts, line: 7, language: ts, tags: [enum_topic]}
+  - {id: p3, topic: audit-jobs, file: src/audit.service.ts, line: 9, language: ts, tags: [enum_topic]}
+  - {id: p4, topic: externalqueue.billing, file: src/billing.ts, line: 9, language: ts, tags: [enum_topic]}
+  - {id: p5, topic: report-jobs, file: src/alias.service.ts, line: 9, language: ts, tags: [enum_topic]}
+
+consumers:
+  - {id: c1, topic: email-jobs, file: src/email.processor.ts, line: 5, language: ts, tags: [enum_topic]}
+  - {id: c2, topic: report-jobs, file: src/report.worker.ts, line: 5, language: ts, tags: [enum_topic]}
+  - {id: c3, topic: legacy-email-jobs, file: src/legacy.processor.ts, line: 5, language: ts, tags: [enum_topic]}
+  - {id: c4, topic: externalqueue.billing, file: src/billing.ts, line: 12, language: ts, tags: [enum_topic]}
+  - {id: c5, topic: email, file: src/events/handler.ts, line: 5, language: ts, tags: [enum_topic]}
+
+negatives:
+  - {kind: producer, file: src/app.module.ts, line: 7, note: "BullModule.registerQueue declares an injectable queue, it does not publish"}
+  - {kind: consumer, file: src/app.module.ts, line: 7, note: "BullModule.registerQueue is not a worker"}
+  - {kind: producer, file: src/dynamic.ts, line: 5, note: "a queue named at runtime from a template string"}
+  - {kind: producer, file: src/dynamic.ts, line: 9, note: "a queue named by a function parameter"}

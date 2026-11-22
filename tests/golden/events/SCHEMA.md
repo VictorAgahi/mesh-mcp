@@ -94,6 +94,9 @@ negatives:
 
 `kafka_basic`, `layered_calls` (T2/T3), `inproc_bus` (T4), `cqrs` (T4), `cron` (T4), `sql` (T5),
 `config_topic` (T6), `broker_key` (T7), `jvm_broker`, `go_broker`, `py_broker`, `cs_broker` (T8),
+`enum_topic` (T14: the site names its queue through an enum member, so the topic is the member's
+string value, which is not on the line; `check_golden.py` checks the value is a string literal of
+the corpus, or, for a member no file of the corpus declares, that the line names the member),
 `declared_pattern` (site declared by a custom pattern only; always `optional: true`).
 A tag whose feature is not implemented yet is EXPECTED to score 0 on 8.0.1: that is the baseline.
 

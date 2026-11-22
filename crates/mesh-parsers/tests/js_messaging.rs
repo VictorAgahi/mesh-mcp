@@ -1175,3 +1175,123 @@ fn redis_move_spellings_all_link_source_and_destination() {
         );
     }
 }
+
+// ---- enum-member queue names (9.0 T14) --------------------------------------------------
+
+#[test]
+fn queue_names_given_as_enum_members_are_marked_queue_sites_and_other_names_are_not() {
+    let fi = index(
+        "svc/queues.ts",
+        "import { Processor, InjectQueue } from '@nestjs/bullmq';\n\
+         import { Queue, Worker } from 'bullmq';\n\
+         import { JobQueue, LegacyQueue } from './queues';\n\
+         @Processor(JobQueue.EMAIL) class A {}\n\
+         @Processor({ name: LegacyQueue.EMAIL }) class B {}\n\
+         class S { constructor(@InjectQueue(JobQueue.AUDIT) private q: Queue) {} }\n\
+         const w = new Worker(JobQueue.REPORTS, async () => {});\n\
+         const q = new Queue(JobQueue.REPORTS);\n\
+         export function dyn(name: string) { return new Queue(name); }\n\
+         export function tpl(t: string) { return new Queue(`${t}-jobs`); }\n",
+    );
+    assert_eq!(
+        events(&fi),
+        vec![
+            ev('C', "JobQueue.EMAIL"),
+            ev('C', "JobQueue.REPORTS"),
+            ev('C', "LegacyQueue.EMAIL"),
+            ev('P', "JobQueue.AUDIT"),
+            ev('P', "JobQueue.REPORTS"),
+        ]
+    );
+    // Every member site is a queue site; the runtime names record nothing.
+    assert_eq!(fi.member_sites.len(), 5);
+    assert!(fi.member_sites.iter().all(|m| m.queue));
+    // The imports that bind the members to their declaring file travel with the record.
+    let locals: Vec<&str> = fi.member_imports.iter().map(|i| i.local.as_str()).collect();
+    assert!(
+        locals.contains(&"JobQueue") && locals.contains(&"LegacyQueue"),
+        "{locals:?}"
+    );
+}
+
+#[test]
+fn a_member_naming_a_kafka_topic_keeps_its_member_key() {
+    // Only queues are named by their value: an event or stream member keeps the link it always
+    // had with the same member of another enum (Volontariapp: `Streams.X` and `XEventType.X`).
+    let fi = index(
+        "svc/kafka.ts",
+        "import { Kafka } from 'kafkajs';\nimport { Topics } from './topics';\n\
+         const producer = new Kafka({}).producer();\n\
+         export async function run() { await producer.send({ topic: Topics.ORDER_PLACED }); }\n",
+    );
+    assert_eq!(events(&fi), vec![ev('P', "Topics.ORDER_PLACED")]);
+    assert!(fi.member_sites.is_empty());
+}
+
+#[test]
+fn string_constants_are_recorded_and_capped_visibly() {
+    let mut code = String::from("export enum Big {\n");
+    for i in 0..4100 {
+        code.push_str(&format!("  M{i} = 'q-{i}',\n"));
+    }
+    code.push_str("}\n");
+    let big = index("svc/big.ts", &code);
+    assert!(big.const_capped);
+    assert_eq!(big.const_records().count(), 4000);
+    let small = index("svc/small.ts", "export enum Q {\n  A = 'a-q',\n}\n");
+    assert!(!small.const_capped);
+    assert_eq!(small.const_records().collect::<Vec<_>>(), vec!["Q.A=a-q"]);
+}
+
+#[test]
+fn enum_imports_past_the_cap_are_counted() {
+    let mut code = String::new();
+    for i in 0..600 {
+        code.push_str(&format!("import {{ Q{i} }} from './q{i}';\n"));
+    }
+    let big = index("svc/imports.ts", &code);
+    assert!(big.const_capped);
+    assert_eq!(big.member_imports.len(), 512);
+    let small = index("svc/few.ts", "import { Q1 } from './q1';\n");
+    assert!(!small.const_capped);
+    assert_eq!(small.member_imports.len(), 1);
+}
+
+#[test]
+fn hostile_enums_neither_overflow_the_stack_nor_resolve_a_cycle() {
+    // 3000 members, an alias cycle between enums, a value that is itself placeholder syntax.
+    let mut code = String::from(
+        "export enum A { X = B.Y, Z = '${A.W}', W = '${A.Z}' }\nexport enum B { Y = A.X }\n",
+    );
+    code.push_str("export enum Many {\n");
+    for i in 0..3000 {
+        code.push_str(&format!("  M{i} = 'many-{i}',\n"));
+    }
+    code.push_str("}\n");
+    let fi = on_small_stack(move || index("svc/hostile-enums.ts", &code));
+    assert!(!fi.const_capped);
+    // Only string literals are constants: the aliases record nothing; the placeholder-looking
+    // values are recorded as text and refused when they become entries.
+    let records: Vec<&str> = fi.const_records().collect();
+    assert!(
+        records.contains(&"Many.M2999=many-2999"),
+        "{}",
+        records.len()
+    );
+    assert!(!records
+        .iter()
+        .any(|r| r.starts_with("A.X=") || r.starts_with("B.Y=")));
+    // Placeholder-looking values are refused when they become names.
+    let mut table = mesh_core::MemberTable::default();
+    table.set_file(Path::new("/w/hostile-enums.ts"), 0, "w", fi.const_records());
+    table.rebuild();
+    let imp = [mesh_core::ImportBinding {
+        local: "A".into(),
+        exported: "A".into(),
+        module: "./hostile-enums".into(),
+    }];
+    assert_eq!(
+        table.resolve(Path::new("/w/x.ts"), 0, &imp, "A.Z"),
+        mesh_core::MemberResolution::Unknown
+    );
+}
