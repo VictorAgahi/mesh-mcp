@@ -6,6 +6,7 @@ use crate::docs::DocIndex;
 use crate::governance::GovernanceEngine;
 use crate::health::IndexHealth;
 use crate::index_cache::{CacheStats, PersistentIndexCache};
+use crate::member_consts::MemberTable;
 use crate::properties::PropertyRegistry;
 use crate::rescan::BackgroundRescanEngine;
 use crate::routes::HttpPrefixes;
@@ -31,6 +32,8 @@ pub struct MeshSnapshot {
     /// configuration (ticket T6). Not part of `property_registry`: that one keeps one
     /// value per key, this one every value, to tell a profile override from a certainty.
     pub config_values: ConfigValues,
+    /// The string constants queue names given as enum members resolve against (9.0 T14).
+    pub member_table: MemberTable,
     /// Monotonic counter bumped on every install; lets callers detect a reload.
     pub generation: u64,
     /// Counts of what happened to every file since the last full rebuild.
@@ -130,6 +133,7 @@ impl MeshSnapshot {
         let docs = sha(&self.doc_index.canonical_lines_rooted(roots));
         let mut property_lines = self.property_registry.canonical_lines_rooted(roots);
         property_lines.extend(self.config_values.canonical_lines_rooted(roots));
+        property_lines.extend(self.member_table.canonical_lines_rooted(roots));
         let properties = sha(&property_lines);
         let combined =
             AuditLogger::compute_sha256(format!("{graph}\n{docs}\n{properties}").as_bytes());

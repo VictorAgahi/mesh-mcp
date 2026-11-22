@@ -136,6 +136,16 @@ impl DoctorCommand {
                     "{summary}\n    Some ${{key}} topics may stay unresolved or resolve weakly because of these configuration files."
                 ),
             )
+        } else if health.const_degraded()
+            && health.rejected.is_empty()
+            && health.rejected_overflow == 0
+        {
+            DoctorCheck::warn(
+                "Index health",
+                format!(
+                    "{summary}\n    Some queue names given as enum members may stay unresolved: the member's own key is used."
+                ),
+            )
         } else if health.rejected.is_empty() && health.rejected_overflow == 0 {
             DoctorCheck::ok("Index health", summary)
         } else {

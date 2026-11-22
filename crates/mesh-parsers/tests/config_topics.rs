@@ -303,7 +303,11 @@ fn folding_resolves_placeholders_against_the_configuration() {
         config.set_file(Path::new("application.yml"), entries.to_vec());
         config.rebuild();
         let mut g = ContractGraph::new();
-        PolyglotIndexer::extract(Path::new("src/Svc.java"), code, 0).apply_with(&mut g, &config);
+        PolyglotIndexer::extract(Path::new("src/Svc.java"), code, 0).apply_with(
+            &mut g,
+            &config,
+            &mesh_core::MemberTable::default(),
+        );
         g.reconcile_edges();
         edges(&g)
     };

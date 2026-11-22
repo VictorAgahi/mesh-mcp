@@ -260,6 +260,12 @@ fn receiver_is_client(libs: &[&str], site: &Site) -> bool {
         .unwrap_or(true)
 }
 
+/// The value imports of enum-like names of a file, `(local, exported, module)`: what binds an
+/// `Enum.MEMBER` topic to its declaring file (9.0 T14).
+pub(crate) fn member_imports(root: Node, source: &[u8]) -> Vec<(String, String, String)> {
+    ModuleBindings::collect(root, source).member_imports()
+}
+
 /// Broker interactions at a `receiver.method(...)` call.
 pub(crate) fn detect_call(call: Node, source: &[u8], fx: &FrameworkCtx) -> Vec<EventFact> {
     let Some(callee) = call.child_by_field_name("function") else {

@@ -26,36 +26,12 @@ fn first_arg(s: &Site) -> Vec<String> {
     arg_names(s, 0)
 }
 
-/// A BullMQ / Bull queue named by an imported enum member (`JobQueue.EMAIL`) is recorded as the
-/// placeholder `${JobQueue.EMAIL:email}`: the graph resolves it to the member's string constant
-/// (`email-jobs`) when the workspace declares one, and otherwise keeps the member's own key. A
-/// queue name is exact, so two enums that both have an `EMAIL` member are two queues; the
-/// events and streams of other brokers keep the member-name link they always had (the same
-/// member of an event-type enum and of a stream enum is one flow, 9.0 T14).
-fn queue_ref(name: String) -> String {
-    crate::config_ref::member_default(&name)
-        .and_then(|default| crate::config_ref::placeholder(&name, Some(&default)))
-        .unwrap_or(name)
-}
-
-/// The queue names among `names`, enum members as placeholders (see [`queue_ref`]).
-fn queue_refs(names: Vec<String>) -> Vec<String> {
-    names.into_iter().map(queue_ref).collect()
-}
-
 /// A queue name: not a script path (`new Worker('./worker.js')` is a web worker).
 fn queue_name_arg(s: &Site) -> Vec<String> {
-    queue_refs(
-        first_arg(s)
-            .into_iter()
-            .filter(|n| !n.contains('/') && !n.ends_with(".js") && !n.ends_with(".ts"))
-            .collect(),
-    )
-}
-
-/// The queue of Bull's own constructor (`new Queue('q')` from `bull` / `bee-queue`).
-fn bull_queue_arg(s: &Site) -> Vec<String> {
-    queue_refs(first_arg(s))
+    first_arg(s)
+        .into_iter()
+        .filter(|n| !n.contains('/') && !n.ends_with(".js") && !n.ends_with(".ts"))
+        .collect()
 }
 
 /// Every string argument (`redis.subscribe('a', 'b', callback)`): callbacks and
@@ -324,19 +300,17 @@ fn kafka_receiver(s: &Site) -> bool {
 
 /// Bull / bee-queue `queue.process(fn)`: the queue the receiver was built for.
 fn queue_of_receiver(s: &Site) -> Vec<String> {
-    queue_refs(
-        s.receiver_key()
-            .and_then(|k| s.fx.receivers.queue_name(&k).map(str::to_string))
-            .into_iter()
-            .collect(),
-    )
+    s.receiver_key()
+        .and_then(|k| s.fx.receivers.queue_name(&k).map(str::to_string))
+        .into_iter()
+        .collect()
 }
 
 /// `@Processor('q')` / `@Processor({ name: 'q' })`.
 fn processor_queue(s: &Site) -> Vec<String> {
     let mut names = first_arg(s);
     names.extend(object_keys(s, 0, &["name"]));
-    queue_refs(names)
+    names
 }
 
 /// `@RabbitSubscribe({ queue, exchange, routingKey })`: the queue, else the routing key.
@@ -1186,7 +1160,7 @@ pub(super) const CTOR_RULES: &[CtorRule] = &[
         Produce,
         Queue,
         "bull new Queue()",
-        bull_queue_arg
+        first_arg
     ),
     ctor!(
         &["bee-queue"],
@@ -1195,7 +1169,7 @@ pub(super) const CTOR_RULES: &[CtorRule] = &[
         Produce,
         Queue,
         "bee-queue new Queue()",
-        bull_queue_arg
+        first_arg
     ),
     // kafka-node consumers take their topics in the constructor.
     ctor!(
@@ -1336,7 +1310,7 @@ pub(super) const DECORATOR_RULES: &[DecoratorRule] = &[
         role: Role::Produce,
         kind: NodeKind::Queue,
         signature: "nestjs-bull @InjectQueue",
-        extract: bull_queue_arg,
+        extract: first_arg,
     },
     // @golevelup/nestjs-rabbitmq.
     DecoratorRule {

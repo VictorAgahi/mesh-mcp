@@ -1179,7 +1179,7 @@ fn redis_move_spellings_all_link_source_and_destination() {
 // ---- enum-member queue names (9.0 T14) --------------------------------------------------
 
 #[test]
-fn queue_names_given_as_enum_members_are_placeholders_and_other_names_are_not() {
+fn queue_names_given_as_enum_members_are_marked_queue_sites_and_other_names_are_not() {
     let fi = index(
         "svc/queues.ts",
         "import { Processor, InjectQueue } from '@nestjs/bullmq';\n\
@@ -1196,12 +1196,21 @@ fn queue_names_given_as_enum_members_are_placeholders_and_other_names_are_not() 
     assert_eq!(
         events(&fi),
         vec![
-            ev('C', "${JobQueue.EMAIL:email}"),
-            ev('C', "${JobQueue.REPORTS:reports}"),
-            ev('C', "${LegacyQueue.EMAIL:email}"),
-            ev('P', "${JobQueue.AUDIT:audit}"),
-            ev('P', "${JobQueue.REPORTS:reports}"),
+            ev('C', "JobQueue.EMAIL"),
+            ev('C', "JobQueue.REPORTS"),
+            ev('C', "LegacyQueue.EMAIL"),
+            ev('P', "JobQueue.AUDIT"),
+            ev('P', "JobQueue.REPORTS"),
         ]
+    );
+    // Every member site is a queue site; the runtime names record nothing.
+    assert_eq!(fi.member_sites.len(), 5);
+    assert!(fi.member_sites.iter().all(|m| m.queue));
+    // The imports that bind the members to their declaring file travel with the record.
+    let locals: Vec<&str> = fi.member_imports.iter().map(|i| i.local.as_str()).collect();
+    assert!(
+        locals.contains(&"JobQueue") && locals.contains(&"LegacyQueue"),
+        "{locals:?}"
     );
 }
 
@@ -1216,6 +1225,7 @@ fn a_member_naming_a_kafka_topic_keeps_its_member_key() {
          export async function run() { await producer.send({ topic: Topics.ORDER_PLACED }); }\n",
     );
     assert_eq!(events(&fi), vec![ev('P', "Topics.ORDER_PLACED")]);
+    assert!(fi.member_sites.is_empty());
 }
 
 #[test]
@@ -1257,10 +1267,17 @@ fn hostile_enums_neither_overflow_the_stack_nor_resolve_a_cycle() {
     assert!(!records
         .iter()
         .any(|r| r.starts_with("A.X=") || r.starts_with("B.Y=")));
-    let entries = mesh_core::config_values::from_const_records(fi.const_records());
-    assert!(
-        !entries.entries.iter().any(|e| e.key.starts_with("A.")),
-        "no placeholder value"
+    // Placeholder-looking values are refused when they become names.
+    let mut table = mesh_core::MemberTable::default();
+    table.set_file(Path::new("/w/hostile-enums.ts"), 0, fi.const_records());
+    table.rebuild();
+    let imp = [mesh_core::ImportBinding {
+        local: "A".into(),
+        exported: "A".into(),
+        module: "./hostile-enums".into(),
+    }];
+    assert_eq!(
+        table.resolve(Path::new("/w/x.ts"), 0, &imp, "A.Z"),
+        mesh_core::MemberResolution::Unknown
     );
-    assert_eq!(entries.entries.len(), 3000);
 }

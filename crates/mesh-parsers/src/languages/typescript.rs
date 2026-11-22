@@ -204,6 +204,17 @@ impl TypeScriptExtractor {
             ));
         }
         Self::record_string_constants(root, source_bytes, &nodes, rpc_calls);
+        // The imports that bind an `Enum.MEMBER` topic to its declaring file (9.0 T14): passed
+        // through `rpc_calls` and moved into `FileIndex::member_imports` right after extraction.
+        for (local, exported, module) in js_frameworks::member_imports(root, source_bytes) {
+            rpc_calls.push((
+                0,
+                CompactStr::new(format!(
+                    "{}{local}|{exported}|{module}",
+                    super::IMPORT_RECORD_PREFIX
+                )),
+            ));
+        }
         nodes
     }
 
@@ -2352,6 +2363,8 @@ mod tests {
             &mut rpc_calls,
             &["@GrpcMethod".to_string()],
         );
+        // The import records of member topics are not calls.
+        rpc_calls.retain(|(_, r)| !r.starts_with(crate::languages::IMPORT_RECORD_PREFIX));
         (nodes, rpc_calls)
     }
 
@@ -3265,6 +3278,7 @@ export class UserController {
             &mut rpc_calls,
             &[DEFAULT_GRPC_ANNOTATION.to_string()],
         );
+        rpc_calls.retain(|(_, r)| !r.starts_with(crate::languages::IMPORT_RECORD_PREFIX));
         (nodes, rpc_calls)
     }
 

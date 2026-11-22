@@ -29,7 +29,7 @@ use crate::decapitate::LanguageKind;
 use crate::guard::{AstGuard, ParseOutcome};
 use mesh_core::{
     Broker, CallFacts, CompactStr, ConfigValues, ContractGraph, ContractNode, ContractsConfig,
-    CustomPatternConfig, FilePath, NodeKind, PatternKind, RepoId,
+    CustomPatternConfig, FilePath, MemberResolution, MemberTable, NodeKind, PatternKind, RepoId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -239,7 +239,32 @@ pub struct FileIndex {
     /// this file: counted in `IndexHealth::files_const_capped`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub const_capped: bool,
+    /// The value imports of enum-like names of this file (`import { JobQueue as Q } from ...`):
+    /// what binds an `Enum.MEMBER` topic to the file that declares the enum (9.0 T14).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_imports: Vec<mesh_core::ImportBinding>,
+    /// The producers and consumers whose topic is an enum member reference (`JobQueue.EMAIL`),
+    /// resolved against the workspace's string constants when the file is folded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_sites: Vec<MemberSite>,
 }
+
+/// A producer or consumer whose topic is an enum member reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberSite {
+    /// `producers` (true) or `consumers` (false).
+    pub producer: bool,
+    /// Index into that vector.
+    pub pair: u32,
+    /// The site's own node, renamed to the resolved value.
+    pub node: Option<u32>,
+    /// A built-in queue site (BullMQ / Bull / bee-queue): resolved by value. Otherwise a custom
+    /// pattern's capture, which joins a queue only when it binds to a queue declaration.
+    pub queue: bool,
+}
+
+/// The prefix of the import records the TypeScript extractor passes through `rpc_calls`.
+pub(crate) const IMPORT_RECORD_PREFIX: char = '%';
 
 fn is_zero_u32(n: &u32) -> bool {
     *n == 0
@@ -258,6 +283,17 @@ impl FileIndex {
         self.dependencies
             .extend(other.dependencies.into_iter().map(|(i, t)| (i + offset, t)));
         let (produced, consumed) = (self.producers.len(), self.consumers.len());
+        self.member_sites
+            .extend(other.member_sites.into_iter().map(|mut m| {
+                m.pair += if m.producer { produced } else { consumed } as u32;
+                m.node = m.node.map(|n| n + offset as u32);
+                m
+            }));
+        for import in other.member_imports {
+            if !self.member_imports.contains(&import) {
+                self.member_imports.push(import);
+            }
+        }
         self.producer_brokers.extend(
             other
                 .producer_brokers
@@ -292,7 +328,7 @@ impl FileIndex {
     /// Inserts the extracted nodes and relations into `graph`. A `${key}` topic is resolved
     /// against nothing (only its own `${key:default}` fallback applies).
     pub fn apply(self, graph: &mut ContractGraph) {
-        self.apply_with(graph, &ConfigValues::default());
+        self.apply_with(graph, &ConfigValues::default(), &MemberTable::default());
     }
 
     /// Removes every placeholder default that is not a plain topic name from the topics, node
@@ -323,51 +359,71 @@ impl FileIndex {
 
     /// The string constants of this file (`Enum.MEMBER=value`, `OBJ.KEY=value`, `NAME=value`),
     /// as recorded by the TypeScript extractor: what resolves an imported enum member used as a
-    /// topic in another file (9.0 T14).
+    /// queue name in another file (9.0 T14).
     pub fn const_records(&self) -> impl Iterator<Item = &str> {
         self.rpc_calls
             .iter()
             .filter_map(|(_, r)| r.strip_prefix(mesh_core::CONST_VALUE_PREFIX))
     }
 
-    /// Sets `const_capped` when the file holds as many constant records as the extractor keeps
-    /// at most (the records past the cap were dropped).
-    fn note_const_cap(&mut self) {
+    /// Moves the import records the TypeScript extractor passed through `rpc_calls` into
+    /// `member_imports` and sets `const_capped` when the file holds as many constant records as
+    /// the extractor keeps at most (the records past the cap were dropped). Idempotent.
+    pub fn finish_member_facts(&mut self) {
+        let mut imports = Vec::new();
+        self.rpc_calls
+            .retain(|(_, r)| match r.strip_prefix(IMPORT_RECORD_PREFIX) {
+                Some(rest) => {
+                    let mut parts = rest.splitn(3, '|');
+                    if let (Some(local), Some(exported), Some(module)) =
+                        (parts.next(), parts.next(), parts.next())
+                    {
+                        imports.push(mesh_core::ImportBinding {
+                            local: local.into(),
+                            exported: exported.into(),
+                            module: module.into(),
+                        });
+                    }
+                    false
+                }
+                None => true,
+            });
+        for import in imports {
+            if !self.member_imports.contains(&import) {
+                self.member_imports.push(import);
+            }
+        }
         self.const_capped |= self.const_records().count() >= typescript::MAX_CONST_RECORDS_PER_FILE;
     }
 
-    /// Whether a producer or consumer topic of this file is a `${key}` config placeholder, or a
-    /// bare enum member (`Streams.X`) that becomes one when another file names a queue by a
-    /// member of its enum.
+    /// Whether this file names an enum member as a topic (a queue site or a pattern capture):
+    /// folded again when the workspace's constants change.
+    pub fn has_member_topic(&self) -> bool {
+        !self.member_sites.is_empty()
+    }
+
+    /// The enum members this file's built-in queue sites name (`JobQueue.EMAIL`).
+    pub fn queue_members(&self) -> Vec<CompactStr> {
+        self.member_sites
+            .iter()
+            .filter(|m| m.queue)
+            .filter_map(|m| {
+                let list = if m.producer {
+                    &self.producers
+                } else {
+                    &self.consumers
+                };
+                list.get(m.pair as usize).map(|(_, t)| t.clone())
+            })
+            .collect()
+    }
+
+    /// Whether a producer or consumer topic of this file is a `${key}` config placeholder.
     pub fn has_config_topic(&self) -> bool {
         self.producers
             .iter()
             .chain(&self.consumers)
-            .any(|(_, topic)| topic.contains("${") || mesh_core::is_member_ref(topic))
-    }
-
-    /// The enums (`JobQueue`) this file names a queue by: the first segment of every enum-member
-    /// placeholder a built-in queue site recorded.
-    pub fn queue_enums(&self) -> std::collections::BTreeSet<CompactStr> {
-        self.producers
-            .iter()
-            .chain(&self.consumers)
-            .filter_map(|(_, t)| mesh_core::member_ref_of_placeholder(t))
-            .filter_map(|member| member.split('.').next())
-            .map(CompactStr::new)
-            .collect()
-    }
-
-    /// `topic` as a placeholder when it is a bare enum member of an enum some file names a
-    /// queue by (what a custom pattern captures: `UserQueue.USER`), else as it is.
-    fn queue_member_topic(topic: &CompactStr, config: &ConfigValues) -> CompactStr {
-        let enum_name = topic.split('.').next().unwrap_or("");
-        if !mesh_core::is_member_ref(topic) || !config.is_queue_enum(enum_name) {
-            return topic.clone();
-        }
-        let default = crate::config_ref::member_default(topic);
-        crate::config_ref::placeholder(topic, default.as_deref())
-            .map_or_else(|| topic.clone(), CompactStr::new)
+            .any(|(_, topic)| topic.contains("${"))
     }
 
     /// [`Self::apply`] with the workspace's configuration values: a `${key}` topic is
@@ -375,7 +431,13 @@ impl FileIndex {
     /// profiles disagree), and the site is linked `heuristic` unless exactly one strong
     /// value says so. A placeholder nothing resolves stays registered as the `${key}` topic
     /// itself, `heuristic`: visible, never guessed.
-    pub fn apply_with(mut self, graph: &mut ContractGraph, config: &ConfigValues) {
+    pub fn apply_with(
+        mut self,
+        graph: &mut ContractGraph,
+        config: &ConfigValues,
+        members: &MemberTable,
+    ) {
+        self.finish_member_facts();
         // Also masked here: an index built by hand, merged from custom patterns, or read from a
         // cache written before the rule existed.
         self.mask_placeholder_defaults();
@@ -392,23 +454,44 @@ impl FileIndex {
             }
         }
         // A call-site node named after its topic shows the resolved name when the
-        // configuration gives exactly one. An enum member (`${Q.USER:user}`) shows the constant's
-        // value, or, with no single value, the member as it was written (`Q.USER`).
+        // configuration gives exactly one.
         let mut nodes = self.nodes;
         for n in nodes.iter_mut().filter(|n| n.name.contains("${")) {
-            let resolved = config.resolve(&n.name).filter(|r| r.topics.len() == 1);
-            match mesh_core::member_ref_of_placeholder(&n.name).map(str::to_string) {
-                Some(member) => {
-                    let value = resolved
-                        .filter(|r| !Self::is_member_fallback(&n.name, &r.topics[0]))
-                        .map(|r| r.topics[0].0.clone());
-                    n.name = CompactStr::new(value.as_deref().unwrap_or(&member));
+            if let Some(r) = config.resolve(&n.name).filter(|r| r.topics.len() == 1) {
+                n.name = CompactStr::new(&r.topics[0].0);
+            }
+        }
+        // Enum-member queue names (9.0 T14): by value when the declaration says one, else the
+        // qualified member key (`jobqueue.email`), `heuristic`: never the bare member, which two
+        // enums share.
+        let mut member_topics: HashMap<(bool, usize), (CompactStr, bool)> = HashMap::new();
+        if let Some(first) = nodes.first() {
+            let (path, repo) = (first.file_path.clone(), first.repo_id);
+            for site in &self.member_sites {
+                let list = if site.producer {
+                    &self.producers
+                } else {
+                    &self.consumers
+                };
+                let Some((_, topic)) = list.get(site.pair as usize) else {
+                    continue;
+                };
+                if !site.queue && !members.is_queue_member(&path, repo, &self.member_imports, topic)
+                {
+                    continue;
                 }
-                None => {
-                    if let Some(r) = resolved {
-                        n.name = CompactStr::new(&r.topics[0].0);
+                let resolved = match members.resolve(&path, repo, &self.member_imports, topic) {
+                    MemberResolution::Value(v) => {
+                        if let Some(n) = site.node.and_then(|n| nodes.get_mut(n as usize)) {
+                            n.name = v.clone();
+                        }
+                        (v, false)
                     }
-                }
+                    MemberResolution::Ambiguous | MemberResolution::Unknown => {
+                        (CompactStr::new(topic.to_lowercase()), true)
+                    }
+                };
+                member_topics.insert((site.producer, site.pair as usize), resolved);
             }
         }
         let ids: Vec<_> = nodes.into_iter().map(|n| graph.add_node(n)).collect();
@@ -419,16 +502,30 @@ impl FileIndex {
         let mut weak_nodes: BTreeSet<usize> = BTreeSet::new();
         for (pair, (i, topic)) in self.producers.into_iter().enumerate() {
             let broker = producer_brokers.get(&pair).copied();
-            let topic = Self::queue_member_topic(&topic, config);
-            for topic in Self::config_topics(&topic, config, i, &mut weak_nodes) {
+            for topic in Self::member_or_config_topics(
+                &member_topics,
+                true,
+                pair,
+                &topic,
+                config,
+                i,
+                &mut weak_nodes,
+            ) {
                 graph.add_producer_on(ids[i], &topic, broker);
             }
         }
         let consumer_brokers: HashMap<usize, Broker> = self.consumer_brokers.into_iter().collect();
         for (pair, (i, topic)) in self.consumers.into_iter().enumerate() {
             let broker = consumer_brokers.get(&pair).copied();
-            let topic = Self::queue_member_topic(&topic, config);
-            for topic in Self::config_topics(&topic, config, i, &mut weak_nodes) {
+            for topic in Self::member_or_config_topics(
+                &member_topics,
+                false,
+                pair,
+                &topic,
+                config,
+                i,
+                &mut weak_nodes,
+            ) {
                 graph.add_consumer_on(ids[i], &topic, broker);
             }
         }
@@ -448,6 +545,28 @@ impl FileIndex {
         }
     }
 
+    /// [`Self::config_topics`], except for a site whose topic is an enum member (see
+    /// [`MemberSite`]): the value or qualified key chosen for it.
+    fn member_or_config_topics(
+        member_topics: &HashMap<(bool, usize), (CompactStr, bool)>,
+        producer: bool,
+        pair: usize,
+        topic: &CompactStr,
+        config: &ConfigValues,
+        i: usize,
+        weak: &mut BTreeSet<usize>,
+    ) -> Vec<CompactStr> {
+        match member_topics.get(&(producer, pair)) {
+            Some((t, is_weak)) => {
+                if *is_weak {
+                    weak.insert(i);
+                }
+                vec![t.clone()]
+            }
+            None => Self::config_topics(topic, config, i, weak),
+        }
+    }
+
     /// The topics a recorded topic stands for: itself when it holds no placeholder, else what
     /// `config` resolves it to. A weak or unresolved link adds node `i` to `weak`.
     fn config_topics(
@@ -460,14 +579,6 @@ impl FileIndex {
             return vec![topic.clone()];
         }
         match config.resolve(topic) {
-            // An enum member no string constant names keeps the member's own key, exactly as
-            // before it was resolved (an enum of a package that is not indexed).
-            Some(resolved)
-                if resolved.topics.len() == 1
-                    && Self::is_member_fallback(topic, &resolved.topics[0]) =>
-            {
-                vec![CompactStr::new(&resolved.topics[0].0)]
-            }
             Some(resolved) if !resolved.topics.is_empty() => resolved
                 .topics
                 .into_iter()
@@ -483,19 +594,6 @@ impl FileIndex {
                 vec![topic.clone()]
             }
         }
-    }
-
-    /// Whether `resolved` (one candidate of the placeholder `topic`) is only the member
-    /// fallback of `${Enum.MEMBER:member}`: no string constant named the member.
-    fn is_member_fallback(topic: &str, resolved: &(String, bool)) -> bool {
-        let default = topic
-            .strip_prefix("${")
-            .and_then(|t| t.strip_suffix('}'))
-            .and_then(|t| t.split_once(':'))
-            .map(|(_, d)| d);
-        mesh_core::member_ref_of_placeholder(topic).is_some()
-            && resolved.1
-            && default == Some(resolved.0.as_str())
     }
 
     /// Records `broker` for every producer and consumer registered so far that has none: the
@@ -818,6 +916,21 @@ impl PolyglotIndexer {
             if let Some(b) = broker {
                 out.node_brokers.push((i, b));
             }
+            // A BullMQ / Bull / bee-queue site naming its queue by an enum member.
+            if matches!(broker, Some(Broker::Bull | Broker::BeeQueue))
+                && mesh_core::is_member_ref(&node.name)
+            {
+                out.member_sites.push(MemberSite {
+                    producer: produces,
+                    pair: (if produces {
+                        out.producers.len()
+                    } else {
+                        out.consumers.len()
+                    }) as u32,
+                    node: Some(i as u32),
+                    queue: true,
+                });
+            }
             if produces {
                 if let Some(b) = broker {
                     out.producer_brokers.push((out.producers.len(), b));
@@ -925,7 +1038,10 @@ impl PolyglotIndexer {
         // A single-file component is its script blocks, read with the JS / TS grammar;
         // the component itself is a declaration named after its file.
         if sfc::is_sfc(file_path) {
-            return Self::extract_component(file_path, content, repo_id, cfg, timeout_micros);
+            let mut index =
+                Self::extract_component(file_path, content, repo_id, cfg, timeout_micros);
+            index.finish_member_facts();
+            return index;
         }
         // `.sql`: outbox inserts, NOTIFY and LISTEN (no grammar, a bounded scanner).
         if sql::is_sql_path(file_path) {
@@ -935,7 +1051,7 @@ impl PolyglotIndexer {
         let mut index =
             Self::extract_as(file_path, content, repo_id, cfg, lang_kind, timeout_micros);
         index.mask_placeholder_defaults();
-        index.note_const_cap();
+        index.finish_member_facts();
         index
     }
 
@@ -1534,6 +1650,23 @@ impl PolyglotIndexer {
                     docstring: None,
                 });
 
+                if matches!(
+                    pat.kind,
+                    PatternKind::TopicProducer | PatternKind::TopicConsumer
+                ) && mesh_core::is_member_ref(target)
+                {
+                    let producer = matches!(pat.kind, PatternKind::TopicProducer);
+                    out.member_sites.push(MemberSite {
+                        producer,
+                        pair: (if producer {
+                            out.producers.len()
+                        } else {
+                            out.consumers.len()
+                        }) as u32,
+                        node: None,
+                        queue: false,
+                    });
+                }
                 match pat.kind {
                     PatternKind::TopicProducer => {
                         out.producers.push((idx, CompactStr::new(target)));
@@ -1856,6 +1989,8 @@ mod tests {
             sql_capped: false,
             inproc_capped: false,
             const_capped: false,
+            member_imports: Vec::new(),
+            member_sites: Vec::new(),
         };
         let before = format!("{index:?}");
         let anchored = index.relativize(&root_a).expect("all under root");

@@ -152,15 +152,6 @@ pub fn is_member_ref(expr: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// `Enum.MEMBER` as the key of the placeholder `text` (`${Enum.MEMBER:member}` or
-/// `${Enum.MEMBER}`, how an extractor records an imported enum member as a topic), or `None`
-/// when `text` is anything else (a config key, a literal).
-pub fn member_ref_of_placeholder(text: &str) -> Option<&str> {
-    let inner = text.strip_prefix("${")?.strip_suffix('}')?;
-    let key = inner.split_once(':').map_or(inner, |(k, _)| k);
-    is_member_ref(key).then_some(key)
-}
-
 /// Prefix of a recorded RPC call target naming one method (`=UserService.signUp`):
 /// resolved by exact `Service.Method` only, with the resolution's own confidence.
 pub const RPC_EXACT_METHOD_PREFIX: char = '=';

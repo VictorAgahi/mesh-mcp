@@ -11,6 +11,7 @@ pub mod governance;
 pub mod health;
 pub mod identity;
 pub mod index_cache;
+pub mod member_consts;
 pub mod paths;
 pub mod properties;
 pub mod reload_kind;
@@ -39,16 +40,16 @@ pub use config::{
 };
 pub use config_values::{ConfigEntry, ConfigFile, ConfigValues};
 pub use contracts::{
-    fold_rpc_name, is_member_ref, member_ref_of_placeholder, normalize_topic_key,
-    qualified_topic_key, service_from_client_field_name, split_qualified_topic_key, Broker,
-    CallFact, CallFacts, CallReceiver, CallStats, CallableFact, ContractGraph, DependentsMatch,
-    FlowBounds, FlowDirection, FlowEnd, FlowEntry, FlowHop, FlowLimit, FlowNext, FlowOutcome,
-    FlowSite, FlowStep, FlowStepKind, FlowTrace, GrpcTrace, ImpactFlow, ImpactMatrix, ImpactRole,
-    ImpactRow, ImpactScope, ImportFact, InjectionFact, ReconcileMode, RecordedCaller,
-    ResolvedRpcRecord, RpcRecordResolver, TypeFact, TypeFactKind, CALLABLE_ID_BASE,
-    CLIENT_FIELD_BINDING_PREFIX, CONST_VALUE_PREFIX, DEFAULT_CALL_DEPTH, DEFAULT_EVENT_DEPTH,
-    DEFAULT_FAN_OUT, HANDLER_REF_PREFIX, MAX_CALL_DEPTH, MAX_DERIVED_CALL_SITES, MAX_EVENT_DEPTH,
-    MAX_FAN_OUT, MAX_FLOW_HOPS, MAX_STRUCTURAL_IMPLS, MAX_STRUCTURAL_PAIRS, MAX_TYPE_HOPS,
+    fold_rpc_name, is_member_ref, normalize_topic_key, qualified_topic_key,
+    service_from_client_field_name, split_qualified_topic_key, Broker, CallFact, CallFacts,
+    CallReceiver, CallStats, CallableFact, ContractGraph, DependentsMatch, FlowBounds,
+    FlowDirection, FlowEnd, FlowEntry, FlowHop, FlowLimit, FlowNext, FlowOutcome, FlowSite,
+    FlowStep, FlowStepKind, FlowTrace, GrpcTrace, ImpactFlow, ImpactMatrix, ImpactRole, ImpactRow,
+    ImpactScope, ImportFact, InjectionFact, ReconcileMode, RecordedCaller, ResolvedRpcRecord,
+    RpcRecordResolver, TypeFact, TypeFactKind, CALLABLE_ID_BASE, CLIENT_FIELD_BINDING_PREFIX,
+    CONST_VALUE_PREFIX, DEFAULT_CALL_DEPTH, DEFAULT_EVENT_DEPTH, DEFAULT_FAN_OUT,
+    HANDLER_REF_PREFIX, MAX_CALL_DEPTH, MAX_DERIVED_CALL_SITES, MAX_EVENT_DEPTH, MAX_FAN_OUT,
+    MAX_FLOW_HOPS, MAX_STRUCTURAL_IMPLS, MAX_STRUCTURAL_PAIRS, MAX_TYPE_HOPS,
     MAX_WILDCARD_PRODUCERS, RPC_EXACT_METHOD_PREFIX, RPC_INFERRED_METHOD_PREFIX,
     RPC_INHERITED_METHOD_PREFIX,
 };
@@ -58,6 +59,7 @@ pub use governance::{GovernanceEngine, RsahResponse};
 pub use health::{IndexHealth, RejectReason, RejectedFile};
 pub use identity::{cache_family_id, family_id, RepoFamily, ViewKey, WorkspaceIdentity};
 pub use index_cache::{sha256, CacheDirId, CacheEntry, IndexCacheError, PersistentIndexCache};
+pub use member_consts::{ImportBinding, MemberResolution, MemberTable};
 pub use paths::mesh_cache_dir;
 pub use properties::{PropertyRegistry, PropertySourceMatcher};
 pub use rescan::BackgroundRescanEngine;

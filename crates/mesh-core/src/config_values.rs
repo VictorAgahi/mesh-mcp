@@ -93,11 +93,6 @@ pub struct ConfigValues {
     ref_files: HashSet<PathBuf>,
     /// Entries dropped by [`MAX_ENTRIES_TOTAL`] at the last rebuild.
     dropped_total: usize,
-    /// Per source file, the enums (`JobQueue` of `JobQueue.EMAIL`) it names a queue by (9.0 T14).
-    queue_enums_by_file: BTreeMap<PathBuf, std::collections::BTreeSet<CompactStr>>,
-    /// Their union, rebuilt by [`Self::rebuild`]: every reference to a member of one of these
-    /// enums (a custom pattern's capture included) names a queue.
-    queue_enums: HashSet<CompactStr>,
     memo: Memo,
 }
 
@@ -117,20 +112,6 @@ impl ConfigValues {
         }
     }
 
-    /// Sets (or, with none, clears) the enums the source file at `path` names a queue by.
-    pub fn set_queue_enums(&mut self, path: &Path, enums: std::collections::BTreeSet<CompactStr>) {
-        if enums.is_empty() {
-            self.queue_enums_by_file.remove(path);
-        } else {
-            self.queue_enums_by_file.insert(path.to_path_buf(), enums);
-        }
-    }
-
-    /// Whether some file names a queue by a member of `enum_name`.
-    pub fn is_queue_enum(&self, enum_name: &str) -> bool {
-        self.queue_enums.contains(enum_name)
-    }
-
     /// Records that `path` did not parse (call after [`Self::set_file`]).
     pub fn mark_failed(&mut self, path: &Path) {
         self.failed.insert(path.to_path_buf());
@@ -138,8 +119,6 @@ impl ConfigValues {
 
     pub fn remove_files(&mut self, paths: &HashSet<&Path>) {
         self.by_file.retain(|p, _| !paths.contains(p.as_path()));
-        self.queue_enums_by_file
-            .retain(|p, _| !paths.contains(p.as_path()));
         self.failed.retain(|p| !paths.contains(p.as_path()));
         self.ref_files.retain(|p| !paths.contains(p.as_path()));
     }
@@ -162,38 +141,8 @@ impl ConfigValues {
         self.dropped_total
     }
 
-    /// An order-independent digest of the key index (call after [`Self::rebuild`]): two
-    /// values are equal exactly when every key resolves to the same candidates. A reload
-    /// compares it before and after folding to know that the string constants moved and the
-    /// source files holding a placeholder must be folded again (9.0 T14).
-    pub fn index_digest(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        self.index
-            .iter()
-            .map(|(key, values)| {
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                key.hash(&mut h);
-                let mut values: Vec<_> = values.iter().collect();
-                values.sort();
-                values.hash(&mut h);
-                h.finish()
-            })
-            .chain(self.queue_enums.iter().map(|name| {
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                ("queue-enum", name).hash(&mut h);
-                h.finish()
-            }))
-            .fold(self.index.len() as u64, |acc, d| acc ^ d)
-    }
-
     /// Rebuilds the key index from the per-file entries, in path order (deterministic).
     pub fn rebuild(&mut self) {
-        self.queue_enums = self
-            .queue_enums_by_file
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
         self.index.clear();
         self.memo.clear();
         self.dropped_total = 0;
@@ -238,13 +187,6 @@ impl ConfigValues {
                 })
             })
             .collect();
-        let enums: std::collections::BTreeSet<&CompactStr> =
-            self.queue_enums_by_file.values().flatten().collect();
-        lines.extend(
-            enums
-                .into_iter()
-                .map(|e| serde_json::json!(["queue-enum", e.as_str()]).to_string()),
-        );
         lines.extend(self.failed.iter().map(|p| {
             serde_json::json!([
                 "config-failed",
@@ -453,7 +395,7 @@ impl Memo {
 /// ever retained, so nothing else a config file holds can reach the graph): a bounded token of
 /// ASCII name characters and `${key:default}` placeholder syntax, with no URL scheme, no
 /// userinfo (`@`), and nothing that looks like a credential token.
-fn name_shaped(value: &str) -> bool {
+pub(crate) fn name_shaped(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_VALUE_LEN
         && value.chars().all(|c| {
@@ -603,7 +545,7 @@ fn looks_like_token(value: &str) -> bool {
 
 /// A key that names a credential, a connection string or a secret: never kept, whatever the
 /// value looks like. Stricter than `PropertyRegistry::is_sensitive_key` on purpose.
-fn secret_key(key: &str) -> bool {
+pub(crate) fn secret_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     const SUFFIXES: &[&str] = &[
         "_key",
@@ -706,34 +648,6 @@ fn push_entry(
         value: CompactStr::new(value),
         weak,
     });
-}
-
-/// The string constants one source file declares (`Enum.MEMBER=value`, the records of
-/// `FileIndex::const_records`) as entries a `${Enum.MEMBER}` topic resolves against (9.0 T14).
-///
-/// Only a topic-shaped literal is kept (no placeholder syntax, no URL scheme, no token-looking
-/// run). The key is a code identifier, not a configuration key: no secret-key filter applies,
-/// since the value only reaches the graph when a messaging site names the member. The caller
-/// bounds the records of one file (`MAX_CONST_RECORDS_PER_FILE`), so the per-file entry cap of
-/// configuration files does not apply.
-pub fn from_const_records<'a>(records: impl Iterator<Item = &'a str>) -> ConfigFile {
-    let mut file = ConfigFile::default();
-    for record in records {
-        let Some((key, value)) = record.split_once('=') else {
-            continue;
-        };
-        // Member paths only (`Enum.MEMBER`): a bare `const TOPIC = 'x'` must never answer a
-        // `process.env.TOPIC` placeholder.
-        if key.len() > 200 || !crate::contracts::is_member_ref(key) || !plain_topic(value) {
-            continue;
-        }
-        file.entries.push(ConfigEntry {
-            key: CompactStr::new(key),
-            value: CompactStr::new(value),
-            weak: false,
-        });
-    }
-    file
 }
 
 /// The entries of a Spring-style registry (a `.properties` or a yaml file already flattened
@@ -911,85 +825,6 @@ fn unquote(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn string_constants_answer_enum_members_only() {
-        let consts = from_const_records(
-            [
-                "JobQueue.EMAIL=email-jobs",
-                "LegacyQueue.EMAIL=legacy-email-jobs",
-                // A bare constant must never answer a `process.env.TOPIC` placeholder.
-                "TOPIC=orders",
-                // Not topic-shaped: a sentence, a URL, placeholder syntax, a token.
-                "JobQueue.SENTENCE=two words",
-                "JobQueue.URL=redis://u:p@h/0",
-                "JobQueue.NESTED=${JobQueue.EMAIL}",
-                "JobQueue.TOKEN=Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A",
-                "no equals sign",
-            ]
-            .into_iter(),
-        );
-        let keys: Vec<&str> = consts.entries.iter().map(|e| e.key.as_str()).collect();
-        assert_eq!(keys, ["JobQueue.EMAIL", "LegacyQueue.EMAIL"]);
-        let v = values(&[("src/queues.ts", consts)]);
-        // Two enums with the same member name are two queues.
-        assert_eq!(
-            v.resolve("${JobQueue.EMAIL:email}").map(|r| r.topics),
-            Some(vec![("email-jobs".to_string(), false)])
-        );
-        assert_eq!(
-            v.resolve("${LegacyQueue.EMAIL:email}").map(|r| r.topics),
-            Some(vec![("legacy-email-jobs".to_string(), false)])
-        );
-        // An enum no file declares falls back to its default (the member), weakly.
-        assert_eq!(
-            v.resolve("${ExternalQueue.BILLING:billing}")
-                .map(|r| r.topics),
-            Some(vec![("billing".to_string(), true)])
-        );
-        assert!(v.resolve("${TOPIC}").is_none());
-    }
-
-    #[test]
-    fn two_files_declaring_one_member_differently_make_both_values_weak() {
-        let a = from_const_records(["Q.A=one"].into_iter());
-        let b = from_const_records(["Q.A=two"].into_iter());
-        let v = values(&[("a/q.ts", a), ("b/q.ts", b)]);
-        let mut topics = v.resolve("${Q.A:a}").expect("resolved").topics;
-        topics.sort();
-        // Both values, and the member's own key (the placeholder's default) as a third candidate.
-        assert_eq!(
-            topics,
-            vec![
-                ("a".to_string(), true),
-                ("one".to_string(), true),
-                ("two".to_string(), true)
-            ]
-        );
-        // The same value from two copies is one strong value.
-        let same = values(&[
-            ("a/q.ts", from_const_records(["Q.A=one"].into_iter())),
-            ("b/q.ts", from_const_records(["Q.A=one"].into_iter())),
-        ]);
-        assert_eq!(
-            same.resolve("${Q.A:a}").expect("resolved").topics,
-            vec![("one".to_string(), false)]
-        );
-    }
-
-    #[test]
-    fn the_index_digest_moves_with_the_constants_and_with_nothing_else() {
-        let one = values(&[("a.ts", from_const_records(["Q.A=one"].into_iter()))]);
-        let again = values(&[("z.ts", from_const_records(["Q.A=one"].into_iter()))]);
-        let other = values(&[("a.ts", from_const_records(["Q.A=two"].into_iter()))]);
-        assert_eq!(
-            one.index_digest(),
-            again.index_digest(),
-            "the path is not part of it"
-        );
-        assert_ne!(one.index_digest(), other.index_digest());
-        assert_ne!(one.index_digest(), ConfigValues::default().index_digest());
-    }
 
     fn values(files: &[(&str, ConfigFile)]) -> ConfigValues {
         let mut v = ConfigValues::default();

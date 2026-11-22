@@ -214,6 +214,11 @@ pub struct IndexHealth {
     /// or stream name, which then keeps the member's own name. Counted like `files_scanned`.
     #[serde(default)]
     pub files_const_capped: usize,
+    /// Enum members declared with different values in different files (copies that disagree): a
+    /// queue site that cannot tell which declaration it imports resolves to neither and keeps its
+    /// qualified member key, `heuristic`. Distinct member paths, set after every fold.
+    #[serde(default)]
+    pub const_members_conflicting: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -364,6 +369,13 @@ impl IndexHealth {
     #[inline]
     pub fn const_truncated(&self) -> bool {
         self.files_const_capped > 0
+    }
+
+    /// Whether queue names given as enum members may be unresolved (a cap, or members declared
+    /// with different values): `doctor` warns.
+    #[inline]
+    pub fn const_degraded(&self) -> bool {
+        self.files_const_capped > 0 || self.const_members_conflicting > 0
     }
 
     /// Whether the in-process site cap dropped events: some bus sites or schedules are missing.
@@ -622,6 +634,15 @@ impl IndexHealth {
                  `as const` keys; docs/parser-support.md, section 3.7): a queue or stream named by a \
                  member past the cap keeps the member's own name instead of its value",
                 self.files_const_capped
+            );
+        }
+        if self.const_members_conflicting > 0 {
+            let _ = writeln!(
+                out,
+                "    {} enum member(s) declared with different values in different files \
+                 (docs/parser-support.md, section 3.7): a queue site that cannot tell which \
+                 declaration it imports resolves to neither and keeps its qualified member key",
+                self.const_members_conflicting
             );
         }
         if self.sql_sites_unresolved > 0 {

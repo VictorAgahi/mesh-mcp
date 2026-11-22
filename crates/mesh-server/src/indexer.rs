@@ -1214,8 +1214,9 @@ impl WorkspaceIndexer {
             .collect();
         snapshot.doc_index.remove_files(&stale_files);
         snapshot.property_registry.remove_files(&stale_files);
-        let constants_before = snapshot.config_values.index_digest();
+        let constants_before = snapshot.member_table.digest();
         snapshot.config_values.remove_files(&stale_files);
+        snapshot.member_table.remove_files(&stale_files);
         drop(stale_files);
         let changed_count = changed.len();
         let mut changed = changed;
@@ -1227,11 +1228,11 @@ impl WorkspaceIndexer {
         // An enum or constant this batch added, removed or edited moves how the unchanged files
         // naming it as a topic resolve: they are folded again below, once.
         let const_refresh: Vec<(RepoId, PathBuf)> =
-            if snapshot.config_values.index_digest() == constants_before {
+            if snapshot.member_table.digest() == constants_before {
                 Vec::new()
             } else {
                 snapshot
-                    .config_values
+                    .member_table
                     .ref_files()
                     .filter(|p| !changed_paths.contains(*p))
                     .filter_map(|p| {
@@ -1929,22 +1930,28 @@ impl WorkspaceIndexer {
     /// against the files folded so far.
     fn fold_config(fragments: &mut [FileFragment], snapshot: &mut MeshSnapshot) {
         for frag in fragments.iter_mut() {
-            let mut config = frag.config.take().unwrap_or_default();
-            // The string constants a source file declares answer the enum members other files
-            // use as a topic (9.0 T14).
-            config
-                .entries
-                .extend(config_values::from_const_records(frag.code.const_records()).entries);
+            let config = frag.config.take().unwrap_or_default();
             snapshot.config_values.set_file(&frag.path, config.entries);
+            // The string constants a source file declares, and the queue sites that name an
+            // enum member, resolve each other across files (9.0 T14).
+            let repo = frag.code.nodes.first().map_or(0, |n| n.repo_id);
             snapshot
-                .config_values
-                .set_queue_enums(&frag.path, frag.code.queue_enums());
+                .member_table
+                .set_file(&frag.path, repo, frag.code.const_records());
+            snapshot.member_table.set_sites(
+                &frag.path,
+                repo,
+                frag.code.member_imports.clone(),
+                frag.code.queue_members(),
+            );
             if config.failed {
                 snapshot.config_values.mark_failed(&frag.path);
             }
         }
         snapshot.config_values.rebuild();
+        snapshot.member_table.rebuild();
         snapshot.health.config_entries_dropped = snapshot.config_values.dropped_total();
+        snapshot.health.const_members_conflicting = snapshot.member_table.conflicts();
     }
 
     fn fold(frag: FileFragment, snapshot: &mut MeshSnapshot) {
@@ -1957,8 +1964,14 @@ impl WorkspaceIndexer {
         snapshot
             .config_values
             .note_ref_file(&frag.path, frag.code.has_config_topic());
-        frag.code
-            .apply_with(&mut snapshot.contract_graph, &snapshot.config_values);
+        snapshot
+            .member_table
+            .note_ref_file(&frag.path, frag.code.has_member_topic());
+        frag.code.apply_with(
+            &mut snapshot.contract_graph,
+            &snapshot.config_values,
+            &snapshot.member_table,
+        );
     }
 }
 
@@ -3780,7 +3793,7 @@ resolve_placeholders = true
         {
             let view = state.snapshot();
             let g = &view.contract_graph;
-            for target in ["JobQueue.EMAIL", "email-jobs", "${JobQueue.EMAIL:email}"] {
+            for target in ["JobQueue.EMAIL", "email-jobs"] {
                 let flow = g.analyze_impact(target);
                 assert_eq!(flow.key.as_str(), "email-jobs", "{target}");
                 assert_eq!(flow.upstream_producers.len(), 1, "{target}");
@@ -3809,16 +3822,17 @@ resolve_placeholders = true
         );
         converges(&state);
 
-        // The enum file is deleted: the members keep their own key (as before this feature).
+        // The enum file is deleted: the members keep their QUALIFIED key, `heuristic`, so the
+        // two enums do not collapse onto one topic `email`.
         std::fs::remove_file(root.join("src/queues.ts")).expect("rm");
         WorkspaceIndexer::reload(&state);
         let view = state.snapshot();
         assert_eq!(
             topic_rows(&view),
             [
-                "Consumes exact email consumer.ts",
-                "Consumes exact email legacy.ts",
-                "Produces exact email producer.ts"
+                "Consumes heuristic jobqueue.email consumer.ts",
+                "Consumes heuristic legacyqueue.email legacy.ts",
+                "Produces heuristic jobqueue.email producer.ts"
             ]
         );
         drop(view);
@@ -3856,7 +3870,8 @@ resolve_placeholders = true
         write(
             &root,
             "src/outbox.ts",
-            "export const job = { target: JobQueue.EMAIL, stream: Streams.EMAIL };\n",
+            "import { JobQueue } from './queues';\nimport { Streams } from './streams';\n\
+             export const job = { target: JobQueue.EMAIL, stream: Streams.EMAIL };\n",
         );
         let cfg = Config::load_from_str(
             "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n\
@@ -3927,6 +3942,206 @@ resolve_placeholders = true
         converges(&state);
     }
 
+    fn queue_state(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, Arc<AppState>) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        for (rel, text) in files {
+            write(&root, rel, text);
+        }
+        let state = make_state(&root);
+        build_and_install(&state);
+        (tmp, root, state)
+    }
+
+    /// An event or stream naming a member keeps its member-name link with another enum's member
+    /// even when a queue site elsewhere names the same enum (Volontariapp: `Streams.X` and
+    /// `XEventType.X` are one flow), and a same-named enum of another package stays unresolved by
+    /// the first one's queue declaration.
+    #[test]
+    fn a_non_queue_site_naming_a_member_keeps_its_member_key() {
+        let (_t, _r, state) = queue_state(&[
+            (
+                "src/streams.ts",
+                "export enum Streams { USER_CREATED = 'user:created' }\n\
+                 export enum UserEventMessagingType { USER_CREATED = 'user.created' }\n",
+            ),
+            (
+                "src/bull.ts",
+                "import { Queue } from 'bullmq';\nimport { Streams } from './streams';\n\
+                 export const bq = new Queue(Streams.USER_CREATED);\n",
+            ),
+            (
+                "src/kafka.ts",
+                "import { EventPattern } from '@nestjs/microservices';\n\
+                 import { Streams, UserEventMessagingType } from './streams';\n\
+                 export class K {\n  @EventPattern(Streams.USER_CREATED)\n  onStream() {}\n\
+                 \x20 @EventPattern(UserEventMessagingType.USER_CREATED)\n  onEvent() {}\n}\n",
+            ),
+            (
+                "pkga/queues.ts",
+                "export enum JobQueue { EMAIL = 'a-email' }\n",
+            ),
+            (
+                "pkga/worker.ts",
+                "import { Processor } from '@nestjs/bullmq';\nimport { JobQueue } from './queues';\n\
+                 @Processor(JobQueue.EMAIL)\nexport class W {}\n",
+            ),
+            (
+                "pkgb/enums.ts",
+                "export enum JobQueue { EMAIL = 'b-email' }\n",
+            ),
+            (
+                "pkgb/kafka.ts",
+                "import { EventPattern } from '@nestjs/microservices';\nimport { JobQueue } from './enums';\n\
+                 export class C {\n  @EventPattern(JobQueue.EMAIL)\n  handle() {}\n}\n",
+            ),
+        ]);
+        let rows = topic_rows(&state.snapshot());
+        // The queue site is by value; both Kafka consumers of `user_created` stay one hub.
+        assert!(
+            rows.contains(&"Produces exact user:created bull.ts".to_string()),
+            "{rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.starts_with("Consumes exact user_created kafka.ts"))
+                .count(),
+            2,
+            "{rows:?}"
+        );
+        // `pkga` resolves its own declaration; `pkgb`'s @EventPattern is no queue consumer.
+        assert!(
+            rows.contains(&"Consumes exact a-email worker.ts".to_string()),
+            "{rows:?}"
+        );
+        assert!(
+            rows.contains(&"Consumes exact email kafka.ts".to_string()),
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|r| r.contains("b-email")), "{rows:?}");
+    }
+
+    /// The constants of a test file are never recorded: they neither change what production
+    /// resolves nor appear as a topic.
+    #[test]
+    fn a_test_file_constant_never_resolves_a_production_queue() {
+        let (_t, _r, state) = queue_state(&[
+            ("pkga/queues.ts", "export enum JobQueue { EMAIL = 'a-email' }\n"),
+            (
+                "pkga/worker.ts",
+                "import { Processor } from '@nestjs/bullmq';\nimport { JobQueue } from './queues';\n\
+                 @Processor(JobQueue.EMAIL)\nexport class W {}\n",
+            ),
+            (
+                "src/__tests__/q.spec.ts",
+                "export enum JobQueue { EMAIL = 'TEST-ONLY-email' }\n",
+            ),
+        ]);
+        let view = state.snapshot();
+        assert_eq!(topic_rows(&view), ["Consumes exact a-email worker.ts"]);
+        assert_eq!(view.health.const_members_conflicting, 0);
+    }
+
+    /// Two declarations of one member with different values, and an import that cannot choose
+    /// between them: neither is chosen, the qualified key is `heuristic`, and it is counted.
+    #[test]
+    fn a_member_two_declarations_disagree_on_resolves_to_neither_and_is_counted() {
+        let (_t, _r, state) = queue_state(&[
+            ("a/queues.ts", "export enum JobQueue { EMAIL = 'a-email' }\n"),
+            ("b/queues.ts", "export enum JobQueue { EMAIL = 'b-email' }\n"),
+            (
+                "c/worker.ts",
+                "import { Processor } from '@nestjs/bullmq';\nimport { JobQueue } from '@acme/queues';\n\
+                 @Processor(JobQueue.EMAIL)\nexport class W {}\n",
+            ),
+            (
+                "a/worker.ts",
+                "import { Processor } from '@nestjs/bullmq';\nimport { JobQueue } from './queues';\n\
+                 @Processor(JobQueue.EMAIL)\nexport class W {}\n",
+            ),
+        ]);
+        let view = state.snapshot();
+        assert_eq!(
+            topic_rows(&view),
+            [
+                "Consumes exact a-email worker.ts",
+                "Consumes heuristic jobqueue.email worker.ts"
+            ]
+        );
+        assert_eq!(view.health.const_members_conflicting, 1);
+        assert!(view.health.const_degraded());
+        assert!(view
+            .health
+            .render_summary(10)
+            .contains("declared with different values"));
+    }
+
+    /// An aliased import and a namespace import bind to the declaring file; a member named like a
+    /// credential, and values that are tokens, URLs, `Bearer_...` or password-shaped, are never a
+    /// topic name: the site keeps its qualified member key.
+    #[test]
+    fn aliases_bind_and_secret_looking_constants_never_become_names() {
+        let (_t, _r, state) = queue_state(&[
+            (
+                "src/queues.ts",
+                "export enum JobQueue { EMAIL = 'email-jobs', REPORTS = 'report-jobs' }\n\
+                 export enum Q {\n  A = 'sk_live_CANARYA1234567890abcdef',\n  \
+                 B = 'postgres://admin:CANARY_PW_B@db.internal/x',\n  C = 'hunter2-prod-CANARYC',\n  \
+                 D = 'ghp_CANARYDTOKEN0123456789abcdefghij',\n  E = 'jdbc:mysql://h/db?password=CANARY_PW_E',\n  \
+                 F = 'Bearer_CANARY_F_eyJhbGciOiJIUzI1NiJ9',\n  PASSWORD = 'plain-name',\n  OK = 'ok-jobs',\n}\n",
+            ),
+            (
+                "src/use.ts",
+                "import { Processor } from '@nestjs/bullmq';\nimport { Queue, Worker } from 'bullmq';\n\
+                 import { JobQueue as J, Q } from './queues';\nimport * as Qs from './queues';\n\
+                 @Processor(J.EMAIL)\nexport class P {}\n\
+                 export const n = new Queue(Qs.JobQueue.REPORTS);\n\
+                 export const a = new Queue(Q.A);\nexport const b = new Queue(Q.B);\n\
+                 export const c = new Worker(Q.C, async () => {});\nexport const d = new Queue(Q.D);\n\
+                 export const e = new Queue(Q.E);\nexport const f = new Queue(Q.F);\n\
+                 export const p = new Queue(Q.PASSWORD);\nexport const ok = new Queue(Q.OK);\n",
+            ),
+        ]);
+        let view = state.snapshot();
+        let rows = topic_rows(&view);
+        assert!(
+            rows.contains(&"Consumes exact email-jobs use.ts".to_string()),
+            "{rows:?}"
+        );
+        assert!(
+            rows.contains(&"Produces exact report-jobs use.ts".to_string()),
+            "{rows:?}"
+        );
+        assert!(
+            rows.contains(&"Produces exact ok-jobs use.ts".to_string()),
+            "{rows:?}"
+        );
+        for letter in ["a", "b", "c", "d", "e", "f", "password"] {
+            let key = format!("q.{letter}");
+            assert!(
+                rows.iter()
+                    .any(|r| r.contains(&format!("heuristic {key} use.ts"))),
+                "{key}: {rows:?}"
+            );
+        }
+        // No canary reaches a topic hub or a site node of the graph.
+        let g = &view.contract_graph;
+        for e in g.all_edges() {
+            for id in [e.from, e.to] {
+                if let Some(n) = g.get_node(id) {
+                    if n.kind != mesh_core::NodeKind::Module {
+                        let name = n.name.to_ascii_lowercase();
+                        assert!(
+                            !name.contains("canary") && !name.contains("hunter2"),
+                            "{}",
+                            n.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// An enum file past the per-file constant cap is counted in `IndexHealth` and named by the
     /// `doctor` summary, a member past it keeps its member key, and none of it needs more than
     /// the 2 MB stack of an indexing thread.
@@ -3965,11 +4180,14 @@ resolve_placeholders = true
             .render_summary(10)
             .contains("more string constants than the per-file cap"));
         // The first member is inside the cap and resolves; the last one is past it and keeps its
-        // member key, visibly different, never a guess.
+        // qualified member key, heuristic, never a guess.
         let rows = topic_rows(&view);
         assert_eq!(
             rows,
-            ["Consumes exact big-0 use.ts", "Consumes exact m4099 use.ts"]
+            [
+                "Consumes exact big-0 use.ts",
+                "Consumes heuristic big.m4099 use.ts"
+            ]
         );
     }
 }

@@ -5,6 +5,7 @@
   "dependencies": {
     "@nestjs/bullmq": "^10.0.0",
     "@nestjs/common": "^10.0.0",
+    "@nestjs/microservices": "^10.0.0",
     "bullmq": "^5.0.0"
   }
 }

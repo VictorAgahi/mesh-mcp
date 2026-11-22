@@ -404,42 +404,55 @@ format other than the above (JSON, TOML, `.ini`).
 
 ### 3.7 Queue names given as enum members
 
-A BullMQ / Bull queue named by an imported enum member (`@Processor(JobQueue.EMAIL)`,
-`@InjectQueue(JobQueue.EMAIL)`, `new Queue(JobQueue.EMAIL)`, `new Worker(JobQueue.EMAIL, ...)`,
-`@Processor({ name: JobQueue.EMAIL })`, a `bull` / `bee-queue` constructor) is recorded as the
-placeholder `${JobQueue.EMAIL:email}` and resolved, when the file is folded into the graph, against
-the string constants of the workspace (`enum` members with a string literal, `as const` object keys,
-`static` class fields): `JobQueue.EMAIL = 'email-jobs'` makes the topic `email-jobs`. The consumer
-and the producer meet on the value, and two enums with one member name (`LegacyQueue.EMAIL`) are two
-queues. It uses the machinery of 3.6, so a constant edit re-folds the unchanged files naming it and an
-incremental reload equals a cold rebuild.
+A BullMQ / Bull / bee-queue site that names its queue by an imported enum member
+(`@Processor(JobQueue.EMAIL)`, `@Processor({ name: JobQueue.EMAIL })`, `@InjectQueue(JobQueue.EMAIL)`,
+`new Queue(JobQueue.EMAIL)`, `new Worker(JobQueue.EMAIL, ...)`, the `bull` constructor) is resolved, when
+the file is folded into the graph, against the string constants of the workspace: `JobQueue.EMAIL =
+'email-jobs'` makes the topic `email-jobs`, so the consumer and the producer meet on the value. A
+constant edit re-folds the unchanged files naming it (one extra pass after the reload, never a loop),
+and an incremental reload equals a cold rebuild.
 
-- A member no indexed file declares (an enum of an npm package outside the roots, a value that is
-  not a string literal, a template string) keeps the member's own key (`email`), `exact`, as every
-  member reference did before: nothing is guessed. Two files declaring one member with different
-  values register both values (and the member key), `heuristic`.
-- Only queues are named by their value. A Kafka topic, a Redis stream, a NATS subject or an event
-  type given as an enum member keeps the member key: the same member of two enums is one flow by
-  design in a codebase that names a stream and its event type alike (Volontariapp:
-  `Streams.USER_CREATED = 'user:created'`, `UserEventMessagingType.USER_CREATED = 'user.created'`).
-- A custom pattern that captures `UserQueue.USER` takes the same placeholder only in a file where a
-  built-in site already names that member. In a file with no built-in queue site it keeps the member
-  key, which does not meet a value-keyed consumer: write the producer so a built-in site reads it
-  (`@InjectQueue`, `new Queue`).
-- `BullModule.registerQueue({ name })` only makes a queue injectable (every worker app registers the
-  queues it consumes): it is not a producer. The producer of an injected queue is its
-  `@InjectQueue(...)` injection point, the one of a `new Queue(...)` its construction. A chain
-  (`trace_flow`) does not continue through such a site: it is outside any method, so the calls layer
-  sees no callable that publishes. Not read: `FlowProducer` / `@InjectFlowProducer`, a queue named
-  `Enum[kind]` or built at runtime.
-- `analyze_impact` and `trace_flow` accept the member as written (`JobQueue.EMAIL`), its value
-  (`email-jobs`) or the recorded placeholder; a member two files declare differently is not
-  resolved to either.
-- Bounds, counted: at most 4,000 string constants per file (`IndexHealth::files_const_capped`,
-  `doctor` warns; a member past the cap keeps its member key), each value up to 249 bytes and
-  topic-shaped (a value with placeholder syntax, a URL or a token is not an entry), and the shared
-  limits of 3.6 (50,000 entries per workspace, 256 expansion steps). Member paths only: a bare
-  `const TOPIC = 'x'` never answers a `process.env.TOPIC` placeholder. No walk is recursive.
+Which declaration a site means is decided by its own imports, never by the bare enum name:
+
+- the site's import binds the enum's local name to a module: a relative path (`./queues`,
+  `../a/queues.js`, `./queues/index`) selects the declaring file; an alias (`import { JobQueue as Q }`)
+  and a namespace import (`Qs.JobQueue.REPORTS`) bind the same way. A package import, a barrel or a path
+  that matches no file selects the declarations of the importer's own repository, else every one.
+- the declared string literals of those candidates are the answer when they all agree (`exact`). Two
+  candidates that give the member different values and an import that cannot choose between them
+  resolve to NEITHER: the topic is the qualified member key (`jobqueue.email`), `heuristic`, and
+  `IndexHealth::const_members_conflicting` counts the members declared with different values
+  (`doctor` warns).
+- a member no candidate declares (an enum of a package outside the roots, a value that is not a plain
+  string literal, a member named like a credential, a value that is a token, a URL, `Bearer_...`, a
+  password-shaped word or a random-looking run of six or more letters and digits) keeps the QUALIFIED
+  member key (`externalqueue.billing`), `heuristic`. Never the bare member (`billing`): two enums with a
+  `BILLING` member are two queues. A site that names a queue still meets the other sites of that same
+  qualified key.
+- the constants of test files (`*.spec.ts`, `__tests__/`, `test/`, ...) are never recorded.
+
+Only queue sites are resolved by value. An event, a stream, a Kafka topic or any other site naming a
+member (`@EventPattern(Streams.USER_CREATED)`) keeps the member key it always had, so the same member of
+two enums stays one flow in a codebase that names a stream and its event type alike (Volontariapp:
+`Streams.USER_CREATED = 'user:created'`, `UserEventMessagingType.USER_CREATED = 'user.created'`).
+A custom pattern's capture of a member (`target:\s*(\w+Queue\.\w+)`) joins a queue by value only when
+it binds, through the importing file's own imports, to a declaration some queue site names a queue by.
+
+What is read: string-literal `enum` members and `as const` / plain object keys whose last segment is
+ALL-CAPS (`Topics.ORDERS`, not `Topics.orders`). Not read: `static` class fields (`Names.EMAIL` keeps its
+qualified key), template literals, enum aliases, `FlowProducer` / `@InjectFlowProducer`, a queue named
+`Enum[kind]` or built at runtime, an aliased `bee-queue` constructor. `BullModule.registerQueue({ name })`
+only makes a queue injectable (every worker app registers the queues it consumes): it is not a
+producer. The producer of an injected queue is its `@InjectQueue(...)` injection point, that of a
+`new Queue(...)` its construction. A chain (`trace_flow`) does not continue through such a site: it
+is outside any method, so the calls layer sees no callable that publishes.
+
+`analyze_impact` and `trace_flow` accept the member as written (`JobQueue.EMAIL`), its value
+(`email-jobs`) or the qualified key.
+
+Bounds, all counted: at most 4,000 string constants per file (`IndexHealth::files_const_capped`,
+`doctor` warns; a member past the cap keeps its qualified key), 249-byte values, 512 imports per file,
+no recursive walk.
 
 ## 4. What every level shares
 

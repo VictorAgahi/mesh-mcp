@@ -302,6 +302,26 @@ impl ModuleBindings {
         self.locals.get(local).filter(|b| !b.type_only)
     }
 
+    /// The value imports of enum-like names (`import { JobQueue as Q }`, `import * as Qs`), as
+    /// `(local, exported, module)`, sorted and bounded: what binds an `Enum.MEMBER` topic to the
+    /// file that declares the enum (9.0 T14). A type-only import and a default one name no value
+    /// member.
+    pub(crate) fn member_imports(&self) -> Vec<(String, String, String)> {
+        let mut out: Vec<(String, String, String)> = self
+            .locals
+            .iter()
+            .filter(|(local, b)| {
+                !b.type_only
+                    && b.imported != "default"
+                    && local.starts_with(|c: char| c.is_ascii_uppercase())
+            })
+            .map(|(local, b)| (local.clone(), b.imported.clone(), b.module.clone()))
+            .collect();
+        out.sort();
+        out.truncate(512);
+        out
+    }
+
     /// Whether the file declares `name` itself at module level.
     pub(crate) fn declares(&self, name: &str) -> bool {
         self.declared.contains(name)

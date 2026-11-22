@@ -222,16 +222,25 @@ def has_topic(line, topic, arn=False):
 
 def enum_topic_ok(root, line, topic):
     """Tag `enum_topic` (T14): the line names the topic through an enum member, so the line need
-    not carry the topic. It is checked instead against the source: the topic is a quoted string
-    literal somewhere under `root` (the member's value), or, for a member no file of the corpus
-    declares, the line carries the member itself (`ExternalQueue.BILLING` -> `billing`)."""
+    not carry the topic. The member the line names must say it: `Enum.MEMBER` where the topic is
+    that member's own key (`externalqueue.billing`, `email`), or where some source file of the
+    corpus declares `MEMBER = '<topic>'` (the member's value, found on that member's own
+    declaration, not anywhere in the corpus)."""
     topic = str(topic)
-    quoted = re.compile(r"""(['"`])""" + re.escape(topic) + r"""\1""")
+    members = re.findall(r"\b([A-Za-z_]\w*)\.([A-Z][A-Z0-9_]*)\b", line or "")
+    for enum, member in members:
+        if topic.lower() in (member.lower(), f"{enum}.{member}".lower()):
+            return True
+    declared = [
+        re.compile(r"\b" + re.escape(member) + r"\s*=\s*(['\"`])" + re.escape(topic) + r"\1")
+        for _, member in members
+    ]
     for p in sorted(Path(root).rglob("*")):
         if p.is_file() and p.suffix in {".ts", ".js"} and "node_modules" not in p.parts:
-            if quoted.search(p.read_text(errors="replace")):
+            text = p.read_text(errors="replace")
+            if any(d.search(text) for d in declared):
                 return True
-    return re.search(r"\.[A-Z0-9_]*" + re.escape(topic) + r"\b", line or "", re.I) is not None
+    return False
 
 
 def has_symbol(line, name):

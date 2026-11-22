@@ -621,36 +621,46 @@ impl ContractGraph {
     }
 
     /// The registry key a query `target` names: [`normalize_topic_key`], except that an enum
-    /// member spelled as written in code (`UserQueue.USER`, or the `${UserQueue.USER:user}` an
-    /// extractor records) names the topic its string constant is, when no topic is keyed by the
-    /// member itself and the workspace declares exactly one value for it (9.0 T14).
+    /// member spelled as written in code (`JobQueue.EMAIL`) names the queue its string constant
+    /// is (or its qualified key `jobqueue.email` when no single value is known), when such a
+    /// queue is a topic of the graph; otherwise the member's own key (9.0 T14).
     pub fn topic_target_key(&self, target: &str) -> String {
-        let written = member_ref_of_placeholder(target).unwrap_or(target);
-        let norm = normalize_topic_key(written);
+        let norm = normalize_topic_key(target);
         let known = |key: &str| {
             self.topic_producers.contains_key(key) || self.topic_consumers.contains_key(key)
         };
-        let expr = written.trim().trim_matches(['\'', '"', '`']).trim();
+        let expr = target.trim().trim_matches(['\'', '"', '`']).trim();
         let expr = expr.strip_prefix("typeof ").map_or(expr, str::trim);
-        if known(&norm) || !is_member_ref(expr) {
+        if !is_member_ref(expr) {
             return norm;
         }
-        // Distinct values only: copies of one enum that agree are one value, two that disagree
-        // are not a guess.
+        // Distinct values only (copies that agree are one value, two that disagree are not a
+        // guess); the constants of test files do not count.
         let mut values: Vec<String> = self
             .rpc_calls
             .iter()
-            .filter_map(|(_, r)| r.strip_prefix(CONST_VALUE_PREFIX))
-            .filter_map(|c| c.split_once('='))
-            .filter(|(path, _)| *path == expr)
-            .map(|(_, value)| normalize_topic_key(value))
+            .filter_map(|(id, r)| Some((id, r.strip_prefix(CONST_VALUE_PREFIX)?)))
+            .filter_map(|(id, c)| Some((id, c.split_once('=')?)))
+            .filter(|(_, (path, _))| *path == expr)
+            .filter(|(id, _)| {
+                self.nodes
+                    .get(id)
+                    .is_some_and(|n| !crate::test_paths::is_test_path(&n.file_path))
+            })
+            .map(|(_, (_, value))| normalize_topic_key(value))
             .collect();
         values.sort_unstable();
         values.dedup();
-        match values.as_slice() {
-            [only] if known(only) => only.clone(),
-            _ => norm,
+        if let [only] = values.as_slice() {
+            if known(only) {
+                return only.clone();
+            }
         }
+        let qualified = expr.to_lowercase();
+        if known(&qualified) {
+            return qualified;
+        }
+        norm
     }
 
     /// Asynchronous causal impact flow resolution
