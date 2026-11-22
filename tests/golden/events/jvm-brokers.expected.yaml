@@ -12,9 +12,12 @@
 # `refunds.requested` is `app.queues.refunds` of src/main/resources/application.yml.
 # `ShipmentHandlers` listens at class level (`@RabbitListener` + `@RabbitHandler` methods): the
 # class is the one consumer of `shipments`.
-# Decoys.java holds no site: a `convertAndSend` of an unrelated class, a string in a log line, a
-# queue name that is a parameter, a destination that is a method result, a request built
-# elsewhere. src/test/... holds a real-looking `convertAndSend`: the scorer ignores test files.
+# Decoys.java holds one site, `legacy.pp` (its payload `body` is not a channel), and decoys: a
+# `convertAndSend` of an unrelated class, a string in a log line, a queue name that is a
+# parameter, a destination that is a method result, a request built elsewhere, a routing-key
+# pattern. Shadowed.java holds none: a nested RabbitTemplate class, a for-each variable and a
+# lambda parameter hide the field, and its import is in a comment.
+# src/test/... holds a real-looking `convertAndSend`: the scorer ignores test files.
 corpus: jvm-brokers
 root: examples/eda/jvm-brokers
 config: mesh-mcp.toml
@@ -33,6 +36,7 @@ producers:
   - {id: p10, topic: alerts.fired, file: src/main/java/com/acme/jvm/PriceFeed.java, line: 24, language: java, tags: [jvm_broker]}
   - {id: p11, topic: telemetry.cpu, file: src/main/java/com/acme/jvm/TelemetryBus.java, line: 17, language: java, tags: [jvm_broker]}
   - {id: p12, topic: telemetry-events, file: src/main/java/com/acme/jvm/TelemetryExport.java, line: 16, language: java, tags: [jvm_broker]}
+  - {id: p13, topic: legacy.pp, file: src/main/java/com/acme/jvm/Decoys.java, line: 42, language: java, tags: [jvm_broker]}
 
 consumers:
   - {id: c1, topic: "rabbitmq:orders", file: src/main/java/com/acme/jvm/OrderRabbitListener.java, line: 15, language: java, tags: [jvm_broker, broker_key]}
@@ -94,7 +98,11 @@ chains:
     min_hops: 1
 
 negatives:
-  - {kind: producer, file: src/main/java/com/acme/jvm/Decoys.java, line: 34, note: "convertAndSend of an unrelated LegacyBridge"}
-  - {kind: producer, file: src/main/java/com/acme/jvm/Decoys.java, line: 36, note: "queue name is a parameter"}
-  - {kind: producer, file: src/main/java/com/acme/jvm/Decoys.java, line: 37, note: "destination is a method result"}
-  - {kind: producer, file: src/main/java/com/acme/jvm/Decoys.java, line: 38, note: "request built elsewhere, no literal topic ARN"}
+  - {kind: producer, file: src/main/java/com/acme/jvm/Decoys.java, line: 40, note: "convertAndSend of an unrelated LegacyBridge"}
+  - {kind: producer, file: src/main/java/com/acme/jvm/Decoys.java, line: 40, note: "queue name is a parameter"}
+  - {kind: producer, file: src/main/java/com/acme/jvm/Decoys.java, line: 39, note: "destination is a method result"}
+  - {kind: producer, file: src/main/java/com/acme/jvm/Decoys.java, line: 40, note: "request built elsewhere, no literal topic ARN"}
+  - {kind: producer, file: src/main/java/com/acme/jvm/Decoys.java, line: 41, note: "routing key is a topic-exchange pattern: a producer never publishes to one"}
+  - {kind: producer, file: src/main/java/com/acme/jvm/Shadowed.java, line: 23, note: "RabbitTemplate is a nested class of the file"}
+  - {kind: producer, file: src/main/java/com/acme/jvm/Shadowed.java, line: 27, note: "for-each variable hides the field"}
+  - {kind: producer, file: src/main/java/com/acme/jvm/Shadowed.java, line: 31, note: "lambda parameter hides the field"}
