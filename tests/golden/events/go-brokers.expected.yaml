@@ -1,0 +1,128 @@
+# Hand-annotated from the source of examples/eda/go-brokers. Never generated from tool output.
+# Go only: a service on RabbitMQ (amqp091-go), NATS (core and JetStream), Redis (go-redis v9),
+# SQS / SNS (aws-sdk-go-v2), Pub/Sub and kafka-go (9.0 T8b).
+# The channel key of each site is the name the call site shows:
+#  - RabbitMQ: the routing key of `PublishWithContext(ctx, exchange, key, ...)` (the queue when the
+#    exchange is the default one), the queue of `Consume(queue, ...)`, or, for a queue the file
+#    binds with `QueueBind(q.Name, key, exchange, ...)`, that routing key;
+#  - SQS / SNS: the last segment of the queue URL or topic ARN of the request literal;
+#  - NATS, Redis, Pub/Sub: the subject, channel or topic. A Pub/Sub subscription is read only
+#    through the topic the file creates it on (`CreateSubscription(..., SubscriptionConfig{Topic: t})`).
+# `orders` is a RabbitMQ queue, an SQS queue and a Kafka topic, `audit.events` a RabbitMQ queue and
+# a NATS subject: several channels each, so `<broker>:<name>` (SCHEMA.md). Every other name is used
+# on one broker only and keeps its plain spelling.
+# shipments.go: sarama's consumer group and franz-go, the Kafka clients the Go extractor did not read.
+# `refunds.requested` is `REFUNDS_SUBJECT` of .env.example (`os.Getenv`), producer and consumer.
+# decoys.go holds one site, `legacy.relay`, and decoys: a `Publish` of an unrelated interface, a
+# string in a log line, a subject that is a parameter, a `fmt.Sprintf` subject, a pattern producer
+# key, a literal that an `os.Getenv` branch overrides (a default is never a name).
+# shadowed.go holds none: a local `Bus` and `Conn` have the method names of a NATS connection.
+# commented.go holds none: its import of the NATS client is commented out.
+# consumer_test.go holds a real-looking `nc.Publish`: the scorer ignores test files.
+corpus: go-brokers
+root: examples/eda/go-brokers
+config: mesh-mcp.toml
+languages: [go]
+
+producers:
+  - {id: p1, topic: invoices.issued, file: billing.go, line: 14, language: go, tags: [go_broker]}
+  - {id: p2, topic: mail.outbox, file: mail.go, line: 14, language: go, tags: [go_broker]}
+  - {id: p3, topic: "sqs:orders", file: queues_sqs.go, line: 16, language: go, tags: [go_broker, broker_key]}
+  - {id: p4, topic: order-events, file: notifier.go, line: 15, language: go, tags: [go_broker, broker_key]}
+  - {id: p5, topic: alerts.fired, file: prices.go, line: 14, language: go, tags: [go_broker]}
+  - {id: p6, topic: price.updates, file: prices.go, line: 23, language: go, tags: [go_broker]}
+  - {id: p7, topic: telemetry.cpu, file: telemetry.go, line: 18, language: go, tags: [go_broker]}
+  - {id: p8, topic: telemetry.export, file: telemetry.go, line: 31, language: go, tags: [go_broker]}
+  - {id: p9, topic: invoices.archive, file: archive.go, line: 12, language: go, tags: [go_broker]}
+  - {id: p10, topic: refunds.requested, file: refunds.go, line: 11, language: go, tags: [go_broker, config_topic]}
+  - {id: p11, topic: legacy.relay, file: decoys.go, line: 33, language: go, tags: [go_broker]}
+  - {id: p12, topic: "kafka:orders", file: ledger.go, line: 7, language: go, tags: [kafka_basic, broker_key]}
+  - {id: p13, topic: shipments.ack, file: shipments.go, line: 16, language: go, tags: [go_broker]}
+  - {id: p14, topic: shipments.ledger, file: shipments.go, line: 20, language: go, tags: [go_broker]}
+
+consumers:
+  - {id: c1, topic: "rabbitmq:orders", file: orders_rabbit.go, line: 16, language: go, tags: [go_broker, broker_key]}
+  - {id: c2, topic: invoices.issued, file: invoice_mail.go, line: 23, language: go, tags: [go_broker]}
+  - {id: c3, topic: mail.outbox, file: mail_outbox.go, line: 10, language: go, tags: [go_broker]}
+  - {id: c4, topic: "rabbitmq:audit.events", file: audit.go, line: 12, language: go, tags: [go_broker, broker_key]}
+  - {id: c5, topic: "nats:audit.events", file: audit.go, line: 17, language: go, tags: [go_broker, broker_key]}
+  - {id: c6, topic: "sqs:orders", file: queues_sqs.go, line: 21, language: go, tags: [go_broker, broker_key]}
+  - {id: c7, topic: price.updates, file: prices.go, line: 27, language: go, tags: [go_broker]}
+  - {id: c8, topic: "metrics.*", file: prices.go, line: 37, language: go, tags: [go_broker]}
+  - {id: c9, topic: "devices.>", file: telemetry.go, line: 22, language: go, tags: [go_broker]}
+  - {id: c10, topic: invoices.archive, file: archive.go, line: 22, language: go, tags: [go_broker]}
+  - {id: c11, topic: refunds.requested, file: refunds.go, line: 16, language: go, tags: [go_broker, config_topic]}
+  - {id: c12, topic: shipments.dispatched, file: shipments.go, line: 12, language: go, tags: [go_broker]}
+  - {id: c13, topic: shipments.returned, file: shipments.go, line: 16, language: go, tags: [go_broker]}
+
+hops:
+  - id: h1
+    from: {symbol: OrderListener.Run, file: orders_rabbit.go, line: 21}
+    to: {symbol: BillingService.Charge, file: billing.go, line: 13}
+    via: injected_field
+    tags: [layered_calls, go_broker]
+  - id: h2
+    from: {symbol: InvoiceMailer.Run, file: invoice_mail.go, line: 28}
+    to: {symbol: MailService.Send, file: mail.go, line: 13}
+    via: injected_field
+    tags: [layered_calls, go_broker]
+  - id: h3
+    from: {symbol: OrderQueue.Poll, file: queues_sqs.go, line: 26}
+    to: {symbol: Notifier.Announce, file: notifier.go, line: 14}
+    via: injected_field
+    tags: [layered_calls, go_broker]
+  - id: h4
+    from: {symbol: PriceFeed.Watch, file: prices.go, line: 29}
+    to: {symbol: Alerts.Raise, file: prices.go, line: 13}
+    via: injected_field
+    tags: [layered_calls, go_broker]
+
+chains:
+  # RabbitMQ `orders` -> billing -> routing key `invoices.issued` -> mail -> NATS `mail.outbox`.
+  # It must not start from the SQS `orders` producer or the Kafka `orders` writer.
+  - id: ch1
+    entry: {kind: topic, value: "rabbitmq:orders"}
+    direction: forward
+    steps:
+      - {kind: consume, file: orders_rabbit.go, line: 16, topic: "rabbitmq:orders"}
+      - {kind: call, file: billing.go, line: 13}
+      - {kind: produce, file: billing.go, line: 14, topic: invoices.issued}
+      - {kind: consume, file: invoice_mail.go, line: 23, topic: invoices.issued}
+      - {kind: call, file: mail.go, line: 13}
+      - {kind: produce, file: mail.go, line: 14, topic: mail.outbox}
+      - {kind: consume, file: mail_outbox.go, line: 10, topic: mail.outbox}
+    tags: [layered_calls, go_broker, broker_key]
+    min_hops: 2
+  # SQS `orders` -> notifier -> SNS `order-events`.
+  - id: ch2
+    entry: {kind: topic, value: "sqs:orders"}
+    direction: forward
+    steps:
+      - {kind: consume, file: queues_sqs.go, line: 21, topic: "sqs:orders"}
+      - {kind: call, file: notifier.go, line: 14}
+      - {kind: produce, file: notifier.go, line: 15, topic: order-events}
+    tags: [layered_calls, go_broker, broker_key]
+    min_hops: 1
+  # Redis `price.updates` -> alerts -> Redis `alerts.fired`.
+  - id: ch3
+    entry: {kind: topic, value: price.updates}
+    direction: forward
+    steps:
+      - {kind: consume, file: prices.go, line: 27, topic: price.updates}
+      - {kind: call, file: prices.go, line: 13}
+      - {kind: produce, file: prices.go, line: 14, topic: alerts.fired}
+    tags: [layered_calls, go_broker]
+    min_hops: 1
+
+negatives:
+  - {kind: producer, file: decoys.go, line: 22, note: "Publish of an unrelated Bridge interface"}
+  - {kind: producer, file: decoys.go, line: 24, note: "subject is a parameter"}
+  - {kind: producer, file: decoys.go, line: 25, note: "subject is a fmt.Sprintf result"}
+  - {kind: producer, file: decoys.go, line: 26, note: "a producer never publishes to a pattern"}
+  - {kind: producer, file: decoys.go, line: 27, note: "routing key is a topic-exchange pattern"}
+  - {kind: producer, file: decoys.go, line: 32, note: "literal that an os.Getenv branch overrides: a default is never a name"}
+  - {kind: producer, file: shadowed.go, line: 21, note: "range variable of a local Bus type"}
+  - {kind: producer, file: shadowed.go, line: 24, note: "closure parameter of a local Bus type"}
+  - {kind: producer, file: shadowed.go, line: 27, note: "local Conn type, not nats.Conn"}
+  - {kind: consumer, file: shadowed.go, line: 30, note: "block-scoped Bus hides the nats.Conn parameter"}
+  - {kind: producer, file: commented.go, line: 12, note: "the nats.go import is commented out"}
