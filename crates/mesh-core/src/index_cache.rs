@@ -119,7 +119,10 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// `process.env` / `ConfigService`, Go `os.Getenv` / viper, Python `os.environ`, Java `@Value`),
 /// resolved when the index is folded; the extractors no longer record the env key itself as a
 /// Go / Python topic.
-const SCHEMA_VERSION: u8 = 19;
+/// v20: JVM brokers in Java (9.0 T8a): RabbitMQ, JMS, SQS / SNS, Redis, NATS and Pub/Sub
+/// listeners, producers and consumers (`EventStream` call-site nodes, `Broker::Jms`),
+/// `FileIndex::jvm_brokers_capped`.
+const SCHEMA_VERSION: u8 = 20;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

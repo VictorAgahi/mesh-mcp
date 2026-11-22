@@ -695,6 +695,7 @@ impl WorkspaceIndexer {
             );
             health.record_sql(frag.code.sql_capped, frag.code.sql_unresolved);
             health.record_inproc(frag.code.inproc_capped);
+            health.record_jvm_brokers(frag.code.jvm_brokers_capped);
             if frag.code.calls.capped {
                 tracing::warn!(
                     target: "mesh::indexer",
@@ -2314,6 +2315,42 @@ mod tests {
 
     /// The in-process site cap (9.0 T4) is counted, listed by the summary and survives the parse
     /// cache; a file under the cap is not counted.
+    #[test]
+    fn jvm_broker_site_cap_reaches_index_health_and_survives_the_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        let mut hostile = String::from(
+            "package p;\nimport org.springframework.amqp.rabbit.core.RabbitTemplate;\npublic class Hostile {\n RabbitTemplate rabbit;\n",
+        );
+        for i in 0..2_100 {
+            hostile.push_str(&format!(
+                " void m{i}(Object o) {{ rabbit.convertAndSend(\"q{i}\", o); }}\n"
+            ));
+        }
+        hostile.push_str("}\n");
+        std::fs::write(root.join("Hostile.java"), hostile).expect("write hostile");
+        std::fs::write(
+            root.join("Ok.java"),
+            "package p;\nimport org.springframework.amqp.rabbit.core.RabbitTemplate;\npublic class Ok {\n RabbitTemplate rabbit;\n void m(Object o) { rabbit.convertAndSend(\"q\", o); }\n}\n",
+        )
+        .expect("write ok");
+        let config =
+            Config::load_from_str("[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n")
+                .expect("config");
+        let roots = vec![root.clone()];
+        let cache = mesh_core::PersistentIndexCache::in_memory().expect("cache");
+        let mut prints = Vec::new();
+        for pass in ["cold", "warm"] {
+            let snap = WorkspaceIndexer::build_snapshot(&config, &roots, None, None, Some(&cache));
+            assert_eq!(snap.health.files_jvm_brokers_capped, 1, "{pass}");
+            assert!(snap.health.jvm_brokers_truncated(), "{pass}");
+            let summary = snap.health.render_summary(5);
+            assert!(summary.contains("JVM broker site cap"), "{summary}");
+            prints.push(snap.fingerprint());
+        }
+        assert_eq!(prints[0], prints[1]);
+    }
+
     #[test]
     fn inproc_site_cap_reaches_index_health_and_survives_the_cache() {
         let tmp = tempfile::tempdir().expect("tempdir");

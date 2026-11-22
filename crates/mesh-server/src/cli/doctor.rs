@@ -116,14 +116,16 @@ impl DoctorCommand {
                     "{summary}\n    A call path through these files, or a wildcard subscription, may be cut."
                 ),
             )
-        } else if (health.sql_truncated() || health.inproc_truncated())
+        } else if (health.sql_truncated()
+            || health.inproc_truncated()
+            || health.jvm_brokers_truncated())
             && health.rejected.is_empty()
             && health.rejected_overflow == 0
         {
             DoctorCheck::warn(
                 "Index health",
                 format!(
-                    "{summary}\n    Some SQL events, in-process bus sites or schedules of these files are not registered."
+                    "{summary}\n    Some SQL events, in-process bus sites, schedules or JVM broker sites of these files are not registered."
                 ),
             )
         } else if health.config_degraded()

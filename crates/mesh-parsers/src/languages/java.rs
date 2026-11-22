@@ -541,7 +541,7 @@ impl JavaExtractor {
 
     /// The parameters and local variables a method declares (bounded walk): a bare name among
     /// them is not a field of the class.
-    fn local_names(method: Node, source: &[u8]) -> HashSet<String> {
+    pub(super) fn local_names(method: Node, source: &[u8]) -> HashSet<String> {
         fn walk(node: Node, source: &[u8], out: &mut HashSet<String>, depth: usize) {
             if depth > crate::guard::AstGuard::MAX_NESTING_DEPTH || out.len() > 512 {
                 return;
@@ -646,7 +646,7 @@ impl JavaExtractor {
     /// `@Value("${key}")` / `@Value("${key:default}")`: the Spring way to read a topic name
     /// from `application.yml`. Bounded; a name injected twice with different keys is
     /// ambiguous and left out.
-    fn value_placeholder_fields(content: &str) -> HashMap<String, String> {
+    pub(super) fn value_placeholder_fields(content: &str) -> HashMap<String, String> {
         const MAX_FIELDS: usize = 256;
         let mut out: HashMap<String, String> = HashMap::new();
         let mut dup: HashSet<String> = HashSet::new();
