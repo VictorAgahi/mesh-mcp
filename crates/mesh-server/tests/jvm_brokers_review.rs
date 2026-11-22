@@ -56,7 +56,7 @@ async fn everything(state: &Arc<AppState>, targets: &[&str]) -> String {
     out += &text(state, "visualize_mesh", json!({"format": "mermaid"})).await;
     for t in targets {
         out += &text(state, "analyze_impact", json!({"target": t, "depth": 3})).await;
-        out += &text(state, "trace_flow", json!({"entry": t})).await;
+        out += &text(state, "trace_flow", json!({"target": t})).await;
         out += &text(state, "smart_search", json!({"query": t})).await;
         out += &text(state, "find_dependents", json!({"target": t})).await;
     }
@@ -169,17 +169,22 @@ async fn a_same_file_reemit_never_crosses_from_one_broker_to_another() {
             if tool == "analyze_impact" {
                 json!({"target": t, "depth": 3, "limit": 200})
             } else {
-                json!({"entry": t})
+                json!({"target": t})
             }
         };
         // RabbitMQ `orders` is consumed in two files that also produce on Kafka / JMS.
         let rabbit = text(&state, tool, args("rabbitmq:orders")).await;
+        assert!(
+            rabbit.contains("Mix.java:7"),
+            "{tool}: not vacuous: {rabbit}"
+        );
         assert!(!rabbit.contains("Mix.java:6"), "{tool}: {rabbit}");
         assert!(!rabbit.contains("MixJms.java:6"), "{tool}: {rabbit}");
         assert!(!rabbit.contains("kafka:orders"), "{tool}: {rabbit}");
         assert!(!rabbit.contains("jms:orders"), "{tool}: {rabbit}");
         // A Kafka listener never re-emits to the Redis producer of its own file.
         let kafka = text(&state, tool, args("kafka:audit.redis")).await;
+        assert!(kafka.contains("Two.java:7"), "{tool}: not vacuous: {kafka}");
         assert!(!kafka.contains("Two.java:6"), "{tool}: {kafka}");
         assert!(!kafka.contains("redis:audit.redis"), "{tool}: {kafka}");
     }
