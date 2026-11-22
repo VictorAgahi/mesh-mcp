@@ -402,6 +402,45 @@ Not resolved: Spring relaxed binding, `@ConfigurationProperties`, Helm / Kustomi
 (`settings.KAFKA_TOPIC`, `config.kafka.topic`), NestJS `registerAs` factories, and any config file
 format other than the above (JSON, TOML, `.ini`).
 
+### 3.7 Queue names given as enum members
+
+A BullMQ / Bull queue named by an imported enum member (`@Processor(JobQueue.EMAIL)`,
+`@InjectQueue(JobQueue.EMAIL)`, `new Queue(JobQueue.EMAIL)`, `new Worker(JobQueue.EMAIL, ...)`,
+`@Processor({ name: JobQueue.EMAIL })`, a `bull` / `bee-queue` constructor) is recorded as the
+placeholder `${JobQueue.EMAIL:email}` and resolved, when the file is folded into the graph, against
+the string constants of the workspace (`enum` members with a string literal, `as const` object keys,
+`static` class fields): `JobQueue.EMAIL = 'email-jobs'` makes the topic `email-jobs`. The consumer
+and the producer meet on the value, and two enums with one member name (`LegacyQueue.EMAIL`) are two
+queues. It uses the machinery of 3.6, so a constant edit re-folds the unchanged files naming it and an
+incremental reload equals a cold rebuild.
+
+- A member no indexed file declares (an enum of an npm package outside the roots, a value that is
+  not a string literal, a template string) keeps the member's own key (`email`), `exact`, as every
+  member reference did before: nothing is guessed. Two files declaring one member with different
+  values register both values (and the member key), `heuristic`.
+- Only queues are named by their value. A Kafka topic, a Redis stream, a NATS subject or an event
+  type given as an enum member keeps the member key: the same member of two enums is one flow by
+  design in a codebase that names a stream and its event type alike (Volontariapp:
+  `Streams.USER_CREATED = 'user:created'`, `UserEventMessagingType.USER_CREATED = 'user.created'`).
+- A custom pattern that captures `UserQueue.USER` takes the same placeholder only in a file where a
+  built-in site already names that member. In a file with no built-in queue site it keeps the member
+  key, which does not meet a value-keyed consumer: write the producer so a built-in site reads it
+  (`@InjectQueue`, `new Queue`).
+- `BullModule.registerQueue({ name })` only makes a queue injectable (every worker app registers the
+  queues it consumes): it is not a producer. The producer of an injected queue is its
+  `@InjectQueue(...)` injection point, the one of a `new Queue(...)` its construction. A chain
+  (`trace_flow`) does not continue through such a site: it is outside any method, so the calls layer
+  sees no callable that publishes. Not read: `FlowProducer` / `@InjectFlowProducer`, a queue named
+  `Enum[kind]` or built at runtime.
+- `analyze_impact` and `trace_flow` accept the member as written (`JobQueue.EMAIL`), its value
+  (`email-jobs`) or the recorded placeholder; a member two files declare differently is not
+  resolved to either.
+- Bounds, counted: at most 4,000 string constants per file (`IndexHealth::files_const_capped`,
+  `doctor` warns; a member past the cap keeps its member key), each value up to 249 bytes and
+  topic-shaped (a value with placeholder syntax, a URL or a token is not an entry), and the shared
+  limits of 3.6 (50,000 entries per workspace, 256 expansion steps). Member paths only: a bare
+  `const TOPIC = 'x'` never answers a `process.env.TOPIC` placeholder. No walk is recursive.
+
 ## 4. What every level shares
 
 - **Pattern-based.** A framework is recognised by a convention in the syntax tree, not by
