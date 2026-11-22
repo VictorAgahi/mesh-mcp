@@ -1,0 +1,85 @@
+# Hand-annotated from the source of examples/eda/py-brokers. Never generated from tool output.
+# Python only: services on RabbitMQ (pika, aio-pika, kombu), Redis, NATS, SQS / SNS, Pub/Sub and
+# Kafka (9.0 T8c). The channel key of each site is the name the call site shows:
+#  - RabbitMQ: the routing key of a publish (a publish to the default exchange names the queue
+#    there), the queue of a consume / get / `queue.consume()`, the queues of a kombu `Consumer`;
+#  - Redis, NATS: the channel or subject; a keyword of `pubsub.subscribe(heartbeat=...)` is the channel;
+#  - SQS / SNS: the last segment of a queue URL or topic ARN (or the queue a `get_queue_url` names);
+#  - Pub/Sub: the topic of `publisher.topic_path(...)`; the consumer of `subscriber.subscribe` is keyed
+#    by the subscription id (a subscription is not the topic, so it joins nothing by itself);
+#  - Kafka: only the gaps of the older reader (`KafkaConsumer("a", "b")`, `subscribe(topics=[...])`)
+#    and the `send` of a bound producer.
+# `orders` is a RabbitMQ queue and an SQS queue, `audit.events` a RabbitMQ queue and a NATS subject,
+# `payments.settled` a Kafka topic and a Redis channel: several channels each, so `<broker>:<name>`
+# (SCHEMA.md). Every other name is used on one broker only and keeps its plain spelling.
+# `payments.queue` is `PAYMENTS_QUEUE` and `orders.dead` is `ORDERS_DEAD_LETTER` of the corpus docker-compose.yml;
+# the `os.getenv` default `payments.fallback` is never a name.
+# decoys.py holds no site: a class of the file named Bus, log-line and print literals, channel names
+# that are a parameter, an f-string or a concatenation. shadowed.py holds one site, `shadow.nats.real`:
+# its commented-out imports, a parameter, a comprehension variable, a lambda parameter, a loop
+# variable and a local class all hide the boto3 client, and `pika` is never imported.
+# tests/test_publish.py holds a real-looking publish: the scorer ignores test files.
+corpus: py-brokers
+root: examples/eda/py-brokers
+config: mesh-mcp.toml
+languages: [python]
+
+producers:
+  - {id: p1, topic: "rabbitmq:orders", file: src/pybrk/rabbit_pika.py, line: 14, language: python, tags: [py_broker, broker_key]}
+  - {id: p2, topic: order.created, file: src/pybrk/rabbit_pika.py, line: 18, language: python, tags: [py_broker]}
+  - {id: p3, topic: payments.queue, file: src/pybrk/rabbit_pika.py, line: 31, language: python, tags: [py_broker, config_topic]}
+  - {id: p4, topic: invoices.done, file: src/pybrk/rabbit_aio.py, line: 13, language: python, tags: [py_broker]}
+  - {id: p5, topic: invoice.paid, file: src/pybrk/rabbit_aio.py, line: 15, language: python, tags: [py_broker]}
+  - {id: p6, topic: shipping.requests, file: src/pybrk/rabbit_kombu.py, line: 10, language: python, tags: [py_broker]}
+  - {id: p7, topic: alerts.fired, file: src/pybrk/redis_pubsub.py, line: 8, language: python, tags: [py_broker]}
+  - {id: p8, topic: "nats:audit.events", file: src/pybrk/nats_client.py, line: 7, language: python, tags: [py_broker, broker_key]}
+  - {id: p9, topic: orders.shipped, file: src/pybrk/nats_client.py, line: 10, language: python, tags: [py_broker]}
+  - {id: p10, topic: rpc.quote, file: src/pybrk/nats_client.py, line: 12, language: python, tags: [py_broker]}
+  - {id: p11, topic: "sqs:orders", file: src/pybrk/aws_queues.py, line: 10, language: python, tags: [py_broker, broker_key]}
+  - {id: p12, topic: order-events, file: src/pybrk/aws_queues.py, line: 18, language: python, tags: [py_broker]}
+  - {id: p13, topic: refunds, file: src/pybrk/aws_queues.py, line: 24, language: python, tags: [py_broker]}
+  - {id: p14, topic: price-alerts, file: src/pybrk/gcp_pubsub.py, line: 10, language: python, tags: [py_broker]}
+  - {id: p15, topic: clicks.clean, file: src/pybrk/kafka_gaps.py, line: 10, language: python, tags: [py_broker, kafka_basic]}
+  - {id: p16, topic: tasks.new, file: src/pybrk/worker.py, line: 12, language: python, tags: [py_broker]}
+  - {id: p17, topic: "kafka:payments.settled", file: src/pybrk/mixed.py, line: 10, language: python, tags: [py_broker, broker_key]}
+  - {id: p18, topic: shadow.nats.real, file: src/pybrk/shadowed.py, line: 40, language: python, tags: [py_broker]}
+
+consumers:
+  - {id: c1, topic: "rabbitmq:orders", file: src/pybrk/rabbit_pika.py, line: 35, language: python, tags: [py_broker, broker_key]}
+  - {id: c2, topic: "rabbitmq:audit.events", file: src/pybrk/rabbit_pika.py, line: 36, language: python, tags: [py_broker, broker_key]}
+  - {id: c3, topic: orders.dead, file: src/pybrk/rabbit_pika.py, line: 41, language: python, tags: [py_broker, config_topic]}
+  - {id: c4, topic: invoices.todo, file: src/pybrk/rabbit_aio.py, line: 8, language: python, tags: [py_broker]}
+  - {id: c5, topic: invoices.retry, file: src/pybrk/rabbit_aio.py, line: 10, language: python, tags: [py_broker]}
+  - {id: c6, topic: shipping.requests, file: src/pybrk/rabbit_kombu.py, line: 14, language: python, tags: [py_broker]}
+  - {id: c7, topic: alerts.fired, file: src/pybrk/redis_pubsub.py, line: 12, language: python, tags: [py_broker]}
+  - {id: c8, topic: metrics.cpu, file: src/pybrk/redis_pubsub.py, line: 12, language: python, tags: [py_broker]}
+  - {id: c9, topic: "logs.*", file: src/pybrk/redis_pubsub.py, line: 13, language: python, tags: [py_broker]}
+  - {id: c10, topic: heartbeat, file: src/pybrk/redis_pubsub.py, line: 14, language: python, tags: [py_broker]}
+  - {id: c11, topic: price.updates, file: src/pybrk/nats_client.py, line: 9, language: python, tags: [py_broker]}
+  - {id: c12, topic: orders.shipped, file: src/pybrk/nats_client.py, line: 11, language: python, tags: [py_broker]}
+  - {id: c13, topic: "sqs:orders", file: src/pybrk/aws_queues.py, line: 14, language: python, tags: [py_broker, broker_key]}
+  - {id: c14, topic: price-alerts-sub, file: src/pybrk/gcp_pubsub.py, line: 14, language: python, tags: [py_broker]}
+  - {id: c15, topic: clicks.raw, file: src/pybrk/kafka_gaps.py, line: 4, language: python, tags: [py_broker, kafka_basic]}
+  - {id: c16, topic: clicks.late, file: src/pybrk/kafka_gaps.py, line: 4, language: python, tags: [py_broker, kafka_basic]}
+  - {id: c17, topic: views.raw, file: src/pybrk/kafka_gaps.py, line: 14, language: python, tags: [py_broker, kafka_basic]}
+  - {id: c18, topic: tasks.new, file: src/pybrk/worker.py, line: 15, language: python, tags: [py_broker]}
+  - {id: c19, topic: tasks.drained, file: src/pybrk/worker.py, line: 19, language: python, tags: [py_broker]}
+  - {id: c20, topic: "redis:payments.settled", file: src/pybrk/mixed.py, line: 14, language: python, tags: [py_broker, broker_key]}
+
+negatives:
+  - {kind: producer, file: src/pybrk/rabbit_pika.py, line: 22, note: "routing key is a topic-exchange pattern: a producer never publishes to one"}
+  - {kind: producer, file: src/pybrk/rabbit_pika.py, line: 26, note: "routing key is a parameter"}
+  - {kind: producer, file: src/pybrk/nats_client.py, line: 8, note: "subject is a wildcard: a producer never publishes to one"}
+  - {kind: producer, file: src/pybrk/decoys.py, line: 21, note: "publish of a class the file declares"}
+  - {kind: consumer, file: src/pybrk/decoys.py, line: 22, note: "subscribe of a class the file declares"}
+  - {kind: producer, file: src/pybrk/decoys.py, line: 31, note: "channel is a parameter"}
+  - {kind: producer, file: src/pybrk/decoys.py, line: 32, note: "receiver and channel are parameters"}
+  - {kind: producer, file: src/pybrk/decoys.py, line: 33, note: "channel is an f-string"}
+  - {kind: producer, file: src/pybrk/decoys.py, line: 34, note: "channel is a concatenation"}
+  - {kind: producer, file: src/pybrk/decoys.py, line: 38, note: "no channel"}
+  - {kind: producer, file: src/pybrk/shadowed.py, line: 15, note: "the parameter hides the boto3 client"}
+  - {kind: producer, file: src/pybrk/shadowed.py, line: 19, note: "the comprehension variable hides the boto3 client"}
+  - {kind: producer, file: src/pybrk/shadowed.py, line: 23, note: "the lambda parameter hides the boto3 client"}
+  - {kind: producer, file: src/pybrk/shadowed.py, line: 28, note: "the loop variable hides the boto3 client"}
+  - {kind: producer, file: src/pybrk/shadowed.py, line: 33, note: "a local class instance hides the boto3 client"}
+  - {kind: producer, file: src/pybrk/shadowed.py, line: 39, note: "pika is only in a comment: not imported"}

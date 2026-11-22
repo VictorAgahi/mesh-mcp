@@ -1,0 +1,6 @@
+services:
+  worker:
+    image: pybrk/worker
+    environment:
+      PAYMENTS_QUEUE: payments.queue
+      ORDERS_DEAD_LETTER: orders.dead

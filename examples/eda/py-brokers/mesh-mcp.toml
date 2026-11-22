@@ -1,0 +1,12 @@
+# Fixture: Python services that talk to RabbitMQ, Redis, NATS, SQS / SNS, Pub/Sub and Kafka.
+[workspace]
+name = "py-brokers"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/.venv/**", "**/__pycache__/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true
