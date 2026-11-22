@@ -3862,10 +3862,10 @@ resolve_placeholders = true
             "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n\
              [engines.contracts]\nenabled = true\n\
              [[engines.contracts.patterns]]\nname = \"queue-target\"\nkind = \"topic_producer\"\n\
-             confidence = \"exact\"\nfile_pattern = \"/src/\"\nregex = 'target:\\s*(\\w+\\.\\w+)'\n\
+             confidence = \"exact\"\nfile_pattern = \"outbox.ts\"\nregex = 'target:\\s*(\\w+\\.\\w+)'\n\
              target_group = 1\n\
              [[engines.contracts.patterns]]\nname = \"stream-ref\"\nkind = \"topic_producer\"\n\
-             confidence = \"exact\"\nfile_pattern = \"/src/\"\nregex = 'stream:\\s*(\\w+\\.\\w+)'\n\
+             confidence = \"exact\"\nfile_pattern = \"outbox.ts\"\nregex = 'stream:\\s*(\\w+\\.\\w+)'\n\
              target_group = 1\n",
         )
         .expect("config");
