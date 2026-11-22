@@ -294,7 +294,7 @@ def a(body, dynamic):
 }
 
 #[test]
-fn pubsub_topic_and_subscription_paths() {
+fn pubsub_topic_paths_and_a_consumer_only_through_a_created_subscription() {
     let code = r#"
 from google.cloud import pubsub_v1
 from google.cloud.pubsub_v1 import PublisherClient
@@ -303,23 +303,38 @@ pub = PublisherClient()
 sub = pubsub_v1.SubscriberClient()
 tp = pub.topic_path("p", "alerts")
 sp = sub.subscription_path("p", "alerts-sub")
+sub.create_subscription(name=sp, topic=tp)
+orphan = sub.subscription_path("p", "orphan-sub")
+same_id = sub.subscription_path("p", "alerts")
 
 def a(data, cb, dyn):
     pub.publish(tp, data)
     pub.publish("projects/p/topics/literal", data)
     pub.publish(topic=dyn, data=data)
     sub.subscribe(sp, callback=cb)
+    sub.subscribe(orphan, callback=cb)
+    sub.subscribe(same_id, callback=cb)
     sub.subscribe(subscription="projects/p/subscriptions/lit-sub", callback=cb)
 "#;
+    // `alerts-sub` is created on the topic `alerts`: it consumes `alerts`. A subscription the
+    // file does not create (`orphan-sub`, a literal path, one that merely shares the topic's id)
+    // is a consumer of nothing.
     assert_eq!(
         read(code),
         vec![
-            s('C', "pubsub", "alerts-sub"),
-            s('C', "pubsub", "lit-sub"),
+            s('C', "pubsub", "alerts"),
             s('P', "pubsub", "alerts"),
             s('P', "pubsub", "literal"),
         ]
     );
+    let conflicting = r#"
+from google.cloud import pubsub_v1
+sub = pubsub_v1.SubscriberClient()
+sub.create_subscription(name="projects/p/subscriptions/s", topic="projects/p/topics/one")
+sub.create_subscription(name="projects/p/subscriptions/s", topic="projects/p/topics/two")
+sub.subscribe("projects/p/subscriptions/s", callback=None)
+"#;
+    assert!(read(conflicting).is_empty(), "{:?}", read(conflicting));
 }
 
 // ---- Kafka: the gaps and the tag ---------------------------------------------------------

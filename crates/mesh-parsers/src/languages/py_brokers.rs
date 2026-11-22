@@ -222,6 +222,9 @@ struct Ctx<'t> {
     exhausted: bool,
     /// Classes the file declares by node id, and whether each holds a client of its own.
     classes: HashMap<usize, Node<'t>>,
+    /// The tree root and the topic each Pub/Sub subscription id of the file is created on.
+    root: Option<Node<'t>>,
+    sub_topics: Option<HashMap<String, Option<String>>>,
     owns: HashMap<usize, bool>,
     /// A per-call or per-file evaluation budget tripped (counted like the site cap).
     over: bool,
@@ -313,6 +316,8 @@ impl<'t> Ctx<'t> {
             call_steps: 0,
             exhausted: false,
             classes: HashMap::new(),
+            root: None,
+            sub_topics: None,
             owns: HashMap::new(),
             over: false,
             tables: HashMap::new(),
@@ -1218,6 +1223,78 @@ impl<'t> Ctx<'t> {
         });
     }
 
+    /// The topic the file creates the subscription `sub` on, when it shows one (once, and the
+    /// same one: two different topics for one id read as nothing).
+    fn subscription_topic(&mut self, sub: &str) -> Option<String> {
+        if self.sub_topics.is_none() {
+            let saved = self.call_steps;
+            let table = self.collect_subscriptions();
+            self.call_steps = saved;
+            self.sub_topics = Some(table);
+        }
+        self.sub_topics.as_ref()?.get(sub)?.clone()
+    }
+
+    /// Every `subscriber.create_subscription(name, topic)` of the file, by subscription id.
+    fn collect_subscriptions(&mut self) -> HashMap<String, Option<String>> {
+        let mut table: HashMap<String, Option<String>> = HashMap::new();
+        let Some(root) = self.root else {
+            return table;
+        };
+        let mut calls: Vec<Node<'t>> = Vec::new();
+        let mut stack: Vec<Node<'t>> = vec![root];
+        while let Some(n) = stack.pop() {
+            if n.kind() == "call" {
+                let is_create = n
+                    .child_by_field_name("function")
+                    .filter(|f| f.kind() == "attribute")
+                    .and_then(|f| f.child_by_field_name("attribute"))
+                    .is_some_and(|a| text(a, self.source) == "create_subscription");
+                if is_create {
+                    calls.push(n);
+                    if calls.len() >= MAX_CLASS_CALLS {
+                        break;
+                    }
+                }
+            }
+            let mut c = n.walk();
+            stack.extend(n.named_children(&mut c));
+        }
+        for call in calls {
+            self.call_steps = 0;
+            let Some(object) = call
+                .child_by_field_name("function")
+                .and_then(|f| f.child_by_field_name("object"))
+            else {
+                continue;
+            };
+            if self
+                .eval(object, 0)
+                .is_none_or(|v| v.kind != Kind::Subscriber)
+            {
+                continue;
+            }
+            let Some(args) = Args::of(call, self.source) else {
+                continue;
+            };
+            let sub = args.get(Some(0), "name").and_then(|n| self.name_of(n, 0));
+            let topic = args.get(Some(1), "topic").and_then(|n| self.name_of(n, 0));
+            if let (Some(sub), Some(topic)) = (sub, topic) {
+                let (sub, topic) = (last_segment(&sub), last_segment(&topic));
+                match table.get(&sub) {
+                    Some(Some(prev)) if *prev != topic => {
+                        table.insert(sub, None);
+                    }
+                    Some(_) => {}
+                    None => {
+                        table.insert(sub, Some(topic));
+                    }
+                }
+            }
+        }
+        table
+    }
+
     /// The destination of a Pub/Sub / SQS / SNS call: a path value, or a literal URL / ARN.
     fn destination(&mut self, node: Option<Node<'t>>) -> Option<String> {
         self.name_of(node?, 0).map(|n| last_segment(&n))
@@ -1442,7 +1519,10 @@ impl<'t> Ctx<'t> {
                 self.emit(out, call, true, Broker::PubSub, k, method);
             }
             (Kind::Subscriber, "subscribe") => {
-                let k = self.destination(args.get(Some(0), "subscription"));
+                // A subscription is not a topic: it is a consumer only of the topic the file
+                // creates it on (`create_subscription(name=sub, topic=topic)`), as in Go.
+                let sub = self.destination(args.get(Some(0), "subscription"));
+                let k = sub.and_then(|s| self.subscription_topic(&s));
                 self.emit(out, call, false, Broker::PubSub, k, method);
             }
             (Kind::KafkaProducer, "produce" | "send" | "send_and_wait") => {
@@ -1478,6 +1558,7 @@ pub(crate) fn scan(tree: &Tree, content: &str) -> Scan {
         return Scan::default();
     }
     let mut ctx = Ctx::new(content.as_bytes());
+    ctx.root = Some(tree.root_node());
     let mut out = Out {
         overflow: false,
         sites: Vec::new(),
