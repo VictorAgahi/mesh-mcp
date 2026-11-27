@@ -734,14 +734,14 @@ fn facts_of(
         .map(|(p, (i, t))| {
             (
                 *i,
-                Fact::Produces(t.to_string()),
+                Fact::Produces(events::shown_key(t)),
                 producer_broker.get(&p).copied(),
             )
         })
         .chain(index.consumers.iter().enumerate().map(|(p, (i, t))| {
             (
                 *i,
-                Fact::Consumes(t.to_string()),
+                Fact::Consumes(events::shown_key(t)),
                 consumer_broker.get(&p).copied(),
             )
         }))

@@ -440,7 +440,9 @@ fn shown(ch: &EventChannel) -> String {
     }
 }
 
-fn shown_key(key: &str) -> String {
+/// Also the topic text of the per-file section: a site's raw topic never reaches the output
+/// with a placeholder default or a credential-shaped name.
+pub(super) fn shown_key(key: &str) -> String {
     let stripped = strip_placeholder_defaults(key).into_owned();
     // What is left once every `${k}` is taken out must be a name (the T14 rule).
     let mut outside = stripped.clone();
@@ -478,5 +480,386 @@ pub(super) fn push_events(out: &mut String, section: &EventSection, output_budge
     }
     for note in &section.notes {
         out.push_str(note);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{run_with, DiffMeshArgs, Limits};
+    use crate::git::test_support::TempRepo;
+    use crate::indexer::WorkspaceIndexer;
+    use mesh_core::AppState;
+    use std::path::Path;
+
+    // Hand-written fixture: an in-process (`inproc`) chain
+    //   OrderService.create --emit order.created--> InvoiceListener.onOrderCreated
+    //   --calls InvoiceService.issue--> emit invoice.issued --> ReportListener.onInvoice
+    const ORDER_SERVICE: &str = r#"import { Injectable } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+
+@Injectable()
+export class OrderService {
+  constructor(private readonly emitter: EventEmitter2) {}
+
+  create(orderId: string) {
+    this.emitter.emit('order.created', { orderId });
+  }
+}
+"#;
+
+    const INVOICE_LISTENER: &str = r#"import { Injectable } from '@nestjs/common';
+import { OnEvent } from '@nestjs/event-emitter';
+import { InvoiceService } from './invoice.service';
+
+@Injectable()
+export class InvoiceListener {
+  constructor(private readonly invoices: InvoiceService) {}
+
+  @OnEvent('order.created')
+  onOrderCreated(order: { orderId: string }) {
+    this.invoices.issue(order.orderId);
+  }
+}
+"#;
+
+    const INVOICE_SERVICE: &str = r#"import { Injectable } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+
+@Injectable()
+export class InvoiceService {
+  constructor(private readonly emitter: EventEmitter2) {}
+
+  issue(orderId: string) {
+    this.emitter.emit('invoice.issued', { orderId });
+  }
+}
+"#;
+
+    const REPORT_LISTENER: &str = r#"import { Injectable } from '@nestjs/common';
+import { OnEvent } from '@nestjs/event-emitter';
+
+@Injectable()
+export class ReportListener {
+  @OnEvent('invoice.issued')
+  onInvoice(invoice: { orderId: string }) {
+    return invoice.orderId;
+  }
+}
+"#;
+
+    fn state(root: &Path) -> AppState {
+        let config = mesh_core::Config::load_from_str(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n",
+        )
+        .expect("config");
+        let audit = std::sync::Arc::new(mesh_core::AuditLogger::new_in_memory().expect("audit"));
+        let rescan = std::sync::Arc::new(mesh_core::BackgroundRescanEngine::new().expect("rescan"));
+        let state = AppState::new(config, vec![root.to_path_buf()], audit, rescan);
+        let snapshot =
+            WorkspaceIndexer::build_snapshot(&state.config, &state.allowed_roots, None, None, None);
+        state.install_snapshot(snapshot);
+        state
+    }
+
+    fn base() -> TempRepo {
+        let repo = TempRepo::new();
+        repo.write("src/order.service.ts", ORDER_SERVICE);
+        repo.write("src/invoice.listener.ts", INVOICE_LISTENER);
+        repo.write("src/invoice.service.ts", INVOICE_SERVICE);
+        repo.write("src/report.listener.ts", REPORT_LISTENER);
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo
+    }
+
+    fn diff(repo: &TempRepo) -> String {
+        let args = DiffMeshArgs {
+            base: Some("main".into()),
+            scope: None,
+            _meta: None,
+        };
+        run_with(&args, &state(&repo.root), &repo.runner(), Limits::DEFAULT)
+            .expect("diff_mesh ok")
+            .text
+    }
+
+    fn events(text: &str) -> &str {
+        let start = text.find("### Event changes").unwrap_or(text.len());
+        let rest = &text[start..];
+        let end = rest[3..].find("\n### ").map_or(rest.len(), |e| e + 3);
+        &rest[..end]
+    }
+
+    fn rm(repo: &TempRepo, rel: &str) {
+        std::fs::remove_file(repo.root.join(rel)).expect("rm");
+    }
+
+    const NO_CALL: &str = "    this.invoices.issue(order.orderId);\n";
+
+    /// Removed: the only consumer of `invoice.issued` goes, so the channel's link is cut and
+    /// the hop into it from `order.created` is kept (its publish is still there).
+    #[test]
+    fn a_removed_consumer_cuts_the_link_of_its_channel() {
+        let repo = base();
+        rm(&repo, "src/report.listener.ts");
+        let text = diff(&repo);
+        let ev = events(&text);
+        assert!(
+            ev.contains("**Events**: 1 channel(s) with site changes; producers +0 -0; consumers +0 -1; 0 renamed; producer-consumer links cut 1, created 0; chain hops cut 0, created 0."),
+            "{ev}"
+        );
+        assert!(
+            ev.contains("#### `inproc:invoice.issued` — link cut: no producer on this channel reaches a consumer any more\n- - consumer of `inproc:invoice.issued` in `onInvoice` (`src/report.listener.ts, base L7`)\n"),
+            "{ev}"
+        );
+        assert!(ev.contains("*Payload fields: not compared."), "{ev}");
+    }
+
+    /// Added: a new channel with a new producer and a new consumer is a created link.
+    #[test]
+    fn added_sites_on_a_new_channel_create_its_link() {
+        let repo = base();
+        repo.write(
+            "src/order.service.ts",
+            &ORDER_SERVICE.replace(
+                "    this.emitter.emit('order.created', { orderId });\n",
+                "    this.emitter.emit('order.created', { orderId });\n    this.emitter.emit('order.audited', { orderId });\n",
+            ),
+        );
+        repo.write(
+            "src/audit.listener.ts",
+            "import { Injectable } from '@nestjs/common';\nimport { OnEvent } from '@nestjs/event-emitter';\n\n@Injectable()\nexport class AuditListener {\n  @OnEvent('order.audited')\n  onAudit(e: { orderId: string }) {\n    return e.orderId;\n  }\n}\n",
+        );
+        let text = diff(&repo);
+        let ev = events(&text);
+        assert!(
+            ev.contains("producers +1 -0; consumers +1 -0; 0 renamed; producer-consumer links cut 0, created 1;"),
+            "{ev}"
+        );
+        assert!(
+            ev.contains("#### `inproc:order.audited` — link created: a producer now reaches a consumer\n"),
+            "{ev}"
+        );
+        assert!(
+            ev.contains("- + consumer of `inproc:order.audited` in `onAudit` (`src/audit.listener.ts:7`)"),
+            "{ev}"
+        );
+        assert!(
+            ev.contains("- + producer of `inproc:order.audited` in `create` (`src/order.service.ts:"),
+            "{ev}"
+        );
+        // `order.created` keeps its sites: not listed.
+        assert!(!ev.contains("#### `inproc:order.created`"), "{ev}");
+    }
+
+    fn renamed_repo() -> TempRepo {
+        let repo = base();
+        repo.write(
+            "src/invoice.service.ts",
+            &INVOICE_SERVICE.replace("'invoice.issued'", "'invoice.sent'"),
+        );
+        repo.write(
+            "src/report.listener.ts",
+            &REPORT_LISTENER.replace("'invoice.issued'", "'invoice.sent'"),
+        );
+        repo
+    }
+
+    /// Renamed: every site of `invoice.issued` now names `invoice.sent`. One rename line, the
+    /// link kept, and the hop from `order.created` is the same hop under the new name.
+    #[test]
+    fn a_topic_renamed_at_every_site_is_one_rename() {
+        let repo = renamed_repo();
+        let text = diff(&repo);
+        let ev = events(&text);
+        assert!(
+            ev.contains("**Events**: 0 channel(s) with site changes; producers +0 -0; consumers +0 -0; 1 renamed; producer-consumer links cut 0, created 0; chain hops cut 0, created 0."),
+            "{ev}"
+        );
+        assert!(
+            ev.contains("- renamed `inproc:invoice.issued` → `inproc:invoice.sent`: the same 2 site(s): consumer in `onInvoice` (`src/report.listener.ts`), producer in `issue` (`src/invoice.service.ts`); the producer-consumer link is kept under the new name"),
+            "{ev}"
+        );
+        // Deterministic: byte-identical over two runs.
+        assert_eq!(text, diff(&repo));
+    }
+
+    /// A topic renamed at the producer only is no rename: the old channel loses its producer
+    /// (link cut), the new one has no consumer.
+    #[test]
+    fn a_half_rename_is_a_cut_not_a_rename() {
+        let repo = base();
+        repo.write(
+            "src/invoice.service.ts",
+            &INVOICE_SERVICE.replace("'invoice.issued'", "'invoice.sent'"),
+        );
+        let ev = diff(&repo);
+        let ev = events(&ev);
+        assert!(ev.contains(" 0 renamed; producer-consumer links cut 1, created 0;"), "{ev}");
+        assert!(ev.contains("#### `inproc:invoice.issued` — link cut"), "{ev}");
+        // The hop now publishes on the new channel.
+        assert!(
+            ev.contains("#### Chain hops cut\n- consumer of `inproc:order.created` in `onOrderCreated` (`src/invoice.listener.ts`) → publishes `inproc:invoice.issued` in `issue` (`src/invoice.service.ts`) _(exact)_"),
+            "{ev}"
+        );
+        assert!(
+            ev.contains("#### Chain hops created\n- consumer of `inproc:order.created` in `onOrderCreated` (`src/invoice.listener.ts`) → publishes `inproc:invoice.sent` in `issue` (`src/invoice.service.ts`) _(exact)_"),
+            "{ev}"
+        );
+    }
+
+    /// Chain cut: the handler no longer calls the service that publishes. No site changes,
+    /// the hop `order.created` -> `invoice.issued` is gone.
+    #[test]
+    fn a_handler_that_stops_calling_the_publisher_cuts_the_hop() {
+        let repo = base();
+        repo.write(
+            "src/invoice.listener.ts",
+            &INVOICE_LISTENER.replace(NO_CALL, ""),
+        );
+        let text = diff(&repo);
+        let ev = events(&text);
+        assert!(
+            ev.contains("**Events**: 0 channel(s) with site changes; producers +0 -0; consumers +0 -0; 0 renamed; producer-consumer links cut 0, created 0; chain hops cut 1, created 0."),
+            "{ev}"
+        );
+        assert!(
+            ev.contains("#### Chain hops cut\n- consumer of `inproc:order.created` in `onOrderCreated` (`src/invoice.listener.ts`) → publishes `inproc:invoice.issued` in `issue` (`src/invoice.service.ts`) _(exact)_\n"),
+            "{ev}"
+        );
+    }
+
+    /// Chain created: the reverse of the cut.
+    #[test]
+    fn a_handler_that_starts_calling_the_publisher_creates_the_hop() {
+        let repo = TempRepo::new();
+        repo.write("src/order.service.ts", ORDER_SERVICE);
+        repo.write(
+            "src/invoice.listener.ts",
+            &INVOICE_LISTENER.replace(NO_CALL, ""),
+        );
+        repo.write("src/invoice.service.ts", INVOICE_SERVICE);
+        repo.write("src/report.listener.ts", REPORT_LISTENER);
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write("src/invoice.listener.ts", INVOICE_LISTENER);
+        let ev = diff(&repo);
+        let ev = events(&ev);
+        assert!(ev.contains("chain hops cut 0, created 1."), "{ev}");
+        assert!(
+            ev.contains("#### Chain hops created\n- consumer of `inproc:order.created` in `onOrderCreated` (`src/invoice.listener.ts`) → publishes `inproc:invoice.issued` in `issue` (`src/invoice.service.ts`) _(exact)_\n"),
+            "{ev}"
+        );
+        assert!(!ev.contains("#### Chain hops cut"), "{ev}");
+    }
+
+    /// No cross-broker bleed: a Kafka `orders` producer and an in-process `orders` consumer
+    /// are two channels. Removing the in-process consumer is a row of `inproc:orders` only, and
+    /// cuts no link (the Kafka producer never reached it).
+    #[test]
+    fn sites_of_two_brokers_on_one_name_stay_apart() {
+        let repo = TempRepo::new();
+        repo.write(
+            "src/kafka.producer.ts",
+            "import { Producer } from 'kafkajs';\n\nexport class OrderEvents {\n  constructor(private readonly producer: Producer) {}\n\n  async placed(id: string) {\n    await this.producer.send({ topic: 'orders', messages: [{ value: id }] });\n  }\n}\n",
+        );
+        repo.write(
+            "src/orders.listener.ts",
+            "import { Injectable } from '@nestjs/common';\nimport { OnEvent } from '@nestjs/event-emitter';\n\n@Injectable()\nexport class OrdersListener {\n  @OnEvent('orders')\n  onOrders(e: { id: string }) {\n    return e.id;\n  }\n}\n",
+        );
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        rm(&repo, "src/orders.listener.ts");
+        let text = diff(&repo);
+        let ev = events(&text);
+        assert!(
+            ev.contains("#### `inproc:orders`\n- - consumer of `inproc:orders` in `onOrders` (`src/orders.listener.ts, base L7`)\n"),
+            "{ev}"
+        );
+        assert!(ev.contains("producer-consumer links cut 0, created 0;"), "{ev}");
+        assert!(!ev.contains("kafka:orders"), "{ev}");
+        // Every channel row carries its broker.
+        for line in ev.lines().filter(|l| l.starts_with("- + ") || l.starts_with("- - ")) {
+            assert!(line.contains("`inproc:") || line.contains("`kafka:"), "{line}");
+        }
+    }
+
+    /// Secrets: a key-shaped topic name (built at run time, never written in the source) and a
+    /// placeholder default are never shown.
+    #[test]
+    fn secret_shaped_topics_and_placeholder_defaults_never_reach_the_output() {
+        let token: String = ["tok", "_", "9f8e7d6c5b4a3f2e1d"].concat();
+        let default: String = ["a3f9", "c1e7", "b2d4x9"].concat();
+        let repo = base();
+        repo.write(
+            "src/leak.service.ts",
+            &ORDER_SERVICE
+                .replace("OrderService", "LeakService")
+                .replace("'order.created'", &format!("'{token}'")),
+        );
+        repo.write(
+            "src/main/java/demo/Listener.java",
+            &format!("package demo;\n\nimport org.springframework.kafka.annotation.KafkaListener;\n\npublic class Listener {{\n    @KafkaListener(topics = \"${{orders.topic:{default}}}\")\n    public void on(String m) {{}}\n}}\n"),
+        );
+        let text = diff(&repo);
+        assert!(!text.contains(&token), "{text}");
+        assert!(!text.contains(&default), "{text}");
+        // The listener is seen, its placeholder shown without its default.
+        assert!(text.contains("consumes topic `${orders.topic}`"), "{text}");
+        let ev = events(&text);
+        assert!(ev.contains(super::REDACTED), "{ev}");
+    }
+
+    /// Hostile input, on a 2 MB stack: a 380 KB file of thousands of distinct topics and a cyclic
+    /// chain (`ping` -> `pong` -> `ping`). The walk ends, the answer stays under the cap and says
+    /// what it left out.
+    #[test]
+    fn thousands_of_topics_and_a_cycle_stay_bounded() {
+        let repo = TempRepo::new();
+        let cycle = |me: &str, on: &str, emit: &str| {
+            format!("import {{ Injectable }} from '@nestjs/common';\nimport {{ OnEvent, EventEmitter2 }} from '@nestjs/event-emitter';\n\n@Injectable()\nexport class {me} {{\n  constructor(private readonly emitter: EventEmitter2) {{}}\n\n  @OnEvent('{on}')\n  handle() {{\n    this.relay();\n  }}\n\n  relay() {{\n    this.emitter.emit('{emit}', {{}});\n  }}\n}}\n")
+        };
+        repo.write("src/ping.ts", &cycle("Ping", "ping", "pong"));
+        repo.write("src/pong.ts", &cycle("Pong", "pong", "ping"));
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        let mut big = String::from("import { Injectable } from '@nestjs/common';\nimport { EventEmitter2 } from '@nestjs/event-emitter';\n\n@Injectable()\nexport class Flood {\n  constructor(private readonly emitter: EventEmitter2) {}\n\n  fire() {\n");
+        let mut k = 0;
+        while big.len() < 375 * 1024 {
+            let _ = std::fmt::Write::write_fmt(
+                &mut big,
+                format_args!("    this.emitter.emit('flood.topic.number.{k:05}', {{}});\n"),
+            );
+            k += 1;
+        }
+        big.push_str("  }\n}\n");
+        assert!(big.len() < 384 * 1024);
+        repo.write("src/flood.ts", &big);
+        // Cut the cycle at one end too.
+        repo.write("src/pong.ts", &cycle("Pong", "pong", "pang"));
+        let root = repo.root.clone();
+        let runner = repo.runner();
+        let text = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let args = DiffMeshArgs {
+                    base: Some("main".into()),
+                    scope: None,
+                    _meta: None,
+                };
+                let state = state(&root);
+                let a = run_with(&args, &state, &runner, Limits::DEFAULT).expect("ok").text;
+                let b = run_with(&args, &state, &runner, Limits::DEFAULT).expect("ok").text;
+                assert_eq!(a, b);
+                a
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+        assert!(text.len() <= 48 * 1024, "{}", text.len());
+        let ev = events(&text);
+        assert!(ev.contains("more channel(s) not checked for links and chain hops: cap (200 per call); narrow `scope`."), "{ev}");
+        assert!(ev.contains("more event item(s) not shown to stay under the 48 KB cap; narrow `scope`"), "{ev}");
+        drop(repo);
     }
 }
