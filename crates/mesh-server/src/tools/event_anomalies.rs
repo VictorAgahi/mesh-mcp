@@ -16,6 +16,7 @@ pub enum AnomalyClass {
     Cycles,
     FanOut,
     TestOnlyConsumers,
+    PayloadMismatch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -30,7 +31,7 @@ pub struct EventAnomaliesArgs {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
-        description = "Classes to show (default: all): published_never_consumed, consumed_never_published, unresolved, cycles, fan_out, test_only_consumers. Counts of every class are always given."
+        description = "Classes to show (default: all): published_never_consumed, consumed_never_published, unresolved, cycles, fan_out, test_only_consumers, payload_mismatch. Counts of every class are always given."
     )]
     pub classes: Option<Vec<AnomalyClass>>,
 
@@ -104,6 +105,7 @@ impl McpTool for EventAnomaliesTool {
                     cycles: has(AnomalyClass::Cycles),
                     fan_out: has(AnomalyClass::FanOut),
                     test_only_consumers: has(AnomalyClass::TestOnlyConsumers),
+                    payload_mismatch: has(AnomalyClass::PayloadMismatch),
                 }
             }
         };

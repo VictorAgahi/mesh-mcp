@@ -1,0 +1,13 @@
+# Fixture: payload types per topic, publisher vs consumer (9.0 T11). NestJS (Kafka client,
+# EventPattern), BullMQ and Spring Kafka / RabbitMQ. Truth: tests/golden/events/payloads.report.yaml.
+[workspace]
+name = "payload-types"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/node_modules/**", "**/target/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true
