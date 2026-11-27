@@ -27,6 +27,9 @@ pub const MAX_PAYLOAD_FIELDS_PER_TYPE: usize = 64;
 pub const MAX_PAYLOAD_TYPES_PER_FILE: usize = 256;
 /// Payload sites kept per file; past it the file's facts are `capped`.
 pub const MAX_PAYLOAD_SITES_PER_FILE: usize = 512;
+/// Declared names kept per file past [`MAX_PAYLOAD_TYPES_PER_FILE`], without their fields
+/// (`opaque`): a name the type cap cut still shadows a same-named type of another file.
+pub const MAX_PAYLOAD_TYPE_NAMES_PER_FILE: usize = 4096;
 /// Distinct payload shapes compared per topic side; past it the topic is not compared.
 pub const MAX_PAYLOAD_SHAPES_PER_TOPIC: usize = 8;
 
@@ -54,6 +57,21 @@ pub struct PayloadType {
     /// super class whose fields are not read here.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub incomplete: bool,
+    /// A declared name whose fields are not known (a non-object type alias, an intersection, a
+    /// union, `Omit<...>`, a declaration past the per-file type cap): a payload of this type is
+    /// not statically typed, and the name still shadows a same-named type elsewhere.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opaque: bool,
+}
+
+/// A name a TypeScript file imports (`import { Exported as Local } from 'module'`, `exported`
+/// is `default` for a default import), kept only for the names its payload sites use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PayloadImport {
+    pub local: CompactStr,
+    pub exported: CompactStr,
+    /// The module specifier, relative when the file or an alias config says it is.
+    pub module: CompactStr,
 }
 
 /// The payload a site uses.
@@ -100,11 +118,15 @@ pub struct PayloadFacts {
     /// The repository of the file (what "same repository" means when a type name resolves).
     #[serde(default)]
     pub repo_id: RepoId,
+    /// The imports of the type names this file's sites use: such a name resolves only through
+    /// its import, never to a same-named type of another file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<PayloadImport>,
 }
 
 impl PayloadFacts {
     pub fn is_empty(&self) -> bool {
-        self.sites.is_empty() && self.types.is_empty() && !self.capped
+        self.sites.is_empty() && self.types.is_empty() && !self.capped && self.imports.is_empty()
     }
 
     /// Adds a site unless the per-file cap is reached (then marks the file capped).
@@ -117,17 +139,25 @@ impl PayloadFacts {
     }
 
     /// Adds a declared type unless the per-file cap is reached (then marks the file capped).
-    pub fn push_type(&mut self, ty: PayloadType) {
+    pub fn push_type(&mut self, mut ty: PayloadType) {
         if self.types.len() >= MAX_PAYLOAD_TYPES_PER_FILE {
             self.capped = true;
-        } else {
-            self.types.push(ty);
+            // Past the cap the name is kept without its fields, so it never falls through to a
+            // same-named type of another file.
+            if self.types.len() >= MAX_PAYLOAD_TYPES_PER_FILE + MAX_PAYLOAD_TYPE_NAMES_PER_FILE {
+                return;
+            }
+            ty.fields = Vec::new();
+            ty.incomplete = true;
+            ty.opaque = true;
         }
+        self.types.push(ty);
     }
 
     /// Appends `other` (a second extractor of the same file).
     pub fn merge(&mut self, other: PayloadFacts) {
         self.capped |= other.capped;
+        self.imports.extend(other.imports);
         for s in other.sites {
             self.push_site(s);
         }
@@ -203,6 +233,10 @@ pub struct PayloadEntry<'g> {
     pub consumer_only_skipped: Option<NotCompared>,
     /// `producer_only` was not computed.
     pub producer_only_skipped: Option<NotCompared>,
+    /// `consumer_only` was computed from a partial consumer field list: more may be missing.
+    pub consumer_only_partial: bool,
+    /// `producer_only` was computed from a partial producer field list.
+    pub producer_only_partial: bool,
     /// Live sites of the topic whose payload is not statically typed.
     pub untyped_sites: usize,
 }
@@ -487,6 +521,9 @@ impl ContractGraph {
                     usize::from(consumer_only_skipped.is_some() || producer_only_skipped.is_some());
                 continue;
             }
+            let partial = |sides: &[PayloadSide<'_>]| sides.iter().any(|s| s.incomplete);
+            let consumer_only_partial = consumer_only_skipped.is_none() && partial(&cs);
+            let producer_only_partial = producer_only_skipped.is_none() && partial(&ps);
             out.mismatches.push(PayloadEntry {
                 topic: e.clone(),
                 producers: ps,
@@ -497,6 +534,8 @@ impl ContractGraph {
                 names_differ,
                 consumer_only_skipped,
                 producer_only_skipped,
+                consumer_only_partial,
+                producer_only_partial,
                 untyped_sites: untyped,
             });
         }
@@ -556,6 +595,10 @@ impl ContractGraph {
                 incomplete: *incomplete,
             },
             PayloadShape::Named(name) => {
+                // An imported name resolves through its import only.
+                if let Some(import) = file.facts.imports.iter().find(|i| i.local == *name) {
+                    return self.resolve_import(&node.file_path, import);
+                }
                 let Some(cands) = declared.get(name.as_str()) else {
                     return Resolved::Undeclared;
                 };
@@ -575,15 +618,74 @@ impl ContractGraph {
                 } else {
                     return Resolved::Ambiguous;
                 };
-                Resolved::Side {
-                    type_name: Some(chosen.2.name.as_str()),
-                    file: chosen.0,
-                    repo_id: chosen.1.repo_id,
-                    line: chosen.2.line,
-                    fields: &chosen.2.fields,
-                    incomplete: chosen.2.incomplete,
-                }
+                Self::declared_side(chosen.0, chosen.1, chosen.2)
             }
+        }
+    }
+
+    fn declared_side<'g>(
+        file: &'g FilePath,
+        facts: &'g FilePayloads,
+        ty: &'g PayloadType,
+    ) -> Resolved<'g> {
+        if ty.opaque {
+            return Resolved::Untyped;
+        }
+        Resolved::Side {
+            type_name: Some(ty.name.as_str()),
+            file,
+            repo_id: facts.repo_id,
+            line: ty.line,
+            fields: &ty.fields,
+            incomplete: ty.incomplete,
+        }
+    }
+
+    /// The type `import` names, looked up in the indexed file its relative module resolves to
+    /// (`./x` as `x.ts`, `x.tsx`, `x.js`, `x/index.ts`, ...). A package, an unresolved alias, a
+    /// file that is not indexed or does not declare the name (a re-export) is `Undeclared`.
+    fn resolve_import<'g>(&'g self, from: &Path, import: &PayloadImport) -> Resolved<'g> {
+        let module = import.module.as_str();
+        if !(module.starts_with("./") || module.starts_with("../")) {
+            return Resolved::Undeclared;
+        }
+        let Some(dir) = from.parent() else {
+            return Resolved::Undeclared;
+        };
+        let base = path_clean::clean(dir.join(module));
+        let base_str = base.to_string_lossy();
+        let stem = ["js", "jsx", "mjs", "cjs"]
+            .iter()
+            .find_map(|e| base_str.strip_suffix(&format!(".{e}")))
+            .unwrap_or(&base_str)
+            .to_string();
+        let mut candidates: Vec<PathBuf> = vec![base.clone()];
+        for ext in ["ts", "tsx", "d.ts", "mts", "js", "jsx", "mjs"] {
+            candidates.push(PathBuf::from(format!("{stem}.{ext}")));
+        }
+        for ext in ["ts", "tsx", "js"] {
+            candidates.push(Path::new(&stem).join(format!("index.{ext}")));
+        }
+        let Some((path, facts)) = candidates
+            .iter()
+            .find_map(|c| self.payload_facts.get_key_value(c.as_path()))
+        else {
+            return Resolved::Undeclared;
+        };
+        let found: Vec<&PayloadType> = if import.exported == "default" {
+            facts.facts.types.iter().collect()
+        } else {
+            facts
+                .facts
+                .types
+                .iter()
+                .filter(|t| t.name == import.exported)
+                .collect()
+        };
+        match found.as_slice() {
+            [] => Resolved::Undeclared,
+            [one] => Self::declared_side(path, facts, one),
+            _ => Resolved::Ambiguous,
         }
     }
 }

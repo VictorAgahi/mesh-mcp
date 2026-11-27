@@ -1524,6 +1524,13 @@ impl PolyglotIndexer {
                 out.calls = calls;
                 out.payload = payload;
                 out.payload.repo_id = repo_id;
+                // An aliased module (`@/dto/order`) is the relative path it stands for, so a
+                // payload type imported through it resolves.
+                for import in &mut out.payload.imports {
+                    if let Some(relative) = cfg.ts_aliases.rewrite(file_path, &import.module) {
+                        import.module = CompactStr::new(relative);
+                    }
+                }
                 let mut nodes = nodes;
                 out.inproc_capped = Self::cap_inproc_nodes(&mut nodes);
                 Self::wire_ts_events(&nodes, &mut out);

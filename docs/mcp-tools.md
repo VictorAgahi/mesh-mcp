@@ -1106,15 +1106,28 @@ left out. A payload is read only where it is statically visible in TypeScript / 
 `@RabbitListener`, `@JmsListener`, `@SqsListener`, `@StreamListener` parameters, `ConsumerRecord<K,
 V>`, `Message<T>`, the payload argument of `send` / `convertAndSend`, else the `V` of a
 `KafkaTemplate<K, V>` receiver). A type name resolves to the class, interface, object type alias or
-record that declares it (same file, then same repository, then the one file of the workspace that
-declares it). What is not compared is counted, never presented as a match: a site whose payload is
+record that declares it. A name the file imports (`import { A }`, `import { B as A }`, `import A`)
+resolves ONLY through that import: to the declaration of the exported name in the indexed file the
+relative module (or a `tsconfig` / `jsconfig` path alias) points to; an import from a package, an
+unresolved alias, a file that is not indexed or only re-exports the name is "names a type no indexed
+file declares" (not compared), never a same-named type elsewhere. A name that is not imported
+resolves in the same file, then the same repository, then the one file of the workspace that
+declares it. A type alias whose fields are not statically known (an intersection, a union,
+`Omit<...>`) is declared without fields: it shadows a same-named type and its payload is not
+statically typed. Java imports are not read (Java names resolve by file, then repository). What is not compared is counted, never presented as a match: a site whose payload is
 not statically typed (a raw string, `any`, `JSON.stringify(...)`) or names a type no indexed file
 declares, or several files declare; a topic with no typed producer or no typed consumer; a side
 with more than 8 distinct payloads (`MAX_PAYLOAD_SHAPES_PER_TOPIC`); a direction whose other side
 has an untyped site or a partial field list (more than 64 fields, `MAX_PAYLOAD_FIELDS_PER_TYPE`, an
-`extends`, a spread). The footer says how many topics were compared, match, mismatch and were not
-compared, and names the topics not compared. Field and type names that are credential-shaped print
-as `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`; a field's type is shown as its JSON family and a
+`extends`, a spread). When the side a gap list is taken from has a partial field list, the list is
+shown and a note says more fields may be missing. Past the per-file type cap (256) a declared name
+is kept without its fields (not compared), so it never falls through to a same-named type of
+another file. Quoted keys (`'orderId': string`) are the same fields as bare ones. The footer says how many topics were compared, match, mismatch and were not
+compared, and names the topics not compared. Field and type names that are credential-shaped (the shared name gate, plus
+`member_consts::identifier_is_credential_named`: a credential word once the identifier is split on
+case changes, so `SecretsPayload` and `dbPassword` but not `routingKey`) print
+as `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`, and long rows are clamped in their findings,
+never in their "not compared" notes; a field's type is shown as its JSON family and a
 literal's value is never read. Field names are compared as written (a serializer naming strategy
 such as snake_case is not applied).
 

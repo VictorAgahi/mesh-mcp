@@ -40,9 +40,10 @@ pub use flow::{
 };
 pub use payload::{
     json_family as payload_json_family, FieldClash, FieldGap, NotCompared, PayloadEntry,
-    PayloadFacts, PayloadField, PayloadReport, PayloadShape, PayloadSide, PayloadSite,
-    PayloadSkipReason, PayloadSkipped, PayloadType, MAX_PAYLOAD_FIELDS_PER_TYPE,
+    PayloadFacts, PayloadField, PayloadImport, PayloadReport, PayloadShape, PayloadSide,
+    PayloadSite, PayloadSkipReason, PayloadSkipped, PayloadType, MAX_PAYLOAD_FIELDS_PER_TYPE,
     MAX_PAYLOAD_SHAPES_PER_TOPIC, MAX_PAYLOAD_SITES_PER_FILE, MAX_PAYLOAD_TYPES_PER_FILE,
+    MAX_PAYLOAD_TYPE_NAMES_PER_FILE,
 };
 
 #[cfg(test)]

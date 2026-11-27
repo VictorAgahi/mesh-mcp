@@ -83,7 +83,9 @@ fn shown_key(key: &str) -> String {
 
 /// A type or field name that is safe to print (the shared name gate), else the redaction marker.
 fn shown_name(name: &str) -> String {
-    if mesh_core::member_consts::name_is_printable(name) {
+    if mesh_core::member_consts::name_is_printable(name)
+        && !mesh_core::member_consts::identifier_is_credential_named(name)
+    {
         name.replace(['`', '\n', '\r'], "'")
     } else {
         REDACTED.to_string()
@@ -578,6 +580,20 @@ impl MarkdownFormatter {
             if e.names_differ {
                 text.push_str("\n  - type names differ between producer and consumer");
             }
+            // The "not compared" notes are what keeps a row honest: kept whole, the findings above
+            // them are clamped instead when the row is too long.
+            let mut notes = String::new();
+            for (side, what, partial) in [
+                ("consumer", "expected", e.consumer_only_partial),
+                ("producer", "published", e.producer_only_partial),
+            ] {
+                if partial {
+                    let _ = write!(
+                        notes,
+                        "\n  - partial list above: the {side}'s field list is partial (a cap, a spread, an extends), more {what} fields may be missing"
+                    );
+                }
+            }
             for (what, skipped) in [
                 ("fields a consumer expects", e.consumer_only_skipped),
                 ("fields published", e.producer_only_skipped),
@@ -591,15 +607,21 @@ impl MarkdownFormatter {
                         "a field list of the other side is partial (a cap, a spread, an extends)"
                     }
                 };
-                let _ = write!(text, "\n  - {what}: not compared, {why}");
+                let _ = write!(notes, "\n  - {what}: not compared, {why}");
             }
             if e.untyped_sites > 0 {
                 let _ = write!(
-                    text,
+                    notes,
                     "\n  - {} site(s) of this topic have a payload that is not statically typed",
                     e.untyped_sites
                 );
             }
+            // `- ` and the newline the section adds around a row.
+            let room = ROW_MAX.saturating_sub(3 + notes.chars().count());
+            if text.chars().count() > room {
+                text = Self::clamp_chars(&text, room);
+            }
+            text.push_str(&notes);
             text
         };
         Self::anomaly_section(

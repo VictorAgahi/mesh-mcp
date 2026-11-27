@@ -23,7 +23,7 @@
 
 use super::ts_calls::walk;
 use mesh_core::{
-    CompactStr, PayloadFacts, PayloadField, PayloadShape, PayloadSite, PayloadType,
+    CompactStr, PayloadFacts, PayloadField, PayloadImport, PayloadShape, PayloadSite, PayloadType,
     MAX_PAYLOAD_FIELDS_PER_TYPE,
 };
 use tree_sitter::{Node, Tree};
@@ -150,13 +150,27 @@ fn ts_member_decorators<'t>(n: Node<'t>) -> Vec<Node<'t>> {
     out
 }
 
+/// A member's name: `id`, `'id'` and `"id"` are the same field; a computed key is `None`.
+fn ts_member_name(n: Node, src: &[u8]) -> Option<CompactStr> {
+    match n.kind() {
+        "property_identifier" | "number" => Some(CompactStr::new(text(n, src))),
+        "string" => string_literal(n, src),
+        _ => None,
+    }
+}
+
 fn ts_fields_of_object_type(body: Node, src: &[u8]) -> (Vec<PayloadField>, bool) {
     let mut fields = Vec::new();
     let mut incomplete = false;
     for m in named_children(body) {
         match m.kind() {
             "property_signature" => {
-                let Some(name) = m.child_by_field_name("name") else {
+                let Some(name) = m
+                    .child_by_field_name("name")
+                    .and_then(|n| ts_member_name(n, src))
+                else {
+                    // A computed key: the field list is not closed.
+                    incomplete = true;
                     continue;
                 };
                 let optional = {
@@ -171,7 +185,7 @@ fn ts_fields_of_object_type(body: Node, src: &[u8]) -> (Vec<PayloadField>, bool)
                     &mut fields,
                     &mut incomplete,
                     PayloadField {
-                        name: CompactStr::new(text(name, src)),
+                        name,
                         ty,
                         line: line(m),
                         optional,
@@ -211,12 +225,13 @@ fn ts_class_fields(class: Node, src: &[u8]) -> (Vec<PayloadField>, bool) {
                 if skip {
                     continue;
                 }
-                let Some(name) = m.child_by_field_name("name") else {
+                let Some(name) = m
+                    .child_by_field_name("name")
+                    .and_then(|n| ts_member_name(n, src))
+                else {
+                    // A computed or `#private` member.
                     continue;
                 };
-                if name.kind() != "property_identifier" {
-                    continue;
-                }
                 let mut c = m.walk();
                 let optional = m.children(&mut c).any(|ch| ch.kind() == "?");
                 let ty = m
@@ -226,7 +241,7 @@ fn ts_class_fields(class: Node, src: &[u8]) -> (Vec<PayloadField>, bool) {
                     &mut fields,
                     &mut incomplete,
                     PayloadField {
-                        name: CompactStr::new(text(name, src)),
+                        name,
                         ty,
                         line: line(m),
                         optional,
@@ -656,6 +671,7 @@ fn ts_inject_queue(n: Node, src: &[u8], out: &mut PayloadFacts) {
 /// The payload facts of a TypeScript / JavaScript tree.
 pub(crate) fn scan_ts(tree: &Tree, src: &[u8]) -> PayloadFacts {
     let mut out = PayloadFacts::default();
+    let mut imports: Vec<PayloadImport> = Vec::new();
     walk(tree.root_node(), &mut |n| match n.kind() {
         "interface_declaration" => {
             let (Some(name), Some(body)) =
@@ -673,6 +689,7 @@ pub(crate) fn scan_ts(tree: &Tree, src: &[u8]) -> PayloadFacts {
                 line: line(n),
                 fields,
                 incomplete,
+                opaque: false,
             });
         }
         "type_alias_declaration" => {
@@ -683,6 +700,15 @@ pub(crate) fn scan_ts(tree: &Tree, src: &[u8]) -> PayloadFacts {
                 return;
             };
             if value.kind() != "object_type" {
+                // An intersection, union, mapped or utility type: the name is declared (it
+                // shadows a same-named type elsewhere), its fields are not known.
+                out.push_type(PayloadType {
+                    name: CompactStr::new(text(name, src)),
+                    line: line(n),
+                    fields: Vec::new(),
+                    incomplete: true,
+                    opaque: true,
+                });
                 return;
             }
             let (fields, incomplete) = ts_fields_of_object_type(value, src);
@@ -691,6 +717,7 @@ pub(crate) fn scan_ts(tree: &Tree, src: &[u8]) -> PayloadFacts {
                 line: line(n),
                 fields,
                 incomplete,
+                opaque: false,
             });
         }
         "class_declaration" | "abstract_class_declaration" | "class" => {
@@ -703,15 +730,74 @@ pub(crate) fn scan_ts(tree: &Tree, src: &[u8]) -> PayloadFacts {
                 line: line(n),
                 fields,
                 incomplete,
+                opaque: false,
             });
         }
+        "import_statement" => ts_import(n, src, &mut imports),
         "method_definition" => ts_consumer_method(n, src, &mut out),
         "new_expression" => ts_new_expression(n, src, &mut out),
         "call_expression" => ts_producer_call(n, src, &mut out),
         "public_field_definition" | "required_parameter" => ts_inject_queue(n, src, &mut out),
         _ => {}
     });
+    // Only the imports of names a payload site uses are kept.
+    let used: std::collections::BTreeSet<&str> = out
+        .sites
+        .iter()
+        .filter_map(|s| match &s.shape {
+            PayloadShape::Named(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
+    imports.retain(|i| used.contains(i.local.as_str()));
+    out.imports = imports;
     out
+}
+
+/// `import A, { B, C as D } from './m'` and `import type { E } from './m'`; a namespace import
+/// (`* as ns`) binds no type name.
+fn ts_import(n: Node, src: &[u8], out: &mut Vec<PayloadImport>) {
+    let Some(module) = n
+        .child_by_field_name("source")
+        .and_then(|m| string_literal(m, src))
+    else {
+        return;
+    };
+    let Some(clause) = named_children(n)
+        .into_iter()
+        .find(|c| c.kind() == "import_clause")
+    else {
+        return;
+    };
+    let mut push = |local: &str, exported: &str| {
+        out.push(PayloadImport {
+            local: CompactStr::new(local),
+            exported: CompactStr::new(exported),
+            module: module.clone(),
+        });
+    };
+    for c in named_children(clause) {
+        match c.kind() {
+            "identifier" => push(text(c, src), "default"),
+            "named_imports" => {
+                for spec in named_children(c) {
+                    if spec.kind() != "import_specifier" {
+                        continue;
+                    }
+                    let Some(name) = spec.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let local = spec.child_by_field_name("alias").unwrap_or(name);
+                    let exported = match name.kind() {
+                        "string" => string_literal(name, src).unwrap_or_default(),
+                        _ => CompactStr::new(text(name, src)),
+                    };
+                    push(text(local, src), exported.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------- Java
@@ -1027,6 +1113,7 @@ pub(crate) fn scan_java(tree: &Tree, src: &[u8]) -> PayloadFacts {
                 line: line(n),
                 fields,
                 incomplete,
+                opaque: false,
             });
         }
         "record_declaration" => {
@@ -1058,6 +1145,7 @@ pub(crate) fn scan_java(tree: &Tree, src: &[u8]) -> PayloadFacts {
                 line: line(n),
                 fields,
                 incomplete,
+                opaque: false,
             });
         }
         "method_declaration" => java_listener(n, src, &mut out),
@@ -1114,7 +1202,10 @@ mod tests {
              type D = string;\n\
              class E { a: string; private hidden: string; static s: number; constructor(public readonly b: number, c: string, private d: string) {} }\n");
         let names: Vec<&str> = f.types.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["A", "B", "C", "E"]);
+        assert_eq!(names, vec!["A", "B", "C", "D", "E"]);
+        // A non-object alias is declared, its fields unknown: it shadows a same-named type.
+        assert!(f.types[3].opaque && f.types[3].fields.is_empty());
+        assert!(!f.types[0].opaque && !f.types[4].opaque);
         // A literal type is never kept as a type: it could hold a value.
         assert_eq!(
             field_names(&f.types[0]),
@@ -1131,7 +1222,7 @@ mod tests {
             vec![("tags", Some("string[]"), false)]
         );
         assert_eq!(
-            field_names(&f.types[3]),
+            field_names(&f.types[4]),
             vec![("a", Some("string"), false), ("b", Some("number"), false)]
         );
         assert!(f.sites.is_empty());
@@ -1289,6 +1380,63 @@ mod tests {
                 (true, 15, Some("ex"), &PayloadShape::Untyped),
             ]
         );
+    }
+
+    #[test]
+    fn ts_quoted_keys_are_bare_field_names() {
+        let f = ts(
+            "interface Q { 'orderId': string; \"total\": number; [k]: string }\n\
+             class R { 'a': string; [computed] = 1; }\n",
+        );
+        assert_eq!(
+            field_names(&f.types[0]),
+            vec![
+                ("orderId", Some("string"), false),
+                ("total", Some("number"), false)
+            ]
+        );
+        assert!(f.types[0].incomplete, "a computed key leaves the list open");
+        assert_eq!(field_names(&f.types[1]), vec![("a", Some("string"), false)]);
+    }
+
+    #[test]
+    fn ts_imports_of_payload_type_names_are_kept() {
+        let f = ts("import Def, { A, B as Local, Unused } from './m';\n\
+             import * as ns from './ns';\n\
+             import type { T } from '@pkg/types';\n\
+             class H {\n\
+             @EventPattern('a') a(@Payload() x: A) {}\n\
+             @EventPattern('b') b(@Payload() x: Local) {}\n\
+             @EventPattern('c') c(@Payload() x: Def) {}\n\
+             @EventPattern('d') d(@Payload() x: T) {}\n\
+             }\n");
+        let imports: Vec<(&str, &str, &str)> = f
+            .imports
+            .iter()
+            .map(|i| (i.local.as_str(), i.exported.as_str(), i.module.as_str()))
+            .collect();
+        assert_eq!(
+            imports,
+            vec![
+                ("Def", "default", "./m"),
+                ("A", "A", "./m"),
+                ("Local", "B", "./m"),
+                ("T", "T", "@pkg/types"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_type_past_the_cap_keeps_its_name_only() {
+        let decls: String = (0..260)
+            .map(|i| format!("interface T{i} {{ a: string }}\n"))
+            .collect();
+        let f = ts(&decls);
+        assert_eq!(f.types.len(), 260);
+        assert!(f.capped);
+        assert!(!f.types[255].opaque);
+        assert!(f.types[256].opaque && f.types[256].fields.is_empty());
+        assert_eq!(f.types[259].name.as_str(), "T259");
     }
 
     #[test]

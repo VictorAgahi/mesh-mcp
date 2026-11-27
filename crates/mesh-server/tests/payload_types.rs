@@ -341,6 +341,7 @@ async fn a_capped_field_list_is_said_not_compared() {
     assert_eq!(
         row.notes,
         vec![
+            "partial list above: the producer's field list is partial (a cap, a spread, an extends), more published fields may be missing".to_string(),
             "fields a consumer expects: not compared, a field list of the other side is partial (a cap, a spread, an extends)"
                 .to_string()
         ],
@@ -438,4 +439,272 @@ async fn credential_shaped_field_names_are_redacted_and_values_never_print() {
         let lower = String::from_utf8_lossy(&bytes).to_lowercase();
         assert!(!lower.contains("payloadcanary"), "canary in the cache");
     }
+}
+
+// ---- Review round 1: imports, aliases, quoted keys, partial sides, ambiguity, names, reloads.
+
+#[tokio::test]
+async fn payload_imports_resolve_through_the_import_only() {
+    let state = state_in(&repo("examples/eda/payload-imports"), None);
+    let text = report(&state, json!({ "classes": ["payload_mismatch"] })).await;
+    let rows = mismatches(&text);
+    // Negative decoy of the import rule: an import that reaches an indexed declaration still
+    // reports its real mismatch.
+    assert_eq!(
+        rows.keys().cloned().collect::<Vec<_>>(),
+        vec!["refund.voided [broker unknown]".to_string()],
+        "{text}"
+    );
+    let row = &rows["refund.voided [broker unknown]"];
+    assert_eq!(row.consumer_only, vec!["reason".to_string()]);
+    assert_eq!(row.producer_only, vec!["amount".to_string()]);
+    // `Refund as Order` (repro A) and the default import `Parcel` match; quoted keys match bare
+    // ones. A package import (repro B) and a declared intersection alias (H2) are not compared.
+    assert_eq!(
+        not_compared(&text),
+        BTreeSet::from([
+            "evt.fired [broker unknown]".to_string(),
+            "order2.placed [broker unknown]".to_string()
+        ]),
+        "{text}"
+    );
+    let summary = payload_line(&text);
+    assert!(
+        summary.contains("6 topic(s) have live producers and consumers; 1 mismatch, 3 match"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("2 site(s) have a payload that is not statically typed (1 name a type no indexed file declares, 0 a type several files declare)"),
+        "{summary}"
+    );
+    // The decoy classes of src/order.ts are never named.
+    assert!(!text.contains("src/order.ts"), "{text}");
+}
+
+#[tokio::test]
+async fn a_partial_consumer_field_list_says_its_gaps_are_partial() {
+    let consumer_fields: String = (0..70).map(|i| format!("  f{i}: string;\n")).collect();
+    let producer_fields: String = (0..60).map(|i| format!("  f{i}: string;\n")).collect();
+    let (_tmp, state) = workspace(&[
+        (
+            "src/wide.ts",
+            format!("export interface Wide {{\n{consumer_fields}}}\n"),
+        ),
+        (
+            "src/narrow.ts",
+            format!("export interface Narrow {{\n{producer_fields}}}\n"),
+        ),
+        ("src/pub.ts", publisher("wide.topic", "Narrow")),
+        ("src/sub.ts", consumer("wide.topic", "Wide")),
+    ]);
+    let text = report(&state, json!({ "classes": ["payload_mismatch"] })).await;
+    let rows = mismatches(&text);
+    let row = rows.get("wide.topic [broker unknown]").expect(&text);
+    // Fields f60..f63 are kept (64-field cap), f64..f69 are past it.
+    assert_eq!(
+        row.consumer_only,
+        vec!["f60", "f61", "f62", "f63"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>(),
+        "{text}"
+    );
+    assert_eq!(
+        row.notes,
+        vec![
+            "partial list above: the consumer's field list is partial (a cap, a spread, an extends), more expected fields may be missing".to_string(),
+            "fields published: not compared, a field list of the other side is partial (a cap, a spread, an extends)".to_string(),
+        ],
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn two_payloads_of_one_node_for_one_topic_are_ambiguous() {
+    let (_tmp, state) = workspace(&[
+        (
+            "src/main/java/a/Pub.java",
+            "package a;\nimport org.springframework.kafka.core.KafkaTemplate;\npublic class Pub {\n    private KafkaTemplate<String, Object> kafkaTemplate;\n    void go() {\n        kafkaTemplate.send(\"dual\", new Other());\n        kafkaTemplate.send(\"dual\", new Ev());\n    }\n}\n".to_string(),
+        ),
+        ("src/main/java/a/Ev.java", "package a;\npublic class Ev {\n    private String id;\n}\n".to_string()),
+        ("src/main/java/a/Other.java", "package a;\npublic class Other {\n    private String nope;\n}\n".to_string()),
+        (
+            "src/main/java/a/Sub.java",
+            "package a;\nimport org.springframework.kafka.annotation.KafkaListener;\npublic class Sub {\n    @KafkaListener(topics = \"dual\")\n    void on(Ev e) {}\n}\n".to_string(),
+        ),
+    ]);
+    let text = report(&state, json!({ "classes": ["payload_mismatch"] })).await;
+    assert!(mismatches(&text).is_empty(), "{text}");
+    assert!(
+        payload_line(&text)
+            .contains("(0 name a type no indexed file declares, 1 a type several files declare)"),
+        "{text}"
+    );
+    assert_eq!(
+        not_compared(&text),
+        BTreeSet::from(["dual [kafka]".to_string()])
+    );
+}
+
+#[tokio::test]
+async fn credential_shaped_type_names_are_redacted() {
+    // Built at runtime: no key-shaped literal in the source.
+    let ty = ["Secrets", "CANARY", "T3"].concat();
+    let (_tmp, state) = workspace(&[
+        (
+            "src/t.ts",
+            format!("export interface {ty} {{ id: string; extra: string }}\nexport interface Plain {{ id: string }}\n"),
+        ),
+        ("src/pub.ts", publisher("canary.topic", &ty)),
+        ("src/sub.ts", consumer("canary.topic", "Plain")),
+    ]);
+    let text = report(&state, json!({ "classes": ["payload_mismatch"] })).await;
+    assert!(
+        mismatches(&text).contains_key("canary.topic [broker unknown]"),
+        "{text}"
+    );
+    assert!(!text.to_lowercase().contains("canaryt3"), "{text}");
+    assert!(
+        text.contains("producer `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`"),
+        "{text}"
+    );
+    // A name with `key` as a whole word only is not a credential.
+    assert!(!mesh_core::member_consts::identifier_is_credential_named(
+        "routingKey"
+    ));
+    assert!(mesh_core::member_consts::identifier_is_credential_named(
+        "apiKey"
+    ));
+    assert!(mesh_core::member_consts::identifier_is_credential_named(
+        "db_password"
+    ));
+}
+
+#[tokio::test]
+async fn a_long_row_keeps_its_not_compared_notes() {
+    let dir = "src/".to_string() + &"very_long_directory_name_".repeat(8);
+    let names: Vec<String> = (0..4).map(|i| format!("LongProducerType{i}")).collect();
+    let mut files: Vec<(String, String)> = Vec::new();
+    let mut decls = String::new();
+    for n in &names {
+        decls.push_str(&format!(
+            "export interface {n} {{ id: string; {n}Only: string }}\n"
+        ));
+    }
+    files.push((format!("{dir}/types.ts"), decls));
+    for (i, n) in names.iter().enumerate() {
+        files.push((format!("{dir}/pub{i}.ts"), publisher("long.topic", n)));
+    }
+    // An untyped producer: the consumer-side gaps are not compared, and say so.
+    files.push((
+        format!("{dir}/raw.ts"),
+        format!("{NEST}export class Raw {{\n  constructor(private readonly client: ClientProxy) {{}}\n  go(s: string) {{\n    this.client.emit('long.topic', s);\n  }}\n}}\n"),
+    ));
+    files.push((
+        format!("{dir}/types2.ts"),
+        "export interface Wanted { id: string; wanted: string }\n".to_string(),
+    ));
+    for i in 0..3 {
+        files.push((
+            format!("{dir}/sub{i}.ts"),
+            consumer("long.topic", "Wanted").replace("C_Wanted", &format!("C{i}")),
+        ));
+    }
+    let refs: Vec<(&str, String)> = files.iter().map(|(p, b)| (p.as_str(), b.clone())).collect();
+    let (_tmp, state) = workspace(&refs);
+    let text = report(&state, json!({ "classes": ["payload_mismatch"] })).await;
+    let row_line = text
+        .lines()
+        .find(|l| l.starts_with("- `long.topic`"))
+        .expect(&text);
+    // The findings were clamped (the row is past 1,500 characters otherwise) ...
+    assert!(row_line.len() > 1000, "{text}");
+    let block: String = text
+        .split("- `long.topic`")
+        .nth(1)
+        .expect("row")
+        .split("\n\n")
+        .next()
+        .expect("block")
+        .to_string();
+    assert!(block.chars().count() <= 1_500, "{}", block.chars().count());
+    assert!(block.contains("..."), "{block}");
+    // ... and the notes survived whole.
+    assert!(
+        block.ends_with("  - fields a consumer expects: not compared, the other side has a site whose payload is not statically typed\n  - 1 site(s) of this topic have a payload that is not statically typed"),
+        "{block}"
+    );
+}
+
+#[tokio::test]
+async fn a_declaration_past_the_type_cap_never_falls_through() {
+    // 256 types, then `Order` and its consumer in the same file: `Order` is past the per-file cap
+    // and must not resolve to the Order of another file.
+    let mut big = String::from(NEST);
+    for i in 0..256 {
+        big.push_str(&format!("interface Filler{i} {{ a: string }}\n"));
+    }
+    big.push_str("interface Order { id: string }\n@Controller()\nexport class C {\n  @EventPattern('capped')\n  on(@Payload() e: Order) {\n    return e;\n  }\n}\n");
+    let (_tmp, state) = workspace(&[
+        ("src/big.ts", big),
+        (
+            "src/other.ts",
+            "export interface Order { other: number }\n".to_string(),
+        ),
+        ("src/pub.ts", publisher("capped", "Sent")),
+        (
+            "src/sent.ts",
+            "export interface Sent { id: string }\n".to_string(),
+        ),
+    ]);
+    let text = report(&state, json!({ "classes": ["payload_mismatch"] })).await;
+    assert!(mismatches(&text).is_empty(), "{text}");
+    assert_eq!(
+        not_compared(&text),
+        BTreeSet::from(["capped [broker unknown]".to_string()])
+    );
+    assert!(
+        text.contains("**Payload facts incomplete**: 1 file(s)"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn an_incremental_reload_updates_the_payload_rows() {
+    let (tmp, state) = workspace(&[
+        (
+            "src/a.ts",
+            "export interface A { id: string; extra: string }\n".to_string(),
+        ),
+        (
+            "src/b.ts",
+            "export interface B { id: string }\n".to_string(),
+        ),
+        ("src/pub.ts", publisher("reload.topic", "A")),
+        ("src/sub.ts", consumer("reload.topic", "B")),
+    ]);
+    let args = json!({ "classes": ["payload_mismatch"] });
+    let before = report(&state, args.clone()).await;
+    assert_eq!(
+        mismatches(&before)["reload.topic [broker unknown]"].producer_only,
+        vec!["extra"]
+    );
+    // The consumer's type gains the field: the row goes.
+    // The watcher reports canonical paths (`/private/var` on macOS), as the graph keys them.
+    let b = dunce::canonicalize(tmp.path())
+        .expect("canonical")
+        .join("src/b.ts");
+    std::fs::write(&b, "export interface B { id: string; extra: string }\n").expect("write");
+    WorkspaceIndexer::reload_paths(&state, std::slice::from_ref(&b));
+    let after = report(&state, args.clone()).await;
+    assert!(mismatches(&after).is_empty(), "{after}");
+    // The type's file is deleted: its facts go with it, the topic is not compared.
+    std::fs::remove_file(&b).expect("rm");
+    WorkspaceIndexer::reload_paths(&state, std::slice::from_ref(&b));
+    let gone = report(&state, args).await;
+    assert!(mismatches(&gone).is_empty(), "{gone}");
+    assert!(
+        payload_line(&gone).contains("(1 name a type no indexed file declares"),
+        "{gone}"
+    );
 }

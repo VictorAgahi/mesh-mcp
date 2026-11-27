@@ -188,7 +188,11 @@ other. Per hub with live (non-test) producers and consumers, each site is matche
 site whose span overlaps its node (the literal topic tells two sites of one node apart; two
 different payloads left is ambiguous, not compared), and a type name is resolved against the
 declared types: same file, then same repository, then the workspace when one file declares it; a
-tie is ambiguous and counted. The comparison reports the non-optional fields a consumer type
+tie is ambiguous and counted. A name the TypeScript file imports (`PayloadFacts::imports`, kept for
+the names its sites use, alias modules rewritten to relative paths) resolves only through that
+import, to the exported declaration of the indexed file the module points to, else it is not
+compared. A non-object type alias and a declaration past the per-file type cap are kept as names
+without fields (`PayloadType::opaque`): they shadow same-named types and are not compared. The comparison reports the non-optional fields a consumer type
 declares that no producer sends, the fields a producer sends that no consumer declares, and fields
 whose primitive JSON family (`string`, `number`, `boolean`, arrays of them) differs; a named
 object field type is not compared. A direction is not compared when the other side has an untyped
