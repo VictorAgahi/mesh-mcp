@@ -41,6 +41,7 @@ type checker behind any of them.
 | OpenAPI, AsyncAPI, Spring properties | contract source | [3.2](#32-openapi-asyncapi-spring-properties) |
 | Markdown | docs | [3.3](#33-markdown) |
 | SQL (`.sql`, and the SQL strings of TypeScript / JavaScript, Go, Java, Python) | events only: outbox inserts, `NOTIFY` / `pg_notify`, `LISTEN` | [3.4](#34-sql) |
+| Declared producer helpers (`[[engines.contracts.producer_calls]]`, TypeScript / JavaScript) | producers: calls of an outbox or publish helper the config names | [3.11](#311-declared-producer-calls) |
 | In-process buses and schedules (NestJS EventEmitter2 / CQRS / `@nestjs/schedule`, Spring application events / `@Scheduled`) | events and chain entries | [3.5](#35-in-process-buses-and-schedules) |
 | Go brokers (RabbitMQ, NATS, Redis, SQS / SNS, Pub/Sub) | events and chain entries | [3.9](#39-go-brokers) |
 
@@ -770,6 +771,57 @@ obj.publish("fp.param")`), a loop, comprehension, lambda, `with ... as` or `exce
 a `global` rebinding that hides a client, and an object from another package
 (`from other_pkg import Redis; Redis().publish("x")`). The matcher was deliberately not widened; this
 pass only guarantees that a call on a client it recognises is read once, under its broker.
+
+### 3.11 Declared producer calls
+
+A project that writes its events and jobs through its own helper (an outbox entity, a stream publisher)
+leaves no broker API call for the generic rules to read. The helper is declared in the config, and its
+calls become producers (9.0 T14b, tag `declared_call`, TypeScript and JavaScript):
+
+```toml
+[[engines.contracts.producer_calls]]
+name = "outbox-job"
+callee = "JobsOutbox.createJob"     # a method name, or `Receiver.method`
+topic_keys = ["type"]               # object keys read as topics (a member keeps its member key)
+queue_keys = ["target"]             # object keys read as queues (a member resolves to its value)
+
+[[engines.contracts.producer_calls]]
+name = "stream-publish"
+callee = "streamBus.publish"        # no keys: argument `arg` (default 0) is the topic itself
+```
+
+- The call is found in the syntax tree, so a call in a comment or a string is not one. A
+  `Receiver.method` callee needs the call's receiver to end with `Receiver` on a segment boundary
+  (`this.deps.JobsOutbox.createJob` matches, `MyJobsOutbox.createJob` does not); a bare `method`
+  callee matches any receiver and a bare call. A parameter or local of the same name as the helper (or
+  its class) hides it. An import alias of the class (`import { JobsOutbox as J }`) is not followed.
+- A key's value is read as any topic name is: a literal, a constant of the file, an imported
+  `Enum.MEMBER`, a `process.env` / `ConfigService` placeholder, or an array of those
+  (`targetServices: [Streams.A, Streams.B]`, one producer per element, each on its own line). Each
+  name is reported on the line that carries it, not on the call line.
+- The topics follow the rules of their kind. A `topic_keys` member keeps its MEMBER key (`scan_file`),
+  so the handler that names the same member meets it (section 3.8: the same member of two enums is
+  one flow). A `queue_keys` member resolves to the member's value through its own imports, and the
+  `Queue.STORAGE` of one enum never meets the `LegacyQueue.STORAGE` of another.
+- Every producer is `heuristic`: the helper is a name the operator vouches for, not a library API.
+  There is no `exact` setting. Brokers never join: a declared producer has no broker, so the
+  graph links it to a consumer by name only.
+- What is not read is counted, never dropped: a value that is not a name (a parameter, `TABLE[kind]`,
+  an argument that is no object literal) and a value refused as secret-shaped (section 3.8 rules, plus a
+  member named like a credential) add to `IndexHealth::declared_call_sites_unread`, which `doctor`
+  prints. It is not a claim that no producer exists. A key an object does not carry is nothing.
+- Bounds: 64 declared entries (`doctor` warns on more), 2,000 sites per file
+  (`IndexHealth::files_declared_capped`, `doctor` warns). A file that never writes the method name is
+  not analysed. Test files are read like any other (their producers are hidden from tool answers
+  unless `include_tests` is set).
+- The declaration is part of the parse-cache key: editing it re-extracts the TypeScript and JavaScript
+  files, and a change to it is a full reload.
+- Not read: lookup tables (`type: COMPUTE_JOB_TYPE[kind]`), generic type arguments
+  (`createEvent<Events.X>(...)`, use a `[[engines.contracts.patterns]]` regex), `new` expressions, a
+  call through an alias of the receiver, other languages.
+
+Fixture and ground truth: `examples/eda/declared-producers` and
+`tests/golden/events/declared-producers.expected.yaml`.
 
 ## 4. What every level shares
 

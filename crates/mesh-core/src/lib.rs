@@ -36,7 +36,7 @@ pub use audit::{
 pub use config::{
     expand_roots, strip_workspace_root_prefix, AsyncApiConfig, Config, ConfigError,
     ContractsConfig, CustomPatternConfig, GrpcConfig, OpenApiConfig, PatternConfidence,
-    PatternKind, ReadGovernanceMode, WorkspaceConfig,
+    PatternKind, ProducerCallConfig, ReadGovernanceMode, WorkspaceConfig, MAX_PRODUCER_CALLS,
 };
 pub use config_values::{ConfigEntry, ConfigFile, ConfigValues};
 pub use contracts::{

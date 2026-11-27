@@ -493,6 +493,22 @@ than failing the run, so watch stderr.
 [`examples/polyglot-shop/mesh-mcp.toml`](examples/polyglot-shop/mesh-mcp.toml) has working
 patterns for TypeScript, Go, Rust, Python and Java — start from those.
 
+### Declared producer calls
+
+When producers go through your own helper (an outbox entity, a stream publisher), declare it instead
+of writing a regex (TypeScript and JavaScript; details in `docs/parser-support.md`, section 3.11):
+
+```toml
+[[engines.contracts.producer_calls]]
+name = "outbox-job"
+callee = "JobsOutbox.createJob"   # `method` or `Receiver.method`
+topic_keys = ["type"]             # object keys read as topics (job or event type, stream names)
+queue_keys = ["target"]           # object keys read as queues (an enum member resolves to its value)
+```
+
+With no keys the call's argument `arg` (default 0) is the topic. Every producer found this way is
+`heuristic`; a value that is not a static name is counted by `doctor`, never guessed.
+
 ### gRPC specifics
 
 ```toml

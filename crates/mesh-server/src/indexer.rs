@@ -699,6 +699,7 @@ impl WorkspaceIndexer {
             health.record_sql(frag.code.sql_capped, frag.code.sql_unresolved);
             health.record_inproc(frag.code.inproc_capped);
             health.record_const(frag.code.const_capped);
+            health.record_declared(frag.code.declared_capped, frag.code.declared_unread);
             health.record_jvm_brokers(frag.code.jvm_brokers_capped);
             health.record_py_brokers(frag.code.py_brokers_capped);
             health.record_go_brokers(frag.code.go_brokers_capped);
@@ -4050,6 +4051,98 @@ resolve_placeholders = true
             ]
         );
         converges(&state);
+    }
+
+    /// A call of a declared producer helper (9.0 T14b) is a `heuristic` producer: its `type` is a
+    /// topic, its `target` a queue that resolves to the enum member's value like a queue site
+    /// does, so a constant edit re-folds the unchanged file, and every state equals a cold rebuild.
+    #[test]
+    fn a_declared_producer_call_joins_its_queue_by_value_and_follows_a_constant_edit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        write(&root, "src/queues.ts", QUEUES_TS);
+        write(&root, "src/consumer.ts", CONSUMER_TS);
+        write(
+            &root,
+            "src/jobs.ts",
+            "import { JobQueue } from './queues';\nimport { Outbox } from './outbox';\n\
+             export const send = () => Outbox.enqueue({\n  type: 'send-welcome',\n  target: JobQueue.EMAIL,\n});\n",
+        );
+        let cfg = Config::load_from_str(
+            "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n\
+             [engines.contracts]\nenabled = true\n\
+             [[engines.contracts.producer_calls]]\nname = \"outbox\"\ncallee = \"Outbox.enqueue\"\n\
+             topic_keys = [\"type\"]\nqueue_keys = [\"target\"]\n",
+        )
+        .expect("config");
+        let audit = Arc::new(AuditLogger::new_in_memory().expect("audit"));
+        let rescan = Arc::new(BackgroundRescanEngine::new().expect("rescan"));
+        let state = Arc::new(AppState::new(cfg, vec![root.clone()], audit, rescan));
+        build_and_install(&state);
+        assert_eq!(
+            topic_rows(&state.snapshot()),
+            [
+                "Consumes exact email-jobs consumer.ts",
+                "Produces heuristic email-jobs jobs.ts",
+                "Produces heuristic send-welcome jobs.ts"
+            ]
+        );
+        let converges = |state: &Arc<AppState>| {
+            let cold = WorkspaceIndexer::build_snapshot(
+                &state.config,
+                &state.allowed_roots,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(
+                state.snapshot().fingerprint().graph,
+                cold.fingerprint().graph,
+                "graph"
+            );
+        };
+        converges(&state);
+        // The unchanged producer file follows the enum's new value.
+        write(
+            &root,
+            "src/queues.ts",
+            &QUEUES_TS.replace("email-jobs", "email-v2"),
+        );
+        WorkspaceIndexer::reload(&state);
+        assert_eq!(
+            topic_rows(&state.snapshot()),
+            [
+                "Consumes exact email-v2 consumer.ts",
+                "Produces heuristic email-v2 jobs.ts",
+                "Produces heuristic send-welcome jobs.ts"
+            ]
+        );
+        converges(&state);
+    }
+
+    /// The extraction configuration is part of the parse-cache key: declaring a helper (or
+    /// editing one) must not serve the facts of the file cached without it.
+    #[test]
+    fn a_declared_producer_call_changes_the_config_fingerprint() {
+        let base = ExtractConfig::default();
+        let declared = ExtractConfig {
+            producer_calls: vec![mesh_core::ProducerCallConfig {
+                name: "p".to_string(),
+                callee: "Outbox.enqueue".to_string(),
+                arg: 0,
+                topic_keys: vec!["type".to_string()],
+                queue_keys: Vec::new(),
+            }],
+            ..ExtractConfig::default()
+        };
+        let mut edited = declared.clone();
+        edited.producer_calls[0].topic_keys.push("kind".to_string());
+        let (a, b, c) = (
+            WorkspaceIndexer::config_fingerprint(&base),
+            WorkspaceIndexer::config_fingerprint(&declared),
+            WorkspaceIndexer::config_fingerprint(&edited),
+        );
+        assert!(a != b && b != c && a != c);
     }
 
     fn queue_state(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, Arc<AppState>) {

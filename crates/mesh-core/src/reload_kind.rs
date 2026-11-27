@@ -124,6 +124,8 @@ fn index_inputs(config: &Config) -> Option<Value> {
         cpp,
         // Partial reload, see `changed_patterns`.
         patterns: _,
+        // Read from the syntax tree of every TS / JS file: moves any file's facts.
+        producer_calls,
     } = contracts;
     // Nothing in the policy engine reaches the index. `AppState::new` rebuilds the
     // governance engine (stop rules, skills, `read_governance_mode`, `enabled`)
@@ -153,6 +155,7 @@ fn index_inputs(config: &Config) -> Option<Value> {
         openapi,
         asyncapi,
         cpp,
+        producer_calls,
         max_size_mb,
     ))
     .ok()
@@ -391,6 +394,7 @@ mod tests {
             ReloadKind::Full,
         ),
         ("engines.contracts.cpp.include_paths", ReloadKind::Full),
+        ("engines.contracts.producer_calls", ReloadKind::Full),
         ("engines.policy.enabled", ReloadKind::DisplayOnly),
         ("engines.policy.enforce_git_hooks", ReloadKind::DisplayOnly),
         (
@@ -429,6 +433,7 @@ mod tests {
         [engines.contracts.asyncapi]\nenabled = true\nspec_files = [\"a.yaml\"]\ninfer_string_topics = false\n\
         [engines.contracts.cpp]\ninclude_paths = [\"inc\"]\n\
         [[engines.contracts.patterns]]\nname = \"p\"\nkind = \"saga\"\nregex = 'x'\nfile_pattern = \"*.ts\"\ntarget_group = 1\nconsumer_group = 2\nconfidence = \"exact\"\n\
+        [[engines.contracts.producer_calls]]\nname = \"c\"\ncallee = \"createJob\"\narg = 0\ntopic_keys = [\"type\"]\nqueue_keys = [\"target\"]\n\
         [engines.policy]\nenabled = true\nenforce_git_hooks = false\ncryptographic_audit_trail = false\n\
         read_governance_mode = \"audit_warn\"\n\
         [engines.policy.stop_rules]\nr = \"stop\"\n\
@@ -463,7 +468,12 @@ mod tests {
                 *value = Value::from(n.as_u64().unwrap_or(0) + 1);
             }
             Value::Array(items) => {
-                if path == "engines.contracts.patterns" {
+                if path == "engines.contracts.producer_calls" {
+                    items.push(serde_json::json!({
+                        "name": "added", "callee": "y", "arg": 0,
+                        "topic_keys": [], "queue_keys": []
+                    }));
+                } else if path == "engines.contracts.patterns" {
                     items.push(serde_json::json!({
                         "name": "added", "kind": "saga", "regex": "y",
                         "file_pattern": null, "target_group": 1,

@@ -363,7 +363,7 @@ pub(crate) fn unquote(node: Node, source: &[u8]) -> Option<String> {
 /// Dotted text of an identifier / member chain (`Topics.ORDERS`, `Topics['q-z']`,
 /// `this.topic`); `None` for anything else (calls, computed access). Iterative and
 /// bounded: a hostile chain cannot overflow the stack.
-fn dotted(node: Node, source: &[u8]) -> Option<String> {
+pub(crate) fn dotted(node: Node, source: &[u8]) -> Option<String> {
     let mut segments: Vec<String> = Vec::new();
     let mut current = node;
     for _ in 0..=crate::guard::AstGuard::MAX_NESTING_DEPTH {

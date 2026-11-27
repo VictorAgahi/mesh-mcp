@@ -138,7 +138,11 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v25: Celery import gate (9.0 T15): a Python `@task` / `@x.task` consumer or `.delay()` producer
 /// is read only when the file's parsed imports bring Celery in; a Locust `@task` no longer is a
 /// consumer.
-const SCHEMA_VERSION: u8 = 25;
+/// v26: declared producer calls (9.0 T14b, after T15's 25): calls of a helper
+/// `[[engines.contracts.producer_calls]]` names register `EventStream` / `Queue` call-site nodes
+/// and `FileIndex::member_sites`, `FileIndex::declared_unread` / `declared_capped`; the
+/// declaration is part of the config fingerprint.
+const SCHEMA_VERSION: u8 = 26;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.
