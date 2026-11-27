@@ -1,0 +1,52 @@
+# Hand-annotated truth for the payload check of `event_anomalies` (9.0 T11), read from the source
+# of examples/eda/payload-types. Never generated from tool output. Consumed by
+# crates/mesh-server/tests/payload_types.rs (not by check_golden.py or score_events.py: this file
+# is not a `<corpus>.expected.yaml`, so the scorer totals do not move).
+#
+# A topic is written `key [broker]` (`broker unknown` for a NestJS @EventPattern, which names no
+# transport). For each mismatch: the fields a consumer expects that no producer sends, the fields
+# published that no consumer expects, the fields whose primitive JSON family differs, and whether
+# the type names differ. `matching` topics are compared and agree; `not_compared` topics have
+# both ends but no statically typed payload on one side (they are NOT "no mismatch").
+# `must_not_flag` are decoys that must appear in no mismatch row.
+corpus: payload-types
+root: examples/eda/payload-types
+topics_with_both_ends: 10
+mismatches:
+  # src/order.publisher.ts:11 sends OrderCreated (src/order.events.ts) {orderId, total: number,
+  # currency, note?}; src/billing.consumer.ts:17 expects BillingOrder {orderId, total: string,
+  # customerId, note?}.
+  - topic: "order.created [broker unknown]"
+    consumer_only: ["customerId"]
+    producer_only: ["currency"]
+    clashes: ["total"]
+    names_differ: true
+  # src/email.queue.ts: new Queue<EmailJob>('email') vs new Worker('email', (job: Job<EmailJobV2>)).
+  - topic: "email [bull]"
+    consumer_only: ["template"]
+    producer_only: []
+    clashes: []
+    names_differ: true
+  # PaymentPublisher sends new PaymentEvent(orderId, long amount); LedgerListener expects
+  # PaymentCaptured {orderId, String amount, method}; its static KIND is not a field.
+  - topic: "payments.captured [kafka]"
+    consumer_only: ["method"]
+    producer_only: []
+    clashes: ["amount"]
+    names_differ: true
+matching:
+  - "order.shipped [broker unknown]"   # ShipmentEvent on both ends
+  - "order.noted [broker unknown]"     # the consumer's only extra field is optional
+  - "payments.voided [kafka]"          # payload = template value type VoidEvent; ConsumerRecord<String, VoidEvent>
+  - "audit [kafka]"                    # AuditKafka on both ends
+  - "audit [rabbitmq]"                 # AuditRabbit on both ends; never joined with audit [kafka]
+not_compared:
+  - "order.cancelled [broker unknown]" # producer sends JSON.stringify(...)
+  - "order.refunded [broker unknown]"  # consumer parameter is `any`
+must_not_flag:
+  - order.shipped
+  - order.noted
+  - order.cancelled
+  - order.refunded
+  - payments.voided
+  - audit

@@ -1066,3 +1066,233 @@ pub(crate) fn scan_java(tree: &Tree, src: &[u8]) -> PayloadFacts {
     });
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(lang: tree_sitter::Language, code: &str) -> Tree {
+        let mut p = tree_sitter::Parser::new();
+        p.set_language(&lang).expect("grammar");
+        p.parse(code, None).expect("tree")
+    }
+
+    fn ts(code: &str) -> PayloadFacts {
+        let tree = parse(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), code);
+        scan_ts(&tree, code.as_bytes())
+    }
+
+    fn java(code: &str) -> PayloadFacts {
+        let tree = parse(tree_sitter_java::LANGUAGE.into(), code);
+        scan_java(&tree, code.as_bytes())
+    }
+
+    fn named(n: &str) -> PayloadShape {
+        PayloadShape::Named(CompactStr::new(n))
+    }
+
+    /// `(producer, line, topic, shape)` of every site.
+    fn sites(f: &PayloadFacts) -> Vec<(bool, u32, Option<&str>, &PayloadShape)> {
+        f.sites
+            .iter()
+            .map(|s| (s.producer, s.line, s.topic.as_deref(), &s.shape))
+            .collect()
+    }
+
+    fn field_names(t: &PayloadType) -> Vec<(&str, Option<&str>, bool)> {
+        t.fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.ty.as_deref(), f.optional))
+            .collect()
+    }
+
+    #[test]
+    fn ts_declared_types_keep_public_fields_and_their_types() {
+        let f = ts("interface A { id: string; n?: number; kind: 'x' }\n\
+             interface B extends A { more: string }\n\
+             type C = { tags: string[] };\n\
+             type D = string;\n\
+             class E { a: string; private hidden: string; static s: number; constructor(public readonly b: number, c: string, private d: string) {} }\n");
+        let names: Vec<&str> = f.types.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["A", "B", "C", "E"]);
+        // A literal type is never kept as a type: it could hold a value.
+        assert_eq!(
+            field_names(&f.types[0]),
+            vec![
+                ("id", Some("string"), false),
+                ("n", Some("number"), true),
+                ("kind", None, false)
+            ]
+        );
+        assert!(!f.types[0].incomplete);
+        assert!(f.types[1].incomplete, "extends: fields of A are not read");
+        assert_eq!(field_names(&f.types[2]), vec![("tags", Some("string[]"), false)]);
+        assert_eq!(
+            field_names(&f.types[3]),
+            vec![("a", Some("string"), false), ("b", Some("number"), false)]
+        );
+        assert!(f.sites.is_empty());
+    }
+
+    #[test]
+    fn ts_consumer_sites_read_the_payload_parameter() {
+        let f = ts("class H {\n\
+             @EventPattern('t') on(@Payload() d: A, @Ctx() c: any) {}\n\
+             @MessagePattern('m') first(@Ctx() c: any, raw: B) {}\n\
+             @OnEvent('o') inline(e: { id: string }) {}\n\
+             @Get('x') route(d: A) {}\n\
+             plain(d: A) {}\n\
+             async process(job: Job<C>) {}\n\
+             @EventPattern('u') untyped(e: any) {}\n\
+             }\n");
+        assert_eq!(
+            sites(&f),
+            vec![
+                (false, 2, Some("t"), &named("A")),
+                (false, 3, Some("m"), &named("B")),
+                (
+                    false,
+                    4,
+                    Some("o"),
+                    &PayloadShape::Inline {
+                        fields: vec![PayloadField {
+                            name: CompactStr::new("id"),
+                            ty: Some(CompactStr::new("string")),
+                            line: 4,
+                            optional: false
+                        }],
+                        incomplete: false
+                    }
+                ),
+                (false, 7, None, &named("C")),
+                (false, 8, Some("u"), &PayloadShape::Untyped),
+            ]
+        );
+    }
+
+    #[test]
+    fn ts_producer_sites_follow_the_payload_expression() {
+        let f = ts("function go(p: A, s: string) {\n\
+             const v: B = x;\n\
+             const w = new C();\n\
+             client.emit('a', p);\n\
+             client.emit('b', v);\n\
+             client.emit('c', w);\n\
+             client.emit('d', { id, n: 1, ok: true, s: 'v' });\n\
+             client.emit('e', { ...rest, id });\n\
+             client.emit('f', JSON.stringify(p));\n\
+             queue.add('job', s as D);\n\
+             set.add(p);\n\
+             client.emit('g', s);\n\
+             }\n\
+             const q1 = new Queue<E>('q1');\n\
+             const q2 = new Queue('q2');\n\
+             const w1 = new Worker<F>('w1', async (job) => {});\n\
+             const w2 = new Worker('w2', async (job: Job<G>) => {});\n");
+        let shapes: Vec<(bool, Option<&str>, String)> = f
+            .sites
+            .iter()
+            .map(|s| {
+                let shape = match &s.shape {
+                    PayloadShape::Named(n) => n.to_string(),
+                    PayloadShape::Untyped => "untyped".to_string(),
+                    PayloadShape::Inline { fields, incomplete } => format!(
+                        "inline {}{}",
+                        fields
+                            .iter()
+                            .map(|f| format!("{}:{}", f.name, f.ty.as_deref().unwrap_or("?")))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        if *incomplete { " incomplete" } else { "" }
+                    ),
+                };
+                (s.producer, s.topic.as_deref(), shape)
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![
+                (true, Some("a"), "A".to_string()),
+                (true, Some("b"), "B".to_string()),
+                (true, Some("c"), "C".to_string()),
+                (
+                    true,
+                    Some("d"),
+                    "inline id:?,n:number,ok:boolean,s:string".to_string()
+                ),
+                (true, Some("e"), "inline id:? incomplete".to_string()),
+                (true, Some("f"), "untyped".to_string()),
+                (true, Some("job"), "D".to_string()),
+                (true, Some("g"), "untyped".to_string()),
+                (true, Some("q1"), "E".to_string()),
+                (false, Some("w1"), "F".to_string()),
+                (false, Some("w2"), "G".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn ts_inject_queue_generic_is_a_producer_payload() {
+        let f = ts("class S { constructor(@InjectQueue('mail') private readonly q: Queue<Mail>, @InjectQueue('raw') private readonly r: Queue) {} }\n");
+        assert_eq!(sites(&f), vec![(true, 1, Some("mail"), &named("Mail"))]);
+    }
+
+    #[test]
+    fn java_types_and_sites() {
+        let f = java("class P {\n\
+             private final KafkaTemplate<String, Ev> t;\n\
+             private static int K;\n\
+             String a; List<Integer> b;\n\
+             @KafkaListener(topics = \"x\") void on(@Header(\"h\") String h, @Payload Ev e) {}\n\
+             @KafkaListener(topics = \"y\") void rec(ConsumerRecord<String, Ev> r, Acknowledgment ack) {}\n\
+             @RabbitListener(queues = \"z\") void raw(String body) {}\n\
+             void notAListener(Ev e) {}\n\
+             void go(Ev p, String s) {\n\
+               Ev v = new Ev();\n\
+               t.send(\"x\", new Ev(1));\n\
+               t.send(\"x\", p);\n\
+               t.send(\"x\", v);\n\
+               t.send(\"x\", build(s));\n\
+               rabbit.convertAndSend(\"ex\", \"key\", s);\n\
+             }\n\
+             }\n\
+             record Ev(String id, long n) {}\n");
+        let names: Vec<&str> = f.types.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["P", "Ev"]);
+        assert_eq!(
+            field_names(&f.types[0]),
+            vec![
+                ("t", Some("KafkaTemplate<String, Ev>"), false),
+                ("a", Some("String"), false),
+                ("b", Some("List<Integer>"), false)
+            ]
+        );
+        assert_eq!(
+            field_names(&f.types[1]),
+            vec![("id", Some("String"), false), ("n", Some("long"), false)]
+        );
+        let ev = named("Ev");
+        assert_eq!(
+            sites(&f),
+            vec![
+                (false, 5, Some("x"), &ev),
+                (false, 6, Some("y"), &ev),
+                (false, 7, Some("z"), &PayloadShape::Untyped),
+                (true, 11, Some("x"), &ev),
+                (true, 12, Some("x"), &ev),
+                (true, 13, Some("x"), &ev),
+                // A method result: the `V` of the `KafkaTemplate<String, Ev>` receiver.
+                (true, 14, Some("x"), &ev),
+                (true, 15, Some("ex"), &PayloadShape::Untyped),
+            ]
+        );
+    }
+
+    #[test]
+    fn caps_mark_a_type_incomplete() {
+        let fields: String = (0..70).map(|i| format!("f{i}: string; ")).collect();
+        let f = ts(&format!("interface Big {{ {fields} }}\n"));
+        assert_eq!(f.types[0].fields.len(), 64);
+        assert!(f.types[0].incomplete);
+    }
+}
