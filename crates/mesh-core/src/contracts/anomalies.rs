@@ -154,10 +154,13 @@ pub struct EventAnomalies<'g> {
     /// Same-file-only hops (no resolved call path) the cycle search did not follow: a cycle is
     /// only reported when every hop of it rests on a call path.
     pub cycle_guess_hops: usize,
-    /// Consumer sites the cycle search walked.
+    /// Consumer sites the cycle search walked, of `cycle_sites_total`.
     pub cycle_sites_walked: usize,
-    /// The cycle search stopped at [`ANOMALY_MAX_CYCLE_SITES`].
-    pub cycle_search_capped: bool,
+    pub cycle_sites_total: usize,
+    /// The cycle search stopped at [`ANOMALY_MAX_CYCLE_SITES`]: the sites are walked in path
+    /// order, so everything from this one on was not searched and the cycle count is a lower
+    /// bound.
+    pub cycle_first_unsearched: Option<&'g ContractNode>,
 }
 
 /// The topic key and broker of a hub node of the graph (`kafka:orders` is `("orders", Kafka)`).
@@ -172,15 +175,18 @@ fn is_placeholder(key: &str) -> bool {
 
 /// Whether `key` names a dead-letter or retry channel: its last segment, past any trailing
 /// numbers (`orders-retry-2`), is one of the usual words.
-fn is_dead_letter(key: &str) -> bool {
+pub(super) fn is_dead_letter(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
-    let last = lower
-        .rsplit(['.', '-', '_', ':', '/'])
-        .find(|seg| !seg.is_empty() && !seg.bytes().all(|b| b.is_ascii_digit()));
-    matches!(
-        last,
-        Some("dlt" | "dlq" | "retry" | "deadletter" | "dead" | "letter")
-    )
+    let mut tokens = lower
+        .split(['.', '-', '_', ':', '/'])
+        .filter(|t| !t.is_empty() && !t.bytes().all(|b| b.is_ascii_digit()))
+        .rev();
+    match tokens.next() {
+        Some("dlt" | "dlq" | "retry" | "deadletter") => true,
+        // `dead-letter`, `dead_letter`, `dead.letter`: both words, never a bare `letter`.
+        Some("letter") => tokens.next() == Some("dead"),
+        _ => false,
+    }
 }
 
 /// The sites of one hub, before they become rows.
@@ -261,22 +267,67 @@ impl ContractGraph {
                 _ => {}
             }
         }
-        // A concrete subject is heard when a wildcard hub with consumers took its producer in
-        // (the edge carries the concrete subject as metadata).
-        let mut heard: HashSet<(NodeId, &str)> = HashSet::new();
-        for e in &self.edges {
-            if e.kind != EdgeKind::Produces || !hub_ids.contains(&e.to) {
-                continue;
-            }
-            let (Some(hub), Some(subject)) = (self.nodes.get(&e.to), e.metadata.as_deref()) else {
+        // A concrete subject is heard when a wildcard hub with consumers matches it and one of
+        // its producers is linked to that hub. The edge metadata is not read: a producer that
+        // publishes several subjects has one edge per wildcard hub, carrying only the first
+        // subject, so each subject of the producer is matched against the pattern itself.
+        let mut wild_of: HashMap<NodeId, Vec<&ContractNode>> = HashMap::new();
+        let mut wild_consumers: HashMap<NodeId, u32> = HashMap::new();
+        for h in hubs.iter().filter(|h| is_subject_pattern(Self::hub_key(h))) {
+            let Some(cons) = consumed.get(&h.id).filter(|c| !c.is_empty()) else {
                 continue;
             };
-            let key = Self::hub_key(hub);
-            if subject != key
-                && is_subject_pattern(key)
-                && consumed.get(&e.to).is_some_and(|c| !c.is_empty())
-            {
-                heard.insert((e.from, subject));
+            // The brokers the pattern's consumers speak to (0: some consumer's broker unknown).
+            let mask = cons
+                .iter()
+                .map(|(id, _)| self.site_mask(false, Self::hub_key(h), *id))
+                .try_fold(0u32, |acc, m| (m != 0).then_some(acc | m))
+                .unwrap_or(0);
+            wild_consumers.insert(h.id, mask);
+        }
+        for e in &self.edges {
+            if e.kind == EdgeKind::Produces && wild_consumers.contains_key(&e.to) {
+                if let Some(h) = self.nodes.get(&e.to) {
+                    wild_of.entry(e.from).or_default().push(h);
+                }
+            }
+        }
+        let capped: HashSet<NodeId> = hubs
+            .iter()
+            .filter(|h| {
+                self.wildcard_capped
+                    .contains(&(CompactStr::new(Self::hub_key(h)), Self::hub_broker(h)))
+            })
+            .map(|h| h.id)
+            .collect();
+        let compat = |a: u32, b: u32| a == 0 || b == 0 || a & b != 0;
+        let mut heard: HashSet<NodeId> = HashSet::new();
+        for h in &hubs {
+            let key = Self::hub_key(h);
+            if is_subject_pattern(key) {
+                continue;
+            }
+            for (pid, _) in produced.get(&h.id).map(Vec::as_slice).unwrap_or(&[]) {
+                let pm = self.site_mask(true, key, *pid);
+                let linked = wild_of.get(pid).is_some_and(|ws| {
+                    ws.iter().any(|w| {
+                        subject_matches(Self::hub_key(w), key)
+                            && compat(pm, wild_consumers.get(&w.id).copied().unwrap_or(0))
+                    })
+                });
+                // A wildcard hub cut at the producer cap lists only some of its producers.
+                let cut = wild_consumers.iter().any(|(wid, wm)| {
+                    capped.contains(wid)
+                        && compat(pm, *wm)
+                        && self
+                            .nodes
+                            .get(wid)
+                            .is_some_and(|w| subject_matches(Self::hub_key(w), key))
+                });
+                if linked || cut {
+                    heard.insert(h.id);
+                    break;
+                }
             }
         }
 
@@ -311,13 +362,20 @@ impl ContractGraph {
                      producers: Vec<AnomalySite<'g>>,
                      consumers: Vec<AnomalySite<'g>>,
                      confidence| {
+            let broker = self.hub_ref(h.hub).broker;
             TopicEntry {
                 hub: h.hub,
                 key: CompactStr::new(h.key),
-                broker: self.hub_ref(h.hub).broker,
                 producers,
                 consumers,
-                confidence,
+                // A site whose broker is unknown comes from an extractor that does not
+                // identify the transport (a decorator, a declarative pattern): never `exact`.
+                confidence: if broker.is_some() {
+                    confidence
+                } else {
+                    weakest(confidence, EdgeConfidence::Heuristic)
+                },
+                broker,
             }
         };
 
@@ -346,10 +404,7 @@ impl ContractGraph {
                 h.consumers.len() - HubSites::live(&h.consumers),
             );
             let wildcard = is_subject_pattern(h.key);
-            let is_heard = h
-                .producers
-                .iter()
-                .any(|p| heard.contains(&(p.node.id, h.key)));
+            let is_heard = heard.contains(&h.hub.id);
             let reason = if placeholder {
                 Some(UnresolvedReason::Placeholder)
             } else if is_dead_letter(h.key) {
@@ -505,9 +560,11 @@ impl ContractGraph {
         let eligible: Vec<&HubSites<'g>> = all.iter().filter(|h| !is_placeholder(h.key)).collect();
         let ids: Vec<NodeId> = eligible.iter().map(|h| h.hub.id).collect();
         let slot: HashMap<NodeId, usize> = ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
-        let (hops, walked, capped) = self.topic_hops(&ids, is_test, ANOMALY_MAX_CYCLE_SITES);
+        let (hops, walked, total, first_skipped) =
+            self.topic_hops(&ids, is_test, ANOMALY_MAX_CYCLE_SITES);
         out.cycle_sites_walked = walked;
-        out.cycle_search_capped = capped;
+        out.cycle_sites_total = total;
+        out.cycle_first_unsearched = first_skipped;
 
         // The best witness of each (from, to) pair: strongest link, then the first sites in
         // path order.
@@ -566,12 +623,18 @@ impl ContractGraph {
                 ) else {
                     continue;
                 };
+                let (from, to) = (self.hub_ref(from), self.hub_ref(to));
+                let unknown = from.broker.is_none() || to.broker.is_none();
                 path.push(CycleEdge {
-                    from: self.hub_ref(from),
-                    to: self.hub_ref(to),
+                    from,
+                    to,
                     consumer: hop.consumer,
                     producer: hop.producer,
-                    confidence: hop.confidence,
+                    confidence: if unknown {
+                        weakest(hop.confidence, EdgeConfidence::Heuristic)
+                    } else {
+                        hop.confidence
+                    },
                 });
             }
             let confidence = path

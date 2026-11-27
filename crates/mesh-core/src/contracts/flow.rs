@@ -988,7 +988,7 @@ impl ContractGraph {
         hubs: &[NodeId],
         hide: &dyn Fn(&ContractNode) -> bool,
         max_sites: usize,
-    ) -> (Vec<TopicHop<'g>>, usize, bool) {
+    ) -> (Vec<TopicHop<'g>>, usize, usize, Option<&'g ContractNode>) {
         let idx = self.flow_index();
         let wanted: HashSet<NodeId> = hubs.iter().copied().collect();
         let mut consumers: Vec<&ContractNode> = hubs
@@ -999,6 +999,7 @@ impl ContractGraph {
             .filter(|n| !hide(n))
             .collect();
         sort_nodes(&mut consumers);
+        let total = consumers.len();
         // (from, to) -> confidence of the Produces / Consumes edges, once (a scan of the
         // edges per hop would be quadratic).
         let mut produce_conf: HashMap<(NodeId, NodeId), EdgeConfidence> = HashMap::new();
@@ -1012,12 +1013,12 @@ impl ContractGraph {
         }
         let mut hops = Vec::new();
         let mut scanned = 0;
-        let mut capped = false;
+        let mut first_skipped = None;
         let mut limits = Vec::new();
         let mut hidden = 0;
         for c in consumers {
             if scanned >= max_sites {
-                capped = true;
+                first_skipped = Some(c);
                 break;
             }
             scanned += 1;
@@ -1090,7 +1091,7 @@ impl ContractGraph {
                 }
             }
         }
-        (hops, scanned, capped)
+        (hops, scanned, total, first_skipped)
     }
 
     /// The engine: BFS over event levels from `starts`, then the hops reordered

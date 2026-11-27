@@ -47,8 +47,13 @@ pub struct AnomalyView<'a> {
     pub roots: usize,
 }
 
-/// Payload budget of one answer; the central 48 KB cap stays a backstop.
-const BUDGET: usize = 40 * 1024;
+/// Payload budget of one answer past which a section stops adding rows (the first row of a
+/// section is always shown); the central 48 KB cap stays a backstop.
+const BUDGET: usize = 32 * 1024;
+/// Longest row in characters: a row is bounded by construction, this is the last resort.
+const ROW_MAX: usize = 1_500;
+/// Hops of a cycle written out before `+K more hops`.
+const CYCLE_HOPS_SHOWN: usize = 4;
 /// Sites named per row before `+K more`.
 const SITES_PER_ROW: usize = 3;
 /// Topics named per cycle / producer row before `+K more`.
@@ -56,16 +61,17 @@ const NAMES_PER_ROW: usize = 6;
 const REDACTED: &str = "[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]";
 
 /// A topic key that is safe to print: a placeholder default that is not a plain name is
-/// dropped, and a key that still is not a plain name (a token, a password, a random-looking
-/// run) is replaced by the redaction marker (commandment 5, defense in depth: the extractors
-/// already refuse such names).
+/// dropped, and a key that still is not a printable name (`member_consts::name_is_printable`:
+/// the shared name gate without its new-topic randomness rule, so `orders.shard00123` prints;
+/// a token, a URL, a weak password) is replaced by the redaction marker (commandment 5,
+/// defense in depth: the extractors already refuse most such names).
 fn shown_key(key: &str) -> String {
     let masked = mesh_core::config_values::mask_placeholder_defaults(key);
     let probe: String = masked
         .chars()
         .filter(|c| !matches!(c, '$' | '{' | '}'))
         .collect();
-    if mesh_core::member_consts::constant_is_a_name("", &probe) {
+    if mesh_core::member_consts::name_is_printable(&probe) {
         masked.replace(['`', '\n', '\r'], "'")
     } else {
         REDACTED.to_string()
@@ -135,16 +141,29 @@ impl MarkdownFormatter {
         for (name, n) in [
             (
                 "published, never consumed",
-                report.published_never_consumed.len(),
+                report.published_never_consumed.len().to_string(),
             ),
             (
                 "consumed, never published",
-                report.consumed_never_published.len(),
+                report.consumed_never_published.len().to_string(),
             ),
-            ("unresolved (not anomalies)", report.unresolved.len()),
-            ("cycles", report.cycles.len()),
-            ("fan-out", fan_total),
-            ("test-only consumers", report.test_only_consumers.len()),
+            (
+                "unresolved (not anomalies)",
+                report.unresolved.len().to_string(),
+            ),
+            (
+                "cycles",
+                if report.cycle_first_unsearched.is_some() {
+                    format!("{}+ (search incomplete)", report.cycles.len())
+                } else {
+                    report.cycles.len().to_string()
+                },
+            ),
+            ("fan-out", fan_total.to_string()),
+            (
+                "test-only consumers",
+                report.test_only_consumers.len().to_string(),
+            ),
         ] {
             let _ = writeln!(out, "| {name} | {n} |");
         }
@@ -303,11 +322,33 @@ impl MarkdownFormatter {
             "- Thresholds are constants (`ANOMALY_FAN_OUT_CONSUMERS` = {ANOMALY_FAN_OUT_CONSUMERS}, `ANOMALY_FAN_OUT_TOPICS` = {ANOMALY_FAN_OUT_TOPICS}). Cycles follow resolved call paths from a consumer to a publish, so a language or a call the resolver cannot follow shows no cycle ({} same-file-only hop(s) were not followed); a `${{KEY}}` placeholder topic is never part of one ({} placeholder topic(s) skipped).",
             report.cycle_guess_hops, report.placeholder_topics
         );
-        if report.cycle_search_capped {
+        if let Some(first) = report.cycle_first_unsearched {
             let _ = writeln!(
                 out,
-                "- **Cycle search capped**: {} consumer sites walked of more ({ANOMALY_MAX_CYCLE_SITES} is the limit); cycles through the rest are not listed.",
-                report.cycle_sites_walked
+                "- **Cycle search incomplete**: {} of {} consumer sites were walked ({ANOMALY_MAX_CYCLE_SITES} is the limit), in path order; the sites from `{}` on were not searched, so cycles through them are missing and the cycle count is a lower bound. Narrow with `scope` to search a smaller part.",
+                report.cycle_sites_walked,
+                report.cycle_sites_total,
+                MarkdownFormatter::location(first, roots)
+            );
+        }
+        let unknown = report
+            .published_never_consumed
+            .iter()
+            .chain(&report.consumed_never_published)
+            .chain(report.unresolved.iter().map(|u| &u.topic))
+            .chain(&report.fan_out_topics)
+            .chain(&report.test_only_consumers)
+            .filter(|e| e.broker.is_none())
+            .count()
+            + report
+                .cycles
+                .iter()
+                .filter(|c| c.members.iter().any(|m| m.broker.is_none()))
+                .count();
+        if unknown > 0 {
+            let _ = writeln!(
+                out,
+                "- {unknown} row(s) rest on sites whose broker is unknown (a decorator-only match such as a Python `@task` or a NestJS `@EventPattern`, a declarative pattern): they are shown `heuristic` and may be false (a Locust `@task` is read as a Celery consumer); verify each with `rg` before acting."
             );
         }
         if let Some(note) = &view.coverage {
@@ -331,29 +372,31 @@ impl MarkdownFormatter {
         }
         let _ = writeln!(out, "### {title} ({})\n*{blurb}*", rows.len());
         let mut shown = 0;
-        let mut next = view.offset;
         for row in rows.iter().skip(view.offset).take(view.limit) {
-            let line = format!("- {}\n", render(row));
-            if out.len() + line.len() > BUDGET {
+            let mut line = format!("- {}\n", render(row));
+            if line.chars().count() > ROW_MAX {
+                line = format!("{}\n", Self::clamp_chars(line.trim_end(), ROW_MAX));
+            }
+            // The first row of a page is always shown, so a next-page pointer always advances.
+            if shown > 0 && out.len() + line.len() > BUDGET {
                 break;
             }
             out.push_str(&line);
             shown += 1;
-            next += 1;
         }
-        if next < rows.len() {
-            let _ = writeln!(
-                out,
-                "\n*Rows {}-{} of {}. Next page: `offset: {next}`; or narrow with `scope` / `classes`.*",
-                view.offset + 1,
-                next,
-                rows.len()
-            );
-        } else if shown == 0 {
+        let next = view.offset + shown;
+        if shown == 0 {
             let _ = writeln!(
                 out,
                 "\n*No row at `offset: {}` (only {}).*",
                 view.offset,
+                rows.len()
+            );
+        } else if next < rows.len() {
+            let _ = writeln!(
+                out,
+                "\n*Rows {}-{next} of {}. Next page: `offset: {next}`; or narrow with `scope` / `classes`.*",
+                view.offset + 1,
                 rows.len()
             );
         }
@@ -367,9 +410,19 @@ impl MarkdownFormatter {
         roots: &[PathBuf],
     ) {
         let render = |c: &CycleEntry<'_>| {
-            let mut names: Vec<String> = c.path.iter().map(|e| hub_label(&e.from)).collect();
-            if let Some(first) = names.first().cloned() {
-                names.push(first);
+            // Bounded however long the loop: a few topic names, a few hops, the rest counted.
+            let mut names: Vec<String> = c
+                .path
+                .iter()
+                .take(NAMES_PER_ROW)
+                .map(|e| hub_label(&e.from))
+                .collect();
+            let hidden = c.path.len().saturating_sub(NAMES_PER_ROW);
+            if hidden > 0 {
+                names.push(format!("... (+{hidden} more topics)"));
+            }
+            if let Some(first) = c.path.first() {
+                names.push(hub_label(&first.from));
             }
             let mut text = format!("{} {}", names.join(" -> "), confidence(c.confidence));
             if c.members.len() > c.path.len() {
@@ -380,7 +433,7 @@ impl MarkdownFormatter {
                     names_list(&c.members)
                 );
             }
-            for e in &c.path {
+            for e in c.path.iter().take(CYCLE_HOPS_SHOWN) {
                 let _ = write!(
                     text,
                     "\n  - {} -> {}: consumed at `{}`, published at `{}` ({}, resolved call path)",
@@ -390,6 +443,9 @@ impl MarkdownFormatter {
                     MarkdownFormatter::location(e.producer, roots),
                     confidence(e.confidence)
                 );
+            }
+            if c.path.len() > CYCLE_HOPS_SHOWN {
+                let _ = write!(text, "\n  - +{} more hops", c.path.len() - CYCLE_HOPS_SHOWN);
             }
             text
         };
@@ -427,5 +483,65 @@ mod tests {
             "${ORDERS_TOPIC:orders}"
         );
         assert_eq!(shown_key("orders.*"), "orders.*");
+    }
+
+    #[test]
+    fn digit_heavy_names_print_and_tokens_do_not() {
+        for name in [
+            "big.t00005",
+            "orders.shard00123",
+            "events.p1234567",
+            "orders.ab12cd",
+            "user.id.v20260101",
+        ] {
+            assert_eq!(shown_key(name), name);
+        }
+        let aws = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
+        let ghp = format!("{}{}", "ghp_", "R8c1qZ0xK3mP7vB2nT5yL9wD4sF6hJ0aG1eX");
+        let run = format!("{}{}", "a1b2c3d4e5", "f6a7b8c9d0e1f2");
+        for bad in [&aws, &ghp, &run] {
+            assert_eq!(shown_key(bad), REDACTED, "{bad}");
+        }
+    }
+
+    /// Whatever the rows weigh and however full the page already is, a page shows at least one
+    /// row and its next-page pointer moves forward: paging always ends.
+    #[test]
+    fn a_section_over_budget_still_shows_a_row_and_its_pointer_advances() {
+        let rows: Vec<String> = (0..5)
+            .map(|i| format!("row{i} {}", "x".repeat(100_000)))
+            .collect();
+        let mut offset = 0;
+        let mut pages = 0;
+        loop {
+            let view = AnomalyView {
+                show: AnomalyShow::ALL,
+                limit: 25,
+                offset,
+                scope: None,
+                coverage: None,
+                roots: 1,
+            };
+            let mut out = "y".repeat(BUDGET + 1_000);
+            let before = out.len();
+            MarkdownFormatter::anomaly_section(&mut out, "T", "b", &rows, &view, |r| r.clone());
+            let page = &out[before..];
+            assert!(page.contains(&format!("- row{offset} ")), "{offset}");
+            assert!(page.len() < ROW_MAX + 400, "{} bytes", page.len());
+            pages += 1;
+            match page.split("Next page: `offset: ").nth(1) {
+                Some(rest) => {
+                    let next: usize = rest.split('`').next().unwrap().parse().unwrap();
+                    assert!(
+                        next > offset,
+                        "pointer {next} does not advance from {offset}"
+                    );
+                    offset = next;
+                }
+                None => break,
+            }
+            assert!(pages <= 5);
+        }
+        assert_eq!(pages, 5);
     }
 }

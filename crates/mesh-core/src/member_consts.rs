@@ -127,6 +127,29 @@ fn member_is_credential_named(member: &str) -> bool {
 /// `private-events` and `orders2024` are names; `hunter2-prod-x`, `tok_...` and `a3f9c1e7b2d4`
 /// are not.
 fn value_is_a_name(value: &str) -> bool {
+    value_is_not_a_secret(value)
+        // A run of six or more letters and digits with a digit anywhere but a trailing run of at
+        // most four (`orders2024`, `v2`) is random-looking, not a word.
+        && !value
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|seg| {
+                let body = {
+                    let trailing = seg.chars().rev().take_while(char::is_ascii_digit).count();
+                    if trailing <= 4 {
+                        &seg[..seg.len() - trailing]
+                    } else {
+                        seg
+                    }
+                };
+                seg.len() >= 6
+                    && seg.chars().any(|c| c.is_ascii_alphabetic())
+                    && body.chars().any(|c| c.is_ascii_digit())
+            })
+}
+
+/// The part of [`value_is_a_name`] that is about secrets: a plain topic-shaped value that is no
+/// token, URL, `Bearer_...` or weak password.
+fn value_is_not_a_secret(value: &str) -> bool {
     if !name_shaped(value) || !plain_topic(value) {
         return false;
     }
@@ -141,28 +164,23 @@ fn value_is_a_name(value: &str) -> bool {
         .split(['-', '_', '.', ':', '/'])
         .filter(|w| !w.is_empty())
         .collect();
-    if words.iter().any(|w| WEAK_SECRET_TOKENS.contains(w))
-        || (words.len() == 1 && BARE_SECRET_VALUES.contains(&words[0]))
-    {
-        return false;
-    }
-    // A run of six or more letters and digits with a digit anywhere but a trailing run of at most
-    // four (`orders2024`, `v2`) is random-looking, not a word.
-    !value
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|seg| {
-            let body = {
-                let trailing = seg.chars().rev().take_while(char::is_ascii_digit).count();
-                if trailing <= 4 {
-                    &seg[..seg.len() - trailing]
-                } else {
-                    seg
-                }
-            };
-            seg.len() >= 6
-                && seg.chars().any(|c| c.is_ascii_alphabetic())
-                && body.chars().any(|c| c.is_ascii_digit())
-        })
+    !(words.iter().any(|w| WEAK_SECRET_TOKENS.contains(w))
+        || (words.len() == 1 && BARE_SECRET_VALUES.contains(&words[0])))
+}
+
+/// Whether an existing topic name may be PRINTED by a report (9.0 T9): [`value_is_a_name`]
+/// without its random-looking-run rule, which exists to refuse a value as a NEW topic name and
+/// would hide shard and id suffixes (`orders.shard00123`, `big.t00005`) from a display. A
+/// segment of twenty or more letters and digits holding both is still taken for a token.
+pub fn name_is_printable(value: &str) -> bool {
+    value_is_not_a_secret(value)
+        && !value
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|seg| {
+                seg.len() >= 20
+                    && seg.chars().any(|c| c.is_ascii_alphabetic())
+                    && seg.chars().any(|c| c.is_ascii_digit())
+            })
 }
 
 /// Whether a constant may be recorded and may name a topic: the member (or constant) is not

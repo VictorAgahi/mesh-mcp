@@ -170,6 +170,76 @@ fn placeholders_wildcards_and_dead_letters_are_unresolved_not_anomalies() {
 }
 
 #[test]
+fn a_site_of_unknown_broker_is_never_exact() {
+    let mut g = ContractGraph::new();
+    consume(&mut g, "/w/locustfile.py", 1, "browse_product", None);
+    produce(&mut g, "/w/a.ts", 1, "known", Some(Broker::Kafka));
+    g.reconcile_edges();
+    let r = report(&g);
+    assert_eq!(r.consumed_never_published[0].broker, None);
+    assert_eq!(
+        r.consumed_never_published[0].confidence,
+        EdgeConfidence::Heuristic
+    );
+    assert_eq!(
+        r.published_never_consumed[0].confidence,
+        EdgeConfidence::Exact
+    );
+}
+
+#[test]
+fn a_producer_of_several_subjects_is_heard_on_each_one_a_wildcard_matches() {
+    // One site publishes three subjects; the wildcard hub holds one edge for that site.
+    let mut g = ContractGraph::new();
+    let n = Some(Broker::Nats);
+    let id = site(&mut g, "/w/pub.ts", 1);
+    for subject in ["events.created", "events.deleted", "other.thing"] {
+        g.add_producer_on(id, subject, n);
+    }
+    consume(&mut g, "/w/sub.ts", 1, "events.*", n);
+    g.reconcile_edges();
+    let r = report(&g);
+    // `other.thing` matches no wildcard: still a finding. The two `events.` subjects are heard.
+    assert_eq!(keys(&r.published_never_consumed), ["other.thing [nats]"]);
+    assert!(r.unresolved.is_empty());
+    // Another broker's wildcard does not hear them.
+    let mut g = ContractGraph::new();
+    let id = site(&mut g, "/w/pub.ts", 1);
+    g.add_producer_on(id, "events.created", Some(Broker::Redis));
+    g.add_producer_on(id, "events.deleted", Some(Broker::Redis));
+    consume(&mut g, "/w/sub.ts", 1, "events.*", n);
+    g.reconcile_edges();
+    assert_eq!(
+        keys(&report(&g).published_never_consumed),
+        ["events.created [redis]", "events.deleted [redis]"]
+    );
+}
+
+#[test]
+fn dead_letter_names_need_the_whole_token() {
+    for yes in [
+        "orders.dlq",
+        "orders-DLT",
+        "x_retry_3",
+        "orders.dead-letter",
+        "a.dead_letter",
+        "a.deadletter",
+    ] {
+        assert!(anomalies::is_dead_letter(yes), "{yes}");
+    }
+    for no in [
+        "mail.letter",
+        "mail.dead",
+        "retry.policy",
+        "dlqueue",
+        "letter",
+        "orders",
+    ] {
+        assert!(!anomalies::is_dead_letter(no), "{no}");
+    }
+}
+
+#[test]
 fn a_heuristic_site_makes_the_row_heuristic() {
     let mut g = ContractGraph::new();
     let id = site(&mut g, "/w/a.ts", 1);
@@ -189,17 +259,19 @@ fn fan_out_starts_at_the_thresholds() {
     let k = Some(Broker::Kafka);
     produce(&mut g, "/w/p.ts", 1, "narrow", k);
     produce(&mut g, "/w/p.ts", 2, "wide", k);
-    for i in 0..ANOMALY_FAN_OUT_CONSUMERS - 1 {
+    // Literal counts on purpose: the documented thresholds are 6 and 6, and changing the
+    // constants must fail this test.
+    for i in 0..5 {
         consume(&mut g, "/w/c.ts", i + 1, "narrow", k);
     }
-    for i in 0..ANOMALY_FAN_OUT_CONSUMERS {
+    for i in 0..6 {
         consume(&mut g, "/w/c.ts", 100 + i, "wide", k);
     }
     // A file publishing onto exactly the threshold of topics, and one onto one fewer.
-    for i in 0..ANOMALY_FAN_OUT_TOPICS {
+    for i in 0..6 {
         produce(&mut g, "/w/hub.ts", i + 1, &format!("hub.{i}"), k);
     }
-    for i in 0..ANOMALY_FAN_OUT_TOPICS - 1 {
+    for i in 0..5 {
         produce(&mut g, "/w/small.ts", i + 1, &format!("small.{i}"), k);
     }
     g.reconcile_edges();
@@ -271,7 +343,8 @@ fn a_cycle_needs_a_way_back() {
     assert_eq!(r.cycles.len(), 1);
     assert_eq!(r.cycles[0].members.len(), 5);
     assert_eq!(r.cycles[0].path.len(), 5);
-    assert_eq!(r.cycles[0].confidence, EdgeConfidence::Exact);
+    // The ring's sites have no known broker: the loop is never `exact`.
+    assert_eq!(r.cycles[0].confidence, EdgeConfidence::Heuristic);
     // The same five topics as a line: every topic has both ends but the last, which nobody
     // publishes onto: no cycle.
     let open = ring(5, false);
@@ -349,7 +422,7 @@ fn placeholder_topics_are_never_a_cycle_or_a_fan_out() {
         g.add_producer(p, &format!("${{t{}}}", (i + 1) % 3));
     }
     produce(&mut g, "/w/w.ts", 1, "${wide}", None);
-    for i in 0..ANOMALY_FAN_OUT_CONSUMERS + 2 {
+    for i in 0..8 {
         consume(&mut g, "/w/w.ts", 10 + i, "${wide}", None);
     }
     g.reconcile_edges();
@@ -378,7 +451,7 @@ fn a_ring_of_thousands_of_topics_is_one_cycle_on_a_small_stack() {
         assert_eq!(r.cycles.len(), 1);
         assert_eq!(r.cycles[0].members.len(), 3_000);
         assert_eq!(r.cycles[0].path.len(), 3_000);
-        assert!(!r.cycle_search_capped);
+        assert!(r.cycle_first_unsearched.is_none());
         let open = ring(3_000, false);
         assert!(report(&open).cycles.is_empty());
     });
@@ -434,10 +507,10 @@ fn cycle_search_stops_at_the_site_cap_and_says_so() {
         .filter(|n| ContractGraph::is_hub_like(n))
         .map(|n| n.id)
         .collect();
-    let (_, walked, capped) = g.topic_hops(&hubs, &|_| false, 4);
-    assert_eq!((walked, capped), (4, true));
-    let (_, walked, capped) = g.topic_hops(&hubs, &|_| false, 5);
-    assert_eq!((walked, capped), (5, false));
+    let (_, walked, total, first) = g.topic_hops(&hubs, &|_| false, 4);
+    assert_eq!((walked, total, first.is_some()), (4, 5, true));
+    let (_, walked, total, first) = g.topic_hops(&hubs, &|_| false, 5);
+    assert_eq!((walked, total, first.is_some()), (5, 5, false));
 }
 
 #[test]
