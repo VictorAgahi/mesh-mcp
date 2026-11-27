@@ -1012,7 +1012,7 @@ that keeps the report honest:
 | cycles | an event chain that loops back: consuming a topic leads, through resolved calls, to publishing a topic that leads back (a strongly connected set of topics, with the shortest loop as witness and, per hop, the consumer and producer `path:line`); a retry that republishes its own topic is a loop of one |
 | fan-out | a topic with 6 or more consumer sites, or a file publishing onto 6 or more topics (the constants `ANOMALY_FAN_OUT_CONSUMERS` and `ANOMALY_FAN_OUT_TOPICS` in `contracts/anomalies.rs`) |
 | test-only consumers | a topic that production publishes onto and whose every consumer site is in a test file |
-| unresolved (not anomalies) | a one-sided topic that cannot be called an anomaly, with the reason: a `${KEY}` placeholder no configuration resolved, a wildcard subscription (NATS / MQTT subject patterns), or a dead-letter / retry channel (last name segment `dlq`, `dlt`, `retry`, `deadletter`, ...) |
+| unresolved (not anomalies) | a one-sided topic that cannot be called an anomaly, with the reason: a `${KEY}` placeholder no configuration resolved, a wildcard subscription (NATS / MQTT subject patterns), or a dead-letter / retry channel (the last name segment, past trailing numbers, is exactly `dlq`, `dlt`, `retry`, `deadletter`, or `dead` + `letter`; `mail.letter` is not one) |
 
 Honesty rules, which the output repeats: "no producer" and "no consumer" mean none was
 **statically resolved in the indexed roots**, never proof of absence (a topic name built at
@@ -1021,15 +1021,15 @@ footer also counts the files the index did not read). A placeholder topic is `un
 part of a cycle or a fan-out (one `${KEY}` can stand for several unrelated names). A topic is one
 row per broker: two brokers sharing a name are two rows and are never joined
 (`FlowIndex::crosses_brokers` and the broker-qualified hubs of 9.0 T7); a site whose broker is not
-known joins every channel of its name and makes the row `heuristic`. Test files do not count as
-production sites: a topic both ends of which are test code is scaffolding and is reported nowhere.
+known joins every channel of its name and makes the row `heuristic`. A row whose broker is unknown is never `exact` (the sites come from extractors that do not identify the transport: a decorator such as a Python `@task`, a NestJS `@EventPattern`, a declarative pattern) and the footer counts such rows and says to verify them with `rg`. A concrete subject is heard by a wildcard subscription when it matches the pattern (each subject of a producer that publishes several is matched on its own). Test files do not count as
+production sites (`*.spec.ts`, `__tests__/`, `conftest.py`, Go `testdata/`, ...): a topic both ends of which are test code is scaffolding and is reported nowhere.
 Cycles rest on resolved call paths only: the "same file, no call path" guess of `trace_flow` is not
 a reason to say a chain loops back (those hops are counted in the footer), so a language without
-call data shows no cycle. At most 20,000 consumer sites are walked for cycles; past that the search
-stops and says so. Topic names are checked once more before printing (the member-name and
+call data shows no cycle. At most 20,000 consumer sites are walked for cycles, in path order; past
+that the table says `N+ (search incomplete)` and the footer names the first site not searched. Topic names are checked once more before printing (the member-name and
 value rules of `member_consts::constant_is_a_name`, and the placeholder-default mask of
 `config_values`): a name that is a token, a URL or a password prints as
-`[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`.
+`[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]` (the gate is `member_consts::name_is_printable`, the shared name gate without its new-topic randomness rule: `orders.shard00123` prints).
 
 `scope` (resolved through `ValidatedScope`, like `smart_search`) keeps the rows that have a
 producer or consumer site under that path; the analysis always reads every root, so a producer
@@ -1044,8 +1044,7 @@ index cache).
 
 #### Pagination and truncation
 `limit` rows per class (default 25, 1 to 100) from `offset`; each class says `Next page:
-\`offset: N\`` when rows remain. The answer is kept under about 40 KB by the formatter (the 48 KB
-cap is only a backstop); the table of counts is always complete. Narrow with `scope` and `classes`.
+\`offset: N\`` when rows remain. Every row is bounded (a cycle shows at most 6 topics and 4 hops, then `+K more`), a page always shows at least one row of a class and its `Next page` pointer always advances, and the page stops adding rows near 32 KB (the 48 KB cap is only a backstop); the table of counts is always complete. Narrow with `scope` and `classes`.
 
 #### JSON Schema
 ```json
