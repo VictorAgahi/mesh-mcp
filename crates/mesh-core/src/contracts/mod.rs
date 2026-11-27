@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+mod anomalies;
 mod broker;
 mod calls;
 mod delta;
@@ -17,6 +18,11 @@ mod reconcile;
 mod render;
 mod resolve;
 
+pub use anomalies::{
+    AnomalySite, CycleEdge, CycleEntry, EventAnomalies, FanOutProducer, Missing, TopicEntry,
+    UnresolvedEntry, UnresolvedReason, ANOMALY_FAN_OUT_CONSUMERS, ANOMALY_FAN_OUT_TOPICS,
+    ANOMALY_MAX_CYCLE_SITES,
+};
 pub use broker::{qualified_topic_key, split_qualified_topic_key, Broker};
 pub use calls::{
     CallFact, CallFacts, CallReceiver, CallStats, CallableFact, ImportFact, InjectionFact,

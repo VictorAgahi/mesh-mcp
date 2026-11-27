@@ -237,16 +237,16 @@ pub struct FlowTrace<'g> {
 }
 
 /// `(path, line, name, id)`: the one sort order of every list of the engine.
-fn node_key(n: &ContractNode) -> (&FilePath, usize, &str, NodeId) {
+pub(super) fn node_key(n: &ContractNode) -> (&FilePath, usize, &str, NodeId) {
     (&n.file_path, n.line_start, n.name.as_str(), n.id)
 }
 
-fn sort_nodes(v: &mut Vec<&ContractNode>) {
+pub(super) fn sort_nodes(v: &mut Vec<&ContractNode>) {
     v.sort_by(|a, b| node_key(a).cmp(&node_key(b)));
     v.dedup_by_key(|n| n.id);
 }
 
-fn rank(c: EdgeConfidence) -> u8 {
+pub(super) fn rank(c: EdgeConfidence) -> u8 {
     match c {
         EdgeConfidence::Exact => 0,
         EdgeConfidence::Heuristic => 1,
@@ -254,7 +254,7 @@ fn rank(c: EdgeConfidence) -> u8 {
     }
 }
 
-fn weakest(a: EdgeConfidence, b: EdgeConfidence) -> EdgeConfidence {
+pub(super) fn weakest(a: EdgeConfidence, b: EdgeConfidence) -> EdgeConfidence {
     if rank(a) >= rank(b) {
         a
     } else {
@@ -328,6 +328,18 @@ struct Pending<'g> {
     /// Index of the parent's `next` entry (the topic) that led here.
     slot: usize,
     topic: Option<CompactStr>,
+}
+
+/// One topic -> topic hop of the whole graph (see [`ContractGraph::topic_hops`]): `consumer`
+/// listens on hub `from`, and the call path (or same-file fallback) from it reaches `producer`,
+/// which publishes onto hub `to`.
+pub(super) struct TopicHop<'g> {
+    pub from: NodeId,
+    pub to: NodeId,
+    pub consumer: &'g ContractNode,
+    pub producer: &'g ContractNode,
+    pub confidence: EdgeConfidence,
+    pub fallback: bool,
 }
 
 impl ContractGraph {
@@ -964,6 +976,116 @@ impl ContractGraph {
         }
         Self::cap_segments(&mut segs, p, bounds, limits);
         (segs, cut && !call_linked)
+    }
+
+    /// Every topic -> topic hop through the consumer sites of `hubs` (9.0 ticket T9, the cycle
+    /// search of `event_anomalies`): the consumer's call walk, or the same-file fallback, reaches
+    /// a publish onto another hub. One call walk per consumer site, whatever the number of hubs
+    /// it listens on; `hide` leaves test sites out; at most `max_sites` consumer sites are
+    /// walked (the flag says the cap was hit). Sorted by the walk order, deterministic.
+    pub(super) fn topic_hops<'g>(
+        &'g self,
+        hubs: &[NodeId],
+        hide: &dyn Fn(&ContractNode) -> bool,
+        max_sites: usize,
+    ) -> (Vec<TopicHop<'g>>, usize, bool) {
+        let idx = self.flow_index();
+        let wanted: HashSet<NodeId> = hubs.iter().copied().collect();
+        let mut consumers: Vec<&ContractNode> = hubs
+            .iter()
+            .filter_map(|h| idx.consumes.get(h))
+            .flatten()
+            .filter_map(|id| self.nodes.get(id))
+            .filter(|n| !hide(n))
+            .collect();
+        sort_nodes(&mut consumers);
+        // (from, to) -> confidence of the Produces / Consumes edges, once (a scan of the
+        // edges per hop would be quadratic).
+        let mut produce_conf: HashMap<(NodeId, NodeId), EdgeConfidence> = HashMap::new();
+        let mut consume_conf: HashMap<(NodeId, NodeId), EdgeConfidence> = HashMap::new();
+        for e in &self.edges {
+            match e.kind {
+                EdgeKind::Produces => produce_conf.insert((e.from, e.to), e.confidence),
+                EdgeKind::Consumes => consume_conf.insert((e.from, e.to), e.confidence),
+                _ => None,
+            };
+        }
+        let mut hops = Vec::new();
+        let mut scanned = 0;
+        let mut capped = false;
+        let mut limits = Vec::new();
+        let mut hidden = 0;
+        for c in consumers {
+            if scanned >= max_sites {
+                capped = true;
+                break;
+            }
+            scanned += 1;
+            let mut from: Vec<NodeId> = idx
+                .consumes
+                .get(&c.id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+                .iter()
+                .copied()
+                .filter(|h| wanted.contains(h))
+                .collect();
+            from.sort_unstable();
+            let within = if c.kind == NodeKind::Callable {
+                None
+            } else {
+                self.site_callables(c).first().copied()
+            };
+            let start = self.site_step(
+                FlowStepKind::Consume,
+                c,
+                None,
+                within,
+                self.topic_confidence(c.id),
+            );
+            let bounds = FlowBounds::clamped(None, None, Some(MAX_FAN_OUT));
+            let (segs, _) =
+                self.forward_segments(&idx, c, start, bounds, &mut limits, hide, &mut hidden);
+            limits.clear();
+            for seg in segs {
+                let Some(last) = seg.steps.last() else {
+                    continue;
+                };
+                let steps = seg
+                    .steps
+                    .iter()
+                    .fold(EdgeConfidence::Exact, |acc, s| weakest(acc, s.confidence));
+                for &h in &from {
+                    for &to in idx.produces.get(&last.node.id).map(Vec::as_slice).unwrap_or(&[]) {
+                        if !wanted.contains(&to) {
+                            continue;
+                        }
+                        let confidence = weakest(
+                            weakest(
+                                steps,
+                                consume_conf
+                                    .get(&(h, c.id))
+                                    .copied()
+                                    .unwrap_or(EdgeConfidence::Exact),
+                            ),
+                            produce_conf
+                                .get(&(last.node.id, to))
+                                .copied()
+                                .unwrap_or(EdgeConfidence::Exact),
+                        );
+                        hops.push(TopicHop {
+                            from: h,
+                            to,
+                            consumer: c,
+                            producer: last.node,
+                            confidence,
+                            fallback: seg.fallback,
+                        });
+                    }
+                }
+            }
+        }
+        (hops, scanned, capped)
     }
 
     /// The engine: BFS over event levels from `starts`, then the hops reordered

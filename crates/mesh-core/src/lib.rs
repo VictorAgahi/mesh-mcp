@@ -40,6 +40,9 @@ pub use config::{
 };
 pub use config_values::{ConfigEntry, ConfigFile, ConfigValues};
 pub use contracts::{
+    AnomalySite, CycleEdge, CycleEntry, EventAnomalies, FanOutProducer, Missing, TopicEntry,
+    UnresolvedEntry, UnresolvedReason, ANOMALY_FAN_OUT_CONSUMERS, ANOMALY_FAN_OUT_TOPICS,
+    ANOMALY_MAX_CYCLE_SITES,
     fold_rpc_name, is_member_ref, normalize_topic_key, qualified_topic_key,
     service_from_client_field_name, split_qualified_topic_key, Broker, CallFact, CallFacts,
     CallReceiver, CallStats, CallableFact, ContractGraph, DependentsMatch, FlowBounds,
