@@ -790,6 +790,52 @@ repositories), the working tree is compared with a base revision at the **contra
   `path:line` and its match (`exact`, `heuristic`, `ambiguous`). Generic names (`constructor`,
   `main`, ...) are not looked up; routes and gRPC services are not looked up either, and one line
   says so (HTTP callers are not linked in the graph; a service's callers are listed under its RPCs).
+- **Event changes** (9.0 T10), per broker-qualified channel (`kafka:orders`, `inproc:order.created`;
+  a site whose broker is not statically known is shown as `orders` (broker unknown)). Both sides are
+  graphs: the live graph is the working tree, and the base graph is a copy of it in which every
+  analysed changed file is replaced by its base version and reconciled the way a reload is. The
+  base graph is a full copy of the live graph, built only when a changed file has a producer or
+  consumer on either side: its cost is the graph's size, not the branch's (measured on kubernetes,
+  30,526 files: peak RSS of the call 496 MB against 323 MB for the same call without an event
+  change, about +200 ms; freed when the call returns). Only channels with a site in a changed file
+  (either side), plus the concrete subjects a changed wildcard subscription matches, are compared.
+  Reported:
+  - producers and consumers added or removed, one row each, with the channel on every row, the
+    declaration the site belongs to and `path:line` (`base L` for a removed one). A site's identity
+    is its channel, role, file and declaration, never its line: a site that moved is no change;
+  - renamed channels: a channel gone from the whole working tree and a new one on the same broker
+    whose sites are the same (role, file, declaration), one to one; otherwise a removal and an
+    addition. A rename that keeps a producer-consumer link says so;
+  - producer-consumer links cut or created: a channel with a producer and a consumer on the same
+    broker (an unknown-broker site joins every channel of its name; a wildcard subscription that
+    matches the key counts) at the base and not in the working tree, or the reverse;
+  - chain hops cut or created: the one-hop chains of the `trace_flow` engine (an entry, consumer,
+    route, handler or cron method, then the calls, then a publish) found forward from each channel's
+    consumers and reverse from its producers, at the base and not in the working tree, or the
+    reverse; a renamed channel is compared under its new name, so a pure rename cuts nothing. Each
+    hop carries its weakest confidence, and `same-file fallback` when only the engine's legacy rule
+    links it. A hop on a channel whose trace a bound cut on either side (`call_depth`, `fan_out`, the
+    hop cap), that the time budget left untraced, or past the channel cap is never reported cut or
+    created: it is counted under "Not compared (bound)".
+
+  The section also says when a changed file was skipped (its sites unknown: counts are lower
+  bounds; shown even when no other changed file has a site), when a file hit a per-file site cap
+  (`MAX_INPROC_SITES_PER_FILE` and the broker caps: its counts are truncated), and when a changed
+  file edits string constants while some indexed site names its topic through a constant (those
+  sites are not compared).
+
+  Topic text is keyed raw (two redacted topics stay two facts) and shown with every placeholder default stripped (`${orders.topic:x}` is
+  `${orders.topic}`), here and in the per-file section, and a key that is not a name by the T14 rule
+  (`member_consts::constant_is_a_name`: a token, a random-looking run, a URL) is shown as
+  `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`, its broker qualifier kept. Payload fields are not
+  compared: no extractor exposes the payload type of an event yet (one line says so). Limits: 200
+  channels checked for links and hops per call (the rest counted), the time budget checked before
+  each channel's traces; each trace is bounded like
+  `trace_flow` with `event_depth` 1, `call_depth` 6 and `fan_out` 50, and the traces a bound cut are
+  counted; a hop whose only changed file is an intermediate callee (no site in it, no site of the
+  channel in a changed file) is not compared; the base graph does not refold unchanged files whose
+  topic resolves through an enum or constant the branch edited, and files whose call sites the live
+  index pruned are counted when a base chain runs through them.
 - **Wire-format check** of every changed `.proto`, against the same base, with the rules of
   `analyze_grpc` (see [Wire-format check](#wire-format-check)). It reuses the base sha and the two
   versions already read: no further `git` run.
@@ -804,8 +850,12 @@ for the notes the registry prepends); a final clamp enforces the bound. In order
    report, else its result line), then not checked or not compared, removed, clean. Past the
    budget, results collapse into counts: "N more breaking `.proto` not listed", "N `.proto` with
    no wire-format breaking change".
-3. The impact rows; the "impact not computed" notes always fit.
-4. The per-file sections.
+3. `### Event changes (broker-qualified channels)`, within 14 KB: an **Events** count line, the
+   renames, one section per channel (20 site rows each), the chain hops cut and created, then the
+   notes (payload limit, channels not checked, bounded traces), which always fit; past the budget,
+   "N more event item(s) not shown ... narrow `scope`".
+4. The impact rows; the "impact not computed" notes always fit.
+5. The per-file sections.
 
 Each section that is cut ends with an "N more ... narrow `scope`" line. Paths are clipped to 160
 characters, prose lines to 320.

@@ -23,6 +23,10 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[path = "diff_mesh_events.rs"]
+mod events;
+use events::{event_report, push_events, EventInput, EventSection};
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DiffMeshArgs {
@@ -49,7 +53,7 @@ pub struct DiffMeshTool;
 
 impl McpTool for DiffMeshTool {
     const NAME: &'static str = "diff_mesh";
-    const DESCRIPTION: &'static str = "Contract-level diff of the working tree (uncommitted edits and untracked files included) against a Git base, per configured root: declarations added, removed or with a changed signature, gRPC services and RPCs, HTTP routes, event producers and consumers per topic, imports and RPC calls; then, from the live graph, the callers and dependents of every removed or changed symbol and RPC (path:line, heuristic or ambiguous rows marked) and the .proto wire-format check of every changed .proto. This is the tool for 'what does my branch change in the mesh / what will this change break'. Body-only edits are counted, never listed. The time budget is about 20 s, checked between files: files, .proto and elements it does not reach are counted and named, never dropped. DO NOT USE to trace one known symbol, RPC or topic (use find_dependents, analyze_grpc or analyze_impact). DO NOT pass a file path or a `--option` as `base`.";
+    const DESCRIPTION: &'static str = "Contract-level diff of the working tree (uncommitted edits and untracked files included) against a Git base, per configured root: declarations added, removed or with a changed signature, gRPC services and RPCs, HTTP routes, event producers and consumers per topic, imports and RPC calls; per broker-qualified channel (kafka:orders), producers and consumers added or removed, renamed channels, producer-consumer links and one-hop event chains cut or created by the branch; then, from the live graph, the callers and dependents of every removed or changed symbol and RPC (path:line, heuristic or ambiguous rows marked) and the .proto wire-format check of every changed .proto. This is the tool for 'what does my branch change in the mesh / what will this change break'. Body-only edits are counted, never listed. The time budget is about 20 s, checked between files: files, .proto and elements it does not reach are counted and named, never dropped. DO NOT USE to trace one known symbol, RPC or topic (use find_dependents, analyze_grpc or analyze_impact). DO NOT pass a file path or a `--option` as `base`.";
     type Args = DiffMeshArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {
@@ -622,8 +626,9 @@ impl Fact {
             Self::Rpc(kind, n) => format!("{kind} `{n}`"),
             Self::Route(n) => format!("route `{n}`"),
             Self::Decl(kind, n) => format!("{kind} `{n}`"),
-            Self::Produces(t) => format!("produces topic `{t}`"),
-            Self::Consumes(t) => format!("consumes topic `{t}`"),
+            // The fact keeps the raw topic (two secrets are two facts); only the text is redacted.
+            Self::Produces(t) => format!("produces topic `{}`", events::shown_key(t)),
+            Self::Consumes(t) => format!("consumes topic `{}`", events::shown_key(t)),
             Self::Import(t) => format!("import `{t}`"),
             Self::Calls(t) => format!("calls RPC `{t}`"),
             Self::CallsInferred(raw, t) => format!(
@@ -1090,6 +1095,7 @@ fn run_with(
     let mut protos: Vec<ProtoInput> = Vec::new();
     // Changed `.proto` files the extraction loop never reached (time budget).
     let mut pending_protos: Vec<String> = Vec::new();
+    let mut events = EventInput::default();
     for (i, c) in changed.iter().enumerate() {
         if Instant::now() >= deadline {
             counters.timed_out = changed[i..].iter().map(|c| c.display.clone()).collect();
@@ -1128,31 +1134,40 @@ fn run_with(
             });
         }
         let mut skipped = None;
-        let mut extract = |side: Side, label: &str| -> BTreeMap<Fact, FactVal> {
-            match side {
-                Side::Absent => BTreeMap::new(),
-                Side::Skipped(why) => {
-                    skipped.get_or_insert_with(|| format!("{label}: {why}"));
-                    BTreeMap::new()
-                }
-                Side::Content(bytes) => match extractor.extract(&c.abs, &bytes, c.repo_id) {
-                    Ok(index) if index.parse_failed => {
-                        skipped.get_or_insert_with(|| format!("{label}: the parse failed"));
-                        BTreeMap::new()
-                    }
-                    Ok(index) => facts_of(&index, &resolver, c.repo_id),
-                    Err(why) => {
+        let mut extract =
+            |side: Side, label: &str| -> (BTreeMap<Fact, FactVal>, Option<FileIndex>) {
+                match side {
+                    Side::Absent => (BTreeMap::new(), None),
+                    Side::Skipped(why) => {
                         skipped.get_or_insert_with(|| format!("{label}: {why}"));
-                        BTreeMap::new()
+                        (BTreeMap::new(), None)
                     }
-                },
-            }
-        };
-        let before = extract(base_side, "base");
-        let after = extract(current_side, "working tree");
+                    Side::Content(bytes) => match extractor.extract(&c.abs, &bytes, c.repo_id) {
+                        Ok(index) if index.parse_failed => {
+                            skipped.get_or_insert_with(|| format!("{label}: the parse failed"));
+                            (BTreeMap::new(), None)
+                        }
+                        Ok(index) => (facts_of(&index, &resolver, c.repo_id), Some(index)),
+                        Err(why) => {
+                            skipped.get_or_insert_with(|| format!("{label}: {why}"));
+                            (BTreeMap::new(), None)
+                        }
+                    },
+                }
+            };
+        let (before, base_index) = extract(base_side, "base");
+        let (after, current_index) = extract(current_side, "working tree");
         let changes = if skipped.is_some() {
+            events.skipped += 1;
             Vec::new()
         } else {
+            events.add(
+                &c.abs,
+                &c.display,
+                base_index,
+                current_index.as_ref(),
+                &snapshot.member_table,
+            );
             diff_facts(&before, &after)
         };
         reports.push(FileReport {
@@ -1164,7 +1179,18 @@ fn run_with(
         });
     }
 
-    // 5. Impact from the live graph, and the wire check of every changed .proto.
+    // 5. Events: the base graph (the live one with the changed files at their base version)
+    // against the live graph.
+    let events = event_report(
+        events,
+        &snapshot.contract_graph,
+        &snapshot.config_values,
+        &snapshot.member_table,
+        &view,
+        deadline,
+    );
+
+    // 6. Impact from the live graph, and the wire check of every changed .proto.
     let impact = render_impact(
         &reports,
         &snapshot.contract_graph,
@@ -1225,9 +1251,16 @@ fn run_with(
         }
     }
 
-    // 6. Render.
+    // 7. Render.
     let text = render(
-        &diffs, &failures, &reports, &counters, &impact, &wire, &view,
+        &diffs,
+        &failures,
+        &reports,
+        &counters,
+        events.as_ref(),
+        &impact,
+        &wire,
+        &view,
     );
     Ok(ToolOutput {
         text,
@@ -1328,10 +1361,19 @@ fn push_rows(
     sites: &mut usize,
 ) {
     for (node, how) in rows.iter().take(MAX_IMPACT_ROWS) {
+        // A call-site node is named after its topic: shown through the topic gate.
+        let name = if matches!(
+            node.kind,
+            NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue
+        ) {
+            events::shown_key(&node.name)
+        } else {
+            node.name.to_string()
+        };
         let _ = writeln!(
             out,
             "- `{}` in `{}:{}` _({how})_",
-            node.name,
+            name,
             clip_path(&view.path(&node.file_path)),
             node.line_start
         );
@@ -1812,17 +1854,20 @@ fn listed_names<'a>(names: impl Iterator<Item = &'a String>, total: usize) -> St
 /// 2. the wire-format results, within [`WIRE_BUDGET`]: breaking first (full
 ///    report, else its result line), then not checked / not compared, removed,
 ///    clean; what does not fit is collapsed into counts;
-/// 3. the impact rows, with their closing notes reserved;
-/// 4. the per-file sections.
+/// 3. the event changes, within [`events::EVENT_BUDGET`], their notes reserved;
+/// 4. the impact rows, with their closing notes reserved;
+/// 5. the per-file sections.
 ///
 /// Each cut section ends with an "N more ... narrow `scope`" line. A final
 /// clamp cuts at [`OUTPUT_BUDGET`] should the sections ever overrun it; the
 /// sizes above keep it from firing.
+#[allow(clippy::too_many_arguments)]
 fn render(
     diffs: &[RootDiff],
     failures: &[RootFailure],
     reports: &[FileReport],
     counters: &Counters,
+    events: Option<&EventSection>,
     impact: &Impact,
     wire: &[WireEntry],
     view: &RootView<'_>,
@@ -1987,7 +2032,12 @@ fn render(
         }
     }
 
-    // 3. Impact rows; the closing notes have their room reserved.
+    // 3. Event changes (9.0 T10), within their own budget.
+    if let Some(section) = events {
+        push_events(&mut out, section, OUTPUT_BUDGET);
+    }
+
+    // 4. Impact rows; the closing notes have their room reserved.
     let notes_len: usize = impact.notes.iter().map(String::len).sum();
     if !impact.items.is_empty() || !impact.notes.is_empty() {
         out.push_str("\n### Impact (live graph)\n");
@@ -2008,7 +2058,7 @@ fn render(
         out.push_str(note);
     }
 
-    // 4. Per-file sections.
+    // 5. Per-file sections.
     let listed: Vec<&FileReport> = reports
         .iter()
         .filter(|r| has_contract_change(r) || r.skipped.is_some())

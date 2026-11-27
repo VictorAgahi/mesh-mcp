@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 mod broker;
 mod calls;
 mod delta;
+mod event_diff;
 mod flow;
 mod index;
 mod query;
@@ -24,6 +25,7 @@ pub use calls::{
     MAX_STRUCTURAL_PAIRS, MAX_TYPE_HOPS,
 };
 pub use delta::ReconcileMode;
+pub use event_diff::{EventChannel, EventHop, EventHops, EventSite, HopEnd};
 pub use flow::{
     FlowBounds, FlowDirection, FlowEnd, FlowEntry, FlowHop, FlowLimit, FlowNext, FlowOutcome,
     FlowSite, FlowStep, FlowStepKind, FlowTrace, DEFAULT_CALL_DEPTH, DEFAULT_EVENT_DEPTH,

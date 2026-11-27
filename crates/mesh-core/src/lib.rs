@@ -42,16 +42,16 @@ pub use config_values::{ConfigEntry, ConfigFile, ConfigValues};
 pub use contracts::{
     fold_rpc_name, is_member_ref, normalize_topic_key, qualified_topic_key,
     service_from_client_field_name, split_qualified_topic_key, Broker, CallFact, CallFacts,
-    CallReceiver, CallStats, CallableFact, ContractGraph, DependentsMatch, FlowBounds,
-    FlowDirection, FlowEnd, FlowEntry, FlowHop, FlowLimit, FlowNext, FlowOutcome, FlowSite,
-    FlowStep, FlowStepKind, FlowTrace, GrpcTrace, ImpactFlow, ImpactMatrix, ImpactRole, ImpactRow,
-    ImpactScope, ImportFact, InjectionFact, ReconcileMode, RecordedCaller, ResolvedRpcRecord,
-    RpcRecordResolver, TypeFact, TypeFactKind, CALLABLE_ID_BASE, CLIENT_FIELD_BINDING_PREFIX,
-    CONST_VALUE_PREFIX, DEFAULT_CALL_DEPTH, DEFAULT_EVENT_DEPTH, DEFAULT_FAN_OUT,
-    HANDLER_REF_PREFIX, MAX_CALL_DEPTH, MAX_DERIVED_CALL_SITES, MAX_EVENT_DEPTH, MAX_FAN_OUT,
-    MAX_FLOW_HOPS, MAX_STRUCTURAL_IMPLS, MAX_STRUCTURAL_PAIRS, MAX_TYPE_HOPS,
-    MAX_WILDCARD_PRODUCERS, RPC_EXACT_METHOD_PREFIX, RPC_INFERRED_METHOD_PREFIX,
-    RPC_INHERITED_METHOD_PREFIX,
+    CallReceiver, CallStats, CallableFact, ContractGraph, DependentsMatch, EventChannel, EventHop,
+    EventHops, EventSite, FlowBounds, FlowDirection, FlowEnd, FlowEntry, FlowHop, FlowLimit,
+    FlowNext, FlowOutcome, FlowSite, FlowStep, FlowStepKind, FlowTrace, GrpcTrace, HopEnd,
+    ImpactFlow, ImpactMatrix, ImpactRole, ImpactRow, ImpactScope, ImportFact, InjectionFact,
+    ReconcileMode, RecordedCaller, ResolvedRpcRecord, RpcRecordResolver, TypeFact, TypeFactKind,
+    CALLABLE_ID_BASE, CLIENT_FIELD_BINDING_PREFIX, CONST_VALUE_PREFIX, DEFAULT_CALL_DEPTH,
+    DEFAULT_EVENT_DEPTH, DEFAULT_FAN_OUT, HANDLER_REF_PREFIX, MAX_CALL_DEPTH,
+    MAX_DERIVED_CALL_SITES, MAX_EVENT_DEPTH, MAX_FAN_OUT, MAX_FLOW_HOPS, MAX_STRUCTURAL_IMPLS,
+    MAX_STRUCTURAL_PAIRS, MAX_TYPE_HOPS, MAX_WILDCARD_PRODUCERS, RPC_EXACT_METHOD_PREFIX,
+    RPC_INFERRED_METHOD_PREFIX, RPC_INHERITED_METHOD_PREFIX,
 };
 pub use crawler::{ExcludeMatcher, FilesystemCrawler, WatchPlan};
 pub use docs::{DocIndex, DocSection};
