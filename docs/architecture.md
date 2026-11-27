@@ -159,6 +159,45 @@ collapsed into one key, so a producer of one appeared linked to a consumer of an
 - Golden files write a name used on two or more brokers of a corpus as `<broker>:<name>`
   (`tests/golden/events/SCHEMA.md`).
 
+### 3.5 Payload types per topic (9.0 T11)
+
+The events analogue of the `.proto` wire check. TypeScript / JavaScript and Java files carry
+`FileIndex::payload` (`mesh_core::PayloadFacts`, parse cache `SCHEMA_VERSION` 26), extracted in
+the same parse as the rest of the file (`mesh-parsers` `languages/payload.rs`):
+
+- **Declared types**: interfaces, object type aliases and classes (public fields, constructor
+  parameter properties) in TypeScript; classes (instance fields) and records (components) in Java.
+  Each keeps its name, line and fields (name, declared type as written, line, optional), at most
+  `MAX_PAYLOAD_FIELDS_PER_TYPE` (64) fields; a type past the cap, with an `extends` / super class,
+  a spread or an index signature is `incomplete`.
+- **Sites**: the payload a producer or consumer construct uses where it is statically visible (a
+  NestJS handler's `@Payload()` parameter, a BullMQ `Job<T>`, `Queue<T>` / `Worker<T>`, the payload
+  argument of `emit` / `send` / `add`, a Spring listener's `@Payload` parameter, `ConsumerRecord<K,
+  V>`, the payload argument of `send` / `convertAndSend` or the `V` of a `KafkaTemplate<K, V>`
+  receiver): a type name, an inline object type or literal (a literal value is kept as its JSON
+  family, never as the value), or "untyped". Each site keeps the line span of its construct and
+  its literal topic argument, if any.
+- At most `MAX_PAYLOAD_SITES_PER_FILE` (512) sites and `MAX_PAYLOAD_TYPES_PER_FILE` (256) types per
+  file; a cut file is `capped` and counted in the report.
+
+The indexer stores the facts by file path (`ContractGraph::add_payload_facts`; a file of records
+has no graph node), and `patch_files` drops them with their file. The check runs inside the
+`event_anomalies` pass (`ContractGraph::payload_mismatches`, `contracts/payload.rs`), over the hubs
+it already partitions per broker, so two brokers sharing a name are never compared with each
+other. Per hub with live (non-test) producers and consumers, each site is matched to the payload
+site whose span overlaps its node (the literal topic tells two sites of one node apart; two
+different payloads left is ambiguous, not compared), and a type name is resolved against the
+declared types: same file, then same repository, then the workspace when one file declares it; a
+tie is ambiguous and counted. The comparison reports the non-optional fields a consumer type
+declares that no producer sends, the fields a producer sends that no consumer declares, and fields
+whose primitive JSON family (`string`, `number`, `boolean`, arrays of them) differs; a named
+object field type is not compared. A direction is not compared when the other side has an untyped
+site or an incomplete field list, and a hub with no typed producer or no typed consumer, or more
+than `MAX_PAYLOAD_SHAPES_PER_TOPIC` (8) distinct payloads on a side, is listed as "not compared",
+never as "no mismatch". Field and type names pass the shared name gate
+(`member_consts::name_is_printable`) at render; field types are shown as their JSON family only.
+Placeholder and wildcard hubs are left out.
+
 ---
 
 ## 4. Path jail: `ValidatedScope`

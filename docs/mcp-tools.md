@@ -829,7 +829,8 @@ repositories), the working tree is compared with a base revision at the **contra
   `${orders.topic}`), here and in the per-file section, and a key that is not a name by the T14 rule
   (`member_consts::constant_is_a_name`: a token, a random-looking run, a URL) is shown as
   `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`, its broker qualifier kept. Payload fields are not
-  compared: no extractor exposes the payload type of an event yet (one line says so). Limits: 200
+  compared here (one line says so and points to `event_anomalies`, class `payload_mismatch`, which
+  compares publisher and consumer payloads on the working tree). Limits: 200
   channels checked for links and hops per call (the rest counted), the time budget checked before
   each channel's traces; each trace is bounded like
   `trace_flow` with `event_depth` 1, `call_depth` 6 and `fan_out` 50, and the traces a bound cut are
@@ -1052,7 +1053,7 @@ page. The notes are on the first page.
 ### Tool 9: `event_anomalies`
 
 #### Description
-Workspace event anomaly report in one call (9.0), over the event graph. Five classes, plus one
+Workspace event anomaly report in one call (9.0), over the event graph. Six classes, plus one
 that keeps the report honest:
 
 | Class | A row is... |
@@ -1062,6 +1063,7 @@ that keeps the report honest:
 | cycles | an event chain that loops back: consuming a topic leads, through resolved calls, to publishing a topic that leads back (a strongly connected set of topics, with the shortest loop as witness and, per hop, the consumer and producer `path:line`); a retry that republishes its own topic is a loop of one |
 | fan-out | a topic with 6 or more consumer sites, or a file publishing onto 6 or more topics (the constants `ANOMALY_FAN_OUT_CONSUMERS` and `ANOMALY_FAN_OUT_TOPICS` in `contracts/anomalies.rs`) |
 | test-only consumers | a topic that production publishes onto and whose every consumer site is in a test file |
+| payload mismatches (9.0 T11) | a topic whose producers and consumers disagree on the payload, with `path:line` on both sides (where each type is declared and where each site is): the fields a consumer's type declares (not optional) that no producer sends, the fields a producer sends that no consumer's type declares, and fields whose primitive JSON family (`string`, `number`, `boolean`, arrays of them) differs; whether the type names differ |
 | unresolved (not anomalies) | a one-sided topic that cannot be called an anomaly, with the reason: a `${KEY}` placeholder no configuration resolved, a wildcard subscription (NATS / MQTT subject patterns), or a dead-letter / retry channel (the last name segment, past trailing numbers, is exactly `dlq`, `dlt`, `retry`, `deadletter`, or `dead` + `letter`; `mail.letter` is not one) |
 
 Honesty rules, which the output repeats: "no producer" and "no consumer" mean none was
@@ -1089,8 +1091,32 @@ index cache).
 
 > **Negative constraints:** DO NOT USE to trace what one event triggers hop by hop (use
 > `trace_flow`), to list every producer and consumer of one named event (use `analyze_impact`), or
-> for gRPC or imports (use `analyze_grpc`, `find_dependents`). It does NOT check payload types and
-> does NOT detect anomalies in code that registers handlers at runtime.
+> for gRPC or imports (use `analyze_grpc`, `find_dependents`). It does NOT read payload types outside
+> TypeScript / JavaScript and Java, does NOT read the fields a handler's code accesses (a
+> consumer's expected fields are its declared type's), and does NOT detect anomalies in code that
+> registers handlers at runtime.
+
+#### Payload check (class `payload_mismatch`)
+Over every topic hub (per broker) with live producers and consumers, placeholder and wildcard hubs
+left out. A payload is read only where it is statically visible in TypeScript / JavaScript (NestJS
+`@EventPattern` / `@MessagePattern` / `@OnEvent` / `@Process` / `@RabbitSubscribe` /
+`@SqsMessageHandler` handlers' `@Payload()` or first parameter, BullMQ `Job<T>`, `Queue<T>`,
+`Worker<T>`, `@InjectQueue` `Queue<T>`, the payload argument of `emit` / `send` / `add`: `new T()`,
+`x as T`, an object literal, a parameter or local whose type is written) and Java (`@KafkaListener`,
+`@RabbitListener`, `@JmsListener`, `@SqsListener`, `@StreamListener` parameters, `ConsumerRecord<K,
+V>`, `Message<T>`, the payload argument of `send` / `convertAndSend`, else the `V` of a
+`KafkaTemplate<K, V>` receiver). A type name resolves to the class, interface, object type alias or
+record that declares it (same file, then same repository, then the one file of the workspace that
+declares it). What is not compared is counted, never presented as a match: a site whose payload is
+not statically typed (a raw string, `any`, `JSON.stringify(...)`) or names a type no indexed file
+declares, or several files declare; a topic with no typed producer or no typed consumer; a side
+with more than 8 distinct payloads (`MAX_PAYLOAD_SHAPES_PER_TOPIC`); a direction whose other side
+has an untyped site or a partial field list (more than 64 fields, `MAX_PAYLOAD_FIELDS_PER_TYPE`, an
+`extends`, a spread). The footer says how many topics were compared, match, mismatch and were not
+compared, and names the topics not compared. Field and type names that are credential-shaped print
+as `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`; a field's type is shown as its JSON family and a
+literal's value is never read. Field names are compared as written (a serializer naming strategy
+such as snake_case is not applied).
 
 #### Pagination and truncation
 `limit` rows per class (default 25, 1 to 100) from `offset`; each class says `Next page:
@@ -1105,7 +1131,7 @@ index cache).
     "scope": { "type": "string" },
     "classes": {
       "type": "array",
-      "items": { "enum": ["published_never_consumed", "consumed_never_published", "unresolved", "cycles", "fan_out", "test_only_consumers"] }
+      "items": { "enum": ["published_never_consumed", "consumed_never_published", "unresolved", "cycles", "fan_out", "test_only_consumers", "payload_mismatch"] }
     },
     "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
     "offset": { "type": "integer", "minimum": 0 }
