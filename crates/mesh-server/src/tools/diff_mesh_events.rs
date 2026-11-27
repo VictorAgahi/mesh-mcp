@@ -30,6 +30,8 @@ pub(super) const MAX_EVENT_CHANNELS: usize = 200;
 pub(super) const EVENT_BUDGET: usize = 14 * 1024;
 /// Site rows listed per channel; the rest are counted.
 const MAX_SITE_ROWS: usize = 20;
+/// Said when a changed file edits string constants some indexed site names its topic through.
+const CONSTANTS_NOTE: &str = "\n*Topic constants edited: event sites in unchanged files that resolve their topic through them are not compared.*\n";
 /// What a channel key that may be a secret is shown as (commandment 5).
 const REDACTED: &str = "[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]";
 
@@ -136,9 +138,17 @@ pub(super) fn event_report(
     deadline: Instant,
 ) -> Option<EventSection> {
     if !input.relevant {
-        // A skipped file may hold sites: say so rather than show no section.
-        return (input.skipped > 0).then(|| EventSection {
-            head: format!("\n### Event changes (broker-qualified channels)\n\n*Not compared in {} skipped changed file(s) (see the file sections): their producers and consumers are unknown.*\n", input.skipped),
+        // No changed file has a site, but one may hide sites (skipped) or move topics resolved
+        // in unchanged files (constants): say so rather than show no section.
+        let mut head = String::new();
+        if input.skipped > 0 {
+            let _ = writeln!(head, "\n*Not compared in {} skipped changed file(s) (see the file sections): their producers and consumers are unknown.*", input.skipped);
+        }
+        if input.constants_changed {
+            head.push_str(CONSTANTS_NOTE);
+        }
+        return (!head.is_empty()).then(|| EventSection {
+            head: format!("\n### Event changes (broker-qualified channels)\n{head}"),
             items: Vec::new(),
             notes: Vec::new(),
         });
@@ -488,10 +498,7 @@ pub(super) fn event_report(
         ));
     }
     if constants_changed {
-        notes.push(
-            "\n*Topic constants edited: event sites in unchanged files that resolve their topic through them are not compared.*\n"
-                .to_string(),
-        );
+        notes.push(CONSTANTS_NOTE.to_string());
     }
     if missing > 0 {
         notes.push(format!(
@@ -1016,6 +1023,229 @@ export class ReportListener {
             ev.contains("more event item(s) not shown to stay under the 48 KB cap; narrow `scope`"),
             "{ev}"
         );
+        // The flood file is over the in-process site cap: its counts are said to be truncated.
+        assert!(ev.contains("*Per-file site cap hit"), "{ev}");
+        assert!(ev.contains("`src/flood.ts`"), "{ev}");
         drop(repo);
+    }
+
+    /// The deep chain fixture: `@OnEvent('deep.in')` -> `depth` private hops -> `OutService.issue`
+    /// (another file, so no same-file fallback links it) -> emit `deep.out`.
+    fn deep_handler(depth: usize) -> String {
+        let mut s = String::from("import { Injectable } from '@nestjs/common';\nimport { OnEvent } from '@nestjs/event-emitter';\nimport { OutService } from './out.service';\n\n@Injectable()\nexport class Deep {\n  constructor(private readonly out: OutService) {}\n\n  @OnEvent('deep.in')\n  handle() {\n    this.h0();\n  }\n");
+        for k in 0..depth {
+            let next = if k + 1 == depth {
+                "this.out.issue()".to_string()
+            } else {
+                format!("this.h{}()", k + 1)
+            };
+            s.push_str(&format!("\n  h{k}() {{\n    {next};\n  }}\n"));
+        }
+        s.push_str("}\n");
+        s
+    }
+
+    const OUT_SERVICE: &str = "import { Injectable } from '@nestjs/common';\nimport { EventEmitter2 } from '@nestjs/event-emitter';\n\n@Injectable()\nexport class OutService {\n  constructor(private readonly emitter: EventEmitter2) {}\n\n  issue() {\n    this.emitter.emit('deep.out', {});\n  }\n}\n";
+
+    fn deep_repo(base_depth: usize, head_depth: usize) -> TempRepo {
+        let repo = TempRepo::new();
+        repo.write("src/out.service.ts", OUT_SERVICE);
+        repo.write("src/deep.ts", &deep_handler(base_depth));
+        repo.write(
+            "src/emit.ts",
+            "import { Injectable } from '@nestjs/common';\nimport { EventEmitter2 } from '@nestjs/event-emitter';\n\n@Injectable()\nexport class Start {\n  constructor(private readonly emitter: EventEmitter2) {}\n\n  go() {\n    this.emitter.emit('deep.in', {});\n  }\n}\n",
+        );
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write("src/deep.ts", &deep_handler(head_depth));
+        repo
+    }
+
+    /// H1: a hop the base reaches within `call_depth` and the working tree only past it is not
+    /// reported cut (the bound, not the branch, hides it), and the reverse is not "created".
+    #[test]
+    fn a_hop_hidden_by_call_depth_is_not_compared_either_way() {
+        // Sanity: within the bound on both sides, the same hop, nothing reported.
+        let ev = diff(&deep_repo(2, 3));
+        let ev = events(&ev);
+        assert!(ev.contains("chain hops cut 0, created 0."), "{ev}");
+        assert!(!ev.contains("Not compared (bound)"), "{ev}");
+        for (b, h) in [(2, 9), (9, 2)] {
+            let text = diff(&deep_repo(b, h));
+            let ev = events(&text);
+            assert!(
+                ev.contains("chain hops cut 0, created 0."),
+                "{b}->{h}: {ev}"
+            );
+            assert!(
+                ev.contains("*Not compared (bound): 1 chain hop(s) that differ between the sides"),
+                "{b}->{h}: {ev}"
+            );
+        }
+    }
+
+    /// M4: removing a wildcard subscription cuts the link of the concrete subject it heard,
+    /// whose producer file did not change.
+    #[test]
+    fn a_removed_wildcard_consumer_cuts_the_link_of_the_subjects_it_matched() {
+        let repo = TempRepo::new();
+        repo.write(
+            "pub.go",
+            "package main\n\nimport \"github.com/nats-io/nats.go\"\n\nfunc pub(nc *nats.Conn) {\n\tnc.Publish(\"orders.created\", []byte(\"x\"))\n}\n",
+        );
+        repo.write(
+            "sub.go",
+            "package main\n\nimport \"github.com/nats-io/nats.go\"\n\nfunc sub(nc *nats.Conn) {\n\tnc.Subscribe(\"orders.*\", func(m *nats.Msg) {})\n}\n",
+        );
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        rm(&repo, "sub.go");
+        let text = diff(&repo);
+        let ev = events(&text);
+        assert!(
+            ev.contains("#### `nats:orders.created` — link cut: no producer on this channel reaches a consumer any more\n"),
+            "{ev}"
+        );
+        assert!(
+            ev.contains("- - consumer of `nats:orders.*` in `sub`"),
+            "{ev}"
+        );
+    }
+
+    /// M3: a changed file a guard refuses on one side is not compared, and the section says so.
+    #[test]
+    fn a_skipped_changed_file_is_named_in_the_event_section() {
+        let mut big = REPORT_LISTENER.to_string();
+        while big.len() < 456 * 1024 {
+            big.push_str("// padding line of a generated file, under the 1,024-byte line guard\n");
+        }
+        let repo = TempRepo::new();
+        repo.write("src/report.listener.ts", &big);
+        repo.write("src/invoice.service.ts", INVOICE_SERVICE);
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write("src/report.listener.ts", "export class ReportListener {}\n");
+        let ev = diff(&repo);
+        let ev = events(&ev);
+        assert!(
+            ev.contains("*Not compared in 1 skipped changed file(s) (see the file sections)"),
+            "{ev}"
+        );
+        // With a compared event change beside it, the counts are lower bounds.
+        repo.write(
+            "src/invoice.service.ts",
+            &INVOICE_SERVICE.replace("'invoice.issued'", "'invoice.voided'"),
+        );
+        let ev = diff(&repo);
+        let ev = events(&ev);
+        assert!(
+            ev.contains("*1 changed file(s) skipped (see the file sections): their sites are not compared, so the counts above are lower bounds.*"),
+            "{ev}"
+        );
+    }
+
+    /// M5: editing the value of a queue constant (a file with no site) says that the sites
+    /// resolving through it are not compared, instead of showing nothing.
+    #[test]
+    fn an_edited_topic_constant_is_noted() {
+        let repo = TempRepo::new();
+        repo.write(
+            "src/queues.ts",
+            "export enum JobQueue {\n  EMAIL = 'email-jobs',\n}\n",
+        );
+        repo.write(
+            "src/email.processor.ts",
+            "import { Processor, WorkerHost } from '@nestjs/bullmq';\nimport { JobQueue } from './queues';\n\n@Processor(JobQueue.EMAIL)\nexport class EmailProcessor extends WorkerHost {\n  async process(): Promise<void> {}\n}\n",
+        );
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write(
+            "src/queues.ts",
+            "export enum JobQueue {\n  EMAIL = 'mail-jobs',\n}\n",
+        );
+        let ev = diff(&repo);
+        let ev = events(&ev);
+        assert!(ev.contains("*Topic constants edited:"), "{ev}");
+    }
+
+    /// M1: two secret-shaped topics stay two facts in the per-file section (keyed by the raw
+    /// topic, redacted only when shown): removing one, or renaming one to another secret-shaped
+    /// name, is a change.
+    #[test]
+    fn two_redacted_topics_stay_two_facts() {
+        let a: String = ["tok", "_", "1a2b3c4d5e6f7a8b9c"].concat();
+        let b: String = ["tok", "_", "9c8b7a6f5e4d3c2b1a"].concat();
+        let c: String = ["tok", "_", "5e5e5e1a1a1a2b2b2b"].concat();
+        let listener = |topics: &[&str]| {
+            let mut s = String::from("import { Injectable } from '@nestjs/common';\nimport { OnEvent } from '@nestjs/event-emitter';\n\n@Injectable()\nexport class Secrets {\n");
+            for (k, t) in topics.iter().enumerate() {
+                s.push_str(&format!(
+                    "  @OnEvent('{t}')\n  on{k}() {{\n    return {k};\n  }}\n\n"
+                ));
+            }
+            s.push_str("}\n");
+            s
+        };
+        let repo = TempRepo::new();
+        repo.write("src/secrets.ts", &listener(&[&a, &b]));
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write("src/secrets.ts", &listener(&[&a]));
+        let text = diff(&repo);
+        assert!(
+            text.contains("- - consumes topic `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`"),
+            "{text}"
+        );
+        repo.write("src/secrets.ts", &listener(&[&a, &c]));
+        let text = diff(&repo);
+        assert!(
+            text.contains("- + consumes topic `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`")
+                && text
+                    .contains("- - consumes topic `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`"),
+            "{text}"
+        );
+        for t in [&a, &b, &c] {
+            assert!(!text.contains(t.as_str()), "{text}");
+        }
+    }
+
+    /// A site that only moved within its file (new lines above it) is no change.
+    #[test]
+    fn a_site_moved_within_its_file_is_no_change() {
+        let repo = base();
+        repo.write(
+            "src/report.listener.ts",
+            &REPORT_LISTENER.replace(
+                "export class ReportListener {\n",
+                "export class ReportListener {\n  // moved\n  // down\n  // by three lines\n",
+            ),
+        );
+        let ev = diff(&repo);
+        let ev = events(&ev);
+        assert!(
+            ev.contains("**Events**: 0 channel(s) with site changes; producers +0 -0; consumers +0 -0; 0 renamed; producer-consumer links cut 0, created 0; chain hops cut 0, created 0."),
+            "{ev}"
+        );
+    }
+
+    /// A rename is one to one only: two channels renamed in one place, with the same sites, are
+    /// ambiguous and stay removals and additions.
+    #[test]
+    fn an_ambiguous_rename_is_no_rename() {
+        let both = |x: &str, y: &str| {
+            format!("import {{ Injectable }} from '@nestjs/common';\nimport {{ OnEvent, EventEmitter2 }} from '@nestjs/event-emitter';\n\n@Injectable()\nexport class Pair {{\n  constructor(private readonly emitter: EventEmitter2) {{}}\n\n  @OnEvent(['{x}', '{y}'])\n  on() {{\n    return 1;\n  }}\n\n  fire() {{\n    this.emitter.emit('{x}', {{}});\n    this.emitter.emit('{y}', {{}});\n  }}\n}}\n")
+        };
+        let repo = TempRepo::new();
+        repo.write("src/pair.ts", &both("a.x", "b.x"));
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write("src/pair.ts", &both("c.x", "d.x"));
+        let ev = diff(&repo);
+        let ev = events(&ev);
+        assert!(
+            ev.contains("producers +2 -2; consumers +2 -2; 0 renamed;"),
+            "{ev}"
+        );
+        assert!(!ev.contains("- renamed "), "{ev}");
     }
 }
