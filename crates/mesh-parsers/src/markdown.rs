@@ -1380,7 +1380,7 @@ impl MarkdownFormatter {
     const NOTE_NAME_CHARS: usize = 80;
     const NOTE_LOC_CHARS: usize = 100;
 
-    fn clamp_chars(text: &str, max: usize) -> String {
+    pub(crate) fn clamp_chars(text: &str, max: usize) -> String {
         if text.chars().count() <= max {
             return text.to_string();
         }
@@ -1449,7 +1449,7 @@ impl MarkdownFormatter {
     }
 
     /// `path:line`, the path relative to the node's root when it has one.
-    fn location(node: &ContractNode, roots: &[PathBuf]) -> String {
+    pub(crate) fn location(node: &ContractNode, roots: &[PathBuf]) -> String {
         match roots
             .get(node.repo_id as usize)
             .and_then(|root| node.file_path.strip_prefix(root).ok())
@@ -1461,7 +1461,7 @@ impl MarkdownFormatter {
 
     /// A relative path with `/` separators on every platform, so a matrix
     /// reads (and compares) the same on Windows.
-    fn slash_path(rel: &Path) -> String {
+    pub(crate) fn slash_path(rel: &Path) -> String {
         rel.components()
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()

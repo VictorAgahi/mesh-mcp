@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod anomalies;
 pub mod config_ref;
 pub mod decapitate;
 pub mod graph;
@@ -8,6 +9,7 @@ pub mod languages;
 pub mod markdown;
 pub mod topology;
 
+pub use anomalies::{AnomalyShow, AnomalyView};
 pub use decapitate::{AstDecapitator, DecapitatedSource, LanguageKind};
 pub use graph::{GraphRenderer, WebEdge, WebGraphPayload, WebNode};
 pub use guard::{AstGuard, BoundedMatch, GuardRejection, ParserError};

@@ -474,6 +474,7 @@ repositories, start from the graph, then check what matters with your usual read
 - events: who publishes, which topics, queues or streams, which consumers → `analyze_impact`
 - gRPC: server handlers, client call sites, `.proto` changes → `analyze_grpc`
 - an event flow end to end (handler -> calls -> publish -> next consumers, or reverse) → `trace_flow`
+- where the event graph looks wrong (published never consumed, consumed never published, cycles, fan-out) → `event_anomalies`
 
 Every row carries a `path:line`: a verifiable starting point, not an answer to take on trust. Rows
 marked `heuristic` or `ambiguous` deserve a check.
