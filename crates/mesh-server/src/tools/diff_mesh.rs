@@ -626,8 +626,9 @@ impl Fact {
             Self::Rpc(kind, n) => format!("{kind} `{n}`"),
             Self::Route(n) => format!("route `{n}`"),
             Self::Decl(kind, n) => format!("{kind} `{n}`"),
-            Self::Produces(t) => format!("produces topic `{t}`"),
-            Self::Consumes(t) => format!("consumes topic `{t}`"),
+            // The fact keeps the raw topic (two secrets are two facts); only the text is redacted.
+            Self::Produces(t) => format!("produces topic `{}`", events::shown_key(t)),
+            Self::Consumes(t) => format!("consumes topic `{}`", events::shown_key(t)),
             Self::Import(t) => format!("import `{t}`"),
             Self::Calls(t) => format!("calls RPC `{t}`"),
             Self::CallsInferred(raw, t) => format!(
@@ -734,14 +735,14 @@ fn facts_of(
         .map(|(p, (i, t))| {
             (
                 *i,
-                Fact::Produces(events::shown_key(t)),
+                Fact::Produces(t.to_string()),
                 producer_broker.get(&p).copied(),
             )
         })
         .chain(index.consumers.iter().enumerate().map(|(p, (i, t))| {
             (
                 *i,
-                Fact::Consumes(events::shown_key(t)),
+                Fact::Consumes(t.to_string()),
                 consumer_broker.get(&p).copied(),
             )
         }))
@@ -1157,15 +1158,16 @@ fn run_with(
         let (before, base_index) = extract(base_side, "base");
         let (after, current_index) = extract(current_side, "working tree");
         let changes = if skipped.is_some() {
+            events.skipped += 1;
             Vec::new()
         } else {
-            let has_sites = |i: &Option<FileIndex>| {
-                i.as_ref()
-                    .is_some_and(|i| !(i.producers.is_empty() && i.consumers.is_empty()))
-            };
-            events.relevant |= has_sites(&base_index) || has_sites(&current_index);
-            events.files.push(c.abs.clone());
-            events.base.extend(base_index);
+            events.add(
+                &c.abs,
+                &c.display,
+                base_index,
+                current_index.as_ref(),
+                &snapshot.member_table,
+            );
             diff_facts(&before, &after)
         };
         reports.push(FileReport {
@@ -1359,10 +1361,19 @@ fn push_rows(
     sites: &mut usize,
 ) {
     for (node, how) in rows.iter().take(MAX_IMPACT_ROWS) {
+        // A call-site node is named after its topic: shown through the topic gate.
+        let name = if matches!(
+            node.kind,
+            NodeKind::KafkaTopic | NodeKind::EventStream | NodeKind::Queue
+        ) {
+            events::shown_key(&node.name)
+        } else {
+            node.name.to_string()
+        };
         let _ = writeln!(
             out,
             "- `{}` in `{}:{}` _({how})_",
-            node.name,
+            name,
             clip_path(&view.path(&node.file_path)),
             node.line_start
         );

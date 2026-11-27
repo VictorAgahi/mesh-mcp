@@ -5,8 +5,10 @@
 //!
 //! Both sides are graphs: the live graph is the working tree; the base graph is a copy of it
 //! with every analysed changed file replaced by its base version and reconciled the way a
-//! reload is. Only the channels with a site in a changed file (on either side) are compared,
-//! so the work is bounded by the branch, not by the workspace.
+//! reload is. Only the channels with a site in a changed file (on either side) are compared, so
+//! the traces are bounded by the branch. The base graph is not: it is a full copy of the live
+//! graph, built once per call when a changed file has an event site (on kubernetes, about +170 MB
+//! of peak memory for the call, freed when it returns).
 
 use super::{clip_line, clip_path, push_within, RootView, NOTE_RESERVE};
 use mesh_core::config_values::strip_placeholder_defaults;
@@ -40,6 +42,48 @@ pub(super) struct EventInput {
     pub(super) files: Vec<PathBuf>,
     /// The base version of each of them that exists at the base.
     pub(super) base: Vec<FileIndex>,
+    /// Changed files skipped on either side (a guard, a parse failure): their sites are not
+    /// compared.
+    pub(super) skipped: usize,
+    /// Changed files whose sites a per-file extraction cap cut (either side), for display.
+    pub(super) capped: Vec<String>,
+    /// A changed file declares string constants that differ between the sides while some
+    /// indexed site names its topic through a constant.
+    pub(super) constants_changed: bool,
+}
+
+impl EventInput {
+    /// Records the two extracted sides of one analysed changed file.
+    pub(super) fn add(
+        &mut self,
+        abs: &Path,
+        display: &str,
+        base: Option<FileIndex>,
+        current: Option<&FileIndex>,
+        members: &MemberTable,
+    ) {
+        let has_sites = |i: &FileIndex| !(i.producers.is_empty() && i.consumers.is_empty());
+        let capped = |i: &FileIndex| {
+            i.inproc_capped
+                || i.jvm_brokers_capped
+                || i.go_brokers_capped
+                || i.py_brokers_capped
+                || i.sql_capped
+        };
+        self.relevant |= base.as_ref().is_some_and(has_sites) || current.is_some_and(has_sites);
+        if base.as_ref().is_some_and(capped) || current.is_some_and(capped) {
+            self.capped.push(display.to_string());
+        }
+        let consts = |i: Option<&FileIndex>| -> BTreeSet<String> {
+            i.map(|i| i.const_records().map(str::to_string).collect())
+                .unwrap_or_default()
+        };
+        if !self.constants_changed && consts(base.as_ref()) != consts(current) {
+            self.constants_changed = members.ref_files().next().is_some();
+        }
+        self.files.push(abs.to_path_buf());
+        self.base.extend(base);
+    }
 }
 
 /// `(producer, file, owner)`: a site of a channel, line-independent.
@@ -92,8 +136,15 @@ pub(super) fn event_report(
     deadline: Instant,
 ) -> Option<EventSection> {
     if !input.relevant {
-        return None;
+        // A skipped file may hold sites: say so rather than show no section.
+        return (input.skipped > 0).then(|| EventSection {
+            head: format!("\n### Event changes (broker-qualified channels)\n\n*Not compared in {} skipped changed file(s) (see the file sections): their producers and consumers are unknown.*\n", input.skipped),
+            items: Vec::new(),
+            notes: Vec::new(),
+        });
     }
+    let (skipped, capped, constants_changed) =
+        (input.skipped, input.capped.clone(), input.constants_changed);
     if Instant::now() >= deadline {
         return Some(EventSection {
             head: "\n### Event changes\n\n*Not compared: the time budget of this call is spent; narrow `scope`.*\n".into(),
@@ -204,17 +255,26 @@ pub(super) fn event_report(
         renames.iter().map(|r| (&r.from, &r.to)).collect();
 
     // Links and hops, over every channel with a site in a changed file (capped).
-    let touched: BTreeSet<&EventChannel> = base_sites
+    // A wildcard subscription added or removed changes the links of the channels it matches,
+    // whose producers may sit in unchanged files.
+    let mut touched: BTreeSet<EventChannel> = base_sites
         .iter()
         .chain(&head_sites)
-        .map(|s| &s.channel)
+        .map(|s| s.channel.clone())
         .collect();
-    let traced: Vec<EventChannel> = touched
+    let matched: Vec<EventChannel> = touched
         .iter()
-        .take(MAX_EVENT_CHANNELS)
-        .map(|c| (*c).clone())
+        .flat_map(|c| {
+            base.channels_matching(c)
+                .into_iter()
+                .chain(live.channels_matching(c))
+        })
         .collect();
-    let untraced = touched.len() - traced.len();
+    touched.extend(matched);
+    let traced: Vec<EventChannel> = touched.iter().take(MAX_EVENT_CHANNELS).cloned().collect();
+    let untraced_set: BTreeSet<EventChannel> =
+        touched.iter().skip(MAX_EVENT_CHANNELS).cloned().collect();
+    let untraced = untraced_set.len();
     let renamed_linked: BTreeSet<&EventChannel> = renames
         .iter()
         .filter(|r| r.linked)
@@ -232,40 +292,55 @@ pub(super) fn event_report(
             }
         }
     }
-    let mut hops_timed_out = false;
     let (mut cut, mut created) = (Vec::new(), Vec::new());
-    let mut bounded = 0;
-    if Instant::now() >= deadline {
-        hops_timed_out = true;
-    } else {
-        let rename = |c: &mut Option<EventChannel>| {
-            if let Some(to) = c.as_ref().and_then(|ch| renamed_to.get(ch)) {
-                *c = Some((*to).clone());
-            }
-        };
-        let b = base.event_hops(&traced);
-        let h = live.event_hops(&traced);
-        bounded = b.bounded.max(h.bounded);
-        let b_hops: BTreeMap<EventHop, (EdgeConfidence, bool)> = b
-            .hops
+    // Hops of a channel whose trace a bound or the deadline cut on either side, or that was
+    // not traced (channel cap), are not compared: a missing hop there may be the bound's.
+    let mut not_compared = 0usize;
+    let rename = |c: &EventChannel| {
+        renamed_to
+            .get(c)
+            .map_or_else(|| c.clone(), |t| (*t).clone())
+    };
+    let b = base.event_hops(&traced, deadline);
+    let h = live.event_hops(&traced, deadline);
+    let mut excluded: BTreeSet<EventChannel> = untraced_set;
+    for side in [&b, &h] {
+        excluded.extend(side.bounded.iter().chain(&side.not_traced).map(rename));
+    }
+    let bounded = b.bounded.union(&h.bounded).count();
+    let not_traced = b.not_traced.union(&h.not_traced).count();
+    let b_hops: BTreeMap<EventHop, (EdgeConfidence, bool)> = b
+        .hops
+        .into_iter()
+        .map(|(mut hop, v)| {
+            hop.entry.channel = hop.entry.channel.as_ref().map(rename);
+            hop.publish.channel = hop.publish.channel.as_ref().map(rename);
+            (hop, v)
+        })
+        .collect();
+    let compared = |k: &EventHop| {
+        ![&k.entry.channel, &k.publish.channel]
             .into_iter()
-            .map(|(mut hop, v)| {
-                rename(&mut hop.entry.channel);
-                rename(&mut hop.publish.channel);
-                (hop, v)
-            })
-            .collect();
-        cut = b_hops
-            .iter()
-            .filter(|(k, _)| !h.hops.contains_key(*k))
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-        created = h
-            .hops
-            .iter()
-            .filter(|(k, _)| !b_hops.contains_key(*k))
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
+            .flatten()
+            .any(|c| excluded.contains(c))
+    };
+    for (k, v) in &b_hops {
+        if !h.hops.contains_key(k) {
+            if compared(k) {
+                cut.push((k.clone(), *v));
+            } else {
+                not_compared += 1;
+            }
+        }
+    }
+    for (k, v) in &h.hops {
+        if !b_hops.contains_key(k) {
+            if compared(k) {
+                created.push((k.clone(), *v));
+            } else {
+                not_compared += 1;
+            }
+        }
     }
     let missing = base.call_files_missing_sites().len();
 
@@ -391,16 +466,32 @@ pub(super) fn event_report(
             "\n*{untraced} more channel(s) not checked for links and chain hops: cap ({MAX_EVENT_CHANNELS} per call); narrow `scope`.*\n"
         ));
     }
-    if hops_timed_out {
+    if not_traced > 0 {
+        notes.push(format!(
+            "\n*{not_traced} channel(s) not traced for chain hops: the time budget of this call is spent; narrow `scope`.*\n"
+        ));
+    }
+    if bounded > 0 || not_compared > 0 {
+        notes.push(format!(
+            "\n*Not compared (bound): {not_compared} chain hop(s) that differ between the sides on {bounded} channel(s) whose trace hit a bound (call_depth 6, fan_out 50 or the hop cap), or on a channel not traced; check them with `trace_flow`.*\n"
+        ));
+    }
+    if skipped > 0 {
+        notes.push(format!(
+            "\n*{skipped} changed file(s) skipped (see the file sections): their sites are not compared, so the counts above are lower bounds.*\n"
+        ));
+    }
+    if !capped.is_empty() {
+        notes.push(format!(
+            "\n*Per-file site cap hit (for example `MAX_INPROC_SITES_PER_FILE`, 2,000): the sites of {} are truncated, so its counts are too.*\n",
+            super::listed_names(capped.iter(), capped.len())
+        ));
+    }
+    if constants_changed {
         notes.push(
-            "\n*Chain hops not compared: the time budget of this call is spent; narrow `scope`.*\n"
+            "\n*Topic constants edited: event sites in unchanged files that resolve their topic through them are not compared.*\n"
                 .to_string(),
         );
-    }
-    if bounded > 0 {
-        notes.push(format!(
-            "\n*{bounded} trace(s) hit a bound (call_depth, fan_out or the hop cap): a hop past it is not compared; check with `trace_flow`.*\n"
-        ));
     }
     if missing > 0 {
         notes.push(format!(

@@ -91,9 +91,11 @@ pub struct EventHops {
     /// Each hop with its weakest confidence over every trace that found it, and whether only
     /// the same-file fallback linked it.
     pub hops: BTreeMap<EventHop, (EdgeConfidence, bool)>,
-    /// Traces cut by a bound (`call_depth`, `fan_out`, the hop cap): a hop past it may be
-    /// missing from this side.
-    pub bounded: usize,
+    /// Channels whose trace was cut by a bound (`call_depth`, `fan_out`, the hop cap): a hop
+    /// of theirs may be missing from this side, so it is not compared.
+    pub bounded: BTreeSet<EventChannel>,
+    /// Channels not traced because the caller's deadline passed.
+    pub not_traced: BTreeSet<EventChannel>,
 }
 
 fn weaker(a: EdgeConfidence, b: EdgeConfidence) -> EdgeConfidence {
@@ -204,6 +206,32 @@ impl ContractGraph {
             .collect()
     }
 
+    /// The concrete producer channels a wildcard `pattern` channel (`orders.*`) matches: a
+    /// wildcard consumer added or removed changes their links. Empty for a plain key.
+    pub fn channels_matching(&self, pattern: &EventChannel) -> Vec<EventChannel> {
+        let key = pattern.key.as_str();
+        if !is_subject_pattern(key) {
+            return Vec::new();
+        }
+        let mut out: Vec<EventChannel> = self
+            .topic_producers
+            .iter()
+            .filter(|(k, _)| subject_matches(key, k))
+            .flat_map(|(k, ids)| {
+                ids.iter()
+                    .map(move |id| self.site_mask(true, k, *id))
+                    .filter(|m| pattern.admits(*m))
+                    .flat_map(move |m| EventChannel::of(k, m))
+            })
+            .filter(|c| {
+                c.broker.is_none() || pattern.broker.is_none() || c.broker == pattern.broker
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Whether any site, producer or consumer, is on `channel`.
     pub fn channel_has_sites(&self, channel: &EventChannel) -> bool {
         !self.channel_masks(channel, true).is_empty()
@@ -248,8 +276,9 @@ impl ContractGraph {
     /// The one-hop chains around `channels`: forward from each channel's consumers (what
     /// handling it publishes) and reverse from its producers (which entries reach the publish).
     /// One adjacency for every trace; each trace is bounded like `trace_flow` with
-    /// `event_depth` 1 and the maximum `fan_out`.
-    pub fn event_hops(&self, channels: &[EventChannel]) -> EventHops {
+    /// `event_depth` 1 and the maximum `fan_out`. The `deadline` is checked before each channel;
+    /// the channels it leaves are listed in [`EventHops::not_traced`].
+    pub fn event_hops(&self, channels: &[EventChannel], deadline: std::time::Instant) -> EventHops {
         let idx = self.flow_index();
         let bounds = FlowBounds {
             call_depth: DEFAULT_CALL_DEPTH,
@@ -258,6 +287,10 @@ impl ContractGraph {
         };
         let mut out = EventHops::default();
         for channel in channels {
+            if std::time::Instant::now() >= deadline {
+                out.not_traced.insert(channel.clone());
+                continue;
+            }
             for (producer, direction, kind) in [
                 (false, FlowDirection::Forward, FlowStepKind::Consume),
                 (true, FlowDirection::Reverse, FlowStepKind::Produce),
@@ -289,7 +322,7 @@ impl ContractGraph {
                     &|_| false,
                 );
                 if trace.capped || trace.entries_more > 0 || !trace.limits.is_empty() {
-                    out.bounded += 1;
+                    out.bounded.insert(channel.clone());
                 }
                 for hop in &trace.hops {
                     let entry = hop.steps.iter().find(|s| {
