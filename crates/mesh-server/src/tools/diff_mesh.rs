@@ -53,7 +53,7 @@ pub struct DiffMeshTool;
 
 impl McpTool for DiffMeshTool {
     const NAME: &'static str = "diff_mesh";
-    const DESCRIPTION: &'static str = "Contract-level diff of the working tree (uncommitted edits and untracked files included) against a Git base, per configured root: declarations added, removed or with a changed signature, gRPC services and RPCs, HTTP routes, event producers and consumers per topic, imports and RPC calls; then, from the live graph, the callers and dependents of every removed or changed symbol and RPC (path:line, heuristic or ambiguous rows marked) and the .proto wire-format check of every changed .proto. This is the tool for 'what does my branch change in the mesh / what will this change break'. Body-only edits are counted, never listed. The time budget is about 20 s, checked between files: files, .proto and elements it does not reach are counted and named, never dropped. DO NOT USE to trace one known symbol, RPC or topic (use find_dependents, analyze_grpc or analyze_impact). DO NOT pass a file path or a `--option` as `base`.";
+    const DESCRIPTION: &'static str = "Contract-level diff of the working tree (uncommitted edits and untracked files included) against a Git base, per configured root: declarations added, removed or with a changed signature, gRPC services and RPCs, HTTP routes, event producers and consumers per topic, imports and RPC calls; per broker-qualified channel (kafka:orders), producers and consumers added or removed, renamed channels, producer-consumer links and one-hop event chains cut or created by the branch; then, from the live graph, the callers and dependents of every removed or changed symbol and RPC (path:line, heuristic or ambiguous rows marked) and the .proto wire-format check of every changed .proto. This is the tool for 'what does my branch change in the mesh / what will this change break'. Body-only edits are counted, never listed. The time budget is about 20 s, checked between files: files, .proto and elements it does not reach are counted and named, never dropped. DO NOT USE to trace one known symbol, RPC or topic (use find_dependents, analyze_grpc or analyze_impact). DO NOT pass a file path or a `--option` as `base`.";
     type Args = DiffMeshArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {
@@ -1133,33 +1133,36 @@ fn run_with(
             });
         }
         let mut skipped = None;
-        let mut extract = |side: Side, label: &str| -> (BTreeMap<Fact, FactVal>, Option<FileIndex>) {
-            match side {
-                Side::Absent => (BTreeMap::new(), None),
-                Side::Skipped(why) => {
-                    skipped.get_or_insert_with(|| format!("{label}: {why}"));
-                    (BTreeMap::new(), None)
-                }
-                Side::Content(bytes) => match extractor.extract(&c.abs, &bytes, c.repo_id) {
-                    Ok(index) if index.parse_failed => {
-                        skipped.get_or_insert_with(|| format!("{label}: the parse failed"));
-                        (BTreeMap::new(), None)
-                    }
-                    Ok(index) => (facts_of(&index, &resolver, c.repo_id), Some(index)),
-                    Err(why) => {
+        let mut extract =
+            |side: Side, label: &str| -> (BTreeMap<Fact, FactVal>, Option<FileIndex>) {
+                match side {
+                    Side::Absent => (BTreeMap::new(), None),
+                    Side::Skipped(why) => {
                         skipped.get_or_insert_with(|| format!("{label}: {why}"));
                         (BTreeMap::new(), None)
                     }
-                },
-            }
-        };
+                    Side::Content(bytes) => match extractor.extract(&c.abs, &bytes, c.repo_id) {
+                        Ok(index) if index.parse_failed => {
+                            skipped.get_or_insert_with(|| format!("{label}: the parse failed"));
+                            (BTreeMap::new(), None)
+                        }
+                        Ok(index) => (facts_of(&index, &resolver, c.repo_id), Some(index)),
+                        Err(why) => {
+                            skipped.get_or_insert_with(|| format!("{label}: {why}"));
+                            (BTreeMap::new(), None)
+                        }
+                    },
+                }
+            };
         let (before, base_index) = extract(base_side, "base");
         let (after, current_index) = extract(current_side, "working tree");
         let changes = if skipped.is_some() {
             Vec::new()
         } else {
-            let has_sites =
-                |i: &Option<FileIndex>| i.as_ref().is_some_and(|i| !(i.producers.is_empty() && i.consumers.is_empty()));
+            let has_sites = |i: &Option<FileIndex>| {
+                i.as_ref()
+                    .is_some_and(|i| !(i.producers.is_empty() && i.consumers.is_empty()))
+            };
             events.relevant |= has_sites(&base_index) || has_sites(&current_index);
             events.files.push(c.abs.clone());
             events.base.extend(base_index);

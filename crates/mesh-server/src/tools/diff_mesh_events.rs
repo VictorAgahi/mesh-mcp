@@ -105,7 +105,14 @@ pub(super) fn event_report(
     let paths: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
     let base_sites = base.event_sites_in(&paths);
     let head_sites = live.event_sites_in(&paths);
-    let id = |s: &EventSite| (s.channel.clone(), s.producer, s.file.clone(), s.owner.clone());
+    let id = |s: &EventSite| {
+        (
+            s.channel.clone(),
+            s.producer,
+            s.file.clone(),
+            s.owner.clone(),
+        )
+    };
     let bmap: BTreeMap<_, &EventSite> = base_sites.iter().map(|s| (id(s), s)).collect();
     let hmap: BTreeMap<_, &EventSite> = head_sites.iter().map(|s| (id(s), s)).collect();
 
@@ -325,9 +332,8 @@ pub(super) fn event_report(
     for (ch, d) in &channels {
         let mut item = format!("\n#### {}", shown(ch));
         match d.link {
-            Some(false) => item.push_str(
-                " — link cut: no producer on this channel reaches a consumer any more",
-            ),
+            Some(false) => item
+                .push_str(" — link cut: no producer on this channel reaches a consumer any more"),
             Some(true) => item.push_str(" — link created: a producer now reaches a consumer"),
             None => {}
         }
@@ -637,15 +643,21 @@ export class ReportListener {
             "{ev}"
         );
         assert!(
-            ev.contains("#### `inproc:order.audited` — link created: a producer now reaches a consumer\n"),
+            ev.contains(
+                "#### `inproc:order.audited` — link created: a producer now reaches a consumer\n"
+            ),
             "{ev}"
         );
         assert!(
-            ev.contains("- + consumer of `inproc:order.audited` in `onAudit` (`src/audit.listener.ts:7`)"),
+            ev.contains(
+                "- + consumer of `inproc:order.audited` in `onAudit` (`src/audit.listener.ts:7`)"
+            ),
             "{ev}"
         );
         assert!(
-            ev.contains("- + producer of `inproc:order.audited` in `create` (`src/order.service.ts:"),
+            ev.contains(
+                "- + producer of `inproc:order.audited` in `create` (`src/order.service.ts:"
+            ),
             "{ev}"
         );
         // `order.created` keeps its sites: not listed.
@@ -695,8 +707,14 @@ export class ReportListener {
         );
         let ev = diff(&repo);
         let ev = events(&ev);
-        assert!(ev.contains(" 0 renamed; producer-consumer links cut 1, created 0;"), "{ev}");
-        assert!(ev.contains("#### `inproc:invoice.issued` — link cut"), "{ev}");
+        assert!(
+            ev.contains(" 0 renamed; producer-consumer links cut 1, created 0;"),
+            "{ev}"
+        );
+        assert!(
+            ev.contains("#### `inproc:invoice.issued` — link cut"),
+            "{ev}"
+        );
         // The hop now publishes on the new channel.
         assert!(
             ev.contains("#### Chain hops cut\n- consumer of `inproc:order.created` in `onOrderCreated` (`src/invoice.listener.ts`) → publishes `inproc:invoice.issued` in `issue` (`src/invoice.service.ts`) _(exact)_"),
@@ -776,12 +794,52 @@ export class ReportListener {
             ev.contains("#### `inproc:orders`\n- - consumer of `inproc:orders` in `onOrders` (`src/orders.listener.ts, base L7`)\n"),
             "{ev}"
         );
-        assert!(ev.contains("producer-consumer links cut 0, created 0;"), "{ev}");
+        assert!(
+            ev.contains("producer-consumer links cut 0, created 0;"),
+            "{ev}"
+        );
         assert!(!ev.contains("kafka:orders"), "{ev}");
         // Every channel row carries its broker.
-        for line in ev.lines().filter(|l| l.starts_with("- + ") || l.starts_with("- - ")) {
-            assert!(line.contains("`inproc:") || line.contains("`kafka:"), "{line}");
+        for line in ev
+            .lines()
+            .filter(|l| l.starts_with("- + ") || l.starts_with("- - "))
+        {
+            assert!(
+                line.contains("`inproc:") || line.contains("`kafka:"),
+                "{line}"
+            );
         }
+    }
+
+    /// A rename is per broker: the Kafka sites of `orders` move to `orders2` while a RabbitMQ
+    /// queue keeps the name `orders`. The Kafka channel is gone (the RabbitMQ site is not on it),
+    /// so it is a rename, and the RabbitMQ channel is untouched.
+    #[test]
+    fn a_rename_on_one_broker_ignores_the_same_name_on_another() {
+        let kafka_producer = |t: &str| {
+            format!("import {{ Producer }} from 'kafkajs';\n\nexport class OrderEvents {{\n  constructor(private readonly producer: Producer) {{}}\n\n  async placed(id: string) {{\n    await this.producer.send({{ topic: '{t}', messages: [{{ value: id }}] }});\n  }}\n}}\n")
+        };
+        let kafka_consumer = |t: &str| {
+            format!("import {{ Consumer }} from 'kafkajs';\n\nexport class OrderConsumer {{\n  constructor(private readonly consumer: Consumer) {{}}\n\n  async start() {{\n    await this.consumer.subscribe({{ topic: '{t}' }});\n  }}\n}}\n")
+        };
+        let repo = TempRepo::new();
+        repo.write("src/kafka.producer.ts", &kafka_producer("orders"));
+        repo.write("src/kafka.consumer.ts", &kafka_consumer("orders"));
+        repo.write(
+            "src/rabbit.ts",
+            "import amqp from 'amqplib';\n\nexport class Rabbit {\n  async send(ch: amqp.Channel, id: string) {\n    ch.sendToQueue('orders', Buffer.from(id));\n  }\n}\n",
+        );
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write("src/kafka.producer.ts", &kafka_producer("orders2"));
+        repo.write("src/kafka.consumer.ts", &kafka_consumer("orders2"));
+        let text = diff(&repo);
+        let ev = events(&text);
+        assert!(
+            ev.contains("- renamed `kafka:orders` → `kafka:orders2`: the same 2 site(s)"),
+            "{ev}"
+        );
+        assert!(!ev.contains("rabbitmq:"), "{ev}");
     }
 
     /// Secrets: a key-shaped topic name (built at run time, never written in the source) and a
@@ -848,8 +906,12 @@ export class ReportListener {
                     _meta: None,
                 };
                 let state = state(&root);
-                let a = run_with(&args, &state, &runner, Limits::DEFAULT).expect("ok").text;
-                let b = run_with(&args, &state, &runner, Limits::DEFAULT).expect("ok").text;
+                let a = run_with(&args, &state, &runner, Limits::DEFAULT)
+                    .expect("ok")
+                    .text;
+                let b = run_with(&args, &state, &runner, Limits::DEFAULT)
+                    .expect("ok")
+                    .text;
                 assert_eq!(a, b);
                 a
             })
@@ -859,7 +921,10 @@ export class ReportListener {
         assert!(text.len() <= 48 * 1024, "{}", text.len());
         let ev = events(&text);
         assert!(ev.contains("more channel(s) not checked for links and chain hops: cap (200 per call); narrow `scope`."), "{ev}");
-        assert!(ev.contains("more event item(s) not shown to stay under the 48 KB cap; narrow `scope`"), "{ev}");
+        assert!(
+            ev.contains("more event item(s) not shown to stay under the 48 KB cap; narrow `scope`"),
+            "{ev}"
+        );
         drop(repo);
     }
 }

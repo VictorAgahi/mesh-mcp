@@ -149,7 +149,10 @@ impl ContractGraph {
         if ids.is_empty() {
             return out;
         }
-        for (producer, map) in [(true, &self.topic_producers), (false, &self.topic_consumers)] {
+        for (producer, map) in [
+            (true, &self.topic_producers),
+            (false, &self.topic_consumers),
+        ] {
             for (key, sites) in map {
                 for id in sites.iter().filter(|id| ids.contains(id)) {
                     let Some(node) = self.get_node(*id) else {
@@ -211,15 +214,18 @@ impl ContractGraph {
     /// different known brokers (the rule of `FlowIndex::crosses_brokers`).
     pub fn channel_linked(&self, channel: &EventChannel) -> bool {
         let consumers = self.channel_masks(channel, false);
-        self.channel_masks(channel, true).iter().any(|p| {
-            consumers
-                .iter()
-                .any(|c| *p == 0 || *c == 0 || p & c != 0)
-        })
+        self.channel_masks(channel, true)
+            .iter()
+            .any(|p| consumers.iter().any(|c| *p == 0 || *c == 0 || p & c != 0))
     }
 
     /// The channels `node` publishes on (`producer`) or consumes from, through its edges.
-    fn site_channels(&self, idx: &FlowIndex<'_>, node: &ContractNode, producer: bool) -> Vec<EventChannel> {
+    fn site_channels(
+        &self,
+        idx: &FlowIndex<'_>,
+        node: &ContractNode,
+        producer: bool,
+    ) -> Vec<EventChannel> {
         let hubs = if producer {
             idx.produces.get(&node.id)
         } else {
