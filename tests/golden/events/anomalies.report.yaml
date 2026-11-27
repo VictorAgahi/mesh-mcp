@@ -86,7 +86,7 @@ corpora:
   - corpus: anomalies
     root: examples/eda/anomalies
     config: mesh-mcp.toml
-    published_never_consumed: ["catalog.refreshed [kafka]", "payments [kafka]"]
+    published_never_consumed: ["catalog.refreshed [kafka]", "firmware.unmatched [nats]", "payments [kafka]"]
     consumed_never_published: ["legacy.imported [kafka]", "payments [rabbitmq]"]
     unresolved:
       - {topic: "${inbound_topic} [kafka]", missing: producer, reason: placeholder}
@@ -108,6 +108,10 @@ corpora:
       - line.c
       - sensors.temp
       - sensors.*
+      # one function publishes both devices.* subjects: both are heard by the devices.* subscriber
+      - devices.created
+      - devices.deleted
+      - devices.*
       - ${shared_topic}
       - fan.narrow
       - small.t0

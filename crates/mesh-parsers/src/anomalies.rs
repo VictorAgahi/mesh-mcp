@@ -544,4 +544,57 @@ mod tests {
         }
         assert_eq!(pages, 5);
     }
+
+    #[test]
+    fn a_capped_cycle_search_says_incomplete_not_zero() {
+        use mesh_core::{CompactStr, NodeKind};
+        let node = ContractNode {
+            id: 1,
+            name: CompactStr::new("site"),
+            kind: NodeKind::ServiceClass,
+            file_path: std::sync::Arc::from(std::path::Path::new("/w/src/z.ts")),
+            line_start: 3,
+            line_end: 3,
+            package: CompactStr::new("app"),
+            repo_id: 0,
+            signature: None,
+            docstring: None,
+        };
+        let report = EventAnomalies {
+            cycle_sites_walked: 20_000,
+            cycle_sites_total: 25_000,
+            cycle_first_unsearched: Some(&node),
+            ..EventAnomalies::default()
+        };
+        let view = AnomalyView {
+            show: AnomalyShow::ALL,
+            limit: 25,
+            offset: 0,
+            scope: None,
+            coverage: None,
+            roots: 1,
+        };
+        let text =
+            MarkdownFormatter::format_event_anomalies(&report, &[PathBuf::from("/w")], &view);
+        assert!(
+            text.contains("| cycles | 0+ (search incomplete) |"),
+            "{text}"
+        );
+        assert!(
+            text.contains("20000 of 25000 consumer sites were walked"),
+            "{text}"
+        );
+        assert!(
+            text.contains("from `src/z.ts:3` on were not searched"),
+            "{text}"
+        );
+        assert!(!text.contains("of more"), "{text}");
+        // Complete search: a plain count and no such note.
+        let done = EventAnomalies::default();
+        let text = MarkdownFormatter::format_event_anomalies(&done, &[PathBuf::from("/w")], &view);
+        assert!(
+            text.contains("| cycles | 0 |") && !text.contains("incomplete"),
+            "{text}"
+        );
+    }
 }

@@ -415,31 +415,58 @@ async fn a_380_kb_file_with_thousands_of_topics_stays_bounded_and_stable() {
         "{a}"
     );
     assert!(a.contains("Next page: `offset: 25`"));
-    assert_eq!(sections(&a)["published_never_consumed"].len(), 25);
+    let rows = &sections(&a)["published_never_consumed"];
+    assert_eq!(rows.len(), 25);
+    // Digit-heavy names print as written: 25 distinct rows, not 25 copies of a redaction.
+    let topics: BTreeSet<String> = rows.iter().map(|r| topic_of(r)).collect();
+    assert_eq!(topics.len(), 25, "{rows:?}");
+    assert!(
+        topics.iter().all(|t| t.starts_with("bulk.t0")),
+        "{topics:?}"
+    );
+    assert!(!a.contains("REDACTED"), "{a}");
     assert_eq!(sections(&a)["fan_out_producers"].len(), 1);
 }
 
-#[tokio::test]
-async fn a_cyclic_workspace_of_files_terminates() {
-    // 40 files, each consuming `ring.i` and publishing `ring.(i+1) % 40` from the same function.
-    let n = 40;
+/// `n` files in a ring: file `i` subscribes to `ring.t<i>` and calls `pub<i+1>` of the next
+/// file, which publishes `ring.t<i+1>`.
+fn ring_workspace(n: usize) -> (tempfile::TempDir, Arc<AppState>) {
     let files: Vec<(String, String)> = (0..n)
         .map(|i| {
+            let next = (i + 1) % n;
             let body = format!(
-                "{KAFKA}export async function hop{i}(): Promise<void> {{\n  await consumer.subscribe({{ topic: 'ring.{i}' }});\n  await producer.send({{ topic: 'ring.{}', messages: [] }});\n}}\n",
-                (i + 1) % n
+                "import {{ pub{next} }} from './hop{next}';\n{KAFKA}export async function hop{i}(): Promise<void> {{\n  await consumer.subscribe({{ topic: 'ring.t{i}' }});\n  await pub{next}();\n}}\nexport async function pub{i}(): Promise<void> {{\n  await producer.send({{ topic: 'ring.t{i}', messages: [] }});\n}}\n"
             );
             (format!("src/hop{i}.ts"), body)
         })
         .collect();
     let refs: Vec<(&str, String)> = files.iter().map(|(p, b)| (p.as_str(), b.clone())).collect();
-    let (_tmp, state) = workspace(&refs);
-    let text = report(&state, json!({ "classes": ["cycles"] })).await;
-    assert_eq!(count_in_table(&text, "cycles"), 1, "{text}");
-    assert!(
-        text.contains(&format!("loop of {n} topics")) || text.contains("-> `ring."),
-        "{text}"
-    );
+    workspace(&refs)
+}
+
+#[tokio::test]
+async fn a_ring_of_files_is_one_bounded_cycle_row_at_any_size() {
+    for n in [40, 300, 3_000] {
+        let (_tmp, state) = ring_workspace(n);
+        let text = report(&state, json!({})).await;
+        assert!(text.len() <= 48 * 1024, "{n}: {} bytes", text.len());
+        assert_eq!(count_in_table(&text, "cycles"), 1, "{n}");
+        // The row is there (a row too long for the page used to be dropped, with a next-page
+        // pointer that did not move), bounded, and says what it left out.
+        let rows = sections(&text);
+        assert_eq!(rows["cycles"].len(), 1, "{n}:\n{text}");
+        assert!(!text.contains("Next page"), "{n}:\n{text}");
+        assert!(
+            rows["cycles"][0].contains(&format!("+{} more topics", n - 6)),
+            "{n}"
+        );
+        assert!(text.contains(&format!("+{} more hops", n - 4)), "{n}");
+        assert!(
+            rows["cycles"][0].len() < 1_600,
+            "{n}: {}",
+            rows["cycles"][0].len()
+        );
+    }
 }
 
 /// Credential-shaped values are built here, never written as literals: a key-shaped literal in
@@ -488,6 +515,52 @@ export async function leak(): Promise<void> {{\n\
         text.contains("[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]"),
         "{text}"
     );
+}
+
+#[tokio::test]
+async fn a_decorator_only_python_task_is_heuristic_and_the_footer_says_why() {
+    // A Locust load test: `@task` is read as a Celery consumer, with no broker.
+    let locust = "from locust import HttpUser, task\n\nclass Shopper(HttpUser):\n    @task(1)\n    def browse_product(self):\n        self.client.get('/')\n".to_string();
+    let (_tmp, state) = workspace(&[("locustfile.py", locust)]);
+    let text = report(&state, json!({})).await;
+    let rows = sections(&text);
+    let row = &rows["consumed_never_published"][0];
+    assert!(
+        row.starts_with("`browse_product` [broker unknown] heuristic"),
+        "{text}"
+    );
+    assert!(!text.contains("exact"), "{text}");
+    assert!(
+        text.contains("1 row(s) rest on sites whose broker is unknown"),
+        "{text}"
+    );
+    assert!(text.contains("verify each with `rg`"), "{text}");
+    // A report with only known brokers makes no such claim.
+    let state = state_in(&repo("examples/eda/anomalies"), None);
+    let clean = report(&state, json!({})).await;
+    assert!(!clean.contains("rest on sites whose broker"), "{clean}");
+}
+
+#[tokio::test]
+async fn go_testdata_and_pytest_conftest_are_test_files() {
+    let prod = format!("{KAFKA}export async function emit(): Promise<void> {{\n  await producer.send({{ topic: 'catalog.sync', messages: [] }});\n}}\n");
+    let listener = format!("{KAFKA}export async function listen(): Promise<void> {{\n  await consumer.subscribe({{ topic: 'catalog.sync' }});\n}}\n");
+    let conftest = "from celery import Celery\napp = Celery()\n\n@app.task\ndef conftest_only_task():\n    pass\n".to_string();
+    let (_tmp, state) = workspace(&[
+        ("src/prod.ts", prod),
+        ("pkg/testdata/listener.ts", listener),
+        ("svc/conftest.py", conftest),
+    ]);
+    let text = report(&state, json!({})).await;
+    let rows = sections(&text);
+    assert_eq!(
+        topic_of(&rows["test_only_consumers"][0]),
+        "catalog.sync [kafka]",
+        "{text}"
+    );
+    // A test fixture's task is no production consumer: no "consumed, never published" row.
+    assert!(!text.contains("conftest_only_task"), "{text}");
+    assert!(!rows.contains_key("consumed_never_published"), "{text}");
 }
 
 #[tokio::test]
