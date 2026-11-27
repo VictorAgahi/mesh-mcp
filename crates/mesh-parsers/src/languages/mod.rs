@@ -361,7 +361,7 @@ impl FileIndex {
     }
 
     /// Removes every placeholder default that is not a plain topic name from the topics, node
-    /// names and signatures of this file (`@KafkaListener(topics = "${k:postgres://u:pw@h/x}")`
+    /// names, signatures and payload-site topics of this file (`@KafkaListener(topics = "${k:postgres://u:pw@h/x}")`
     /// becomes `${k}`): a credential written as a default must reach neither the graph, a tool
     /// answer nor the parse cache.
     pub fn mask_placeholder_defaults(&mut self) {
@@ -383,6 +383,22 @@ impl FileIndex {
             if let Some(sig) = node.signature.as_deref().and_then(masked) {
                 node.signature = Some(CompactStr::new(sig));
             }
+        }
+        // The literal topic argument of a payload site (9.0 T11): its defaults stripped, and
+        // dropped when it still is not a printable name (it only tells two sites of one node
+        // apart, so nothing is lost but that hint).
+        for site in &mut self.payload.sites {
+            let Some(topic) = site.topic.as_deref() else {
+                continue;
+            };
+            // Every default is stripped (not only the non-name ones): the hint needs the key only.
+            let topic = mesh_core::config_values::strip_placeholder_defaults(topic).into_owned();
+            let probe: String = topic
+                .chars()
+                .filter(|c| !matches!(c, '$' | '{' | '}'))
+                .collect();
+            site.topic = (probe.is_empty() || mesh_core::member_consts::name_is_printable(&probe))
+                .then(|| CompactStr::new(topic));
         }
     }
 

@@ -708,3 +708,85 @@ async fn an_incremental_reload_updates_the_payload_rows() {
         "{gone}"
     );
 }
+
+// ---- Review round 2: placeholder defaults in payload-site topics.
+
+#[tokio::test]
+async fn a_placeholder_default_never_reaches_payload_facts_or_the_cache() {
+    // Built at runtime: no credential-shaped literal in the source.
+    let ts_canary = ["tspw", "-", "PAYDEF1"].concat();
+    let java_canary = ["jvpw", "-", "PAYDEF2"].concat();
+    let token_topic = ["tok", "_", "PAYDEF3", "abc123def456ghi789jkl"].concat();
+    // A credential-shaped default: masked everywhere in the file index. A name-shaped default
+    // (`tspw-PAYDEF1`) may stay in a TypeScript node name by the T6 rule, never in a payload fact.
+    let url = ["postgres", "://u:pw@h/", "PAYDEFURL"].concat();
+    let ts = format!(
+        "{NEST}interface Ev {{ id: string }}\n@Controller()\nexport class C {{\n  constructor(private readonly client: ClientProxy) {{}}\n  @EventPattern('${{app.url:{url}}}')\n  onUrl(@Payload() e: Ev) {{\n    return e;\n  }}\n  @EventPattern('${{app.absent:{ts_canary}}}')\n  on(@Payload() e: Ev) {{\n    this.client.emit('${{app.out:{ts_canary}}}', e);\n    this.client.emit('{token_topic}', e);\n  }}\n}}\n"
+    );
+    let java = format!(
+        "package p;\nimport org.springframework.amqp.rabbit.annotation.RabbitListener;\nimport org.springframework.kafka.annotation.KafkaListener;\nimport org.springframework.kafka.core.KafkaTemplate;\npublic class C {{\n    private KafkaTemplate<String, Ev> kafkaTemplate;\n    @RabbitListener(queues = \"${{app.absent6:{java_canary}}}\") public void r(Ev m) {{}}\n    @KafkaListener(topics = \"${{app.absent7:{java_canary}}}\") public void k(Ev m) {{}}\n    @KafkaListener(topics = \"${{app.url7:{url}}}\") public void u(Ev m) {{}}\n    void go(Ev e) {{ kafkaTemplate.send(\"${{app.out7:{java_canary}}}\", e); }}\n}}\nclass Ev {{ String id; }}\n"
+    );
+    let canaries = [
+        ts_canary.as_str(),
+        java_canary.as_str(),
+        "PAYDEF3",
+        "PAYDEFURL",
+    ];
+    for (path, code) in [("src/c.ts", &ts), ("src/main/java/p/C.java", &java)] {
+        let fi = mesh_parsers::PolyglotIndexer::extract(Path::new(path), code, 0);
+        assert!(!fi.parse_failed, "{path}");
+        assert!(
+            !fi.payload.sites.is_empty(),
+            "{path}: payload sites recorded"
+        );
+        assert!(!format!("{fi:?}").contains("PAYDEFURL"), "{path}: {fi:?}");
+        let dump = format!("{:?}", fi.payload);
+        for c in canaries {
+            assert!(
+                !dump.contains(c),
+                "{c} reached the file index of {path}: {dump}"
+            );
+        }
+        // The placeholder stays a visible `${key}` hint.
+        assert!(
+            fi.payload
+                .sites
+                .iter()
+                .any(|s| s.topic.as_deref().is_some_and(|t| t.starts_with("${app."))),
+            "{path}: {:?}",
+            fi.payload.sites
+        );
+    }
+    // Nor in the parse cache (database, -wal, -shm): the canaries no rule lets through anywhere
+    // (a name-shaped default is a TypeScript or `@KafkaListener` node name by the T6 rule, checked above to be
+    // absent from the payload facts, which are serialized with the same record).
+    // shortcut: only the credential-shaped default is checked in the cache; a token-shaped literal
+    // topic (`tok_...`) is still a TypeScript call-site node name there (pre-existing, outside the
+    // payload facts), upgrade when that extractor gates literal topics.
+    let canaries = ["PAYDEFURL"];
+    let (tmp, _state) = workspace(&[
+        ("src/c.ts", ts.clone()),
+        ("src/main/java/p/C.java", java.clone()),
+    ]);
+    let cache_dir = tempfile::tempdir().expect("tempdir");
+    let cache = PersistentIndexCache::open(cache_dir.path().join("index-cache.db"), u64::MAX)
+        .expect("cache");
+    let _ = state_in(tmp.path(), Some(&cache));
+    let _ = state_in(tmp.path(), Some(&cache));
+    drop(cache);
+    for entry in std::fs::read_dir(cache_dir.path()).expect("dir") {
+        let path = entry.expect("entry").path();
+        let bytes = std::fs::read(&path).expect("read");
+        let text = String::from_utf8_lossy(&bytes);
+        for c in canaries {
+            if let Some(i) = text.find(c) {
+                let lo = text[..i]
+                    .char_indices()
+                    .rev()
+                    .nth(200)
+                    .map_or(0, |(j, _)| j);
+                panic!("{c} in {}: {}", path.display(), &text[lo..i + c.len()]);
+            }
+        }
+    }
+}
