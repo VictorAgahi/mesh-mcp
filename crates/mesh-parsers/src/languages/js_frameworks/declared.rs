@@ -8,7 +8,7 @@
 //! a name (a parameter, a lookup table, a refused secret-shaped value) yields no producer and
 //! is counted, never dropped silently.
 
-use super::scope::{dotted, is_shadowed, Names};
+use super::scope::{is_shadowed, Names};
 use mesh_core::ProducerCallConfig;
 use tree_sitter::Node;
 
@@ -37,17 +37,71 @@ pub(crate) struct Declared {
     pub capped: bool,
 }
 
-/// Whether `name` may become a topic name (commandment 5): a placeholder (its default is masked
-/// where the file is folded), or a name that is no token, URL or password.
+/// Whether `name` may become a topic name (commandment 5): a name that is no token, URL or
+/// password, or a placeholder whose every default is a name and whose key is not a credential's
+/// (`${DB_PASSWORD:hunter2}` and `${TOPIC:hunter2-prod}` are refused, `${TOPIC:orders}` is kept).
+/// The shared fold-time masking only drops a default that is not topic-shaped, which a short
+/// password is; this site must not rely on it.
 fn name_may_be_recorded(name: &str) -> bool {
     if name.contains("${") {
-        return true;
+        return placeholders_are_safe(name);
     }
     if mesh_core::is_member_ref(name) {
         // The member's own name is what is judged; the value is not known here.
         return mesh_core::member_consts::constant_is_a_name(name, "name");
     }
     mesh_core::member_consts::constant_is_a_name("", name)
+}
+
+fn placeholders_are_safe(name: &str) -> bool {
+    let mut rest = name;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            return false;
+        };
+        let inner = &after[..end];
+        if inner.contains("${") {
+            return false;
+        }
+        if let Some((key, default)) = inner.split_once(':') {
+            let key = key.replace(['.', '-'], "_");
+            if mesh_core::member_consts::member_is_credential_named(&key)
+                || !mesh_core::member_consts::constant_is_a_name("", default)
+            {
+                return false;
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    true
+}
+
+/// The dotted name of a receiver, read through the wrappers that do not change it
+/// (`(X as any)`, `this.jobs!`): `None` for anything else (a call, an index).
+fn receiver_path(node: Node, source: &[u8]) -> Option<String> {
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = node;
+    for _ in 0..=crate::guard::AstGuard::MAX_NESTING_DEPTH {
+        current = super::super::typescript::TypeScriptExtractor::peel_wrappers(current);
+        match current.kind() {
+            "identifier" | "this" => {
+                segments.push(current.utf8_text(source).ok()?.to_string());
+                segments.reverse();
+                return Some(segments.join("."));
+            }
+            "member_expression" => {
+                let property = current.child_by_field_name("property")?;
+                if property.kind() != "property_identifier" {
+                    return None;
+                }
+                segments.push(property.utf8_text(source).ok()?.to_string());
+                current = current.child_by_field_name("object")?;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// `receiver` ends with the declared qualifier on a segment boundary.
@@ -75,7 +129,10 @@ pub(crate) fn collect(
         if node.kind() != "call_expression" {
             continue;
         }
-        let Some(function) = node.child_by_field_name("function") else {
+        let Some(function) = node
+            .child_by_field_name("function")
+            .map(super::super::typescript::TypeScriptExtractor::peel_wrappers)
+        else {
             continue;
         };
         let (method, receiver) = match function.kind() {
@@ -86,7 +143,7 @@ pub(crate) fn collect(
                     .and_then(|p| p.utf8_text(source).ok()),
                 function
                     .child_by_field_name("object")
-                    .and_then(|o| dotted(o, source)),
+                    .and_then(|o| receiver_path(o, source)),
             ),
             _ => continue,
         };
@@ -97,6 +154,12 @@ pub(crate) fn collect(
             // first segment of the declared receiver.
             let hideable = match (qualifier, receiver.as_deref()) {
                 (Some(q), Some(r)) if receiver_matches(r, q) => q.split('.').next(),
+                // A receiver that is a call, an index or another expression cannot be compared
+                // with the declared one: counted, not guessed.
+                (Some(_), None) => {
+                    out.unread += 1;
+                    continue;
+                }
                 (Some(_), _) => continue,
                 (None, _) if bare => Some(method),
                 (None, _) => None,

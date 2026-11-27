@@ -807,9 +807,23 @@ callee = "streamBus.publish"        # no keys: argument `arg` (default 0) is the
   There is no `exact` setting. Brokers never join: a declared producer has no broker, so the
   graph links it to a consumer by name only.
 - What is not read is counted, never dropped: a value that is not a name (a parameter, `TABLE[kind]`,
-  an argument that is no object literal) and a value refused as secret-shaped (section 3.8 rules, plus a
-  member named like a credential) add to `IndexHealth::declared_call_sites_unread`, which `doctor`
-  prints. It is not a claim that no producer exists. A key an object does not carry is nothing.
+  an argument that is no object literal), a receiver that is a call or an index and so cannot be
+  compared with the declared one (`getOutbox().createJob(...)`, an angle-bracket cast), and a value
+  refused as secret-shaped add to `IndexHealth::declared_call_sites_unread`, which `doctor` prints.
+  `event_anomalies` (its Coverage line) and `analyze_impact` (under a "No producer statically
+  resolved" answer) say so too, only when the count or a file cap is non-zero: "N declared producer
+  call site(s) could not be read statically ...: a missing producer may be one of them". It is not a
+  claim that no producer exists. A key an object does not carry is nothing. Refused as secret-shaped:
+  a literal or constant that is not a name (section 3.8 rules), a member named like a credential
+  (`API_KEY`), and a placeholder whose KEY is credential-named (`${DB_PASSWORD:x}`, whatever the
+  default) or whose DEFAULT is not a name (`${TOPIC:hunter2-prod}`); `${TOPIC:orders}` and `${TOPIC}`
+  are kept. This judgement is made at the declared site itself: the shared fold-time masking only
+  drops a default that is not topic-shaped, and a short password is.
+- A receiver is read through `as`, `!`, `satisfies` and parentheses (`(JobsOutbox as any).createJob`,
+  `this.jobs!.enqueue`), and so is the callee itself (`(JobsOutbox.createJob as any)(...)`).
+- A bare enum member as a topic key (`type: K.ONE`) becomes the generic topic `one`, so it can join
+  any other `X.ONE` of the workspace (the section 3.8 rule: a member keeps its member key). Declare a
+  queue key, or write the value, where two enums share a member name and must stay apart.
 - Bounds: 64 declared entries (`doctor` warns on more), 2,000 sites per file
   (`IndexHealth::files_declared_capped`, `doctor` warns). A file that never writes the method name is
   not analysed. Test files are read like any other (their producers are hidden from tool answers

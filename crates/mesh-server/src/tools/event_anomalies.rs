@@ -124,6 +124,9 @@ impl McpTool for EventAnomaliesTool {
                 h.config_topics_unresolved
             ));
         }
+        if let Some(note) = h.declared_gap_note() {
+            coverage.push(note);
+        }
         let view = AnomalyView {
             show,
             limit: args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as usize,

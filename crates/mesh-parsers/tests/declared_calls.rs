@@ -136,6 +136,69 @@ fn a_receiver_qualifier_matches_on_a_segment_boundary() {
     );
     let fi = index_with(outbox(), "svc/q.ts", &code);
     assert_eq!(producers(&fi), vec![("JobType.A".to_string(), 3)]);
+    // `getOutbox()` is no name that can be compared with the declared receiver: counted.
+    assert_eq!(fi.declared_unread, 1);
+}
+
+#[test]
+fn a_receiver_wrapped_in_a_cast_a_non_null_or_parentheses_is_still_read() {
+    let calls = vec![
+        call("JobsOutbox.createJob", 0, &["type"], &[]),
+        call("jobs.enqueue", 0, &["type"], &[]),
+    ];
+    let code = "import { JobsOutbox } from './outbox';\n\
+                (JobsOutbox as any).createJob({ type: 'cast-job' });\n\
+                JobsOutbox!.createJob({ type: 'bang-job' });\n\
+                (this.deps.JobsOutbox!).createJob({ type: 'deep-job' });\n\
+                (JobsOutbox.createJob as any)({ type: 'callee-cast-job' });\n\
+                this.jobs!.enqueue({ type: 'field-job' });\n\
+                (<any>JobsOutbox).createJob({ type: 'angle-job' });\n\
+                other().createJob({ type: 'not-read' });\n";
+    let fi = index_with(calls, "svc/wrapped.ts", code);
+    let got: Vec<String> = producers(&fi).into_iter().map(|(t, _)| t).collect();
+    assert_eq!(
+        got,
+        vec![
+            "cast-job",
+            "bang-job",
+            "deep-job",
+            "callee-cast-job",
+            "field-job"
+        ]
+    );
+    // The call-expression receiver and the angle-bracket cast are counted, never guessed.
+    assert_eq!(fi.declared_unread, 2);
+}
+
+#[test]
+fn a_placeholder_default_is_kept_only_when_key_and_default_are_names() {
+    // Built at runtime: no key-shaped literal in the source of this file.
+    let weak = ["hunter", "2"].concat();
+    let weak_prod = ["hunter", "2-prod"].concat();
+    let code = format!(
+        "import {{ JobsOutbox }} from './outbox';\n\
+         JobsOutbox.createJob({{ type: process.env.DB_PASSWORD || '{weak}' }});\n\
+         JobsOutbox.createJob({{ type: process.env.TOPIC_X || '{weak_prod}' }});\n\
+         JobsOutbox.createJob({{ type: process.env.API_TOKEN ?? 'plain-topic' }});\n\
+         JobsOutbox.createJob({{ type: process.env.TOPIC_Y || 'orders' }});\n\
+         JobsOutbox.createJob({{ type: process.env.TOPIC_Z }});\n"
+    );
+    let fi = index_with(outbox(), "svc/ph.ts", &code);
+    assert_eq!(
+        producers(&fi),
+        vec![
+            ("${TOPIC_Y:orders}".to_string(), 5),
+            ("${TOPIC_Z}".to_string(), 6)
+        ]
+    );
+    assert_eq!(fi.declared_unread, 3);
+    let dump = format!("{fi:?}").to_ascii_lowercase();
+    for canary in [&weak, &weak_prod] {
+        assert!(
+            !dump.contains(canary.as_str()),
+            "{canary} reached the index"
+        );
+    }
 }
 
 #[test]

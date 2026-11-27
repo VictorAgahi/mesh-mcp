@@ -392,6 +392,18 @@ impl IndexHealth {
         self.declared_call_sites_unread += unread as usize;
     }
 
+    /// What a report that says "no producer" must add when declared producer calls could not be
+    /// read: `None` when none was cut or unreadable.
+    pub fn declared_gap_note(&self) -> Option<String> {
+        if self.declared_call_sites_unread == 0 && self.files_declared_capped == 0 {
+            return None;
+        }
+        Some(format!(
+            "{} declared producer call site(s) could not be read statically ({} file(s) cut by the per-file cap): a missing producer may be one of them",
+            self.declared_call_sites_unread, self.files_declared_capped
+        ))
+    }
+
     /// Whether the declared producer call cap dropped sites.
     #[inline]
     pub fn declared_truncated(&self) -> bool {
