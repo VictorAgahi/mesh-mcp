@@ -22,7 +22,7 @@ consumer in another service, and a context window filled with function bodies th
 read to find a signature.
 
 MeshMCP builds that cross-service map once, keeps it in memory, updates it as files change, and
-exposes it through eight MCP tools.
+exposes it through nine MCP tools.
 
 ---
 
@@ -47,7 +47,7 @@ exposes it through eight MCP tools.
 
 ---
 
-## The eight tools
+## The nine tools
 
 | Tool | Answers |
 | :--- | :--- |
@@ -59,6 +59,7 @@ exposes it through eight MCP tools.
 | `visualize_mesh` | Per-service topology as Mermaid, JSON or HTML, bounded in size, with zoom (a zoom also lists the service's HTTP routes in Mermaid). |
 | `diff_mesh` | What does my branch change in the mesh, and what will it break? Contract-level diff of the working tree against a Git base (declarations, RPCs, routes, topics, imports), the callers and dependents of what was removed or changed, and the wire-format check of every changed `.proto`. |
 | `trace_flow` | What does handling this event, route or handler trigger end to end, or what ends up publishing this event? One block per hop: entry site, each resolved call (callee declaration and call site `path:line`), the publish, then the next consumers; per-step and per-chain confidence, bounded and paged by hop. |
+| `event_anomalies` | Where does the event graph look wrong? Topics published but never consumed, consumed but never published, cycles (chains that loop back), abnormal fan-out and test-only consumers in one report; a placeholder, wildcard or dead-letter topic is listed as unresolved, never as an anomaly. |
 
 Arguments, output formats and error handling: [docs/mcp-tools.md](docs/mcp-tools.md).
 

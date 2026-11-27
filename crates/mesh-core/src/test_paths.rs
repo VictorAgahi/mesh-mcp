@@ -20,6 +20,8 @@ const TEST_DIRS: &[&str] = &[
     "testutils",
     "testing",
     "fixtures",
+    // Go: `testdata/` holds test inputs the toolchain never builds.
+    "testdata",
     "__test-utils__",
     "__test_utils__",
     "__testutils__",
@@ -45,6 +47,10 @@ pub fn is_test_path(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
+    // pytest's per-directory fixtures file.
+    if name.eq_ignore_ascii_case("conftest.py") {
+        return true;
+    }
     let stem = name.split('.').next().unwrap_or(name);
     // `foo.spec.ts`, `foo.test.tsx`, `foo.e2e-spec.ts`, `foo.int-test.js`
     let dotted = name.split('.').skip(1).any(|part| {
@@ -132,6 +138,10 @@ mod tests {
             "src/events/events.controller.test.stories.ts",
             "src/events/events.spec.helpers.ts",
             "src/events/events.e2e-spec.ts",
+            "svc/conftest.py",
+            "svc/tests_helpers/Conftest.py",
+            "pkg/testdata/orders.go",
+            "pkg/TestData/orders.go",
         ] {
             assert!(is_test_path(Path::new(p)), "{p}");
         }
@@ -170,6 +180,9 @@ mod tests {
             "src/events/events.controller.ts",
             "src/__generated__/schema.ts",
             "src/contest.config.ts",
+            "svc/conftest.pyc.md",
+            "svc/conftest_helpers.py",
+            "svc/testdata_loader.go",
         ] {
             assert!(!is_test_path(Path::new(p)), "{p}");
         }

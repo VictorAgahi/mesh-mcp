@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+mod anomalies;
 mod broker;
 mod calls;
 mod delta;
@@ -18,6 +19,11 @@ mod reconcile;
 mod render;
 mod resolve;
 
+pub use anomalies::{
+    hub_topic, AnomalySite, CycleEdge, CycleEntry, EventAnomalies, FanOutProducer, HubRef, Missing,
+    TopicEntry, UnresolvedEntry, UnresolvedReason, ANOMALY_FAN_OUT_CONSUMERS,
+    ANOMALY_FAN_OUT_TOPICS, ANOMALY_MAX_CYCLE_SITES,
+};
 pub use broker::{qualified_topic_key, split_qualified_topic_key, Broker};
 pub use calls::{
     CallFact, CallFacts, CallReceiver, CallStats, CallableFact, ImportFact, InjectionFact,
@@ -32,6 +38,8 @@ pub use flow::{
     DEFAULT_FAN_OUT, MAX_CALL_DEPTH, MAX_EVENT_DEPTH, MAX_FAN_OUT, MAX_FLOW_HOPS,
 };
 
+#[cfg(test)]
+mod anomalies_tests;
 #[cfg(test)]
 mod calls_langs_tests;
 #[cfg(test)]

@@ -1,0 +1,1 @@
+{ "name": "anomalies-fixture", "private": true, "dependencies": { "kafkajs": "2", "amqplib": "0.10", "nats": "2" } }

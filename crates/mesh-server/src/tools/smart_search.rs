@@ -178,7 +178,7 @@ fn folded(p: &Path) -> PathBuf {
 }
 
 /// `path.starts_with(prefix)` with the jail's case folding.
-fn starts_with_folded(path: &Path, prefix: &Path) -> bool {
+pub(crate) fn starts_with_folded(path: &Path, prefix: &Path) -> bool {
     folded(path).starts_with(folded(prefix))
 }
 
