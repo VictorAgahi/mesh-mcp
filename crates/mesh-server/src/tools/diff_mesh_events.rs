@@ -716,7 +716,10 @@ export class ReportListener {
             ev.contains("#### `inproc:invoice.issued` — link cut: no producer on this channel reaches a consumer any more\n- - consumer of `inproc:invoice.issued` in `onInvoice` (`src/report.listener.ts, base L7`)\n"),
             "{ev}"
         );
-        assert!(ev.contains("*Payload fields: not compared by this diff."), "{ev}");
+        assert!(
+            ev.contains("*Payload fields: not compared by this diff."),
+            "{ev}"
+        );
     }
 
     /// Added: a new channel with a new producer and a new consumer is a created link.

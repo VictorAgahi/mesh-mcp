@@ -1126,7 +1126,10 @@ mod tests {
         );
         assert!(!f.types[0].incomplete);
         assert!(f.types[1].incomplete, "extends: fields of A are not read");
-        assert_eq!(field_names(&f.types[2]), vec![("tags", Some("string[]"), false)]);
+        assert_eq!(
+            field_names(&f.types[2]),
+            vec![("tags", Some("string[]"), false)]
+        );
         assert_eq!(
             field_names(&f.types[3]),
             vec![("a", Some("string"), false), ("b", Some("number"), false)]

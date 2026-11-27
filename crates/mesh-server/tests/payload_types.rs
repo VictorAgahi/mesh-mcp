@@ -173,7 +173,11 @@ fn golden() -> Golden {
 async fn the_fixture_matches_the_hand_annotated_truth() {
     let g = golden();
     let state = state_in(&repo(&g.root), None);
-    let text = report(&state, json!({ "classes": ["payload_mismatch"], "limit": 100 })).await;
+    let text = report(
+        &state,
+        json!({ "classes": ["payload_mismatch"], "limit": 100 }),
+    )
+    .await;
     let got = mismatches(&text);
 
     let want_topics: BTreeSet<&str> = g.mismatches.iter().map(|r| r.topic.as_str()).collect();
@@ -181,10 +185,22 @@ async fn the_fixture_matches_the_hand_annotated_truth() {
     assert_eq!(got_topics, want_topics, "{text}");
     for w in &g.mismatches {
         let row = &got[&w.topic];
-        assert_eq!(row.consumer_only, w.consumer_only, "{}: consumer_only", w.topic);
-        assert_eq!(row.producer_only, w.producer_only, "{}: producer_only", w.topic);
+        assert_eq!(
+            row.consumer_only, w.consumer_only,
+            "{}: consumer_only",
+            w.topic
+        );
+        assert_eq!(
+            row.producer_only, w.producer_only,
+            "{}: producer_only",
+            w.topic
+        );
         assert_eq!(row.clashes, w.clashes, "{}: clashes", w.topic);
-        assert_eq!(row.names_differ, w.names_differ, "{}: names_differ", w.topic);
+        assert_eq!(
+            row.names_differ, w.names_differ,
+            "{}: names_differ",
+            w.topic
+        );
         // Every direction of the fixture's mismatches is compared.
         assert!(row.notes.is_empty(), "{}: {:?}", w.topic, row.notes);
     }
@@ -201,10 +217,14 @@ async fn the_fixture_matches_the_hand_annotated_truth() {
         )),
         "{summary}"
     );
-    assert!(summary.contains("Not compared is not \"no mismatch\""), "{summary}");
+    assert!(
+        summary.contains("Not compared is not \"no mismatch\""),
+        "{summary}"
+    );
     for decoy in &g.must_not_flag {
         assert!(
-            !got.keys().any(|t| t.split(" [").next() == Some(decoy.as_str())),
+            !got.keys()
+                .any(|t| t.split(" [").next() == Some(decoy.as_str())),
             "{decoy} flagged:\n{text}"
         );
     }
@@ -253,7 +273,11 @@ async fn the_report_is_identical_over_runs_and_index_caches() {
     let dir = repo("examples/eda/payload-types");
     let args = json!({ "classes": ["payload_mismatch"] });
     let plain = report(&state_in(&dir, None), args.clone()).await;
-    assert_eq!(plain, report(&state_in(&dir, None), args.clone()).await, "run 2");
+    assert_eq!(
+        plain,
+        report(&state_in(&dir, None), args.clone()).await,
+        "run 2"
+    );
     let tmp = tempfile::tempdir().expect("tempdir");
     let cache =
         PersistentIndexCache::open(tmp.path().join("index-cache.db"), u64::MAX).expect("cache");
@@ -298,7 +322,10 @@ fn consumer(topic: &str, ty: &str) -> String {
 async fn a_capped_field_list_is_said_not_compared() {
     let fields: String = (0..70).map(|i| format!("  f{i}: string;\n")).collect();
     let (_tmp, state) = workspace(&[
-        ("src/big.ts", format!("export interface Big {{\n{fields}}}\n")),
+        (
+            "src/big.ts",
+            format!("export interface Big {{\n{fields}}}\n"),
+        ),
         (
             "src/small.ts",
             "export interface Small {\n  f0: string;\n  zzz: string;\n}\n".to_string(),
@@ -369,7 +396,8 @@ async fn a_type_declared_twice_is_ambiguous_not_a_mismatch() {
     let text = report(&state, json!({ "classes": ["payload_mismatch"] })).await;
     assert!(mismatches(&text).is_empty(), "{text}");
     assert!(
-        payload_line(&text).contains("(0 name a type no indexed file declares, 1 a type several files declare)"),
+        payload_line(&text)
+            .contains("(0 name a type no indexed file declares, 1 a type several files declare)"),
         "{text}"
     );
 }
