@@ -153,35 +153,48 @@ above are read; constants are resolved within the file, not across packages.
 | Declarations | classes, functions (docstrings kept when bodies are stripped) |
 | Imports | `import` / `from ... import` |
 | gRPC | `*Servicer` servers, `*_pb2_grpc.*Stub(...)` clients |
-| Events | `confluent_kafka`, `kafka-python`, `aiokafka` producers and consumers; Celery tasks as queues, only in a file that imports Celery or an app from a `celery` / `tasks` module (below); module constants resolved; RabbitMQ (pika, aio-pika, kombu), Redis, NATS, SQS / SNS, Google Pub/Sub ([3.10](#310-python-brokers)); an environment variable read is a `${KEY}` placeholder (3.6) |
+| Events | `confluent_kafka`, `kafka-python`, `aiokafka` producers and consumers; Celery tasks as queues, only on a Celery origin (below); module constants resolved; RabbitMQ (pika, aio-pika, kombu), Redis, NATS, SQS / SNS, Google Pub/Sub ([3.10](#310-python-brokers)); an environment variable read is a `${KEY}` placeholder (3.6) |
 | HTTP | routes on decorators of `app`, `router` or `api_router` (Flask, FastAPI); a Blueprint (`@bp.route`) is not read |
 
-**Celery is read through the file's imports (9.0 T15).** A decorator is a Celery task consumer, and a
-`.delay(...)` / `.apply_async(...)` a producer, only when the parsed `import` statements (never a comment
-or a string) say so. Before 9.0 any decorator that contained `@task`, `@celery` or `.task` was a
-consumer, so every Locust `@task` was a "Celery consumer" (21 of 21 event rows on otel-demo and
-bank-of-anthos were such rows). The rule:
+**Celery is read through the file's imports and names (9.0 T15).** A decorator is a Celery task
+consumer, and a `.delay(...)` / `.apply_async(...)` a producer, only when the parsed `import`
+statements and the module-level names (never a comment or a string) say so. Before 9.0 any decorator
+that contained `@task`, `@celery` or `.task` was a consumer, so every Locust `@task` was a "Celery
+consumer" (21 of 21 event rows on otel-demo and bank-of-anthos were such rows); the same reader never
+saw `@shared_task` or an alias such as `@st`, which it now does. Words are matched on tokens, never
+substrings: a module path or name "holds `celery`" when a dotted segment or a `_`-token of it is
+`celery` (`proj.celery`, `my_celery`, `celery_app`; not `mycelery_utils`, `celeryman`), and "has a
+`tasks` segment" only for a whole dotted segment (`myapp.tasks`; not `subtasks`, `taskstore`,
+`shop_tasks`). Packages `invoke`, `fabric`, `locust`, `prefect`, `huey`, `dramatiq`, `arq`, `rq`,
+`luigi`, `multiprocessing` and `gevent` never count as Celery by the `tasks` or the producer rule.
 
-- Consumer, bare form (`@shared_task`, `@task(...)`, any alias): the name is imported from `celery` (or a
-  module whose path holds `celery`) as `task` or `shared_task`, and the file does not also define or
-  assign that name. `from locust import task`, `from other import task`, a local `def task(fn)` are not.
-- Consumer, attribute form (`@x.task`, `@x.shared_task`, called or not): the file imports `celery`
-  (`import celery`, `from celery import Celery`, `from celery.x import y`), or `x` is imported from a
-  module whose path holds `celery` or `tasks`, or the imported name holds `celery`
-  (`from proj.celery import app`, `from .celery import app`, `from proj import celery_app`,
-  `from myapp.tasks import app`). The task is keyed by `name="..."` when given, else the function name.
-- Producer (`x.delay(...)`, `x.apply_async(...)`): the file imports `celery`, or `x` is a `def` of the
-  file that is a consumer by the rule above, or `x` is imported from a module whose path holds `celery`
-  or `tasks` (`from myapp.tasks import process_order`).
+- Consumer, bare form (`@shared_task`, `@task(...)`, any alias): the name is imported from a module
+  holding `celery` as `task` or `shared_task`, and the file does not define or assign it at module
+  level (a nested assignment or a method named `task` does not hide it). A name bound to two different
+  imports is ambiguous and reads nothing. `from locust import task` is not Celery.
+- Consumer, attribute form (`@x.task`, `@x.shared_task`, called or not, `x` may be a chain): `x` holds
+  the token `celery` (`@celery.task`), or is assigned at module level only from calls to `Celery`,
+  `make_celery`, `create_celery` or any callee holding the token or imported from a celery module (the
+  Flask factory `celery = make_celery(app)` works), or is imported from a module holding `celery`, under
+  a name holding `celery`, or from a module with a `tasks` segment (`from proj.celery import app`,
+  `from proj import celery_app`, `from myapp.tasks import app`). Importing `celery` somewhere else in
+  the file is not enough: `import celery` next to `@locust.task` reads nothing.
+- Producer (`x.delay(...)`, `x.apply_async(...)`, also behind `x.s(...)`, `.si(...)`, `.signature(...)`,
+  keyed by `x`): `x` is a consumer `def` of the file, or a name bound by a `from ... import` of any
+  module that is not in the list above, or an attribute chain rooted at an imported name
+  (`shop_tasks.charge_card.s(2).delay()` is read, keyed `charge_card`; base read it as a producer named
+  `s(2)`). A parameter, a local variable, `self.x`, a name assigned in the file and a `def` that is not a
+  task are not read.
 - A decorator the gate refuses is no longer a queue node either, and an `@app.task` it refuses is not
   turned into an HTTP route.
 
-False negatives this introduces (a real task that is no longer read): `from proj import app` then
-`@app.task` in a file that does not import `celery` (the module path holds neither word; also a Flask
-`make_celery(app)` object imported from `app`); a task imported from a module such as `myapp.jobs` and
-called with `.delay()` in a file that does not import `celery`; a decorator written `@(app.task)`.
-Not read before either: `send_task("name")`. False positives that remain: any `@x.task` in a file that
-imports `celery` for another reason, and any `.delay()` in such a file (the base is not checked).
+False negatives this introduces (a real site that is no longer read): `from proj import app` then
+`@app.task` where the module path holds neither word (this includes the Flask `make_celery(app)` object
+imported from `app`); a task assigned from a call in the file under a name the rule does not know;
+`from celery import *` (binds no name: `@shared_task` is not read); `@(app.task)`; a `.delay()` on a
+task held in a variable, a parameter or `self`. Not read before either: `send_task("name")`.
+False positives that remain: a `.delay()` / `.apply_async()` on a name imported from another library
+(`from rx import timer; timer.delay(1)`), because these method names are taken as Celery's.
 Tests: `crates/mesh-parsers/tests/py_celery_gate.rs`; golden `layered-py` is the positive corpus.
 
 Stops: only the frameworks and libraries named above are read; a topic name that comes from a
