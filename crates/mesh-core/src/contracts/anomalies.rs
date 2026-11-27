@@ -94,23 +94,28 @@ pub struct UnresolvedEntry<'g> {
     pub reason: UnresolvedReason,
 }
 
+/// A topic hub with its broker (the hub's, else the name's only known broker).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct HubRef<'g> {
+    pub hub: &'g ContractNode,
+    pub broker: Option<Broker>,
+}
+
 /// One hop of a cycle: the consumer of `from` reaches the producer that publishes onto `to`.
 #[derive(Debug, Clone, Serialize)]
 pub struct CycleEdge<'g> {
-    pub from: &'g ContractNode,
-    pub to: &'g ContractNode,
+    pub from: HubRef<'g>,
+    pub to: HubRef<'g>,
     pub consumer: &'g ContractNode,
     pub producer: &'g ContractNode,
     pub confidence: EdgeConfidence,
-    /// No call path links them: the producer is only declared in the consumer's file.
-    pub fallback: bool,
 }
 
 /// A set of topics whose events loop back (a strongly connected component of the topic graph).
 #[derive(Debug, Clone, Serialize)]
 pub struct CycleEntry<'g> {
     /// Every topic hub of the loop, sorted by key.
-    pub members: Vec<&'g ContractNode>,
+    pub members: Vec<HubRef<'g>>,
     /// The shortest cycle through the first member (a single edge for a self-loop).
     pub path: Vec<CycleEdge<'g>>,
     /// The weakest hop of `path`.
@@ -123,7 +128,7 @@ pub struct FanOutProducer<'g> {
     pub file: &'g FilePath,
     pub repo_id: RepoId,
     /// The hubs it publishes onto, sorted.
-    pub topics: Vec<&'g ContractNode>,
+    pub topics: Vec<HubRef<'g>>,
     /// Its producer sites, sorted.
     pub sites: Vec<&'g ContractNode>,
 }
@@ -146,10 +151,18 @@ pub struct EventAnomalies<'g> {
     /// Hubs named by a `${KEY}` placeholder: never part of the cycle or fan-out search, since a
     /// placeholder can stand for several unrelated names.
     pub placeholder_topics: usize,
+    /// Same-file-only hops (no resolved call path) the cycle search did not follow: a cycle is
+    /// only reported when every hop of it rests on a call path.
+    pub cycle_guess_hops: usize,
     /// Consumer sites the cycle search walked.
     pub cycle_sites_walked: usize,
     /// The cycle search stopped at [`ANOMALY_MAX_CYCLE_SITES`].
     pub cycle_search_capped: bool,
+}
+
+/// The topic key and broker of a hub node of the graph (`kafka:orders` is `("orders", Kafka)`).
+pub fn hub_topic(hub: &ContractNode) -> (&str, Option<Broker>) {
+    (ContractGraph::hub_key(hub), ContractGraph::hub_broker(hub))
 }
 
 /// Whether `key` is a `${KEY}` placeholder topic (or holds one).
@@ -196,6 +209,17 @@ fn weakest_of<'a>(sites: impl Iterator<Item = &'a AnomalySite<'a>>) -> EdgeConfi
 }
 
 impl ContractGraph {
+    /// `hub` with its broker: the hub's own, else the name's only known broker.
+    fn hub_ref<'g>(&self, hub: &'g ContractNode) -> HubRef<'g> {
+        let broker = Self::hub_broker(hub).or_else(|| {
+            let mask = self.known_brokers(Self::hub_key(hub));
+            (mask.count_ones() == 1)
+                .then(|| Broker::of_mask(mask).next())
+                .flatten()
+        });
+        HubRef { hub, broker }
+    }
+
     /// The anomaly report of the whole graph. `is_test` is the caller's test-file rule;
     /// `in_scope` keeps a row only when one of its sites passes (the analysis itself always
     /// reads every site: a producer outside the scope still makes a topic consumed).
@@ -275,14 +299,7 @@ impl ContractGraph {
             TopicEntry {
                 hub: h.hub,
                 key: CompactStr::new(h.key),
-                broker: Self::hub_broker(h.hub).or_else(|| {
-                    let mask = self.known_brokers(h.key);
-                    if mask.count_ones() == 1 {
-                        Broker::of_mask(mask).next()
-                    } else {
-                        None
-                    }
-                }),
+                broker: self.hub_ref(h.hub).broker,
                 producers,
                 consumers,
                 confidence,
@@ -327,9 +344,10 @@ impl ContractGraph {
             };
 
             if cp == 0 && ct > 0 {
-                // Every consumer is a test: nothing in production listens (a placeholder name
-                // proves nothing either way).
-                if reason != Some(UnresolvedReason::Placeholder) {
+                // Every consumer is a test while production publishes onto the topic: nothing in
+                // production listens (a placeholder name proves nothing either way; a topic both
+                // ends of which are test code is scaffolding, not an event).
+                if pp > 0 && reason != Some(UnresolvedReason::Placeholder) {
                     let tests: Vec<_> = h.consumers.iter().filter(|s| s.test).cloned().collect();
                     let c = weakest_of(tests.iter());
                     out.test_only_consumers
@@ -440,6 +458,7 @@ impl ContractGraph {
                 (Self::hub_key(a), Self::hub_broker(a), a.id)
                     .cmp(&(Self::hub_key(b), Self::hub_broker(b), b.id))
             });
+            let topics = topics.into_iter().map(|h| self.hub_ref(h)).collect();
             out.fan_out_producers.push(FanOutProducer {
                 file,
                 repo_id,
@@ -469,17 +488,21 @@ impl ContractGraph {
         out.cycle_sites_walked = walked;
         out.cycle_search_capped = capped;
 
-        // The best witness of each (from, to) pair: strongest link, call path before fallback,
-        // then the first sites in path order.
+        // The best witness of each (from, to) pair: strongest link, then the first sites in
+        // path order.
         let mut best: BTreeMap<(usize, usize), &TopicHop<'g>> = BTreeMap::new();
         for hop in &hops {
             let (Some(&a), Some(&b)) = (slot.get(&hop.from), slot.get(&hop.to)) else {
                 continue;
             };
+            // A guess from the same file is no reason to say a chain loops back.
+            if hop.fallback {
+                out.cycle_guess_hops += 1;
+                continue;
+            }
             let order = |h: &TopicHop<'_>| {
                 (
                     rank(h.confidence),
-                    h.fallback,
                     node_key(h.consumer).0.clone(),
                     h.consumer.line_start,
                     h.consumer.id,
@@ -521,19 +544,22 @@ impl ContractGraph {
                     continue;
                 };
                 path.push(CycleEdge {
-                    from,
-                    to,
+                    from: self.hub_ref(from),
+                    to: self.hub_ref(to),
                     consumer: hop.consumer,
                     producer: hop.producer,
                     confidence: hop.confidence,
-                    fallback: hop.fallback,
                 });
             }
             let confidence = path
                 .iter()
                 .fold(EdgeConfidence::Exact, |acc, e| weakest(acc, e.confidence));
             out.cycles.push(CycleEntry {
-                members: comp.iter().filter_map(|&i| self.nodes.get(&ids[i])).collect(),
+                members: comp
+                    .iter()
+                    .filter_map(|&i| self.nodes.get(&ids[i]))
+                    .map(|h| self.hub_ref(h))
+                    .collect(),
                 path,
                 confidence,
             });
@@ -541,11 +567,11 @@ impl ContractGraph {
         out.cycles.sort_by(|a, b| {
             (
                 rank(a.confidence),
-                a.members.first().map(|n| (Self::hub_key(n), n.id)),
+                a.members.first().map(|n| (Self::hub_key(n.hub), n.hub.id)),
             )
                 .cmp(&(
                     rank(b.confidence),
-                    b.members.first().map(|n| (Self::hub_key(n), n.id)),
+                    b.members.first().map(|n| (Self::hub_key(n.hub), n.hub.id)),
                 ))
         });
     }
