@@ -1,6 +1,6 @@
 # MeshMCP MCP Tools Reference
 
-This document specifies the eight Model Context Protocol (MCP) tools exposed by MeshMCP: their arguments, output formats and error handling. The JSON schemas below are checked against the code by `test_mcp_tools_md_schema_drift_check` (`crates/mesh-server/src/tools/mod.rs`).
+This document specifies the nine Model Context Protocol (MCP) tools exposed by MeshMCP: their arguments, output formats and error handling. The JSON schemas below are checked against the code by `test_mcp_tools_md_schema_drift_check` (`crates/mesh-server/src/tools/mod.rs`).
 
 ---
 
@@ -35,6 +35,7 @@ graph LR
     T -->|visualize_mesh| TV[Mermaid / HTML Topology]
     T -->|diff_mesh| TDM[Branch Contract Diff & Impact]
     T -->|trace_flow| TF[End-to-End Event Chains, Hop by Hop]
+    T -->|event_anomalies| TA[Event Anomaly Report]
 ```
 
 ---
@@ -997,6 +998,93 @@ page. The notes are on the first page.
 4. produce `shipment.scheduled` at `src/shipment.publisher.ts:9` [exact]
 -> `shipment.scheduled`: continues in hop 1.1.1, 1.1.2
 ```
+
+### Tool 9: `event_anomalies`
+
+#### Description
+Workspace event anomaly report in one call (9.0), over the event graph. Five classes, plus one
+that keeps the report honest:
+
+| Class | A row is... |
+| :--- | :--- |
+| published, never consumed | a topic with resolved producers and no resolved consumer |
+| consumed, never published | a topic with resolved consumers and no resolved producer; a producer seen only in test files is named |
+| cycles | an event chain that loops back: consuming a topic leads, through resolved calls, to publishing a topic that leads back (a strongly connected set of topics, with the shortest loop as witness and, per hop, the consumer and producer `path:line`); a retry that republishes its own topic is a loop of one |
+| fan-out | a topic with 6 or more consumer sites, or a file publishing onto 6 or more topics (the constants `ANOMALY_FAN_OUT_CONSUMERS` and `ANOMALY_FAN_OUT_TOPICS` in `contracts/anomalies.rs`) |
+| test-only consumers | a topic that production publishes onto and whose every consumer site is in a test file |
+| unresolved (not anomalies) | a one-sided topic that cannot be called an anomaly, with the reason: a `${KEY}` placeholder no configuration resolved, a wildcard subscription (NATS / MQTT subject patterns), or a dead-letter / retry channel (last name segment `dlq`, `dlt`, `retry`, `deadletter`, ...) |
+
+Honesty rules, which the output repeats: "no producer" and "no consumer" mean none was
+**statically resolved in the indexed roots**, never proof of absence (a topic name built at
+runtime, a registry, a generated client or a root that is not indexed hides the other end; the
+footer also counts the files the index did not read). A placeholder topic is `unresolved`, and never
+part of a cycle or a fan-out (one `${KEY}` can stand for several unrelated names). A topic is one
+row per broker: two brokers sharing a name are two rows and are never joined
+(`FlowIndex::crosses_brokers` and the broker-qualified hubs of 9.0 T7); a site whose broker is not
+known joins every channel of its name and makes the row `heuristic`. Test files do not count as
+production sites: a topic both ends of which are test code is scaffolding and is reported nowhere.
+Cycles rest on resolved call paths only: the "same file, no call path" guess of `trace_flow` is not
+a reason to say a chain loops back (those hops are counted in the footer), so a language without
+call data shows no cycle. At most 20,000 consumer sites are walked for cycles; past that the search
+stops and says so. Topic names are checked once more before printing (the member-name and
+value rules of `member_consts::constant_is_a_name`, and the placeholder-default mask of
+`config_values`): a name that is a token, a URL or a password prints as
+`[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`.
+
+`scope` (resolved through `ValidatedScope`, like `smart_search`) keeps the rows that have a
+producer or consumer site under that path; the analysis always reads every root, so a producer
+outside the scope still counts as a producer. Every walk is iterative with visited sets and every
+list is sorted, so two runs on the same index give byte-identical answers (also with a cold or warm
+index cache).
+
+> **Negative constraints:** DO NOT USE to trace what one event triggers hop by hop (use
+> `trace_flow`), to list every producer and consumer of one named event (use `analyze_impact`), or
+> for gRPC or imports (use `analyze_grpc`, `find_dependents`). It does NOT check payload types and
+> does NOT detect anomalies in code that registers handlers at runtime.
+
+#### Pagination and truncation
+`limit` rows per class (default 25, 1 to 100) from `offset`; each class says `Next page:
+\`offset: N\`` when rows remain. The answer is kept under about 40 KB by the formatter (the 48 KB
+cap is only a backstop); the table of counts is always complete. Narrow with `scope` and `classes`.
+
+#### JSON Schema
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "scope": { "type": "string" },
+    "classes": {
+      "type": "array",
+      "items": { "enum": ["published_never_consumed", "consumed_never_published", "unresolved", "cycles", "fan_out", "test_only_consumers"] }
+    },
+    "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "offset": { "type": "integer", "minimum": 0 }
+  }
+}
+```
+
+#### Sample Response (`examples/eda/multi-broker`, three classes)
+```markdown
+## Event anomalies
+*Read 10 topic(s) over 1 root(s): 9 producer site(s), 9 consumer site(s); rows shown for the whole workspace. Test files do not count as production sites.*
+
+### Published, never consumed (2)
+- `events.created` [redis] exact: 1 producer(s) at `src/redis.ts:14`
+- `shipments` [rabbitmq] exact: 1 producer(s) at `src/fulfilment.ts:4`
+
+### Consumed, never published (1)
+- `orders` [sqs] heuristic: 2 consumer(s) at `src/legacy.ts:7`, `src/sqs.ts:5`
+
+### Unresolved (not anomalies) (1)
+- `events.*` [nats] exact: 1 consumer(s) at `src/nats.ts:13`; wildcard subscription: only statically named subjects were matched, the producers of the others may be built at runtime
+```
+
+Known limits: a producer whose topic is built at runtime is invisible, so its consumers read as
+"consumed, never published" (`examples/unresolved-flow`, `user:deletion:success`, is pinned as a
+known false positive in `tests/golden/events/anomalies.report.yaml`); a Python `@task` decorator
+(Celery) is read as a consumer whatever the framework, so a Locust load test shows its tasks as
+"consumed, never published".
 
 ---
 

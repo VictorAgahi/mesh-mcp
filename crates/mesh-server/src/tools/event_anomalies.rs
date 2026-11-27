@@ -78,10 +78,15 @@ impl McpTool for EventAnomaliesTool {
     }
 
     fn run(args: &Self::Args, state: &AppState) -> Result<ToolOutput, ToolError> {
-        let raw_scope = args.scope.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let raw_scope = args
+            .scope
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let scope = SearchScope::resolve(raw_scope, state)?;
         let snapshot = state.snapshot();
-        let is_test = |n: &mesh_core::ContractNode| mesh_core::is_test_node(n, &state.allowed_roots);
+        let is_test =
+            |n: &mesh_core::ContractNode| mesh_core::is_test_node(n, &state.allowed_roots);
         let in_scope = |n: &mesh_core::ContractNode| match &scope {
             SearchScope::Global => true,
             SearchScope::Scoped(dir) => starts_with_folded(&n.file_path, dir.as_path()),
@@ -103,7 +108,10 @@ impl McpTool for EventAnomaliesTool {
             }
         };
         let h = &snapshot.health;
-        let unread = h.files_rejected_oversized + h.files_rejected_guard + h.files_read_error + h.files_parse_failed;
+        let unread = h.files_rejected_oversized
+            + h.files_rejected_guard
+            + h.files_read_error
+            + h.files_parse_failed;
         let mut coverage = Vec::new();
         if unread > 0 {
             coverage.push(format!(

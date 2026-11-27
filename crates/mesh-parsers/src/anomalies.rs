@@ -3,8 +3,8 @@
 use crate::markdown::MarkdownFormatter;
 use mesh_core::{
     hub_topic, AnomalySite, ContractNode, CycleEntry, EdgeConfidence, EventAnomalies,
-    FanOutProducer, HubRef, Missing, UnresolvedEntry, UnresolvedReason,
-    ANOMALY_FAN_OUT_CONSUMERS, ANOMALY_FAN_OUT_TOPICS, ANOMALY_MAX_CYCLE_SITES,
+    FanOutProducer, HubRef, Missing, UnresolvedEntry, UnresolvedReason, ANOMALY_FAN_OUT_CONSUMERS,
+    ANOMALY_FAN_OUT_TOPICS, ANOMALY_MAX_CYCLE_SITES,
 };
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -61,7 +61,10 @@ const REDACTED: &str = "[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]";
 /// already refuse such names).
 fn shown_key(key: &str) -> String {
     let masked = mesh_core::config_values::mask_placeholder_defaults(key);
-    let probe: String = masked.chars().filter(|c| !matches!(c, '$' | '{' | '}')).collect();
+    let probe: String = masked
+        .chars()
+        .filter(|c| !matches!(c, '$' | '{' | '}'))
+        .collect();
     if mesh_core::member_consts::constant_is_a_name("", &probe) {
         masked.replace(['`', '\n', '\r'], "'")
     } else {
@@ -130,8 +133,14 @@ impl MarkdownFormatter {
         );
         out.push_str("| Class | Rows |\n| :--- | ---: |\n");
         for (name, n) in [
-            ("published, never consumed", report.published_never_consumed.len()),
-            ("consumed, never published", report.consumed_never_published.len()),
+            (
+                "published, never consumed",
+                report.published_never_consumed.len(),
+            ),
+            (
+                "consumed, never published",
+                report.consumed_never_published.len(),
+            ),
             ("unresolved (not anomalies)", report.unresolved.len()),
             ("cycles", report.cycles.len()),
             ("fan-out", fan_total),
@@ -341,7 +350,12 @@ impl MarkdownFormatter {
                 rows.len()
             );
         } else if shown == 0 {
-            let _ = writeln!(out, "\n*No row at `offset: {}` (only {}).*", view.offset, rows.len());
+            let _ = writeln!(
+                out,
+                "\n*No row at `offset: {}` (only {}).*",
+                view.offset,
+                rows.len()
+            );
         }
         out.push('\n');
     }
@@ -357,11 +371,7 @@ impl MarkdownFormatter {
             if let Some(first) = names.first().cloned() {
                 names.push(first);
             }
-            let mut text = format!(
-                "{} {}",
-                names.join(" -> "),
-                confidence(c.confidence)
-            );
+            let mut text = format!("{} {}", names.join(" -> "), confidence(c.confidence));
             if c.members.len() > c.path.len() {
                 let _ = write!(
                     text,
@@ -412,7 +422,10 @@ mod tests {
         assert_eq!(shown_key(&format!("${{K:{url}}}")), "${K}");
         assert_eq!(shown_key(&format!("${{K:{hunter}}}")), REDACTED);
         assert_eq!(shown_key("orders.created"), "orders.created");
-        assert_eq!(shown_key("${ORDERS_TOPIC:orders}"), "${ORDERS_TOPIC:orders}");
+        assert_eq!(
+            shown_key("${ORDERS_TOPIC:orders}"),
+            "${ORDERS_TOPIC:orders}"
+        );
         assert_eq!(shown_key("orders.*"), "orders.*");
     }
 }

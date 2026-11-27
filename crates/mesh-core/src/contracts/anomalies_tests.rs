@@ -105,7 +105,10 @@ fn test_files_are_not_production_sites() {
     let r = report(&g);
     assert_eq!(keys(&r.test_only_consumers), ["audit [kafka]"]);
     assert_eq!(keys(&r.consumed_never_published), ["inbox [kafka]"]);
-    assert!(r.consumed_never_published[0].producers.iter().all(|p| p.test));
+    assert!(r.consumed_never_published[0]
+        .producers
+        .iter()
+        .all(|p| p.test));
     assert!(r.published_never_consumed.is_empty());
     assert!(r.unresolved.is_empty() && r.fan_out_topics.is_empty());
 }
@@ -157,7 +160,11 @@ fn placeholders_wildcards_and_dead_letters_are_unresolved_not_anomalies() {
             ),
         ]
     );
-    assert!(r.published_never_consumed.is_empty(), "{:?}", keys(&r.published_never_consumed));
+    assert!(
+        r.published_never_consumed.is_empty(),
+        "{:?}",
+        keys(&r.published_never_consumed)
+    );
     assert!(r.consumed_never_published.is_empty());
     assert_eq!(r.placeholder_topics, 3);
 }
@@ -170,7 +177,10 @@ fn a_heuristic_site_makes_the_row_heuristic() {
     g.mark_heuristic_topic_node(id);
     g.reconcile_edges();
     let r = report(&g);
-    assert_eq!(r.published_never_consumed[0].confidence, EdgeConfidence::Heuristic);
+    assert_eq!(
+        r.published_never_consumed[0].confidence,
+        EdgeConfidence::Heuristic
+    );
 }
 
 #[test]
@@ -216,7 +226,10 @@ fn a_scope_keeps_rows_with_a_site_in_it_but_still_counts_every_site() {
     // `t` has a consumer in /w/b: still consumed, whatever the scope.
     assert_eq!(keys(&r.published_never_consumed), ["lonely [kafka]"]);
     let in_b = |n: &ContractNode| n.file_path.starts_with("/w/b");
-    assert!(g.event_anomalies(&is_test, &in_b).published_never_consumed.is_empty());
+    assert!(g
+        .event_anomalies(&is_test, &in_b)
+        .published_never_consumed
+        .is_empty());
 }
 
 /// `n` files `rI.ts`: a function that consumes `t<I>` and publishes `t<I+1>` (the last one
@@ -340,7 +353,13 @@ fn thousands_of_topics_come_out_sorted_and_identical() {
         let mut g = ContractGraph::new();
         // Inserted in a scrambled order: the report must not depend on it.
         for i in (0..5_000).map(|i| (i * 7_919) % 5_000) {
-            produce(&mut g, &format!("/w/p{i}.ts"), 1, &format!("t{i:05}"), Some(Broker::Kafka));
+            produce(
+                &mut g,
+                &format!("/w/p{i}.ts"),
+                1,
+                &format!("t{i:05}"),
+                Some(Broker::Kafka),
+            );
         }
         g.reconcile_edges();
         let a = report(&g);
@@ -383,6 +402,9 @@ fn components_of_a_long_chain_do_not_recurse() {
         let comps = anomalies::strongly_connected(&closed);
         assert_eq!(comps.len(), 1);
         let all: HashSet<usize> = (0..n).collect();
-        assert_eq!(anomalies::shortest_cycle(0, &closed, &all).map(|c| c.len()), Some(n));
+        assert_eq!(
+            anomalies::shortest_cycle(0, &closed, &all).map(|c| c.len()),
+            Some(n)
+        );
     });
 }

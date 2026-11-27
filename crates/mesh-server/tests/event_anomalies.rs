@@ -16,8 +16,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 fn repo(rel: &str) -> PathBuf {
-    dunce::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel))
-        .expect("canonicalize")
+    dunce::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel),
+    )
+    .expect("canonicalize")
 }
 
 fn state_in(dir: &Path, cache: Option<&PersistentIndexCache>) -> Arc<AppState> {
@@ -47,7 +51,10 @@ async fn raw(state: &Arc<AppState>, args: Value) -> Value {
 async fn report(state: &Arc<AppState>, args: Value) -> String {
     let res = raw(state, args).await;
     assert_eq!(res["isError"], json!(false), "{res}");
-    res["content"][0]["text"].as_str().expect("text").to_string()
+    res["content"][0]["text"]
+        .as_str()
+        .expect("text")
+        .to_string()
 }
 
 const CLASSES: [(&str, &str); 7] = [
@@ -79,8 +86,16 @@ fn sections(text: &str) -> BTreeMap<&'static str, Vec<String>> {
 
 /// `key [broker]` of a topic row (`` `key` [broker] ``).
 fn topic_of(row: &str) -> String {
-    let key = row.strip_prefix('`').and_then(|r| r.split_once('`')).expect("backticked key");
-    let broker = key.1.trim_start().strip_prefix('[').and_then(|r| r.split_once(']')).expect("broker");
+    let key = row
+        .strip_prefix('`')
+        .and_then(|r| r.split_once('`'))
+        .expect("backticked key");
+    let broker = key
+        .1
+        .trim_start()
+        .strip_prefix('[')
+        .and_then(|r| r.split_once(']'))
+        .expect("broker");
     format!("{} [{}]", key.0, broker.0)
 }
 
@@ -142,7 +157,11 @@ fn sorted(mut v: Vec<String>) -> Vec<String> {
 
 fn unresolved_row(row: &str) -> String {
     let topic = topic_of(row);
-    let missing = if row.contains("consumer(s) at") { "producer" } else { "consumer" };
+    let missing = if row.contains("consumer(s) at") {
+        "producer"
+    } else {
+        "consumer"
+    };
     let reason = if row.contains("placeholder") {
         "placeholder"
     } else if row.contains("wildcard") {
@@ -174,7 +193,10 @@ async fn every_class_matches_the_hand_annotated_truth() {
         let mut consumed = c.consumed_never_published.clone();
         consumed.extend(c.known_false_positives.consumed_never_published.clone());
         for (class, want) in [
-            ("published_never_consumed", c.published_never_consumed.clone()),
+            (
+                "published_never_consumed",
+                c.published_never_consumed.clone(),
+            ),
             ("consumed_never_published", consumed),
             ("test_only_consumers", c.test_only_consumers.clone()),
             ("fan_out_topics", c.fan_out_topics.clone()),
@@ -187,11 +209,21 @@ async fn every_class_matches_the_hand_annotated_truth() {
             .iter()
             .map(|u| format!("{} | {} | {}", u.topic, u.missing, u.reason))
             .collect();
-        let have_unresolved: Vec<String> = rows("unresolved").iter().map(|r| unresolved_row(r)).collect();
-        assert_eq!(sorted(have_unresolved), sorted(want_unresolved), "{}", ctx("unresolved"));
+        let have_unresolved: Vec<String> = rows("unresolved")
+            .iter()
+            .map(|r| unresolved_row(r))
+            .collect();
+        assert_eq!(
+            sorted(have_unresolved),
+            sorted(want_unresolved),
+            "{}",
+            ctx("unresolved")
+        );
 
-        let have_cycles: Vec<Vec<String>> = rows("cycles").iter().map(|r| cycle_topics(r)).collect();
-        let mut want_cycles: Vec<Vec<String>> = c.cycles.iter().map(|c| sorted(c.clone())).collect();
+        let have_cycles: Vec<Vec<String>> =
+            rows("cycles").iter().map(|r| cycle_topics(r)).collect();
+        let mut want_cycles: Vec<Vec<String>> =
+            c.cycles.iter().map(|c| sorted(c.clone())).collect();
         want_cycles.sort();
         let mut have_cycles = have_cycles;
         have_cycles.sort();
@@ -199,16 +231,33 @@ async fn every_class_matches_the_hand_annotated_truth() {
 
         let have_files: Vec<String> = rows("fan_out_producers")
             .iter()
-            .map(|r| r.strip_prefix('`').and_then(|r| r.split_once('`')).expect("file").0.to_string())
+            .map(|r| {
+                r.strip_prefix('`')
+                    .and_then(|r| r.split_once('`'))
+                    .expect("file")
+                    .0
+                    .to_string()
+            })
             .collect();
-        assert_eq!(sorted(have_files), sorted(c.fan_out_producers.clone()), "{}", ctx("fan_out_producers"));
+        assert_eq!(
+            sorted(have_files),
+            sorted(c.fan_out_producers.clone()),
+            "{}",
+            ctx("fan_out_producers")
+        );
 
         // The decoys are the subject of no row, in any class.
         let subjects: BTreeSet<String> = CLASSES
             .iter()
             .filter(|(k, _)| !matches!(*k, "cycles" | "fan_out_producers"))
             .flat_map(|(k, _)| rows(k))
-            .map(|r| topic_of(&r).rsplit_once(" [").expect("broker").0.to_string())
+            .map(|r| {
+                topic_of(&r)
+                    .rsplit_once(" [")
+                    .expect("broker")
+                    .0
+                    .to_string()
+            })
             .chain(
                 rows("cycles")
                     .iter()
@@ -217,7 +266,11 @@ async fn every_class_matches_the_hand_annotated_truth() {
             )
             .collect();
         for decoy in &c.must_not_flag {
-            assert!(!subjects.contains(decoy), "{}: decoy {decoy} flagged:\n{text}", c.corpus);
+            assert!(
+                !subjects.contains(decoy),
+                "{}: decoy {decoy} flagged:\n{text}",
+                c.corpus
+            );
         }
     }
 }
@@ -229,8 +282,17 @@ async fn the_table_counts_every_class_even_when_one_is_shown() {
     let cycles = report(&state, json!({ "classes": ["cycles"] })).await;
     assert!(cycles.contains("### Cycles") && !cycles.contains("### Published"));
     assert!(!cycles.contains("### Fan-out") && !cycles.contains("### Unresolved"));
-    for class in ["published, never consumed", "cycles", "fan-out", "test-only consumers"] {
-        assert_eq!(count_in_table(&cycles, class), count_in_table(&all, class), "{class}");
+    for class in [
+        "published, never consumed",
+        "cycles",
+        "fan-out",
+        "test-only consumers",
+    ] {
+        assert_eq!(
+            count_in_table(&cycles, class),
+            count_in_table(&all, class),
+            "{class}"
+        );
     }
 }
 
@@ -242,7 +304,11 @@ async fn rows_page_with_offset_and_the_footer_names_the_next_page() {
     assert!(all.len() >= 4);
     let first = report(&state, json!({ "classes": ["unresolved"], "limit": 2 })).await;
     assert!(first.contains("Next page: `offset: 2`"), "{first}");
-    let second = report(&state, json!({ "classes": ["unresolved"], "limit": 2, "offset": 2 })).await;
+    let second = report(
+        &state,
+        json!({ "classes": ["unresolved"], "limit": 2, "offset": 2 }),
+    )
+    .await;
     let mut paged = sections(&first)["unresolved"].clone();
     paged.extend(sections(&second)["unresolved"].clone());
     assert_eq!(paged, all[..4].to_vec());
@@ -258,12 +324,18 @@ async fn a_scope_narrows_the_rows_and_the_jail_refuses_an_escape() {
     let scoped = report(&state, json!({ "scope": tests_dir })).await;
     let got = sections(&scoped);
     assert_eq!(got.len(), 1, "{scoped}");
-    assert_eq!(topic_of(&got["test_only_consumers"][0]), "audit.created [kafka]");
+    assert_eq!(
+        topic_of(&got["test_only_consumers"][0]),
+        "audit.created [kafka]"
+    );
     assert!(scoped.contains(&format!("rows shown for `{tests_dir}`")));
     // A producer outside the scope still counts: `payments` stays published-never-consumed.
     let split_file = root.join("src/split.ts").to_string_lossy().into_owned();
     let split = report(&state, json!({ "scope": split_file })).await;
-    assert_eq!(topic_of(&sections(&split)["published_never_consumed"][0]), "payments [kafka]");
+    assert_eq!(
+        topic_of(&sections(&split)["published_never_consumed"][0]),
+        "payments [kafka]"
+    );
 
     for bad in ["../..", "/etc", "src/../../../etc"] {
         let res = raw(&state, json!({ "scope": bad })).await;
@@ -275,13 +347,22 @@ async fn a_scope_narrows_the_rows_and_the_jail_refuses_an_escape() {
 
 #[tokio::test]
 async fn the_report_is_the_same_on_every_run_and_with_a_cold_or_warm_cache() {
-    for rel in ["examples/eda/anomalies", "examples/unresolved-flow", "examples/eda/multi-broker"] {
+    for rel in [
+        "examples/eda/anomalies",
+        "examples/unresolved-flow",
+        "examples/eda/multi-broker",
+    ] {
         let dir = repo(rel);
         let args = json!({ "limit": 100 });
         let plain = report(&state_in(&dir, None), args.clone()).await;
-        assert_eq!(plain, report(&state_in(&dir, None), args.clone()).await, "{rel}: run 2");
+        assert_eq!(
+            plain,
+            report(&state_in(&dir, None), args.clone()).await,
+            "{rel}: run 2"
+        );
         let tmp = tempfile::tempdir().expect("tempdir");
-        let cache = PersistentIndexCache::open(tmp.path().join("index-cache.db"), u64::MAX).expect("cache");
+        let cache =
+            PersistentIndexCache::open(tmp.path().join("index-cache.db"), u64::MAX).expect("cache");
         for pass in ["cold", "warm"] {
             let got = report(&state_in(&dir, Some(&cache)), args.clone()).await;
             assert_eq!(got, plain, "{rel}: {pass} cache");
@@ -329,7 +410,10 @@ async fn a_380_kb_file_with_thousands_of_topics_stays_bounded_and_stable() {
     assert!(a.len() <= 48 * 1024, "{} bytes", a.len());
     // Thousands of topics were read, the page shows a bounded number of them and says how to
     // see the rest, and the file is named once as a fan-out producer.
-    assert!(count_in_table(&a, "published, never consumed") > 1_000, "{a}");
+    assert!(
+        count_in_table(&a, "published, never consumed") > 1_000,
+        "{a}"
+    );
     assert!(a.contains("Next page: `offset: 25`"));
     assert_eq!(sections(&a)["published_never_consumed"].len(), 25);
     assert_eq!(sections(&a)["fan_out_producers"].len(), 1);
@@ -352,7 +436,10 @@ async fn a_cyclic_workspace_of_files_terminates() {
     let (_tmp, state) = workspace(&refs);
     let text = report(&state, json!({ "classes": ["cycles"] })).await;
     assert_eq!(count_in_table(&text, "cycles"), 1, "{text}");
-    assert!(text.contains(&format!("loop of {n} topics")) || text.contains("-> `ring."), "{text}");
+    assert!(
+        text.contains(&format!("loop of {n} topics")) || text.contains("-> `ring."),
+        "{text}"
+    );
 }
 
 /// Credential-shaped values are built here, never written as literals: a key-shaped literal in
@@ -361,7 +448,10 @@ fn canaries() -> [String; 4] {
     [
         format!("{}{}", "sk_live_", "4eC39HqLyjWDarjtT1zdp7dc"),
         format!("{}{}{}", "ghp_", "R8c1qZ0xK3mP7vB2nT5yL9wD4sF6hJ0aG1eX", ""),
-        format!("{}://{}:{}@{}/db", "postgres", "svc", "hunter22secret", "db.internal"),
+        format!(
+            "{}://{}:{}@{}/db",
+            "postgres", "svc", "hunter22secret", "db.internal"
+        ),
         format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE"),
     ]
 }
@@ -381,13 +471,23 @@ export async function leak(): Promise<void> {{\n\
     );
     let (_tmp, state) = workspace(&[("src/leak.ts", src)]);
     let text = report(&state, json!({ "limit": 100 })).await;
-    for secret in [&token, &ghp, &url, &aws, &"hunter22secret".to_string(), &"sk_live_".to_string()] {
+    for secret in [
+        &token,
+        &ghp,
+        &url,
+        &aws,
+        &"hunter22secret".to_string(),
+        &"sk_live_".to_string(),
+    ] {
         assert!(!text.contains(secret.as_str()), "{secret} leaked:\n{text}");
     }
     // The legitimate topic next to them is reported, and a literal topic that is a token is shown
     // as the redaction marker (the graph keeps it; the report must not print it).
     assert!(text.contains("`orders.created` [kafka]"), "{text}");
-    assert!(text.contains("[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]"), "{text}");
+    assert!(
+        text.contains("[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -400,8 +500,14 @@ async fn the_tool_is_advertised_with_its_thresholds_and_negative_constraints() {
         .find(|t| t["name"] == "event_anomalies")
         .expect("advertised");
     let description = tool["description"].as_str().expect("description");
-    assert!(description.contains(&format!("{} or more consumer sites", mesh_core::ANOMALY_FAN_OUT_CONSUMERS)));
-    assert!(description.contains(&format!("onto {} or more topics", mesh_core::ANOMALY_FAN_OUT_TOPICS)));
+    assert!(description.contains(&format!(
+        "{} or more consumer sites",
+        mesh_core::ANOMALY_FAN_OUT_CONSUMERS
+    )));
+    assert!(description.contains(&format!(
+        "onto {} or more topics",
+        mesh_core::ANOMALY_FAN_OUT_TOPICS
+    )));
     assert!(description.contains("DO NOT USE") && description.contains("does NOT"));
     assert!(description.contains("STATICALLY RESOLVED"));
     assert_eq!(tool["inputSchema"]["additionalProperties"], json!(false));
@@ -417,7 +523,14 @@ fn the_new_sources_never_write_to_stdout() {
         let text = std::fs::read_to_string(repo(rel)).expect("source");
         for (n, line) in text.lines().enumerate() {
             let code = line.split("//").next().unwrap_or("");
-            for banned in ["println!", "print!(", "dbg!", "eprintln!", "todo!", "unimplemented!"] {
+            for banned in [
+                "println!",
+                "print!(",
+                "dbg!",
+                "eprintln!",
+                "todo!",
+                "unimplemented!",
+            ] {
                 assert!(!code.contains(banned), "{rel}:{}: {banned}", n + 1);
             }
         }

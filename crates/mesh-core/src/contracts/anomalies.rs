@@ -201,7 +201,7 @@ fn any_in<'a>(
     mut sites: impl Iterator<Item = &'a ContractNode>,
     f: &dyn Fn(&ContractNode) -> bool,
 ) -> bool {
-    sites.any(|n| f(n))
+    sites.any(f)
 }
 
 fn weakest_of<'a>(sites: impl Iterator<Item = &'a AnomalySite<'a>>) -> EdgeConfidence {
@@ -228,11 +228,17 @@ impl ContractGraph {
         is_test: &dyn Fn(&ContractNode) -> bool,
         in_scope: &dyn Fn(&ContractNode) -> bool,
     ) -> EventAnomalies<'g> {
-        let mut hubs: Vec<&ContractNode> =
-            self.nodes.values().filter(|n| Self::is_hub_like(n)).collect();
+        let mut hubs: Vec<&ContractNode> = self
+            .nodes
+            .values()
+            .filter(|n| Self::is_hub_like(n))
+            .collect();
         hubs.sort_by(|a, b| {
-            (Self::hub_key(a), Self::hub_broker(a), a.id)
-                .cmp(&(Self::hub_key(b), Self::hub_broker(b), b.id))
+            (Self::hub_key(a), Self::hub_broker(a), a.id).cmp(&(
+                Self::hub_key(b),
+                Self::hub_broker(b),
+                b.id,
+            ))
         });
         let hub_ids: HashSet<NodeId> = hubs.iter().map(|h| h.id).collect();
 
@@ -241,10 +247,16 @@ impl ContractGraph {
         for e in &self.edges {
             match e.kind {
                 EdgeKind::Produces if hub_ids.contains(&e.to) => {
-                    produced.entry(e.to).or_default().push((e.from, e.confidence));
+                    produced
+                        .entry(e.to)
+                        .or_default()
+                        .push((e.from, e.confidence));
                 }
                 EdgeKind::Consumes if hub_ids.contains(&e.from) => {
-                    consumed.entry(e.from).or_default().push((e.to, e.confidence));
+                    consumed
+                        .entry(e.from)
+                        .or_default()
+                        .push((e.to, e.confidence));
                 }
                 _ => {}
             }
@@ -295,7 +307,10 @@ impl ContractGraph {
             })
             .collect();
 
-        let entry = |h: &HubSites<'g>, producers: Vec<AnomalySite<'g>>, consumers: Vec<AnomalySite<'g>>, confidence| {
+        let entry = |h: &HubSites<'g>,
+                     producers: Vec<AnomalySite<'g>>,
+                     consumers: Vec<AnomalySite<'g>>,
+                     confidence| {
             TopicEntry {
                 hub: h.hub,
                 key: CompactStr::new(h.key),
@@ -432,7 +447,10 @@ impl ContractGraph {
         _is_test: &dyn Fn(&ContractNode) -> bool,
         out: &mut EventAnomalies<'g>,
     ) {
-        type PerFile<'g> = (BTreeMap<NodeId, &'g ContractNode>, BTreeMap<NodeId, &'g ContractNode>);
+        type PerFile<'g> = (
+            BTreeMap<NodeId, &'g ContractNode>,
+            BTreeMap<NodeId, &'g ContractNode>,
+        );
         let mut files: BTreeMap<&'g FilePath, PerFile<'g>> = BTreeMap::new();
         for h in all {
             // A wildcard hub holds producers linked by pattern; they publish onto their own
@@ -455,8 +473,11 @@ impl ContractGraph {
             let repo_id = sites.first().map_or(0, |n| n.repo_id);
             let mut topics: Vec<&ContractNode> = topics.into_values().collect();
             topics.sort_by(|a, b| {
-                (Self::hub_key(a), Self::hub_broker(a), a.id)
-                    .cmp(&(Self::hub_key(b), Self::hub_broker(b), b.id))
+                (Self::hub_key(a), Self::hub_broker(a), a.id).cmp(&(
+                    Self::hub_key(b),
+                    Self::hub_broker(b),
+                    b.id,
+                ))
             });
             let topics = topics.into_iter().map(|h| self.hub_ref(h)).collect();
             out.fan_out_producers.push(FanOutProducer {
@@ -466,8 +487,10 @@ impl ContractGraph {
                 sites,
             });
         }
-        out.fan_out_producers
-            .sort_by(|a, b| (std::cmp::Reverse(a.topics.len()), a.file).cmp(&(std::cmp::Reverse(b.topics.len()), b.file)));
+        out.fan_out_producers.sort_by(|a, b| {
+            (std::cmp::Reverse(a.topics.len()), a.file)
+                .cmp(&(std::cmp::Reverse(b.topics.len()), b.file))
+        });
     }
 
     /// Cycles of the topic graph: strongly connected components (iterative Tarjan), each with
@@ -479,11 +502,9 @@ impl ContractGraph {
         out: &mut EventAnomalies<'g>,
     ) {
         // Placeholder hubs are left out: one `${KEY}` can stand for several unrelated names.
-        let eligible: Vec<&HubSites<'g>> =
-            all.iter().filter(|h| !is_placeholder(h.key)).collect();
+        let eligible: Vec<&HubSites<'g>> = all.iter().filter(|h| !is_placeholder(h.key)).collect();
         let ids: Vec<NodeId> = eligible.iter().map(|h| h.hub.id).collect();
-        let slot: HashMap<NodeId, usize> =
-            ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        let slot: HashMap<NodeId, usize> = ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
         let (hops, walked, capped) = self.topic_hops(&ids, is_test, ANOMALY_MAX_CYCLE_SITES);
         out.cycle_sites_walked = walked;
         out.cycle_search_capped = capped;
@@ -538,9 +559,11 @@ impl ContractGraph {
             let mut path = Vec::new();
             for (i, &a) in order.iter().enumerate() {
                 let b = order[(i + 1) % order.len()];
-                let (Some(hop), Some(from), Some(to)) =
-                    (best.get(&(a, b)), self.nodes.get(&ids[a]), self.nodes.get(&ids[b]))
-                else {
+                let (Some(hop), Some(from), Some(to)) = (
+                    best.get(&(a, b)),
+                    self.nodes.get(&ids[a]),
+                    self.nodes.get(&ids[b]),
+                ) else {
                     continue;
                 };
                 path.push(CycleEdge {

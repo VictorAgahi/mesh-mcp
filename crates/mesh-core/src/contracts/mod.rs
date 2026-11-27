@@ -20,8 +20,8 @@ mod resolve;
 
 pub use anomalies::{
     hub_topic, AnomalySite, CycleEdge, CycleEntry, EventAnomalies, FanOutProducer, HubRef, Missing,
-    TopicEntry, UnresolvedEntry, UnresolvedReason, ANOMALY_FAN_OUT_CONSUMERS, ANOMALY_FAN_OUT_TOPICS,
-    ANOMALY_MAX_CYCLE_SITES,
+    TopicEntry, UnresolvedEntry, UnresolvedReason, ANOMALY_FAN_OUT_CONSUMERS,
+    ANOMALY_FAN_OUT_TOPICS, ANOMALY_MAX_CYCLE_SITES,
 };
 pub use broker::{qualified_topic_key, split_qualified_topic_key, Broker};
 pub use calls::{

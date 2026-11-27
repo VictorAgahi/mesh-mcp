@@ -1056,7 +1056,12 @@ impl ContractGraph {
                     .iter()
                     .fold(EdgeConfidence::Exact, |acc, s| weakest(acc, s.confidence));
                 for &h in &from {
-                    for &to in idx.produces.get(&last.node.id).map(Vec::as_slice).unwrap_or(&[]) {
+                    for &to in idx
+                        .produces
+                        .get(&last.node.id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[])
+                    {
                         if !wanted.contains(&to) {
                             continue;
                         }
