@@ -63,6 +63,16 @@ fn an_object_call_yields_the_type_and_the_queue_on_their_own_lines() {
 }
 
 #[test]
+fn the_declared_argument_index_is_the_one_read() {
+    let calls = vec![call("EventOutbox.createFollowUp", 1, &["type"], &[])];
+    let code = "import { EventOutbox } from './outbox';\n\
+                EventOutbox.createFollowUp({ type: 'source.event' }, { type: 'follow.up' });\n\
+                EventOutbox.createFollowUp({ type: 'only.source' });\n";
+    let fi = index_with(calls, "svc/f.ts", code);
+    assert_eq!(producers(&fi), vec![("follow.up".to_string(), 2)]);
+}
+
+#[test]
 fn every_declared_producer_is_heuristic() {
     let code = format!("{ENUMS}JobsOutbox.createJob({{ type: JobType.A, target: Queue.B }});\n");
     let fi = index_with(outbox(), "svc/jobs.ts", &code);

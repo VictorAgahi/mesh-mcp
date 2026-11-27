@@ -4068,6 +4068,19 @@ resolve_placeholders = true
             "import { JobQueue } from './queues';\nimport { Outbox } from './outbox';\n\
              export const send = () => Outbox.enqueue({\n  type: 'send-welcome',\n  target: JobQueue.EMAIL,\n});\n",
         );
+        // An enum no consumer names a queue by: it is a queue only because the declaration says
+        // `target` is one.
+        write(
+            &root,
+            "src/batch.ts",
+            "import { Outbox } from './outbox';\nimport { BatchQueue } from './batch-queue';\n\
+             export const nightly = () => Outbox.enqueue({ type: 'run-batch', target: BatchQueue.NIGHTLY });\n",
+        );
+        write(
+            &root,
+            "src/batch-queue.ts",
+            "export enum BatchQueue {\n  NIGHTLY = 'nightly-batch',\n}\n",
+        );
         let cfg = Config::load_from_str(
             "[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n\
              [engines.contracts]\nenabled = true\n\
@@ -4084,6 +4097,8 @@ resolve_placeholders = true
             [
                 "Consumes exact email-jobs consumer.ts",
                 "Produces heuristic email-jobs jobs.ts",
+                "Produces heuristic nightly-batch batch.ts",
+                "Produces heuristic run-batch batch.ts",
                 "Produces heuristic send-welcome jobs.ts"
             ]
         );
@@ -4114,6 +4129,8 @@ resolve_placeholders = true
             [
                 "Consumes exact email-v2 consumer.ts",
                 "Produces heuristic email-v2 jobs.ts",
+                "Produces heuristic nightly-batch batch.ts",
+                "Produces heuristic run-batch batch.ts",
                 "Produces heuristic send-welcome jobs.ts"
             ]
         );
