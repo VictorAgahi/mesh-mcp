@@ -519,9 +519,9 @@ export async function leak(): Promise<void> {{\n\
 
 #[tokio::test]
 async fn a_decorator_only_python_task_is_heuristic_and_the_footer_says_why() {
-    // A Locust load test: `@task` is read as a Celery consumer, with no broker.
-    let locust = "from locust import HttpUser, task\n\nclass Shopper(HttpUser):\n    @task(1)\n    def browse_product(self):\n        self.client.get('/')\n".to_string();
-    let (_tmp, state) = workspace(&[("locustfile.py", locust)]);
+    // A Celery task is a consumer with no broker (a Locust `@task` is none since 9.0 T15).
+    let celery = "from celery import Celery\n\napp = Celery('shop')\n\n@app.task\ndef browse_product(item):\n    pass\n".to_string();
+    let (_tmp, state) = workspace(&[("tasks.py", celery)]);
     let text = report(&state, json!({})).await;
     let rows = sections(&text);
     let row = &rows["consumed_never_published"][0];
@@ -535,6 +535,11 @@ async fn a_decorator_only_python_task_is_heuristic_and_the_footer_says_why() {
         "{text}"
     );
     assert!(text.contains("verify each with `rg`"), "{text}");
+    // A Locust load test registers no consumer at all.
+    let locust = "from locust import HttpUser, task\n\nclass Shopper(HttpUser):\n    @task(1)\n    def browse_product(self):\n        self.client.get('/')\n".to_string();
+    let (_tmp2, locust_state) = workspace(&[("locustfile.py", locust)]);
+    let locust_text = report(&locust_state, json!({})).await;
+    assert!(!locust_text.contains("browse_product"), "{locust_text}");
     // A report with only known brokers makes no such claim.
     let state = state_in(&repo("examples/eda/anomalies"), None);
     let clean = report(&state, json!({})).await;
