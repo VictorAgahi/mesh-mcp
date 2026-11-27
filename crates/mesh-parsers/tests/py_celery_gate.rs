@@ -396,6 +396,25 @@ fn a_bare_decorator_of_celery_that_is_not_a_task_decorator() {
     assert_eq!(consumers(code), none());
 }
 
+#[test]
+fn import_order_does_not_decide_an_ambiguous_name() {
+    let code = "from locust import shared_task\nfrom celery import shared_task\n\n@shared_task\ndef a():\n    pass\n";
+    assert_eq!(consumers(code), none());
+}
+
+#[test]
+fn an_app_name_defined_in_the_file_is_not_the_imported_app() {
+    let code =
+        "from proj.celery import app\n\ndef app():\n    pass\n\n@app.task\ndef a():\n    pass\n";
+    assert_eq!(consumers(code), none());
+}
+
+#[test]
+fn a_celery_named_base_is_read_even_when_bound_by_a_star_import() {
+    let code = "from ext import *\n\n@celery.task\ndef a():\n    pass\n";
+    assert_eq!(consumers(code), names(&["a"]));
+}
+
 // ---- producers ---------------------------------------------------------------------------
 
 #[test]
@@ -499,6 +518,12 @@ fn delay_without_a_known_origin_is_no_producer() {
     ] {
         assert_eq!(producers(code), none(), "{code}");
     }
+}
+
+#[test]
+fn a_rebound_import_is_no_producer() {
+    let code = "from rx import timer\ntimer = wrap(timer)\n\ndef go():\n    timer.delay(1)\n";
+    assert_eq!(producers(code), none());
 }
 
 #[test]
