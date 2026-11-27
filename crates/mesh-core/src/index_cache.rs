@@ -135,7 +135,10 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v24: Python brokers (9.0 T8c, after T8b's 23): RabbitMQ, Redis, NATS, SQS / SNS, Pub/Sub and
 /// Kafka-gap producers and consumers (`EventStream` call-site nodes), the broker of the Kafka calls
 /// whose client is bound in the file, `FileIndex::py_brokers_capped`.
-const SCHEMA_VERSION: u8 = 24;
+/// v25: Celery import gate (9.0 T15): a Python `@task` / `@x.task` consumer or `.delay()` producer
+/// is read only when the file's parsed imports bring Celery in; a Locust `@task` no longer is a
+/// consumer.
+const SCHEMA_VERSION: u8 = 25;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

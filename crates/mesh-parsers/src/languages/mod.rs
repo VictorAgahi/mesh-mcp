@@ -13,6 +13,7 @@ pub mod kotlin;
 pub mod php;
 pub mod proto;
 mod py_brokers;
+mod py_celery;
 mod py_calls;
 pub mod python;
 pub mod ruby;
