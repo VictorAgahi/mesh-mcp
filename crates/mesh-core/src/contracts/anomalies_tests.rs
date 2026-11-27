@@ -322,6 +322,43 @@ fn a_same_file_guess_is_not_a_cycle() {
     assert!(r.cycle_guess_hops > 0);
 }
 
+#[test]
+fn placeholder_topics_are_never_a_cycle_or_a_fan_out() {
+    // A ring of `${key}` topics, and one placeholder with more consumers than the threshold.
+    let mut g = ContractGraph::new();
+    for i in 0..3 {
+        let path = format!("/w/ph{i}.ts");
+        g.add_call_facts(
+            Arc::from(Path::new(&path)),
+            0,
+            CompactStr::new("app"),
+            CallFacts {
+                callables: vec![CallableFact {
+                    name: CompactStr::new(format!("f{i}")),
+                    owner: None,
+                    line_start: 1,
+                    line_end: 20,
+                }],
+                ..CallFacts::default()
+            },
+        );
+        g.add_node(node("decl", NodeKind::ServiceClass, &path, 1));
+        let c = g.add_node(node(&format!("c{i}"), NodeKind::KafkaTopic, &path, 2));
+        g.add_consumer(c, &format!("${{t{i}}}"));
+        let p = g.add_node(node(&format!("p{i}"), NodeKind::KafkaTopic, &path, 3));
+        g.add_producer(p, &format!("${{t{}}}", (i + 1) % 3));
+    }
+    produce(&mut g, "/w/w.ts", 1, "${wide}", None);
+    for i in 0..ANOMALY_FAN_OUT_CONSUMERS + 2 {
+        consume(&mut g, "/w/w.ts", 10 + i, "${wide}", None);
+    }
+    g.reconcile_edges();
+    let r = report(&g);
+    assert!(r.cycles.is_empty(), "{:?}", r.cycles.len());
+    assert!(r.fan_out_topics.is_empty());
+    assert_eq!(r.placeholder_topics, 4);
+}
+
 /// Runs `f` on a thread with a 2 MB stack: a recursive walk over thousands of topics would
 /// overflow it.
 fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
@@ -345,6 +382,21 @@ fn a_ring_of_thousands_of_topics_is_one_cycle_on_a_small_stack() {
         let open = ring(3_000, false);
         assert!(report(&open).cycles.is_empty());
     });
+}
+
+#[test]
+fn rows_follow_the_key_not_the_order_hubs_were_created_in() {
+    let mut g = ContractGraph::new();
+    produce(&mut g, "/w/z.ts", 1, "zeta", Some(Broker::Kafka));
+    g.reconcile_edges();
+    // A later reconcile creates the hub of `alpha` after `zeta`'s: a higher node id.
+    produce(&mut g, "/w/a.ts", 1, "alpha", Some(Broker::Kafka));
+    g.reconcile_edges();
+    let r = report(&g);
+    assert_eq!(
+        keys(&r.published_never_consumed),
+        ["alpha [kafka]", "zeta [kafka]"]
+    );
 }
 
 #[test]

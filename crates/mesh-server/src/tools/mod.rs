@@ -1107,6 +1107,22 @@ roots = ["."]
         assert!(docs_props.contains(&"query".to_string()));
         assert!(docs_props.contains(&"max_sections".to_string()));
         assert!(!docs_props.contains(&"scope".to_string()));
+
+        let anomalies = schema_for!(super::event_anomalies::EventAnomaliesArgs);
+        let anomaly_props: Vec<String> = anomalies
+            .schema
+            .object
+            .unwrap()
+            .properties
+            .keys()
+            .cloned()
+            .collect();
+        for p in ["scope", "classes", "limit", "offset"] {
+            assert!(anomaly_props.contains(&p.to_string()), "{p}");
+        }
+        // A whole-workspace report: no target, and the hidden trace context stays hidden.
+        assert!(!anomaly_props.contains(&"target".to_string()));
+        assert!(!anomaly_props.contains(&"_meta".to_string()));
     }
 
     #[test]
