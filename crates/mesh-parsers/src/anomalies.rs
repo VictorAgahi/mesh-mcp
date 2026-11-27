@@ -2,9 +2,10 @@
 
 use crate::markdown::MarkdownFormatter;
 use mesh_core::{
-    hub_topic, AnomalySite, ContractNode, CycleEntry, EdgeConfidence, EventAnomalies,
-    FanOutProducer, HubRef, Missing, UnresolvedEntry, UnresolvedReason, ANOMALY_FAN_OUT_CONSUMERS,
-    ANOMALY_FAN_OUT_TOPICS, ANOMALY_MAX_CYCLE_SITES,
+    hub_topic, payload_json_family, AnomalySite, ContractNode, CycleEntry, EdgeConfidence,
+    EventAnomalies, FanOutProducer, FieldGap, HubRef, Missing, NotCompared, PayloadEntry,
+    PayloadSide, PayloadSkipReason, UnresolvedEntry, UnresolvedReason, ANOMALY_FAN_OUT_CONSUMERS,
+    ANOMALY_FAN_OUT_TOPICS, ANOMALY_MAX_CYCLE_SITES, MAX_PAYLOAD_SHAPES_PER_TOPIC,
 };
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -18,6 +19,7 @@ pub struct AnomalyShow {
     pub cycles: bool,
     pub fan_out: bool,
     pub test_only_consumers: bool,
+    pub payload_mismatch: bool,
 }
 
 impl AnomalyShow {
@@ -28,6 +30,7 @@ impl AnomalyShow {
         cycles: true,
         fan_out: true,
         test_only_consumers: true,
+        payload_mismatch: true,
     };
 }
 
@@ -75,6 +78,33 @@ fn shown_key(key: &str) -> String {
         masked.replace(['`', '\n', '\r'], "'")
     } else {
         REDACTED.to_string()
+    }
+}
+
+/// A type or field name that is safe to print (the shared name gate), else the redaction marker.
+fn shown_name(name: &str) -> String {
+    if mesh_core::member_consts::name_is_printable(name)
+        && !mesh_core::member_consts::identifier_is_credential_named(name)
+    {
+        name.replace(['`', '\n', '\r'], "'")
+    } else {
+        REDACTED.to_string()
+    }
+}
+
+/// `path:line` of a line in a file, relative to its root.
+fn file_line(
+    file: &std::path::Path,
+    repo_id: mesh_core::RepoId,
+    line: u32,
+    roots: &[PathBuf],
+) -> String {
+    match roots
+        .get(repo_id as usize)
+        .and_then(|root| file.strip_prefix(root).ok())
+    {
+        Some(rel) => format!("{}:{line}", MarkdownFormatter::slash_path(rel)),
+        None => format!("{}:{line}", file.display()),
     }
 }
 
@@ -163,6 +193,10 @@ impl MarkdownFormatter {
             (
                 "test-only consumers",
                 report.test_only_consumers.len().to_string(),
+            ),
+            (
+                "payload mismatches",
+                report.payload.mismatches.len().to_string(),
             ),
         ] {
             let _ = writeln!(out, "| {name} | {n} |");
@@ -313,6 +347,10 @@ impl MarkdownFormatter {
             );
         }
 
+        if view.show.payload_mismatch {
+            Self::payload_section(&mut out, report, view, roots);
+        }
+
         out.push_str("### Reading this report\n");
         out.push_str("- \"No consumer\" and \"no producer\" mean none was statically resolved in the indexed roots. A topic name built at runtime, a registry, a generated client or a root that is not indexed can hide the other end: confirm a claim of absence with a search across every root before acting on it.\n");
         out.push_str("- Topics are per broker: two brokers using one name are two rows and are never joined. A site whose broker is unknown joins every channel of its name and is shown `heuristic`.\n");
@@ -350,6 +388,47 @@ impl MarkdownFormatter {
                 out,
                 "- {unknown} row(s) rest on sites whose broker is unknown (a decorator-only match such as a Python `@task` or a NestJS `@EventPattern`, a declarative pattern): they are shown `heuristic` and may be false; verify each with `rg` before acting."
             );
+        }
+        if view.show.payload_mismatch {
+            let p = &report.payload;
+            let not_typed = p
+                .skipped
+                .iter()
+                .filter(|s| s.reason == PayloadSkipReason::NotTyped)
+                .count();
+            let too_many = p.skipped.len() - not_typed;
+            let _ = writeln!(
+                out,
+                "- **Payloads**: {} topic(s) have live producers and consumers; {} mismatch, {} match ({} of them compared one way only), {} not compared because no producer or no consumer payload is statically typed, {} not compared because a side has more than {MAX_PAYLOAD_SHAPES_PER_TOPIC} payload types. {} site(s) have a payload that is not statically typed ({} name a type no indexed file declares, {} a type several files declare). Not compared is not \"no mismatch\". Only TypeScript / JavaScript and Java payloads are read; a consumer's expected fields are its declared type's fields, not the fields its code reads.",
+                p.topics,
+                p.mismatches.len(),
+                p.matching,
+                p.matching_partial,
+                not_typed,
+                too_many,
+                p.untyped_sites,
+                p.undeclared_sites,
+                p.ambiguous_sites
+            );
+            if !p.skipped.is_empty() {
+                let mut names: Vec<String> = p
+                    .skipped
+                    .iter()
+                    .take(NAMES_PER_ROW)
+                    .map(|s| topic_label(&s.topic.key, s.topic.broker))
+                    .collect();
+                if p.skipped.len() > NAMES_PER_ROW {
+                    names.push(format!("+{} more", p.skipped.len() - NAMES_PER_ROW));
+                }
+                let _ = writeln!(out, "- Payloads not compared: {}.", names.join(", "));
+            }
+            if p.capped_files > 0 {
+                let _ = writeln!(
+                    out,
+                    "- **Payload facts incomplete**: {} file(s) hold more payload sites or types than the per-file caps (`MAX_PAYLOAD_SITES_PER_FILE`, `MAX_PAYLOAD_TYPES_PER_FILE`); sites past the cap read as not statically typed.",
+                    p.capped_files
+                );
+            }
         }
         if let Some(note) = &view.coverage {
             let _ = writeln!(out, "- **Coverage**: {note}");
@@ -401,6 +480,158 @@ impl MarkdownFormatter {
             );
         }
         out.push('\n');
+    }
+
+    /// The publisher-versus-consumer payload check (9.0 T11).
+    fn payload_section(
+        out: &mut String,
+        report: &EventAnomalies<'_>,
+        view: &AnomalyView<'_>,
+        roots: &[PathBuf],
+    ) {
+        let render = |e: &PayloadEntry<'_>| {
+            let side = |s: &PayloadSide<'_>| {
+                let name = s.type_name.map_or("inline object".to_string(), |n| {
+                    format!("`{}`", shown_name(n))
+                });
+                let more = if s.sites > 1 {
+                    format!(" (+{} more site(s))", s.sites - 1)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{name} ({}) at `{}`{more}",
+                    file_line(s.file, s.repo_id, s.line, roots),
+                    MarkdownFormatter::location(s.site, roots)
+                )
+            };
+            let sides = |v: &[PayloadSide<'_>]| -> String {
+                let mut out: Vec<String> = v.iter().take(SITES_PER_ROW).map(side).collect();
+                if v.len() > SITES_PER_ROW {
+                    out.push(format!("+{} more", v.len() - SITES_PER_ROW));
+                }
+                out.join("; ")
+            };
+            let mut text = format!(
+                "{} {}: producer {} / consumer {}",
+                topic_label(&e.topic.key, e.topic.broker),
+                confidence(e.topic.confidence),
+                sides(&e.producers),
+                sides(&e.consumers)
+            );
+            let gap_list = |gaps: &[FieldGap<'_>], v: &[PayloadSide<'_>]| -> String {
+                let mut out: Vec<String> = gaps
+                    .iter()
+                    .take(NAMES_PER_ROW)
+                    .map(|g| {
+                        let at = v.get(g.side).map_or(String::new(), |s| {
+                            format!(" ({})", file_line(s.file, s.repo_id, g.field.line, roots))
+                        });
+                        format!("`{}`{at}", shown_name(&g.field.name))
+                    })
+                    .collect();
+                if gaps.len() > NAMES_PER_ROW {
+                    out.push(format!("+{} more", gaps.len() - NAMES_PER_ROW));
+                }
+                out.join(", ")
+            };
+            if !e.consumer_only.is_empty() {
+                let _ = write!(
+                    text,
+                    "\n  - consumer expects, no producer sends: {}",
+                    gap_list(&e.consumer_only, &e.consumers)
+                );
+            }
+            if !e.producer_only.is_empty() {
+                let _ = write!(
+                    text,
+                    "\n  - published, no consumer expects: {}",
+                    gap_list(&e.producer_only, &e.producers)
+                );
+            }
+            for c in e.clashes.iter().take(NAMES_PER_ROW) {
+                let fam = |f: &mesh_core::PayloadField| {
+                    f.ty.as_deref()
+                        .and_then(payload_json_family)
+                        .unwrap_or_default()
+                };
+                let at = |g: &FieldGap<'_>, v: &[PayloadSide<'_>]| {
+                    v.get(g.side).map_or(String::new(), |s| {
+                        file_line(s.file, s.repo_id, g.field.line, roots)
+                    })
+                };
+                let _ = write!(
+                    text,
+                    "\n  - type differs: `{}` is {} in the producer ({}), {} in the consumer ({})",
+                    shown_name(&c.producer.field.name),
+                    fam(c.producer.field),
+                    at(&c.producer, &e.producers),
+                    fam(c.consumer.field),
+                    at(&c.consumer, &e.consumers)
+                );
+            }
+            if e.clashes.len() > NAMES_PER_ROW {
+                let _ = write!(
+                    text,
+                    "\n  - +{} more type differences",
+                    e.clashes.len() - NAMES_PER_ROW
+                );
+            }
+            if e.names_differ {
+                text.push_str("\n  - type names differ between producer and consumer");
+            }
+            // The "not compared" notes are what keeps a row honest: kept whole, the findings above
+            // them are clamped instead when the row is too long.
+            let mut notes = String::new();
+            for (side, what, partial) in [
+                ("consumer", "expected", e.consumer_only_partial),
+                ("producer", "published", e.producer_only_partial),
+            ] {
+                if partial {
+                    let _ = write!(
+                        notes,
+                        "\n  - partial list above: the {side}'s field list is partial (a cap, a spread, an extends), more {what} fields may be missing"
+                    );
+                }
+            }
+            for (what, skipped) in [
+                ("fields a consumer expects", e.consumer_only_skipped),
+                ("fields published", e.producer_only_skipped),
+            ] {
+                let why = match skipped {
+                    None => continue,
+                    Some(NotCompared::Untyped) => {
+                        "the other side has a site whose payload is not statically typed"
+                    }
+                    Some(NotCompared::Incomplete) => {
+                        "a field list of the other side is partial (a cap, a spread, an extends)"
+                    }
+                };
+                let _ = write!(notes, "\n  - {what}: not compared, {why}");
+            }
+            if e.untyped_sites > 0 {
+                let _ = write!(
+                    notes,
+                    "\n  - {} site(s) of this topic have a payload that is not statically typed",
+                    e.untyped_sites
+                );
+            }
+            // `- ` and the newline the section adds around a row.
+            let room = ROW_MAX.saturating_sub(3 + notes.chars().count());
+            if text.chars().count() > room {
+                text = Self::clamp_chars(&text, room);
+            }
+            text.push_str(&notes);
+            text
+        };
+        Self::anomaly_section(
+            out,
+            "Payload mismatches",
+            "Producers and consumers of one topic (per broker) disagree on the payload type: fields a consumer expects that no producer sends, fields published that no consumer expects, primitive field types that differ. Only statically typed payloads are compared.",
+            &report.payload.mismatches,
+            view,
+            render,
+        );
     }
 
     fn cycle_section(

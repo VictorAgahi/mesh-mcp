@@ -138,7 +138,10 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// v25: Celery import gate (9.0 T15): a Python `@task` / `@x.task` consumer or `.delay()` producer
 /// is read only when the file's parsed imports bring Celery in; a Locust `@task` no longer is a
 /// consumer.
-const SCHEMA_VERSION: u8 = 25;
+/// v26: payload facts (9.0 T11): the payload type of TypeScript / JavaScript and Java producer and
+/// consumer sites where it is statically visible, and the fields of the types each file declares
+/// (`FileIndex::payload`; names, declared types and lines, never a value).
+const SCHEMA_VERSION: u8 = 26;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

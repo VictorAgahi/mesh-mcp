@@ -1,0 +1,10 @@
+# Fixture: payload type names resolved through imports and declared aliases (9.0 T11 review).
+# Truth is written in crates/mesh-server/tests/payload_types.rs (payload_imports_* tests).
+[workspace]
+name = "payload-imports"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/node_modules/**"]
+
+[engines.contracts]
+enabled = true

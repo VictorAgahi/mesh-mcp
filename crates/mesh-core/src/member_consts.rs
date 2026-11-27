@@ -183,6 +183,33 @@ pub fn name_is_printable(value: &str) -> bool {
             })
 }
 
+/// Whether an identifier (a type or field name: `SecretsPayload`, `api_key`, `dbPassword`) holds a
+/// credential word once split on case changes, digits and `_` / `-` (9.0 T11). The bare word
+/// `key` alone is not one (`routingKey`, `orderKey` are names); `api` + `key` is.
+pub fn identifier_is_credential_named(name: &str) -> bool {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev: Option<char> = None;
+    for c in name.chars() {
+        let boundary = !c.is_ascii_alphabetic()
+            || (c.is_ascii_uppercase() && prev.is_some_and(|p| p.is_ascii_lowercase()));
+        if boundary && !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+        }
+        if c.is_ascii_alphabetic() {
+            cur.push(c.to_ascii_lowercase());
+        }
+        prev = Some(c);
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+        .iter()
+        .any(|w| w != "key" && CREDENTIAL_WORDS.contains(&w.as_str()))
+        || words.windows(2).any(|p| p[0] == "api" && p[1] == "key")
+}
+
 /// Whether a constant may be recorded and may name a topic: the member (or constant) is not
 /// named like a credential and the value is a name. Applied where the constants are extracted, so
 /// a refused value never reaches the graph or the parse cache.

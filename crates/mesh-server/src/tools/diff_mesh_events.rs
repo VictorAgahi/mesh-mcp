@@ -468,7 +468,7 @@ pub(super) fn event_report(
         }
     }
     let mut notes = vec![
-        "\n*Payload fields: not compared. No extractor exposes the payload type of an event yet.*\n"
+        "\n*Payload fields: not compared by this diff. `event_anomalies` (class `payload_mismatch`) compares publisher and consumer payloads on the working tree.*\n"
             .to_string(),
     ];
     if untraced > 0 {
@@ -716,7 +716,10 @@ export class ReportListener {
             ev.contains("#### `inproc:invoice.issued` — link cut: no producer on this channel reaches a consumer any more\n- - consumer of `inproc:invoice.issued` in `onInvoice` (`src/report.listener.ts, base L7`)\n"),
             "{ev}"
         );
-        assert!(ev.contains("*Payload fields: not compared."), "{ev}");
+        assert!(
+            ev.contains("*Payload fields: not compared by this diff."),
+            "{ev}"
+        );
     }
 
     /// Added: a new channel with a new producer and a new consumer is a created link.

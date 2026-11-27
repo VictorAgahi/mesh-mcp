@@ -152,7 +152,7 @@ WHEN TO USE IT: for a question that spans several repositories, start from the g
 4. Symbol declarations across roots: `smart_search`.
 5. What does my branch change in the mesh / what will this change break (contract-level diff against a Git base, with callers, dependents and the .proto wire check): `diff_mesh`.
 6. An event flow end to end (what does handling an event, route or handler trigger; what ends up publishing an event), hop by hop with each call's path:line: `trace_flow`.
-7. Where the event graph looks wrong (topics published but never consumed or consumed but never published, cycles, abnormal fan-out, test-only consumers), in one report: `event_anomalies`.
+7. Where the event graph looks wrong (topics published but never consumed or consumed but never published, cycles, abnormal fan-out, test-only consumers, payload fields a consumer expects that no producer sends), in one report: `event_anomalies`.
 For an exact identifier (an enum value, a class name), plain grep is fine.
 
 LOADING: in clients that defer MCP tool schemas (such as Claude Code), load them with:
