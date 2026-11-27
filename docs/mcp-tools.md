@@ -1131,9 +1131,10 @@ index cache).
 
 Known limits: a producer whose topic is built at runtime is invisible, so its consumers read as
 "consumed, never published" (`examples/unresolved-flow`, `user:deletion:success`, is pinned as a
-known false positive in `tests/golden/events/anomalies.report.yaml`); a Python `@task` decorator
-(Celery) is read as a consumer whatever the framework, so a Locust load test shows its tasks as
-"consumed, never published".
+known false positive in `tests/golden/events/anomalies.report.yaml`); a Python Celery task
+is read only on a Celery origin (an app built by `Celery(...)` / `make_celery(...)`, a `celery` module or a `tasks` module; 9.0 T15,
+`docs/parser-support.md` 2.4), so a Locust load test shows no task, and a real task whose app comes
+from a module with another name is missed.
 
 ---
 

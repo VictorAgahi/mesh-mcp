@@ -14,6 +14,7 @@ pub mod php;
 pub mod proto;
 mod py_brokers;
 mod py_calls;
+mod py_celery;
 pub mod python;
 pub mod ruby;
 pub mod rust_lang;

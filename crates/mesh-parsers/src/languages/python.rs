@@ -1,4 +1,5 @@
 use super::py_brokers::{self, Claim};
+use super::py_celery::CeleryGate;
 use mesh_core::{Broker, CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::collections::HashSet;
 use std::path::Path;
@@ -80,7 +81,8 @@ impl PythonExtractor {
     /// Same nodes as `extract`, plus native import dependencies (`import x`,
     /// `from x import y`, relative `from .x import y`) and native event
     /// producer/consumer detection (`confluent_kafka`, `aiokafka`, Celery
-    /// `@task` / `@app.task` / `.delay()` / `.apply_async()`).
+    /// `@shared_task` / `@app.task` / `.delay()` / `.apply_async()`, gated on the file's imports:
+    /// see `py_celery`).
     pub fn extract_with_relations(
         file_path: &Path,
         content: &str,
@@ -97,6 +99,7 @@ impl PythonExtractor {
 
         let mut module_idx: Option<usize> = None;
         let brokers = py_brokers::scan(tree, content);
+        let celery = CeleryGate::scan(tree, source_bytes);
         let mut tags = BrokerTags::default();
         Self::visit_node(
             root,
@@ -113,6 +116,7 @@ impl PythonExtractor {
             &mut relations.rpc_calls,
             &mut module_idx,
             &brokers,
+            &celery,
             &mut tags,
             0,
         );
@@ -160,6 +164,7 @@ impl PythonExtractor {
         rpc_calls: &mut Vec<(usize, CompactStr)>,
         module_idx: &mut Option<usize>,
         brokers: &py_brokers::Scan,
+        celery: &CeleryGate,
         tags: &mut BrokerTags,
         depth: usize,
     ) {
@@ -241,13 +246,15 @@ impl PythonExtractor {
                 // Check decorators (supporting multiple stacked decorators, e.g. @app.get + @login_required)
                 let mut check_decorator = |dec_node: Node| {
                     if let Ok(dec_text) = dec_node.utf8_text(source) {
-                        if Self::is_celery_task_decorator(dec_text) {
+                        if celery.is_task_decorator(dec_node, source) {
                             kind = NodeKind::Queue;
                             celery_task_name = Self::celery_task_name_override(dec_text)
                                 .or_else(|| Some(func_name.to_string()));
-                        } else if dec_text.contains("@app.")
+                        } else if (dec_text.contains("@app.")
                             || dec_text.contains("@router.")
-                            || dec_text.contains("@api_router.")
+                            || dec_text.contains("@api_router."))
+                            // An `x.task` the gate refused is no route either.
+                            && !Self::is_task_shaped(dec_text)
                         {
                             kind = NodeKind::HttpEndpoint;
                             if route.is_none() {
@@ -317,7 +324,9 @@ impl PythonExtractor {
                     // A call `py_brokers` reads (another broker) or knows is no producer (a
                     // class of this file) is not the shape-based Kafka reader's.
                     if matches!(claim, None | Some(Claim::Broker(Broker::Kafka))) {
-                        Self::detect_event_call(node, source, idx, producers, consumers, root);
+                        Self::detect_event_call(
+                            node, source, idx, producers, consumers, root, celery,
+                        );
                     }
                     if let Some(Claim::Broker(b)) = claim {
                         tags.producers.extend((p0..producers.len()).map(|i| (i, b)));
@@ -362,6 +371,7 @@ impl PythonExtractor {
                 rpc_calls,
                 module_idx,
                 brokers,
+                celery,
                 tags,
                 depth + 1,
             );
@@ -563,6 +573,7 @@ impl PythonExtractor {
         producers: &mut Vec<(usize, CompactStr)>,
         consumers: &mut Vec<(usize, CompactStr)>,
         root: Node,
+        celery: &CeleryGate,
     ) {
         let Some(func) = node.child_by_field_name("function") else {
             return;
@@ -582,14 +593,11 @@ impl PythonExtractor {
 
                 match method {
                     "delay" | "apply_async" => {
-                        if let Some(object) = func.child_by_field_name("object") {
-                            if let Ok(object_text) = object.utf8_text(source) {
-                                let task_name =
-                                    object_text.rsplit('.').next().unwrap_or(object_text);
-                                if !task_name.is_empty() {
-                                    producers.push((enclosing, CompactStr::new(task_name)));
-                                }
-                            }
+                        if let Some(task) = func
+                            .child_by_field_name("object")
+                            .and_then(|o| celery.producer_task(o, source))
+                        {
+                            producers.push((enclosing, CompactStr::new(task)));
                         }
                     }
                     "produce" | "send" | "send_and_wait" | "publish" => {
@@ -698,8 +706,10 @@ impl PythonExtractor {
         Some((method.to_ascii_uppercase(), path))
     }
 
-    fn is_celery_task_decorator(dec_text: &str) -> bool {
-        dec_text.contains("@task") || dec_text.contains("@celery") || dec_text.contains(".task")
+    /// `@x.task` / `@x.shared_task`, called or not: the shape of a task decorator, whoever owns it.
+    fn is_task_shaped(dec_text: &str) -> bool {
+        let head = dec_text.split('(').next().unwrap_or(dec_text);
+        head.ends_with(".task") || head.ends_with(".shared_task")
     }
 
     fn celery_task_name_override(dec_text: &str) -> Option<String> {
@@ -1340,7 +1350,10 @@ from myapp.tasks import process_order
 def handle_request(order_id):
     process_order.delay(order_id)
 "#;
+        // The consumer file imports its app (the gate reads the parsed imports, 9.0 T15).
         let consumer_code = r#"
+from myapp.celery import app
+
 @app.task
 def process_order(order_id):
     pass
