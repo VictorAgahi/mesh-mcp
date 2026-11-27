@@ -348,7 +348,7 @@ impl MarkdownFormatter {
         if unknown > 0 {
             let _ = writeln!(
                 out,
-                "- {unknown} row(s) rest on sites whose broker is unknown (a decorator-only match such as a Python `@task` or a NestJS `@EventPattern`, a declarative pattern): they are shown `heuristic` and may be false (a Locust `@task` is read as a Celery consumer); verify each with `rg` before acting."
+                "- {unknown} row(s) rest on sites whose broker is unknown (a decorator-only match such as a Python `@task` or a NestJS `@EventPattern`, a declarative pattern): they are shown `heuristic` and may be false; verify each with `rg` before acting."
             );
         }
         if let Some(note) = &view.coverage {

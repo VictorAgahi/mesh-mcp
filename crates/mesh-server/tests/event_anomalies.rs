@@ -535,6 +535,7 @@ async fn a_decorator_only_python_task_is_heuristic_and_the_footer_says_why() {
         "{text}"
     );
     assert!(text.contains("verify each with `rg`"), "{text}");
+    assert!(!text.contains("Locust"), "stale footer claim: {text}");
     // A Locust load test registers no consumer at all.
     let locust = "from locust import HttpUser, task\n\nclass Shopper(HttpUser):\n    @task(1)\n    def browse_product(self):\n        self.client.get('/')\n".to_string();
     let (_tmp2, locust_state) = workspace(&[("locustfile.py", locust)]);

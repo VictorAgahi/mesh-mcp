@@ -263,6 +263,139 @@ fn flask_routes_are_unchanged() {
         .any(|n| n.name == "x" && n.kind == NodeKind::HttpEndpoint));
 }
 
+// ---- consumers: shadowing, Flask factory, token rules, shared_task ------------------------
+
+#[test]
+fn only_module_level_names_shadow_a_celery_task_import() {
+    // a nested assignment and a method named `task` do not hide the module-level import
+    let nested = r#"
+from celery import task
+
+def build():
+    task = load()
+    return task
+
+class Runner:
+    def task(self):
+        pass
+
+@task
+def notify_user():
+    pass
+"#;
+    assert_eq!(consumers(nested), names(&["notify_user"]));
+    // a module-level def, assignment or guarded def does
+    for code in [
+        "from celery import task\n\ndef task(fn):\n    return fn\n\n@task\ndef a():\n    pass\n",
+        "from celery import task\ntask = wrap(task)\n\n@task\ndef a():\n    pass\n",
+        "from celery import task\ntry:\n    pass\nexcept ImportError:\n    def task(fn):\n        return fn\n\n@task\ndef a():\n    pass\n",
+    ] {
+        assert_eq!(consumers(code), none(), "{code}");
+    }
+}
+
+#[test]
+fn a_name_bound_to_two_imports_is_ambiguous() {
+    let code = "from celery import shared_task\nfrom locust import shared_task\n\n@shared_task\ndef a():\n    pass\n";
+    assert_eq!(consumers(code), none());
+}
+
+#[test]
+fn flask_make_celery_in_the_same_file() {
+    let code = "celery = make_celery(app)\n\n@celery.task\ndef a():\n    pass\n";
+    assert_eq!(consumers(code), names(&["a"]));
+    let code = "queue = create_celery(app)\n\n@queue.task(name=\"q\")\ndef a():\n    pass\n";
+    assert_eq!(consumers(code), names(&["q"]));
+    let code = "from celery import Celery as C\nqueue = C()\n\n@queue.task\ndef a():\n    pass\n";
+    assert_eq!(consumers(code), names(&["a"]));
+}
+
+#[test]
+fn an_app_assigned_from_another_call_is_no_celery_app() {
+    for code in [
+        "app = Flask(__name__)\n\n@app.task\ndef a():\n    pass\n",
+        "app = make_thing()\n\n@app.task\ndef a():\n    pass\n",
+        "from celery import Celery\napp = Celery()\napp = Flask(__name__)\n\n@app.task\ndef a():\n    pass\n",
+    ] {
+        assert_eq!(consumers(code), none(), "{code}");
+    }
+}
+
+#[test]
+fn module_words_match_tokens_not_substrings() {
+    for code in [
+        "from mycelery_utils import app\n\n@app.task\ndef a():\n    pass\n",
+        "from celeryman import app\n\n@app.task\ndef a():\n    pass\n",
+        "from proj.subtasks import app\n\n@app.task\ndef a():\n    pass\n",
+        "from proj.taskstore import app\n\n@app.task\ndef a():\n    pass\n",
+        "from proj.tasksmith import app\n\n@app.task\ndef a():\n    pass\n",
+        "from proj.shop_tasks import app\n\n@app.task\ndef a():\n    pass\n",
+        "from invoke import tasks\n\n@tasks.task\ndef a():\n    pass\n",
+        "from fabric import tasks\n\n@tasks.task\ndef a():\n    pass\n",
+        "from locust.tasks import app\n\n@app.task\ndef a():\n    pass\n",
+    ] {
+        assert_eq!(consumers(code), none(), "{code}");
+    }
+    for code in [
+        "from proj.my_celery import app\n\n@app.task\ndef a():\n    pass\n",
+        "from proj import celery_app\n\n@celery_app.task\ndef a():\n    pass\n",
+        "from proj.celery_app import app\n\n@app.task\ndef a():\n    pass\n",
+    ] {
+        assert_eq!(consumers(code), names(&["a"]), "{code}");
+    }
+}
+
+#[test]
+fn importing_celery_elsewhere_does_not_open_the_attribute_form() {
+    for code in [
+        "import celery\nimport locust\n\nclass U(locust.HttpUser):\n    @locust.task\n    def a(self):\n        pass\n",
+        "import celery.app\nfrom elsewhere import app\n\n@app.task\ndef a():\n    pass\n",
+        "from celery import Celery\nfrom locust import HttpUser, task\n\nclass U(HttpUser):\n    @task\n    def a(self):\n        pass\n",
+    ] {
+        assert_eq!(consumers(code), none(), "{code}");
+    }
+}
+
+#[test]
+fn app_shared_task_and_x_shared_task_are_consumers() {
+    let code = "from celery import Celery\napp = Celery()\n\n@app.shared_task\ndef a():\n    pass\n\n@app.shared_task(name=\"b.v2\")\ndef b():\n    pass\n";
+    assert_eq!(consumers(code), names(&["a", "b.v2"]));
+    let code =
+        "from proj.celery import app\nimport celery\n\n@celery.shared_task\ndef a():\n    pass\n";
+    assert_eq!(consumers(code), names(&["a"]));
+}
+
+#[test]
+fn a_decorated_class_is_no_consumer() {
+    let code = "from celery import Celery\napp = Celery()\n\n@app.task\nclass Job:\n    pass\n";
+    assert_eq!(consumers(code), none());
+}
+
+#[test]
+fn only_task_decorators_count_in_a_celery_file() {
+    let code = r#"
+from celery import Celery
+from flask import Flask
+app = Flask(__name__)
+queue = Celery()
+
+@app.route("/x")
+def x():
+    pass
+
+@queue.on_after_configure
+def nf(e):
+    pass
+"#;
+    assert_eq!(consumers(code), none());
+}
+
+#[test]
+fn a_bare_decorator_of_celery_that_is_not_a_task_decorator() {
+    let code = "from celery import signature\n\n@signature\ndef a():\n    pass\n";
+    assert_eq!(consumers(code), none());
+}
+
 // ---- producers ---------------------------------------------------------------------------
 
 #[test]
@@ -275,6 +408,42 @@ def handle(order_id):
     notify.apply_async(args=[1])
 "#;
     assert_eq!(producers(code), names(&["notify", "process_order"]));
+}
+
+#[test]
+fn delay_on_a_from_imported_name_of_any_module() {
+    let code = r#"
+from notify.mailers import deliver_push, deliver_sms
+from billing.jobs import invoice_monthly as monthly
+
+def go():
+    deliver_push.delay()
+    deliver_sms.apply_async(args=[1])
+    monthly.delay()
+"#;
+    // the key is the receiver as written (the local alias)
+    assert_eq!(
+        producers(code),
+        names(&["deliver_push", "deliver_sms", "monthly"])
+    );
+}
+
+#[test]
+fn delay_through_signature_helpers_and_module_chains() {
+    let code = r#"
+import shop_tasks
+from shop import jobs
+
+def go():
+    shop_tasks.charge_card.s(2).delay()
+    jobs.refund.si(1).apply_async()
+    jobs.ship.signature((1,)).delay()
+    shop_tasks.email.delay()
+"#;
+    assert_eq!(
+        producers(code),
+        names(&["charge_card", "email", "refund", "ship"])
+    );
 }
 
 #[test]
@@ -294,21 +463,39 @@ def go():
 }
 
 #[test]
-fn delay_in_a_file_that_imports_celery() {
-    let code = "import celery\n\ndef go(t):\n    t.delay(1)\n";
-    assert_eq!(producers(code), names(&["t"]));
+fn delay_on_a_task_of_the_same_file_without_a_celery_import() {
+    // the app comes from a celery module (cross-file); the task is called in the same file
+    let code = r#"
+from proj.celery import app
+
+@app.task
+def a():
+    pass
+
+def go():
+    a.delay()
+"#;
+    assert_eq!(producers(code), names(&["a"]));
 }
 
 #[test]
-fn delay_without_celery_origin_is_no_producer() {
+fn delay_without_a_known_origin_is_no_producer() {
     for code in [
-        // a timer object of another library
-        "from rx import timer\n\ndef go():\n    timer.delay(1)\n",
+        // a parameter, even in a file that imports celery
+        "import celery\n\ndef go(t):\n    t.delay(1)\n",
         "def go(obj):\n    obj.apply_async(1)\n",
-        // a name of this file that is not a task
+        // a local instance
+        "from rx import make\n\ndef go():\n    timer = make()\n    timer.delay(1)\n",
+        "def go(self):\n    self.timer.delay(1)\n",
+        // a def of this file that is not a task, a module-level instance
         "def job():\n    pass\n\ndef go():\n    job.delay()\n",
-        // a locust file
-        "from locust import task\n\ndef go(self):\n    self.wait.delay(1)\n",
+        "from rx import make\ntimer = make()\n\ndef go():\n    timer.delay(1)\n",
+        // foreign packages and a plain module import
+        "from locust import events\n\ndef go():\n    events.delay(1)\n",
+        "from multiprocessing import pool\n\ndef go():\n    pool.apply_async(1)\n",
+        "import rx\n\ndef go():\n    rx.delay(1)\n",
+        // a call that is not a signature helper
+        "from shop import jobs\n\ndef go():\n    jobs.make().delay()\n",
     ] {
         assert_eq!(producers(code), none(), "{code}");
     }
@@ -330,76 +517,23 @@ def go():
     assert_eq!(consumers(code), none());
 }
 
-#[test]
-fn delay_on_a_task_of_the_same_file_without_a_celery_import() {
-    // the app comes from a celery module (cross-file); the task is called in the same file
-    let code = r#"
-from proj.celery import app
-
-@app.task
-def a():
-    pass
-
-def go():
-    a.delay()
-"#;
-    assert_eq!(producers(code), names(&["a"]));
-}
+// ---- known limits (documented, pinned) ---------------------------------------------------
 
 #[test]
-fn only_task_decorators_count_in_a_celery_file() {
-    let code = r#"
-import celery
-from flask import Flask
-app = Flask(__name__)
-
-@app.route("/x")
-def x():
-    pass
-
-@app.errorhandler(404)
-def nf(e):
-    pass
-"#;
-    assert_eq!(consumers(code), none());
-}
-
-#[test]
-fn a_bare_decorator_of_celery_that_is_not_a_task_decorator() {
-    let code = "from celery import signature\n\n@signature\ndef a():\n    pass\n";
-    assert_eq!(consumers(code), none());
-}
-
-#[test]
-fn a_celery_import_opens_the_attribute_form_for_any_base() {
-    let code = "import celery.app\nfrom elsewhere import app\n\n@app.task\ndef a():\n    pass\n";
-    assert_eq!(consumers(code), names(&["a"]));
-}
-
-#[test]
-fn a_submodule_import_of_celery_opens_the_gate() {
-    let code = "from celery.canvas import group\nfrom elsewhere import app\n\n@app.task\ndef a():\n    pass\n";
-    assert_eq!(consumers(code), names(&["a"]));
-    assert_eq!(
-        consumers(
-            "import celery.app.base\nfrom elsewhere import app\n\n@app.task\ndef b():\n    pass\n"
-        ),
-        names(&["b"])
-    );
-}
-
-// ---- known false negatives (documented, pinned) ------------------------------------------
-
-#[test]
-fn documented_false_negatives() {
-    // app imported from a module whose path holds neither `celery` nor `tasks`, no celery import
+fn documented_limits() {
+    // app imported from a module whose path holds neither `celery` nor a `tasks` segment
     assert_eq!(
         consumers("from proj import app\n\n@app.task\ndef a():\n    pass\n"),
         none()
     );
-    // task imported from a module such as `myapp.jobs`
+    // `from celery import *` binds no name
     assert_eq!(
-        producers("from myapp.jobs import run\n\ndef go():\n    run.delay()\n"),
+        consumers("from celery import *\n\n@shared_task\ndef a():\n    pass\n"),
         none()
+    );
+    // a from-imported object of another library is read as a task (precision cost of the rule)
+    assert_eq!(
+        producers("from rx import timer\n\ndef go():\n    timer.delay(1)\n"),
+        names(&["timer"])
     );
 }

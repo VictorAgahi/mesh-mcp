@@ -593,17 +593,11 @@ impl PythonExtractor {
 
                 match method {
                     "delay" | "apply_async" => {
-                        if let Some(object) = func
+                        if let Some(task) = func
                             .child_by_field_name("object")
-                            .filter(|o| celery.is_producer_receiver(*o, source))
+                            .and_then(|o| celery.producer_task(o, source))
                         {
-                            if let Ok(object_text) = object.utf8_text(source) {
-                                let task_name =
-                                    object_text.rsplit('.').next().unwrap_or(object_text);
-                                if !task_name.is_empty() {
-                                    producers.push((enclosing, CompactStr::new(task_name)));
-                                }
-                            }
+                            producers.push((enclosing, CompactStr::new(task)));
                         }
                     }
                     "produce" | "send" | "send_and_wait" | "publish" => {
