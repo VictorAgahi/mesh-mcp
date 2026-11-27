@@ -81,7 +81,8 @@ impl PythonExtractor {
     /// Same nodes as `extract`, plus native import dependencies (`import x`,
     /// `from x import y`, relative `from .x import y`) and native event
     /// producer/consumer detection (`confluent_kafka`, `aiokafka`, Celery
-    /// `@task` / `@app.task` / `.delay()` / `.apply_async()`).
+    /// `@shared_task` / `@app.task` / `.delay()` / `.apply_async()`, gated on the file's imports:
+    /// see `py_celery`).
     pub fn extract_with_relations(
         file_path: &Path,
         content: &str,

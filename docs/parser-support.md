@@ -153,8 +153,36 @@ above are read; constants are resolved within the file, not across packages.
 | Declarations | classes, functions (docstrings kept when bodies are stripped) |
 | Imports | `import` / `from ... import` |
 | gRPC | `*Servicer` servers, `*_pb2_grpc.*Stub(...)` clients |
-| Events | `confluent_kafka`, `kafka-python`, `aiokafka` producers and consumers; Celery tasks as queues; module constants resolved; RabbitMQ (pika, aio-pika, kombu), Redis, NATS, SQS / SNS, Google Pub/Sub ([3.10](#310-python-brokers)); an environment variable read is a `${KEY}` placeholder (3.6) |
+| Events | `confluent_kafka`, `kafka-python`, `aiokafka` producers and consumers; Celery tasks as queues, only in a file that imports Celery or an app from a `celery` / `tasks` module (below); module constants resolved; RabbitMQ (pika, aio-pika, kombu), Redis, NATS, SQS / SNS, Google Pub/Sub ([3.10](#310-python-brokers)); an environment variable read is a `${KEY}` placeholder (3.6) |
 | HTTP | routes on decorators of `app`, `router` or `api_router` (Flask, FastAPI); a Blueprint (`@bp.route`) is not read |
+
+**Celery is read through the file's imports (9.0 T15).** A decorator is a Celery task consumer, and a
+`.delay(...)` / `.apply_async(...)` a producer, only when the parsed `import` statements (never a comment
+or a string) say so. Before 9.0 any decorator that contained `@task`, `@celery` or `.task` was a
+consumer, so every Locust `@task` was a "Celery consumer" (21 of 21 event rows on otel-demo and
+bank-of-anthos were such rows). The rule:
+
+- Consumer, bare form (`@shared_task`, `@task(...)`, any alias): the name is imported from `celery` (or a
+  module whose path holds `celery`) as `task` or `shared_task`, and the file does not also define or
+  assign that name. `from locust import task`, `from other import task`, a local `def task(fn)` are not.
+- Consumer, attribute form (`@x.task`, `@x.shared_task`, called or not): the file imports `celery`
+  (`import celery`, `from celery import Celery`, `from celery.x import y`), or `x` is imported from a
+  module whose path holds `celery` or `tasks`, or the imported name holds `celery`
+  (`from proj.celery import app`, `from .celery import app`, `from proj import celery_app`,
+  `from myapp.tasks import app`). The task is keyed by `name="..."` when given, else the function name.
+- Producer (`x.delay(...)`, `x.apply_async(...)`): the file imports `celery`, or `x` is a `def` of the
+  file that is a consumer by the rule above, or `x` is imported from a module whose path holds `celery`
+  or `tasks` (`from myapp.tasks import process_order`).
+- A decorator the gate refuses is no longer a queue node either, and an `@app.task` it refuses is not
+  turned into an HTTP route.
+
+False negatives this introduces (a real task that is no longer read): `from proj import app` then
+`@app.task` in a file that does not import `celery` (the module path holds neither word; also a Flask
+`make_celery(app)` object imported from `app`); a task imported from a module such as `myapp.jobs` and
+called with `.delay()` in a file that does not import `celery`; a decorator written `@(app.task)`.
+Not read before either: `send_task("name")`. False positives that remain: any `@x.task` in a file that
+imports `celery` for another reason, and any `.delay()` in such a file (the base is not checked).
+Tests: `crates/mesh-parsers/tests/py_celery_gate.rs`; golden `layered-py` is the positive corpus.
 
 Stops: only the frameworks and libraries named above are read; a topic name that comes from a
 settings object or an environment variable is not recorded.

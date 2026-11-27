@@ -142,7 +142,8 @@ def f():
 
 #[test]
 fn a_gated_task_is_a_queue_node() {
-    let fi = extract("from celery import Celery\napp = Celery()\n\n@app.task\ndef f():\n    pass\n");
+    let fi =
+        extract("from celery import Celery\napp = Celery()\n\n@app.task\ndef f():\n    pass\n");
     assert!(fi
         .nodes
         .iter()
@@ -327,6 +328,64 @@ def go():
 "#;
     assert_eq!(producers(code), none());
     assert_eq!(consumers(code), none());
+}
+
+#[test]
+fn delay_on_a_task_of_the_same_file_without_a_celery_import() {
+    // the app comes from a celery module (cross-file); the task is called in the same file
+    let code = r#"
+from proj.celery import app
+
+@app.task
+def a():
+    pass
+
+def go():
+    a.delay()
+"#;
+    assert_eq!(producers(code), names(&["a"]));
+}
+
+#[test]
+fn only_task_decorators_count_in_a_celery_file() {
+    let code = r#"
+import celery
+from flask import Flask
+app = Flask(__name__)
+
+@app.route("/x")
+def x():
+    pass
+
+@app.errorhandler(404)
+def nf(e):
+    pass
+"#;
+    assert_eq!(consumers(code), none());
+}
+
+#[test]
+fn a_bare_decorator_of_celery_that_is_not_a_task_decorator() {
+    let code = "from celery import signature\n\n@signature\ndef a():\n    pass\n";
+    assert_eq!(consumers(code), none());
+}
+
+#[test]
+fn a_celery_import_opens_the_attribute_form_for_any_base() {
+    let code = "import celery.app\nfrom elsewhere import app\n\n@app.task\ndef a():\n    pass\n";
+    assert_eq!(consumers(code), names(&["a"]));
+}
+
+#[test]
+fn a_submodule_import_of_celery_opens_the_gate() {
+    let code = "from celery.canvas import group\nfrom elsewhere import app\n\n@app.task\ndef a():\n    pass\n";
+    assert_eq!(consumers(code), names(&["a"]));
+    assert_eq!(
+        consumers(
+            "import celery.app.base\nfrom elsewhere import app\n\n@app.task\ndef b():\n    pass\n"
+        ),
+        names(&["b"])
+    );
 }
 
 // ---- known false negatives (documented, pinned) ------------------------------------------
