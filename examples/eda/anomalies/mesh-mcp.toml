@@ -1,0 +1,13 @@
+# Fixture: one case of every class of the event anomaly report (`event_anomalies`, 9.0 T9), and
+# the look-alikes that must not be reported. Hand-annotated in tests/golden/events/anomalies.expected.yaml.
+[workspace]
+name = "anomalies"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/node_modules/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true
