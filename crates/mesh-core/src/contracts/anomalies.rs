@@ -579,7 +579,7 @@ impl ContractGraph {
 
 /// Strongly connected components of `adj` (Tarjan, with an explicit stack: no recursion, so a
 /// chain of any length cannot overflow the call stack). Each component is sorted.
-fn strongly_connected(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
+pub(super) fn strongly_connected(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
     const UNSEEN: usize = usize::MAX;
     let n = adj.len();
     let mut index = vec![UNSEEN; n];
@@ -639,7 +639,7 @@ fn strongly_connected(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
 /// The shortest cycle through `start` inside `in_comp`, as the nodes of the cycle in order
 /// (`start` first; the closing edge goes from the last back to `start`). BFS in sorted order,
 /// so ties resolve the same way on every run.
-fn shortest_cycle(
+pub(super) fn shortest_cycle(
     start: usize,
     adj: &[Vec<usize>],
     in_comp: &HashSet<usize>,

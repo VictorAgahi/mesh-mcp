@@ -37,6 +37,8 @@ pub use flow::{
 };
 
 #[cfg(test)]
+mod anomalies_tests;
+#[cfg(test)]
 mod calls_langs_tests;
 #[cfg(test)]
 mod calls_tests;
