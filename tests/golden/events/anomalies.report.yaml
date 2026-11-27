@@ -1,0 +1,114 @@
+# Hand-annotated truth for the `event_anomalies` report (9.0 T9), read from the source of each
+# corpus. Never generated from tool output. Consumed by crates/mesh-server/tests/event_anomalies.rs
+# (not by check_golden.py: this file is not a `<corpus>.expected.yaml`).
+#
+# A row is written `key [broker]` (the broker qualifier is part of the row: two brokers sharing a
+# name are two rows). Test files are not production sites. `must_not_flag` lists decoys: topics that
+# appear in NO row of ANY class. `known_false_positives` lists rows the report emits although the
+# truth says otherwise, because the source builds a name at runtime: the test pins them so the day
+# someone fixes the limit, the test says so.
+#
+# Thresholds under test: 6 consumer sites on one topic, 6 topics published by one file.
+corpora:
+  # examples/unresolved-flow (redis streams).
+  # chain:0 is the entry of seven chained functions and nothing in the workspace publishes it;
+  # legacy:orders is read in src/orphans.ts and written nowhere; metrics:emitted is written in
+  # src/orphans.ts and read nowhere; ghost:events is written in src/ghost.ts and read only by
+  # src/ghost.spec.ts; ghost:inbox is read in src/ghost.ts and written only by src/ghost.spec.ts;
+  # ghost:only is written and read only by src/ghost.spec.ts. cycle:a and cycle:b are read and
+  # written crosswise inside src/cycle.ts. fan:out is read by seven functions of src/fan.ts and
+  # written by one of the same file (the same-file pairing is a guess, never a cycle).
+  - corpus: unresolved-flow
+    root: examples/unresolved-flow
+    config: mesh-mcp.toml
+    published_never_consumed: ["metrics:emitted [redis]"]
+    consumed_never_published: ["chain:0 [redis]", "ghost:inbox [redis]", "legacy:orders [redis]"]
+    unresolved: []
+    cycles: [["cycle:a [redis]", "cycle:b [redis]"]]
+    fan_out_topics: ["fan:out [redis]"]
+    fan_out_producers: []
+    test_only_consumers: ["ghost:events [redis]"]
+    # src/purge.consumer.ts reads user:deletion:success; src/gather.processor.ts publishes it under
+    # a name built at runtime (['user','deletion','success'].join(':')), which no static reader
+    # sees: the report calls it consumed-never-published although it is published.
+    known_false_positives:
+      consumed_never_published: ["user:deletion:success [redis]"]
+    must_not_flag:
+      - chain:1
+      - chain:2
+      - chain:3
+      - chain:4
+      - chain:5
+      - chain:6
+      - user:deletion:requested
+      - cache:purged
+      - ghost:only
+
+  # examples/eda/multi-broker: `orders` on six brokers. SQS only consumes it, SNS only publishes
+  # it; the NestJS @EventPattern('orders') handler has no known broker and joins every channel
+  # (heuristic), so sns:orders has a consumer. events.created (redis stream) is NOT heard by the
+  # NATS wildcard events.*, which therefore stays a wildcard with no producer.
+  - corpus: multi-broker
+    root: examples/eda/multi-broker
+    config: mesh-mcp.toml
+    published_never_consumed: ["events.created [redis]", "shipments [rabbitmq]"]
+    consumed_never_published: ["orders [sqs]"]
+    unresolved:
+      - {topic: "events.* [nats]", missing: producer, reason: wildcard}
+    cycles: []
+    fan_out_topics: []
+    fan_out_producers: []
+    test_only_consumers: []
+    must_not_flag:
+      - invoices
+
+  # examples/eda/nestjs-monolith-bus: every event has a producer and a consumer.
+  - corpus: nestjs-monolith-bus
+    root: examples/eda/nestjs-monolith-bus
+    config: mesh-mcp.toml
+    published_never_consumed: []
+    consumed_never_published: []
+    unresolved: []
+    cycles: []
+    fan_out_topics: []
+    fan_out_producers: []
+    test_only_consumers: []
+    must_not_flag:
+      - order.created
+      - invoice.issued
+      - report.generated
+      - report.purged
+      - issuerefundcommand
+      - refundissuedevent
+      - sendreceiptcommand
+
+  # examples/eda/anomalies: one case of every class, written for this report.
+  - corpus: anomalies
+    root: examples/eda/anomalies
+    config: mesh-mcp.toml
+    published_never_consumed: ["catalog.refreshed [kafka]", "payments [kafka]"]
+    consumed_never_published: ["legacy.imported [kafka]", "payments [rabbitmq]"]
+    unresolved:
+      - {topic: "${inbound_topic} [kafka]", missing: producer, reason: placeholder}
+      - {topic: "${placeholder_only_topic} [kafka]", missing: consumer, reason: placeholder}
+      - {topic: "billing.retry [kafka]", missing: producer, reason: dead_letter}
+      - {topic: "ghosts.* [nats]", missing: producer, reason: wildcard}
+      - {topic: "orders.dlq [kafka]", missing: consumer, reason: dead_letter}
+    cycles:
+      - ["jobs.run [kafka]"]
+      - ["loop.a [kafka]", "loop.b [kafka]", "loop.c [kafka]"]
+    fan_out_topics: ["fan.wide [kafka]"]
+    fan_out_producers: ["src/hub.ts"]
+    test_only_consumers: ["audit.created [kafka]"]
+    must_not_flag:
+      - billing.paid
+      - scaffold.created
+      - line.a
+      - line.b
+      - line.c
+      - sensors.temp
+      - sensors.*
+      - ${shared_topic}
+      - fan.narrow
+      - small.t0
+      - small.t4
