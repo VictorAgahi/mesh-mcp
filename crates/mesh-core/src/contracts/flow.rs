@@ -274,7 +274,7 @@ fn parse_call_meta(meta: Option<&CompactStr>) -> (Option<CompactStr>, Option<usi
 }
 
 /// Adjacency built once per trace from the graph's edges and the calls layer.
-struct FlowIndex<'g> {
+pub(super) struct FlowIndex<'g> {
     calls_out: HashMap<NodeId, Vec<&'g ContractEdge>>,
     calls_in: HashMap<NodeId, Vec<&'g ContractEdge>>,
     /// Callable -> producer nodes it encloses (sorted).
@@ -282,11 +282,11 @@ struct FlowIndex<'g> {
     /// Callable -> entry nodes (consumers, routes, gRPC handlers) it encloses (sorted).
     entries_in: HashMap<NodeId, Vec<&'g ContractNode>>,
     /// Producer -> topics (`Produces` edges).
-    produces: HashMap<NodeId, Vec<NodeId>>,
+    pub(super) produces: HashMap<NodeId, Vec<NodeId>>,
     /// Topic -> producers.
     produced_by: HashMap<NodeId, Vec<NodeId>>,
     /// `Consumes` edges in both directions (topic <-> consumer).
-    consumes: HashMap<NodeId, Vec<NodeId>>,
+    pub(super) consumes: HashMap<NodeId, Vec<NodeId>>,
     consumer_ids: HashSet<NodeId>,
     /// Site -> the brokers (a [`Broker::bit`] mask) it is statically known to talk to; absent
     /// when unknown.
@@ -479,7 +479,7 @@ impl ContractGraph {
         out
     }
 
-    fn flow_index(&self) -> FlowIndex<'_> {
+    pub(super) fn flow_index(&self) -> FlowIndex<'_> {
         let mut calls_out: HashMap<NodeId, Vec<&ContractEdge>> = HashMap::new();
         let mut calls_in: HashMap<NodeId, Vec<&ContractEdge>> = HashMap::new();
         for e in self.call_edges() {
@@ -971,6 +971,33 @@ impl ContractGraph {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn trace_from<'g>(
         &'g self,
+        starts: Vec<&'g ContractNode>,
+        start_kind: FlowStepKind,
+        entry_topic: Option<CompactStr>,
+        seen_topics: HashSet<NodeId>,
+        direction: FlowDirection,
+        bounds: FlowBounds,
+        hide: &dyn Fn(&ContractNode) -> bool,
+    ) -> FlowTrace<'g> {
+        let idx = self.flow_index();
+        self.trace_from_in(
+            &idx,
+            starts,
+            start_kind,
+            entry_topic,
+            seen_topics,
+            direction,
+            bounds,
+            hide,
+        )
+    }
+
+    /// [`Self::trace_from`] over an adjacency built once by the caller, so many traces of one
+    /// graph (`diff_mesh` 9.0 T10) do not rebuild it each.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn trace_from_in<'g>(
+        &'g self,
+        idx: &FlowIndex<'g>,
         mut starts: Vec<&'g ContractNode>,
         start_kind: FlowStepKind,
         entry_topic: Option<CompactStr>,
@@ -979,7 +1006,6 @@ impl ContractGraph {
         bounds: FlowBounds,
         hide: &dyn Fn(&ContractNode) -> bool,
     ) -> FlowTrace<'g> {
-        let idx = self.flow_index();
         sort_nodes(&mut starts);
         let mut hidden = 0;
         let mut limits = Vec::new();
@@ -1005,7 +1031,7 @@ impl ContractGraph {
                     slot: 0,
                     topic: entry_topic
                         .as_ref()
-                        .map(|t| self.entry_label(&idx, s.id, direction, &seen_topics, t)),
+                        .map(|t| self.entry_label(idx, s.id, direction, &seen_topics, t)),
                 });
             }
         }
@@ -1052,7 +1078,7 @@ impl ContractGraph {
             );
             let (segs, cut) = match direction {
                 FlowDirection::Forward => self.forward_segments(
-                    &idx,
+                    idx,
                     p.node,
                     start.clone(),
                     bounds,
@@ -1061,7 +1087,7 @@ impl ContractGraph {
                     &mut hidden,
                 ),
                 FlowDirection::Reverse => self.reverse_segments(
-                    &idx,
+                    idx,
                     p.node,
                     start.clone(),
                     bounds,

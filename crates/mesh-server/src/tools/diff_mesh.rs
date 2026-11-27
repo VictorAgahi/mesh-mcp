@@ -23,6 +23,10 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[path = "diff_mesh_events.rs"]
+mod events;
+use events::{event_report, push_events, EventInput, EventSection};
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DiffMeshArgs {
@@ -1090,6 +1094,7 @@ fn run_with(
     let mut protos: Vec<ProtoInput> = Vec::new();
     // Changed `.proto` files the extraction loop never reached (time budget).
     let mut pending_protos: Vec<String> = Vec::new();
+    let mut events = EventInput::default();
     for (i, c) in changed.iter().enumerate() {
         if Instant::now() >= deadline {
             counters.timed_out = changed[i..].iter().map(|c| c.display.clone()).collect();
@@ -1128,31 +1133,36 @@ fn run_with(
             });
         }
         let mut skipped = None;
-        let mut extract = |side: Side, label: &str| -> BTreeMap<Fact, FactVal> {
+        let mut extract = |side: Side, label: &str| -> (BTreeMap<Fact, FactVal>, Option<FileIndex>) {
             match side {
-                Side::Absent => BTreeMap::new(),
+                Side::Absent => (BTreeMap::new(), None),
                 Side::Skipped(why) => {
                     skipped.get_or_insert_with(|| format!("{label}: {why}"));
-                    BTreeMap::new()
+                    (BTreeMap::new(), None)
                 }
                 Side::Content(bytes) => match extractor.extract(&c.abs, &bytes, c.repo_id) {
                     Ok(index) if index.parse_failed => {
                         skipped.get_or_insert_with(|| format!("{label}: the parse failed"));
-                        BTreeMap::new()
+                        (BTreeMap::new(), None)
                     }
-                    Ok(index) => facts_of(&index, &resolver, c.repo_id),
+                    Ok(index) => (facts_of(&index, &resolver, c.repo_id), Some(index)),
                     Err(why) => {
                         skipped.get_or_insert_with(|| format!("{label}: {why}"));
-                        BTreeMap::new()
+                        (BTreeMap::new(), None)
                     }
                 },
             }
         };
-        let before = extract(base_side, "base");
-        let after = extract(current_side, "working tree");
+        let (before, base_index) = extract(base_side, "base");
+        let (after, current_index) = extract(current_side, "working tree");
         let changes = if skipped.is_some() {
             Vec::new()
         } else {
+            let has_sites =
+                |i: &Option<FileIndex>| i.as_ref().is_some_and(|i| !(i.producers.is_empty() && i.consumers.is_empty()));
+            events.relevant |= has_sites(&base_index) || has_sites(&current_index);
+            events.files.push(c.abs.clone());
+            events.base.extend(base_index);
             diff_facts(&before, &after)
         };
         reports.push(FileReport {
@@ -1164,7 +1174,18 @@ fn run_with(
         });
     }
 
-    // 5. Impact from the live graph, and the wire check of every changed .proto.
+    // 5. Events: the base graph (the live one with the changed files at their base version)
+    // against the live graph.
+    let events = event_report(
+        events,
+        &snapshot.contract_graph,
+        &snapshot.config_values,
+        &snapshot.member_table,
+        &view,
+        deadline,
+    );
+
+    // 6. Impact from the live graph, and the wire check of every changed .proto.
     let impact = render_impact(
         &reports,
         &snapshot.contract_graph,
@@ -1225,9 +1246,16 @@ fn run_with(
         }
     }
 
-    // 6. Render.
+    // 7. Render.
     let text = render(
-        &diffs, &failures, &reports, &counters, &impact, &wire, &view,
+        &diffs,
+        &failures,
+        &reports,
+        &counters,
+        events.as_ref(),
+        &impact,
+        &wire,
+        &view,
     );
     Ok(ToolOutput {
         text,
@@ -1812,17 +1840,20 @@ fn listed_names<'a>(names: impl Iterator<Item = &'a String>, total: usize) -> St
 /// 2. the wire-format results, within [`WIRE_BUDGET`]: breaking first (full
 ///    report, else its result line), then not checked / not compared, removed,
 ///    clean; what does not fit is collapsed into counts;
-/// 3. the impact rows, with their closing notes reserved;
-/// 4. the per-file sections.
+/// 3. the event changes, within [`events::EVENT_BUDGET`], their notes reserved;
+/// 4. the impact rows, with their closing notes reserved;
+/// 5. the per-file sections.
 ///
 /// Each cut section ends with an "N more ... narrow `scope`" line. A final
 /// clamp cuts at [`OUTPUT_BUDGET`] should the sections ever overrun it; the
 /// sizes above keep it from firing.
+#[allow(clippy::too_many_arguments)]
 fn render(
     diffs: &[RootDiff],
     failures: &[RootFailure],
     reports: &[FileReport],
     counters: &Counters,
+    events: Option<&EventSection>,
     impact: &Impact,
     wire: &[WireEntry],
     view: &RootView<'_>,
@@ -1987,7 +2018,12 @@ fn render(
         }
     }
 
-    // 3. Impact rows; the closing notes have their room reserved.
+    // 3. Event changes (9.0 T10), within their own budget.
+    if let Some(section) = events {
+        push_events(&mut out, section, OUTPUT_BUDGET);
+    }
+
+    // 4. Impact rows; the closing notes have their room reserved.
     let notes_len: usize = impact.notes.iter().map(String::len).sum();
     if !impact.items.is_empty() || !impact.notes.is_empty() {
         out.push_str("\n### Impact (live graph)\n");
@@ -2008,7 +2044,7 @@ fn render(
         out.push_str(note);
     }
 
-    // 4. Per-file sections.
+    // 5. Per-file sections.
     let listed: Vec<&FileReport> = reports
         .iter()
         .filter(|r| has_contract_change(r) || r.skipped.is_some())

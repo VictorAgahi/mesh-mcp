@@ -42,7 +42,8 @@ pub use config_values::{ConfigEntry, ConfigFile, ConfigValues};
 pub use contracts::{
     fold_rpc_name, is_member_ref, normalize_topic_key, qualified_topic_key,
     service_from_client_field_name, split_qualified_topic_key, Broker, CallFact, CallFacts,
-    CallReceiver, CallStats, CallableFact, ContractGraph, DependentsMatch, FlowBounds,
+    CallReceiver, CallStats, CallableFact, ContractGraph, DependentsMatch, EventChannel, EventHop,
+    EventHops, EventSite, FlowBounds, HopEnd,
     FlowDirection, FlowEnd, FlowEntry, FlowHop, FlowLimit, FlowNext, FlowOutcome, FlowSite,
     FlowStep, FlowStepKind, FlowTrace, GrpcTrace, ImpactFlow, ImpactMatrix, ImpactRole, ImpactRow,
     ImpactScope, ImportFact, InjectionFact, ReconcileMode, RecordedCaller, ResolvedRpcRecord,
