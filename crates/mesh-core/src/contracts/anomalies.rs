@@ -161,6 +161,9 @@ pub struct EventAnomalies<'g> {
     /// order, so everything from this one on was not searched and the cycle count is a lower
     /// bound.
     pub cycle_first_unsearched: Option<&'g ContractNode>,
+    /// Publisher-versus-consumer payload check (9.0 T11), over the topics with live sites on both
+    /// ends (placeholder and wildcard hubs left out).
+    pub payload: super::payload::PayloadReport<'g>,
 }
 
 /// The topic key and broker of a hub node of the graph (`kafka:orders` is `("orders", Kafka)`).
@@ -462,6 +465,21 @@ impl ContractGraph {
                 out.fan_out_topics.push(entry(h, Vec::new(), live, c));
             }
         }
+
+        let both: Vec<TopicEntry<'g>> = all
+            .iter()
+            .filter(|h| {
+                !is_placeholder(h.key)
+                    && !is_subject_pattern(h.key)
+                    && HubSites::live(&h.producers) > 0
+                    && HubSites::live(&h.consumers) > 0
+            })
+            .map(|h| {
+                let c = weakest_of(h.producers.iter().chain(&h.consumers).filter(|s| !s.test));
+                entry(h, h.producers.clone(), h.consumers.clone(), c)
+            })
+            .collect();
+        out.payload = self.payload_mismatches(&both, in_scope);
 
         self.fan_out_producers(&all, is_test, &mut out);
         self.cycles(&all, is_test, &mut out);

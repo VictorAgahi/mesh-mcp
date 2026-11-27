@@ -16,6 +16,7 @@ pub enum AnomalyClass {
     Cycles,
     FanOut,
     TestOnlyConsumers,
+    PayloadMismatch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -30,7 +31,7 @@ pub struct EventAnomaliesArgs {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
-        description = "Classes to show (default: all): published_never_consumed, consumed_never_published, unresolved, cycles, fan_out, test_only_consumers. Counts of every class are always given."
+        description = "Classes to show (default: all): published_never_consumed, consumed_never_published, unresolved, cycles, fan_out, test_only_consumers, payload_mismatch. Counts of every class are always given."
     )]
     pub classes: Option<Vec<AnomalyClass>>,
 
@@ -59,7 +60,7 @@ pub struct EventAnomaliesTool;
 
 impl McpTool for EventAnomaliesTool {
     const NAME: &'static str = "event_anomalies";
-    const DESCRIPTION: &'static str = "Workspace event anomaly report in one call, over the event graph: topics published but never consumed, topics consumed but never published, cycles (event chains that loop back, with the shortest loop and the call-path sites of each hop), abnormal fan-out (a topic with 6 or more consumer sites, a file publishing onto 6 or more topics), and topics whose only consumers are in test files. Every row gives path:line sites, the broker and a confidence (exact / heuristic / ambiguous); two brokers sharing a topic name are two rows. 'No producer' / 'no consumer' means none was STATICALLY RESOLVED in the indexed roots, never proof of absence: a name that is a `${KEY}` placeholder, a wildcard subscription or a dead-letter / retry channel is listed apart as 'unresolved' with the reason, not as an anomaly, and a runtime-built name or an unindexed root can hide the other end of any row. Test files do not count as production sites. Paged per class with `limit`/`offset`; narrowed with `scope` and `classes`. DO NOT USE to trace what one event triggers hop by hop (use trace_flow), to list every producer and consumer of one named event (use analyze_impact), or for gRPC or imports (use analyze_grpc, find_dependents). It does NOT check payload types, and does NOT detect anomalies in code that registers handlers at runtime.";
+    const DESCRIPTION: &'static str = "Workspace event anomaly report in one call, over the event graph: topics published but never consumed, topics consumed but never published, cycles (event chains that loop back, with the shortest loop and the call-path sites of each hop), abnormal fan-out (a topic with 6 or more consumer sites, a file publishing onto 6 or more topics), topics whose only consumers are in test files, and payload mismatches (per topic, the fields a consumer's declared type expects that no producer sends, fields published that no consumer expects, primitive field type differences, path:line on both sides; TypeScript / JavaScript and Java payloads only, an untyped payload is counted as not compared, never a mismatch). Every row gives path:line sites, the broker and a confidence (exact / heuristic / ambiguous); two brokers sharing a topic name are two rows. 'No producer' / 'no consumer' means none was STATICALLY RESOLVED in the indexed roots, never proof of absence: a name that is a `${KEY}` placeholder, a wildcard subscription or a dead-letter / retry channel is listed apart as 'unresolved' with the reason, not as an anomaly, and a runtime-built name or an unindexed root can hide the other end of any row. Test files do not count as production sites. Paged per class with `limit`/`offset`; narrowed with `scope` and `classes`. DO NOT USE to trace what one event triggers hop by hop (use trace_flow), to list every producer and consumer of one named event (use analyze_impact), or for gRPC or imports (use analyze_grpc, find_dependents). It does NOT read payloads in other languages or the fields a handler's code accesses, and does NOT detect anomalies in code that registers handlers at runtime.";
     type Args = EventAnomaliesArgs;
 
     fn meta(args: &Self::Args) -> Option<&RequestMeta> {
@@ -104,6 +105,7 @@ impl McpTool for EventAnomaliesTool {
                     cycles: has(AnomalyClass::Cycles),
                     fan_out: has(AnomalyClass::FanOut),
                     test_only_consumers: has(AnomalyClass::TestOnlyConsumers),
+                    payload_mismatch: has(AnomalyClass::PayloadMismatch),
                 }
             }
         };

@@ -1959,7 +1959,7 @@ impl WorkspaceIndexer {
         snapshot.health.const_members_conflicting = snapshot.member_table.conflicts();
     }
 
-    fn fold(frag: FileFragment, snapshot: &mut MeshSnapshot) {
+    fn fold(mut frag: FileFragment, snapshot: &mut MeshSnapshot) {
         if !frag.docs.is_empty() {
             snapshot.doc_index.extend_sections(frag.docs);
         }
@@ -1972,6 +1972,15 @@ impl WorkspaceIndexer {
         snapshot
             .member_table
             .note_ref_file(&frag.path, frag.code.has_member_topic());
+        // Keyed by the file's path: a file of records or interfaces may hold no graph node.
+        if !frag.code.payload.is_empty() {
+            let facts = std::mem::take(&mut frag.code.payload);
+            snapshot.contract_graph.add_payload_facts(
+                std::sync::Arc::from(frag.path.as_path()),
+                facts.repo_id,
+                facts,
+            );
+        }
         frag.code.apply_with(
             &mut snapshot.contract_graph,
             &snapshot.config_values,

@@ -10,6 +10,7 @@ mod java_calls;
 mod js_frameworks;
 mod jvm_brokers;
 pub mod kotlin;
+mod payload;
 pub mod php;
 pub mod proto;
 mod py_brokers;
@@ -285,6 +286,11 @@ pub struct FileIndex {
     /// `IndexHealth::files_go_brokers_capped`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub go_brokers_capped: bool,
+    /// Payload facts (9.0 T11): the payload type each producer / consumer site uses where it is
+    /// statically visible, and the fields of the types this file declares (TypeScript /
+    /// JavaScript and Java). Names, declared types and lines only, never a value.
+    #[serde(default, skip_serializing_if = "mesh_core::PayloadFacts::is_empty")]
+    pub payload: mesh_core::PayloadFacts,
 }
 
 /// A producer or consumer whose topic is an enum member reference.
@@ -366,6 +372,7 @@ impl FileIndex {
         self.jvm_brokers_capped |= other.jvm_brokers_capped;
         self.py_brokers_capped |= other.py_brokers_capped;
         self.go_brokers_capped |= other.go_brokers_capped;
+        self.payload.merge(other.payload);
     }
 
     /// Inserts the extracted nodes and relations into `graph`. A `${key}` topic is resolved
@@ -375,7 +382,7 @@ impl FileIndex {
     }
 
     /// Removes every placeholder default that is not a plain topic name from the topics, node
-    /// names and signatures of this file (`@KafkaListener(topics = "${k:postgres://u:pw@h/x}")`
+    /// names, signatures and payload-site topics of this file (`@KafkaListener(topics = "${k:postgres://u:pw@h/x}")`
     /// becomes `${k}`): a credential written as a default must reach neither the graph, a tool
     /// answer nor the parse cache.
     pub fn mask_placeholder_defaults(&mut self) {
@@ -397,6 +404,22 @@ impl FileIndex {
             if let Some(sig) = node.signature.as_deref().and_then(masked) {
                 node.signature = Some(CompactStr::new(sig));
             }
+        }
+        // The literal topic argument of a payload site (9.0 T11): its defaults stripped, and
+        // dropped when it still is not a printable name (it only tells two sites of one node
+        // apart, so nothing is lost but that hint).
+        for site in &mut self.payload.sites {
+            let Some(topic) = site.topic.as_deref() else {
+                continue;
+            };
+            // Every default is stripped (not only the non-name ones): the hint needs the key only.
+            let topic = mesh_core::config_values::strip_placeholder_defaults(topic).into_owned();
+            let probe: String = topic
+                .chars()
+                .filter(|c| !matches!(c, '$' | '{' | '}'))
+                .collect();
+            site.topic = (probe.is_empty() || mesh_core::member_consts::name_is_printable(&probe))
+                .then(|| CompactStr::new(topic));
         }
     }
 
@@ -501,6 +524,14 @@ impl FileIndex {
                     first.package.clone(),
                     self.calls,
                 );
+            }
+        }
+        // The indexer stores them by the file's path before this (a file of records has no
+        // node); an index applied by hand keys them by its first node.
+        if !self.payload.is_empty() {
+            if let Some(first) = self.nodes.first() {
+                let facts = std::mem::take(&mut self.payload);
+                graph.add_payload_facts(first.file_path.clone(), facts.repo_id, facts);
             }
         }
         // A call-site node named after its topic shows the resolved name when the
@@ -1362,19 +1393,22 @@ impl PolyglotIndexer {
                 let with_calls = Self::wants_call_facts(cfg, file_path);
                 out.calls_skipped_path = !with_calls;
                 if let Some((
-                    ((nodes, dependencies, producers, rpc_calls), calls),
+                    (((nodes, dependencies, producers, rpc_calls), calls), payload),
                     (inproc, brokers),
                 )) = parsed!(|tree| {
                     (
                         (
-                            java::JavaExtractor::extract_relations(
-                                file_path, content, repo_id, tree,
+                            (
+                                java::JavaExtractor::extract_relations(
+                                    file_path, content, repo_id, tree,
+                                ),
+                                if with_calls {
+                                    java_calls::extract(tree, content.as_bytes())
+                                } else {
+                                    CallFacts::default()
+                                },
                             ),
-                            if with_calls {
-                                java_calls::extract(tree, content.as_bytes())
-                            } else {
-                                CallFacts::default()
-                            },
+                            payload::scan_java(tree, content.as_bytes()),
                         ),
                         (
                             inproc_java::scan(tree, content),
@@ -1383,6 +1417,8 @@ impl PolyglotIndexer {
                     )
                 }) {
                     out.calls = calls;
+                    out.payload = payload;
+                    out.payload.repo_id = repo_id;
                     for (i, node) in nodes.iter().enumerate() {
                         if node.kind == NodeKind::KafkaTopic {
                             out.consumers.push((i, node.name.clone()));
@@ -1531,7 +1567,8 @@ impl PolyglotIndexer {
                                 &cfg.producer_calls,
                             )
                         };
-                        Some((nodes, imports, rpc_calls, calls, declared))
+                        let payload = payload::scan_ts(tree, content.as_bytes());
+                        Some((nodes, imports, rpc_calls, calls, declared, payload))
                     })
                 };
                 // Plain JavaScript is parsed by its own grammar. A `.js` file
@@ -1549,7 +1586,7 @@ impl PolyglotIndexer {
                         other => other,
                     };
                 }
-                let (nodes, mut imports, rpc_calls, calls, declared) = match outcome {
+                let (nodes, mut imports, rpc_calls, calls, declared, payload) = match outcome {
                     ParseOutcome::Parsed(Some(extracted)) => extracted,
                     ParseOutcome::Parsed(None) | ParseOutcome::NoGrammar => Default::default(),
                     ParseOutcome::ParseFailed => {
@@ -1585,6 +1622,15 @@ impl PolyglotIndexer {
                 }
                 out.rpc_calls = rpc_calls;
                 out.calls = calls;
+                out.payload = payload;
+                out.payload.repo_id = repo_id;
+                // An aliased module (`@/dto/order`) is the relative path it stands for, so a
+                // payload type imported through it resolves.
+                for import in &mut out.payload.imports {
+                    if let Some(relative) = cfg.ts_aliases.rewrite(file_path, &import.module) {
+                        import.module = CompactStr::new(relative);
+                    }
+                }
                 let mut nodes = nodes;
                 out.inproc_capped = Self::cap_inproc_nodes(&mut nodes);
                 Self::wire_ts_events(&nodes, &mut out);
@@ -2201,6 +2247,7 @@ mod tests {
             jvm_brokers_capped: false,
             py_brokers_capped: false,
             go_brokers_capped: false,
+            payload: mesh_core::PayloadFacts::default(),
         };
         let before = format!("{index:?}");
         let anchored = index.relativize(&root_a).expect("all under root");

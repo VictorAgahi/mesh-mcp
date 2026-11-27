@@ -183,6 +183,7 @@ impl ContractGraph {
     pub fn patch_files<'a>(&mut self, file_paths: impl IntoIterator<Item = &'a Path>) {
         let mut stale_set: HashSet<NodeId> = HashSet::new();
         for path in file_paths {
+            self.payload_facts.remove(path);
             if self.call_facts.remove(path).is_some() {
                 self.calls_dirty = true;
             }
