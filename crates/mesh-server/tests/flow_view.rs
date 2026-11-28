@@ -175,6 +175,24 @@ fn is_id(s: &str) -> bool {
     s.len() > 1 && s.starts_with('n') && s[1..].chars().all(|c| c.is_ascii_digit())
 }
 
+/// The id of the node whose table row contains `needle` (`| n3 | consumer | ... |`).
+fn id_of(text: &str, needle: &str) -> String {
+    text.lines()
+        .find(|l| l.starts_with("| n") && l.contains(needle))
+        .and_then(|l| l.split(' ').nth(1))
+        .unwrap_or_else(|| panic!("no table row with {needle} in\n{text}"))
+        .to_string()
+}
+
+/// Whether the diagram has an arrow (solid or dashed, labelled or not) from `from` to `to`.
+fn has_edge(text: &str, from: &str, to: &str) -> bool {
+    mermaid_block(text).lines().any(|l| {
+        let l = l.trim();
+        (l.starts_with(&format!("{from} -->")) || l.starts_with(&format!("{from} -.->")))
+            && l.ends_with(&format!(" {to}"))
+    })
+}
+
 fn has_line(text: &str, line: &str) -> bool {
     text.lines().any(|l| l.trim() == line)
 }
@@ -502,6 +520,14 @@ async fn brokers_never_join() {
     // The bare name is every broker's channel, drawn apart, each qualified.
     let bare = call(&state, json!({ "event": "orders" })).await;
     assert_mermaid_sane(&bare);
+    let kafka_centre = id_of(&bare, "| centre event | `kafka:orders` |");
+    let rabbit_centre = id_of(&bare, "| centre event | `rabbitmq:orders` |");
+    let kafka_consumer = id_of(&bare, "`src/kafka.ts:12`");
+    let rabbit_consumer = id_of(&bare, "`src/rabbit.ts:8`");
+    assert!(has_edge(&bare, &kafka_centre, &kafka_consumer), "{bare}");
+    assert!(has_edge(&bare, &rabbit_centre, &rabbit_consumer), "{bare}");
+    assert!(!has_edge(&bare, &rabbit_centre, &kafka_consumer), "{bare}");
+    assert!(!has_edge(&bare, &kafka_centre, &rabbit_consumer), "{bare}");
     for centre in [
         "kafka:orders",
         "rabbitmq:orders",
@@ -536,6 +562,17 @@ async fn credential_shaped_names_never_reach_the_diagram() {
         "{ok}"
     );
     let asked = call(&state, json!({ "event": token })).await;
+    // A credential-shaped name that matches nothing is not echoed back either.
+    let unknown = format!("{}{}", "tok_", "ffeeddccbbaa9988");
+    let unmatched = call(&state, json!({ "event": unknown })).await;
+    assert!(
+        unmatched.contains("No event matched `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`"),
+        "{unmatched}"
+    );
+    assert!(
+        !unmatched.to_ascii_lowercase().contains(&unknown),
+        "{unmatched}"
+    );
     for text in [&ok, &asked] {
         let lower = text.to_ascii_lowercase();
         for canary in [&token, &handler] {
@@ -799,7 +836,36 @@ async fn a_single_broker_workspace_still_qualifies_every_event() {
     let (_d, state) = temp_workspace(&[("k.ts", src)]);
     let text = call(&state, json!({ "event": "solo.topic" })).await;
     assert_mermaid_sane(&text);
-    assert!(has_line(&text, r#"n0(["kafka:solo.topic"]):::centre"#), "{text}");
+    assert!(
+        has_line(&text, r#"n0(["kafka:solo.topic"]):::centre"#),
+        "{text}"
+    );
     assert!(text.contains(r#"(["kafka:solo.next"]):::event"#), "{text}");
     assert!(!mermaid_block(&text).contains("?:"), "{text}");
+}
+
+#[tokio::test]
+async fn credential_shaped_route_paths_are_redacted_and_braces_are_not() {
+    let segment = format!("{}{}", "H3a9f1c7e2b4d6a8c0e1", "f3a5");
+    let src = format!(
+        "import {{ Controller, Injectable, Post }} from '@nestjs/common';\nimport {{ ClientKafka }} from '@nestjs/microservices';\n@Injectable()\nexport class Svc {{\n  constructor(private readonly client: ClientKafka) {{}}\n  pub(p: any) {{ this.client.emit('route.event', p); }}\n}}\n@Controller('x')\nexport class Gate {{\n  constructor(private readonly svc: Svc) {{}}\n  @Post('{segment}')\n  go(p: any) {{ this.svc.pub(p); }}\n  @Post('{{id}}/retry')\n  retry(p: any) {{ this.svc.pub(p); }}\n}}\n"
+    );
+    let (_d, state) = temp_workspace(&[("g.ts", &src)]);
+    let text = call(
+        &state,
+        json!({ "event": "route.event", "direction": "upstream" }),
+    )
+    .await;
+    assert_mermaid_sane(&text);
+    assert!(
+        !text
+            .to_ascii_lowercase()
+            .contains(&segment.to_ascii_lowercase()),
+        "{text}"
+    );
+    assert!(
+        text.contains("| entry | `POST [REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]` |"),
+        "{text}"
+    );
+    assert!(text.contains("| entry | `POST /x/{id}/retry` |"), "{text}");
 }
