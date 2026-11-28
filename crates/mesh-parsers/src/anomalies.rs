@@ -61,14 +61,14 @@ const CYCLE_HOPS_SHOWN: usize = 4;
 const SITES_PER_ROW: usize = 3;
 /// Topics named per cycle / producer row before `+K more`.
 const NAMES_PER_ROW: usize = 6;
-const REDACTED: &str = "[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]";
+pub(crate) const REDACTED: &str = "[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]";
 
 /// A topic key that is safe to print: a placeholder default that is not a plain name is
 /// dropped, and a key that still is not a printable name (`member_consts::name_is_printable`:
 /// the shared name gate without its new-topic randomness rule, so `orders.shard00123` prints;
 /// a token, a URL, a weak password) is replaced by the redaction marker (commandment 5,
 /// defense in depth: the extractors already refuse most such names).
-fn shown_key(key: &str) -> String {
+pub(crate) fn shown_key(key: &str) -> String {
     let masked = mesh_core::config_values::mask_placeholder_defaults(key);
     let probe: String = masked
         .chars()
@@ -82,7 +82,7 @@ fn shown_key(key: &str) -> String {
 }
 
 /// A type or field name that is safe to print (the shared name gate), else the redaction marker.
-fn shown_name(name: &str) -> String {
+pub(crate) fn shown_name(name: &str) -> String {
     if mesh_core::member_consts::name_is_printable(name)
         && !mesh_core::member_consts::identifier_is_credential_named(name)
     {
@@ -93,7 +93,7 @@ fn shown_name(name: &str) -> String {
 }
 
 /// `path:line` of a line in a file, relative to its root.
-fn file_line(
+pub(crate) fn file_line(
     file: &std::path::Path,
     repo_id: mesh_core::RepoId,
     line: u32,
@@ -108,7 +108,7 @@ fn file_line(
     }
 }
 
-fn confidence(c: EdgeConfidence) -> &'static str {
+pub(crate) fn confidence(c: EdgeConfidence) -> &'static str {
     match c {
         EdgeConfidence::Exact => "exact",
         EdgeConfidence::Heuristic => "heuristic",
