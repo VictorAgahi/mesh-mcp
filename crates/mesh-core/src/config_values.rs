@@ -463,6 +463,55 @@ pub fn mask_placeholder_defaults(text: &str) -> std::borrow::Cow<'_, str> {
     rewrite_placeholder_defaults(text, |d| !d.is_empty() && !plain_topic(d))
 }
 
+/// `text` with the content of every double-quoted literal that is a connection string
+/// (`Endpoint=sb://h/;SharedAccessKey=...`, `Server=h;Password=...`) replaced by the secret mask.
+/// A literal is one when it holds a `key=value` pair whose key is a credential
+/// (`SharedAccessKey`, `AccountKey`, `AccessKey`, `SecretKey`, `Password`, `Pwd`). Text with no
+/// such literal is returned as is. (9.0 T8d: a snippet of C# source must not print one.)
+pub fn mask_connection_strings(text: &str) -> std::borrow::Cow<'_, str> {
+    const KEYS: [&str; 8] = [
+        "sharedaccesskey=",
+        "sharedaccesssignature=",
+        "accountkey=",
+        "accesskey=",
+        "secretkey=",
+        "password=",
+        "pwd=",
+        "authkey=",
+    ];
+    if !text.contains('"') || !text.contains('=') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    let mut rest = text;
+    while let Some(start) = rest.find('"') {
+        out.push_str(&rest[..=start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('"') else {
+            out.push_str(after);
+            rest = "";
+            break;
+        };
+        let lit = &after[..end];
+        let lower = lit.to_ascii_lowercase();
+        if KEYS.iter().any(|k| lower.contains(k)) {
+            out.push_str("[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]");
+            changed = true;
+        } else {
+            out.push_str(lit);
+        }
+        out.push('"');
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 /// `text` with EVERY placeholder default removed (`${k:anything}` -> `${k}`). For a site whose
 /// extractor never takes a default as a name (the JVM brokers of 9.0 T8a): a default that merely
 /// looks like a topic (`hunter2-prod`) is as likely a secret as a name, so the placeholder
@@ -839,6 +888,40 @@ fn unquote(s: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+
+    /// 9.0 T8d: a connection string literal is masked, a plain string and a name are not.
+    #[test]
+    fn connection_string_literals_are_masked_and_names_are_not() {
+        let key = ["Shared", "Access", "Key"].concat();
+        let line = format!(
+            "[ServiceBusTrigger(\"q\", Connection = \"Endpoint=sb://h/;{key}=zz9\")] // \"orders\""
+        );
+        let out = mask_connection_strings(&line);
+        assert_eq!(
+            out,
+            "[ServiceBusTrigger(\"q\", Connection = \"[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]\")] // \"orders\""
+        );
+        assert!(!out.contains("zz9"));
+        let pw = format!(
+            "var c = \"Server=h;{}=hunter2\";",
+            ["Pass", "word"].concat()
+        );
+        assert_eq!(
+            mask_connection_strings(&pw),
+            "var c = \"[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]\";"
+        );
+        for plain in [
+            "var q = \"orders\";",
+            "Route(\"api/[controller]\")",
+            "x = \"a=b\";",
+            "no quote = here",
+        ] {
+            assert!(matches!(
+                mask_connection_strings(plain),
+                std::borrow::Cow::Borrowed(_)
+            ));
+        }
+    }
     use super::*;
 
     fn values(files: &[(&str, ConfigFile)]) -> ConfigValues {

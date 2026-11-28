@@ -1038,6 +1038,8 @@ impl SmartSearchTool {
         // A credential written as a `${key:default}` placeholder default (a connection string,
         // a token) is shown as `${key}`: the same rule the graph applies to topic names.
         let masked = mesh_core::config_values::mask_placeholder_defaults(line);
+        // A connection string literal (`Endpoint=sb://h/;SharedAccessKey=...`) is shown masked.
+        let masked = mesh_core::config_values::mask_connection_strings(&masked);
         let line: &str = &masked;
         let Some(sep_pos) = line.find([':', '=']) else {
             return line.to_string();

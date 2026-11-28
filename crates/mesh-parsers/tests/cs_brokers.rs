@@ -259,6 +259,12 @@ public class OrderCreatedConsumer : IConsumer<OrderCreated> { }
         "services.AddMassTransit(x => x.UsingAzureServiceBus((c, f) => { }));\n        services.AddMassTransit",
     );
     assert_eq!(read(&both)[0], s('C', "?", "OrderCreated"));
+    // A transport with no broker key next to a broker: the bus of the message types is not known.
+    let mixed = rabbit.replace(
+        "services.AddMassTransit",
+        "services.AddMassTransit(x => x.UsingActiveMq((c, f) => { }));\n        services.AddMassTransit",
+    );
+    assert_eq!(read(&mixed)[0], s('C', "?", "OrderCreated"));
     // A transport with no broker key: no broker either.
     let amq = rabbit.replace("UsingRabbitMq", "UsingActiveMq");
     assert_eq!(read(&amq)[0], s('C', "?", "OrderCreated"));
@@ -313,6 +319,65 @@ public class Svc
         read(code),
         vec![s('P', "?", "order-events"), s('P', "?", "orders")]
     );
+}
+
+#[test]
+fn job_consumers_read_and_fault_or_other_generic_messages_do_not() {
+    let code = r##"
+using MassTransit;
+public class A : IJobConsumer<ConvertVideo> { }
+public class B : IConsumer<Fault<OrderCreated>> { }
+public class C : IConsumer<Batch<Foo, Bar>> { }
+public class D : IConsumer<Wrapper<OrderCreated>> { }
+public abstract class E<TMessage> : IConsumer<TMessage> { }
+"##;
+    assert_eq!(read(code), vec![s('C', "?", "ConvertVideo")]);
+}
+
+#[test]
+fn a_typed_variable_of_a_for_foreach_using_or_catch_scope_is_a_receiver() {
+    let code = r##"
+using MassTransit;
+using Azure.Messaging.ServiceBus;
+public class Svc
+{
+    public async Task Go(IEnumerable<IPublishEndpoint> buses)
+    {
+        foreach (IPublishEndpoint each in buses) { await each.Publish(new FromForeach()); }
+        foreach (var other in buses) { await other.Publish(new Unknown()); }
+        for (IPublishEndpoint i = null; i != null; ) { await i.Publish(new FromFor()); }
+        using (var client = new ServiceBusClient("c")) { client.CreateSender("from-using"); }
+        try { }
+        catch (Exception ex) { ex.Publish(new FromCatch()); }
+    }
+}
+"##;
+    assert_eq!(
+        read(code),
+        vec![
+            s('P', "?", "FromFor"),
+            s('P', "?", "FromForeach"),
+            s('P', "servicebus", "from-using"),
+        ]
+    );
+}
+
+#[test]
+fn a_wildcard_name_registers_no_consumer_either() {
+    let code = r##"
+using Azure.Messaging.ServiceBus;
+public class Svc
+{
+    private readonly ServiceBusClient _client;
+    public void Go()
+    {
+        _client.CreateProcessor("orders.*");
+        _client.CreateReceiver("orders.#");
+        _client.CreateProcessor("orders.plain");
+    }
+}
+"##;
+    assert_eq!(read(code), vec![s('C', "servicebus", "orders.plain")]);
 }
 
 // ---- NServiceBus -------------------------------------------------------------------------

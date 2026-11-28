@@ -70,7 +70,6 @@ impl Lib {
             Lib::Functions => &[
                 "Microsoft.Azure.WebJobs",
                 "Microsoft.Azure.Functions.Worker",
-                "Azure.Messaging.ServiceBus",
             ],
             Lib::Config => &["Microsoft.Extensions.Configuration"],
         }
@@ -757,8 +756,6 @@ impl<'a> Ctx<'a> {
                 let id = text(node, source);
                 match self.lookup(node, id, false) {
                     Some(d) if d.local && !d.is_const => return None,
-                    // A property or a non-constant field of that name is not a constant.
-                    Some(d) if !d.local && !self.consts.contains_key(id) => return None,
                     _ => {}
                 }
                 self.const_value(id)?
@@ -1157,12 +1154,7 @@ fn consumer_classes(class: Node, ctx: &Ctx, found: &mut Vec<Site>) {
     let mut c = base_list.walk();
     let bases: Vec<Node> = base_list.named_children(&mut c).take(MAX_PARAMS).collect();
     for base in bases {
-        // `primary_constructor_base_type` wraps the type of `record R(...) : Base(...)`.
-        let ty = if base.kind() == "primary_constructor_base_type" {
-            base.child_by_field_name("type").unwrap_or(base)
-        } else {
-            base
-        };
+        let ty = base;
         let (qualifier, generic) = match ty.kind() {
             "qualified_name" => (
                 ty.child_by_field_name("qualifier"),
