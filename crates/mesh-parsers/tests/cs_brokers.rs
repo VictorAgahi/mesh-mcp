@@ -789,6 +789,143 @@ public class Svc
     );
 }
 
+// ---- the generic Confluent.Kafka reader keeps the same name rule -------------------------------
+
+#[test]
+fn the_confluent_reader_never_registers_a_connection_string_or_credential_as_a_topic() {
+    let key = ["Shared", "Access", "Key"].concat();
+    let canary = ["Kq", "Canary", "Zx9"].concat();
+    let conn = format!("Endpoint=sb://h.example/;{key}={canary}");
+    let code = format!(
+        r##"
+using Confluent.Kafka;
+public class K
+{{
+    private readonly IProducer<string, string> _p;
+    private readonly IConsumer<string, string> _c;
+    public async Task Go()
+    {{
+        await _p.ProduceAsync("{conn}", new Message<string, string> {{ Value = "payload.literal" }});
+        await _p.ProduceAsync("{conn}", "payload.second");
+        await _p.ProduceAsync("hunter2-prod", new Message<string, string>());
+        await _p.ProduceAsync(new TopicPartition("Bearer_CANARYB", 0), new Message<string, string>());
+        _c.Subscribe("postgres://u:pw@h/db");
+        await _p.ProduceAsync("orders.v2", new Message<string, string>());
+        _c.Subscribe("password-reset-jobs");
+    }}
+}}
+"##
+    );
+    let fi = extract(&code);
+    assert_eq!(
+        sites(&fi),
+        vec![
+            s('C', "kafka", "password-reset-jobs"),
+            s('P', "kafka", "orders.v2")
+        ]
+    );
+    let dumped = format!("{fi:?}").to_ascii_lowercase();
+    for gone in [
+        canary.to_ascii_lowercase(),
+        "hunter2".into(),
+        "bearer_canaryb".into(),
+        "payload.".into(),
+    ] {
+        assert!(!dumped.contains(&gone), "{gone} in {dumped}");
+    }
+}
+
+// ---- keys of placeholders, bus evidence over a capped file ---------------------------------------
+
+#[test]
+fn a_credential_word_inside_a_separator_less_key_is_refused_and_a_name_is_not() {
+    let reads = |keys: &[&str]| {
+        let calls: String = keys
+            .iter()
+            .map(|k| {
+                format!(
+                    "        _client.CreateSender(Environment.GetEnvironmentVariable(\"{k}\"));\n"
+                )
+            })
+            .collect();
+        read(&format!(
+            "using Azure.Messaging.ServiceBus;\npublic class S\n{{\n    private readonly ServiceBusClient _client;\n    public void Go()\n    {{\n{calls}    }}\n}}\n"
+        ))
+    };
+    assert!(reads(&[
+        "DBPASSWORD",
+        "APIKEYQUEUE",
+        "DBPASSWORDQ",
+        "PASSWORDS_Q",
+        "SECRETQ",
+        "TOKENQUEUE",
+        "dbpassword",
+        "Db_ConnectionString",
+        "CREDENTIALSQ",
+    ])
+    .is_empty());
+    assert_eq!(
+        reads(&["SECRETARY_QUEUE", "ORDERS_QUEUE", "KEYSTONE_Q"]),
+        vec![
+            s('P', "servicebus", "${KEYSTONE_Q}"),
+            s('P', "servicebus", "${ORDERS_QUEUE}"),
+            s('P', "servicebus", "${SECRETARY_QUEUE}"),
+        ]
+    );
+    // A literal VALUE that holds a credential word is still a name.
+    let names = r##"
+using Azure.Messaging.ServiceBus;
+public class S
+{
+    private readonly ServiceBusClient _client;
+    public void Go()
+    {
+        _client.CreateProcessor("password-reset-jobs");
+        _client.CreateProcessor("secretary-jobs");
+        _client.CreateProcessor("token-refresh-jobs");
+    }
+}
+"##;
+    assert_eq!(
+        read(names),
+        vec![
+            s('C', "servicebus", "password-reset-jobs"),
+            s('C', "servicebus", "secretary-jobs"),
+            s('C', "servicebus", "token-refresh-jobs"),
+        ]
+    );
+}
+
+#[test]
+fn a_bus_named_after_the_site_cap_still_counts_as_evidence() {
+    let mut code = String::from(
+        "using MassTransit;\npublic class Big\n{\n    private readonly IPublishEndpoint _bus;\n    public void Setup(IServiceCollection s)\n    {\n        s.AddMassTransit(x => x.UsingRabbitMq((c, f) => { }));\n    }\n    public void Go()\n    {\n",
+    );
+    for i in 0..MAX_CS_BROKER_SITES_PER_FILE + 5 {
+        code.push_str(&format!("        _bus.Publish(new Evt{i}());\n"));
+    }
+    code.push_str("    }\n    public void Late(IServiceCollection s)\n    {\n        s.AddMassTransit(x => x.UsingAzureServiceBus((c, f) => { }));\n    }\n}\n");
+    let fi = extract(&code);
+    assert!(fi.cs_brokers_capped);
+    assert!(sites(&fi).iter().all(|(_, b, _)| b == "?"));
+    // Without the late bus, every kept site is on RabbitMQ.
+    let one = code.replace("UsingAzureServiceBus", "UsingRabbitMq");
+    let fi = extract(&one);
+    assert_eq!(
+        sites(&fi)
+            .iter()
+            .filter(|(_, b, _)| b == "rabbitmq")
+            .count(),
+        MAX_CS_BROKER_SITES_PER_FILE
+    );
+}
+
+#[test]
+fn a_global_qualified_using_is_read() {
+    let code = "using global::MassTransit;\npublic class A : IConsumer<OrderCreated> { }";
+    assert_eq!(read(code), vec![s('C', "?", "OrderCreated")]);
+}
+
 // ---- shapes without declarations, bounds -----------------------------------------------------
 
 #[test]

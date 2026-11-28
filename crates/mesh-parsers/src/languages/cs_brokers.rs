@@ -35,8 +35,8 @@
 
 use super::{FileIndex, MAX_CS_BROKER_SITES_PER_FILE};
 use mesh_core::member_consts::{
-    constant_is_a_name, identifier_is_credential_named, member_is_credential_named,
-    name_is_printable,
+    constant_is_a_name, identifier_is_credential_named, name_is_printable,
+    placeholder_key_is_credential_named,
 };
 use mesh_core::{Broker, CompactStr, ContractNode, FilePath, NodeKind, RepoId};
 use std::collections::{HashMap, HashSet};
@@ -837,12 +837,7 @@ fn config_env_name(key: &str) -> String {
 
 /// Whether a configuration key reads like a credential or a connection string.
 fn key_is_secret(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
-    lower.contains("connectionstring")
-        || lower.contains("connstr")
-        || lower.contains("sharedaccess")
-        || member_is_credential_named(&key.replace(['-', '.', ':'], "_"))
-        || identifier_is_credential_named(key)
+    placeholder_key_is_credential_named(key)
 }
 
 /// `${key}` for a setting or an environment variable, unless its name is credential-shaped or not
@@ -981,25 +976,13 @@ pub(crate) fn scan(tree: &Tree, content: &str) -> Scan {
     };
 
     let mut found: Vec<Site> = Vec::new();
-    let (mut mt_ev, mut nsb_ev) = (Vec::new(), Vec::new());
     walk(root, |node| {
         match node.kind() {
             "class_declaration" | "record_declaration" | "struct_declaration" => {
                 consumer_classes(node, &ctx, &mut found);
             }
             "attribute" => attribute_sites(node, &mut ctx, &mut found),
-            "invocation_expression" => {
-                call_sites(node, &mut ctx, &mut found, &mut mt_ev, &mut nsb_ev);
-            }
-            "object_creation_expression" if ctx.imports.has(Lib::NServiceBus) => {
-                let class = node
-                    .child_by_field_name("type")
-                    .and_then(|t| named_type(t, source))
-                    .filter(|t| !ctx.types.contains(t));
-                if let Some(t) = class {
-                    nsb_ev.extend(nsb_transport(&t));
-                }
-            }
+            "invocation_expression" => call_sites(node, &mut ctx, &mut found),
             _ => {}
         }
         found.len() <= MAX_CS_BROKER_SITES_PER_FILE
@@ -1007,6 +990,9 @@ pub(crate) fn scan(tree: &Tree, content: &str) -> Scan {
     scan.capped = found.len() > MAX_CS_BROKER_SITES_PER_FILE || ctx.capped;
     found.truncate(MAX_CS_BROKER_SITES_PER_FILE);
     scan.sites = found;
+    // The buses the file names, over the whole file: the walk above stops at the site cap, and a
+    // `Using...` after the cut must still tell the sites kept before it that the bus is not one.
+    let (mt_ev, nsb_ev) = bus_evidence(root, &ctx);
     scan.mt_evidence = mt_ev;
     scan.nsb_evidence = nsb_ev;
     scan
@@ -1026,6 +1012,9 @@ fn declare<'t>(root: Node<'t>, ctx: &mut Ctx) {
                     ctx.types.insert(text(alias, source).to_string());
                 } else if !rest.starts_with("static ") && !rest.is_empty() {
                     let ns: String = rest.split_whitespace().collect();
+                    let ns = ns
+                        .strip_prefix("global::")
+                        .map_or(ns.clone(), str::to_string);
                     if ctx.imports.namespaces.len() < MAX_DECLARED_NAMES {
                         ctx.imports.namespaces.push(ns);
                     }
@@ -1358,30 +1347,54 @@ const CALL_NAMES: &[&str] = &[
     "UseTransport",
 ];
 
-fn call_sites(
-    call: Node,
-    ctx: &mut Ctx,
-    found: &mut Vec<Site>,
-    mt_ev: &mut Vec<Option<Broker>>,
-    nsb_ev: &mut Vec<Option<Broker>>,
-) {
+/// The transports a file names: MassTransit `Using...` calls and NServiceBus `UseTransport<T>()`
+/// / `new XTransport(...)`, as (MassTransit, NServiceBus) evidence lists. One iterative walk.
+fn bus_evidence(root: Node, ctx: &Ctx) -> (Vec<Option<Broker>>, Vec<Option<Broker>>) {
+    let source = ctx.source;
+    let (mut mt, mut nsb) = (Vec::new(), Vec::new());
+    let (has_mt, has_nsb) = (
+        ctx.imports.has(Lib::MassTransit),
+        ctx.imports.has(Lib::NServiceBus),
+    );
+    if !has_mt && !has_nsb {
+        return (mt, nsb);
+    }
+    walk(root, |node| {
+        match node.kind() {
+            "invocation_expression" => {
+                if let Some(c) = callee(node, source) {
+                    if has_mt {
+                        mt.extend(mt_transport(&c.name));
+                    }
+                    if has_nsb && c.name == "UseTransport" {
+                        let class = c.type_args.first().and_then(|t| named_type(*t, source));
+                        if let Some(t) = class.filter(|t| !ctx.types.contains(t)) {
+                            nsb.extend(nsb_transport(&t));
+                        }
+                    }
+                }
+            }
+            "object_creation_expression" if has_nsb => {
+                let class = node
+                    .child_by_field_name("type")
+                    .and_then(|t| named_type(t, source))
+                    .filter(|t| !ctx.types.contains(t));
+                if let Some(t) = class {
+                    nsb.extend(nsb_transport(&t));
+                }
+            }
+            _ => {}
+        }
+        true
+    });
+    (mt, nsb)
+}
+
+fn call_sites(call: Node, ctx: &mut Ctx, found: &mut Vec<Site>) {
     let source = ctx.source;
     let Some(c) = callee(call, source) else {
         return;
     };
-    // The transports the file names (`UsingRabbitMq`, `UseTransport<RabbitMQTransport>`).
-    if ctx.imports.has(Lib::MassTransit) {
-        if let Some(b) = mt_transport(&c.name) {
-            mt_ev.push(b);
-        }
-    }
-    if c.name == "UseTransport" && ctx.imports.has(Lib::NServiceBus) {
-        if let Some(t) = c.type_args.first().and_then(|t| named_type(*t, source)) {
-            if !ctx.types.contains(&t) {
-                nsb_ev.extend(nsb_transport(&t));
-            }
-        }
-    }
     let Some(method) = CALL_NAMES.iter().copied().find(|m| *m == c.name) else {
         return;
     };
