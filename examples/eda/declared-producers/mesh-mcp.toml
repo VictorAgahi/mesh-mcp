@@ -1,0 +1,37 @@
+# Fixture: producers made visible by declared helper calls (9.0 T14b). The helpers are the
+# project's own outbox / bus wrappers, so their names are declared, not guessed.
+[workspace]
+name = "declared-producers"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/node_modules/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true
+
+# `JobsOutbox.createJob({ type, target })`: the job type is a topic (a member keeps its member key),
+# the target is a BullMQ queue (a member resolves to its value).
+[[engines.contracts.producer_calls]]
+name = "outbox-job"
+callee = "JobsOutbox.createJob"
+topic_keys = ["type"]
+queue_keys = ["target"]
+
+# `EventOutbox.createEvent({ type, targetServices: [...] })`: the event type and every stream.
+[[engines.contracts.producer_calls]]
+name = "outbox-event"
+callee = "EventOutbox.createEvent"
+topic_keys = ["type", "targetServices"]
+
+# `streamBus.publish(Streams.X, event)`: the first argument is the stream.
+[[engines.contracts.producer_calls]]
+name = "stream-publish"
+callee = "streamBus.publish"
+
+# `mailOutbox.enqueue('welcome-mail', payload)`, any receiver ending in `mailOutbox`.
+[[engines.contracts.producer_calls]]
+name = "mail-enqueue"
+callee = "mailOutbox.enqueue"

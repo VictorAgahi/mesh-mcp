@@ -226,6 +226,63 @@ pub struct ContractsConfig {
     pub cpp: Option<CppConfig>,
     #[serde(default)]
     pub patterns: Vec<CustomPatternConfig>,
+    /// Calls of a project's own outbox / enqueue / publish helper that name a topic or a queue
+    /// (9.0 T14b), read from the syntax tree of TypeScript and JavaScript files.
+    #[serde(default)]
+    pub producer_calls: Vec<ProducerCallConfig>,
+}
+
+/// The most `[[engines.contracts.producer_calls]]` entries read; the rest are ignored (`doctor`
+/// warns).
+pub const MAX_PRODUCER_CALLS: usize = 64;
+
+/// A helper that produces to a topic or a queue, declared by the project:
+/// `JobsOutboxEntity.createJob({ type: JobType.SCAN, target: Queue.STORAGE })`,
+/// `streamPublisher.publish(Streams.USER_CREATED, event)`.
+///
+/// The call is read where the file's syntax tree has it (never in a string or a comment), and
+/// every producer it yields is `heuristic`: the helper is a name the operator vouches for, not
+/// a known library API. An argument that cannot be resolved to a name (a parameter, a lookup
+/// table) yields nothing and is counted (`IndexHealth::declared_call_sites_dynamic`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerCallConfig {
+    pub name: String,
+    /// `createJob` (any receiver) or `JobsOutboxEntity.createJob` (the receiver's last
+    /// identifiers must be `JobsOutboxEntity`).
+    pub callee: String,
+    /// The argument read (0-based).
+    #[serde(default)]
+    pub arg: usize,
+    /// Keys of the object literal at `arg` whose value is a topic or an event / job type: a
+    /// member reference keeps its member key, so a consumer naming the same member meets it.
+    #[serde(default)]
+    pub topic_keys: Vec<String>,
+    /// Keys of the object literal at `arg` whose value is a queue name: an enum member resolves
+    /// to its string value, as the argument of `new Queue(...)` does.
+    #[serde(default)]
+    pub queue_keys: Vec<String>,
+}
+
+impl ProducerCallConfig {
+    /// The callee split into its optional receiver qualifier and its method name; `None` for a
+    /// callee that is not a dotted identifier path.
+    pub fn callee_parts(&self) -> Option<(Option<&str>, &str)> {
+        let callee = self.callee.trim();
+        let (receiver, method) = match callee.rsplit_once('.') {
+            Some((r, m)) => (Some(r), m),
+            None => (None, callee),
+        };
+        let ident = |s: &str| {
+            !s.is_empty()
+                && s.split('.').all(|p| {
+                    !p.is_empty()
+                        && p.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+                })
+        };
+        (ident(method) && receiver.is_none_or(ident)).then_some((receiver, method))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

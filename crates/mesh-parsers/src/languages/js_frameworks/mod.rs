@@ -12,6 +12,7 @@
 //! site a rule could match, so a file with none pays nothing.
 
 mod api;
+pub(crate) mod declared;
 mod file_routes;
 mod http;
 mod messaging;
@@ -264,6 +265,33 @@ fn receiver_is_client(libs: &[&str], site: &Site) -> bool {
 /// `Enum.MEMBER` topic to its declaring file (9.0 T14).
 pub(crate) fn member_imports(root: Node, source: &[u8]) -> (Vec<(String, String, String)>, bool) {
     ModuleBindings::collect(root, source).member_imports()
+}
+
+/// The calls of the helpers `[[engines.contracts.producer_calls]]` declares (9.0 T14b).
+pub(crate) fn detect_declared_calls(
+    root: Node,
+    source: &[u8],
+    calls: &[mesh_core::ProducerCallConfig],
+) -> declared::Declared {
+    // The text gate: a file that never writes a declared method name pays one scan.
+    let text = std::str::from_utf8(source).unwrap_or("");
+    if !calls
+        .iter()
+        .filter_map(|c| c.callee_parts())
+        .any(|(_, method)| text.contains(method))
+    {
+        return declared::Declared::default();
+    }
+    let fx = FrameworkCtx::new(root, source);
+    let built = fx.built();
+    let names = Names {
+        config: true,
+        source,
+        consts: &built.consts,
+        bindings: &built.bindings,
+        scopes: &built.scopes,
+    };
+    declared::collect(root, source, calls, &names)
 }
 
 /// Broker interactions at a `receiver.method(...)` call.

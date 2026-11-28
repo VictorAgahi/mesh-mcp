@@ -105,6 +105,11 @@ impl McpTool for AnalyzeImpactTool {
                 "\n*{hidden_tests} row(s) in test files left out (`include_tests: true` to list them).*\n"
             ));
         }
+        if matrix.no_producer_resolved {
+            if let Some(note) = snapshot.health.declared_gap_note() {
+                text.push_str(&format!("\n*{note}.*\n"));
+            }
+        }
         let text = with_literal_clash_note(text, &snapshot.contract_graph, args.target.as_str());
         Ok(ToolOutput::text(text))
     }

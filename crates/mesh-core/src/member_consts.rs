@@ -113,7 +113,7 @@ const BARE_SECRET_VALUES: &[&str] = &[
 
 /// Whether a member is named like a credential (`API_KEY`, `DB_PASSWORD`): whole words of its
 /// last segment, so `SECRETARY` is not one.
-fn member_is_credential_named(member: &str) -> bool {
+pub fn member_is_credential_named(member: &str) -> bool {
     let last = member
         .rsplit('.')
         .next()

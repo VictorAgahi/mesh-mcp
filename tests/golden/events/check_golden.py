@@ -31,8 +31,8 @@ REPO = HERE.parents[2]
 LANGS = {"ts", "js", "java", "go", "python", "csharp", "rust", "sql"}
 TAGS = {
     "kafka_basic", "layered_calls", "inproc_bus", "cqrs", "cron", "sql", "config_topic",
-    "broker_key", "jvm_broker", "go_broker", "py_broker", "cs_broker", "declared_pattern",
-    "enum_topic",
+    "broker_key", "jvm_broker", "go_broker", "py_broker", "cs_broker", "declared_pattern", "declared_call",
+    "enum_topic", "declared_call",
 }
 VIA = {"this", "injected_field", "imported_function", "same_module", "interface_impl"}
 ENTRY_KINDS = {"topic", "route", "handler", "cron"}

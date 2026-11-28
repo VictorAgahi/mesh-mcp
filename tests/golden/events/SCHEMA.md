@@ -97,6 +97,8 @@ negatives:
 `enum_topic` (T14: the site names its queue through an enum member, so the topic is the member's
 string value, which is not on the line; `check_golden.py` checks the value is a string literal of
 the corpus, or, for a member no file of the corpus declares, that the line names the member),
+`declared_call` (T14b: a producer found because the corpus config declares its helper in
+`[[engines.contracts.producer_calls]]`; a real call, so it is NOT optional),
 `declared_pattern` (site declared by a custom pattern only; always `optional: true`).
 A tag whose feature is not implemented yet is EXPECTED to score 0 on 8.0.1: that is the baseline.
 

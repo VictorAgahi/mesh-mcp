@@ -1,0 +1,48 @@
+# Hand-annotated from the source of examples/eda/declared-producers. Never generated from tool output.
+# The fixture's mesh-mcp.toml DECLARES four helpers (`[[engines.contracts.producer_calls]]`): the
+# producers below exist because of that declaration, and each is `heuristic` (a helper the operator
+# vouches for, not a library API). Every site sits on the line that carries the name, which for a
+# multi-line call is the `type:` / `target:` line or the array element, not the call line.
+# Job type and event type members keep their MEMBER key (`scan_file`, `user_registered`); a queue
+# key (`target`) resolves to the member's VALUE (`storage-queue`), as `new Queue(Enum.X)` does.
+# `LegacyQueue.STORAGE` is another queue than `Queue.STORAGE` although both members are STORAGE
+# (`legacy-storage-queue`): two members of one name in two enums stay two topics.
+# Consumers: `@Processor(Queue.STORAGE)` (BullMQ) and `@EventPattern(Streams.USER_CREATED)`; the
+# stream member is the event key `user_created`, shared by a publish of the same member.
+# Decoys, all in src/outbox/decoys.ts or jobs.ts (see `negatives`): the helper's method name on a
+# different receiver; a parameter that shadows the declared class; the call in a comment and in a
+# string; an import alias of the class (not followed: a known limit, nothing is guessed); a `type`
+# that is a parameter (the type is no name, the target of the same call still is).
+# Not annotated: the declaration of the helpers (src/outbox/outbox.ts) and the call in
+# src/__tests__/jobs.spec.ts (a test site, ignored by the scorer).
+corpus: declared-producers
+root: examples/eda/declared-producers
+config: mesh-mcp.toml
+languages: [ts]
+
+producers:
+  - {id: p1, topic: scan_file, file: src/outbox/jobs.ts, line: 6, language: ts, tags: [declared_call, enum_topic]}
+  - {id: p2, topic: storage-queue, file: src/outbox/jobs.ts, line: 8, language: ts, tags: [declared_call, enum_topic]}
+  - {id: p3, topic: send_mail, file: src/outbox/jobs.ts, line: 14, language: ts, tags: [declared_call, enum_topic]}
+  - {id: p4, topic: mail-queue, file: src/outbox/jobs.ts, line: 14, language: ts, tags: [declared_call, enum_topic]}
+  - {id: p5, topic: storage-queue, file: src/outbox/jobs.ts, line: 24, language: ts, tags: [declared_call, enum_topic]}
+  - {id: p6, topic: legacy-cleanup, file: src/outbox/legacy.ts, line: 7, language: ts, tags: [declared_call]}
+  - {id: p7, topic: legacy-storage-queue, file: src/outbox/legacy.ts, line: 8, language: ts, tags: [declared_call, enum_topic]}
+  - {id: p8, topic: user_registered, file: src/outbox/events.ts, line: 6, language: ts, tags: [declared_call, enum_topic]}
+  - {id: p9, topic: user_created, file: src/outbox/events.ts, line: 9, language: ts, tags: [declared_call, enum_topic]}
+  - {id: p10, topic: user_deleted, file: src/outbox/events.ts, line: 10, language: ts, tags: [declared_call, enum_topic]}
+  - {id: p11, topic: user_created, file: src/outbox/bus.ts, line: 8, language: ts, tags: [declared_call, enum_topic]}
+  - {id: p12, topic: welcome-mail, file: src/outbox/bus.ts, line: 9, language: ts, tags: [declared_call]}
+
+consumers:
+  - {id: c1, topic: storage-queue, file: src/storage.worker.ts, line: 4, language: ts, tags: [enum_topic]}
+  - {id: c2, topic: user_created, file: src/user.handler.ts, line: 5, language: ts, tags: [enum_topic]}
+
+negatives:
+  - {kind: producer, file: src/outbox/decoys.ts, line: 6, note: "createJob on another receiver (OtherOutbox) is not the declared helper"}
+  - {kind: producer, file: src/outbox/decoys.ts, line: 11, note: "a parameter named JobsOutbox shadows the declared class"}
+  - {kind: producer, file: src/outbox/decoys.ts, line: 15, note: "the call in a comment is not a call"}
+  - {kind: producer, file: src/outbox/decoys.ts, line: 16, note: "the call in a string is not a call"}
+  - {kind: producer, file: src/outbox/decoys.ts, line: 22, note: "an import alias of the declared class is not followed"}
+  - {kind: producer, file: src/outbox/jobs.ts, line: 20, note: "type is a parameter: not a name, no producer"}
+  - {kind: producer, file: src/outbox/bus.ts, line: 14, note: "audit.enqueue is not the declared receiver mailOutbox"}

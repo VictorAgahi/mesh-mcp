@@ -215,6 +215,16 @@ pub struct IndexHealth {
     /// Counted like `files_scanned`.
     #[serde(default)]
     pub files_const_capped: usize,
+    /// Files where the per-file cap on calls of a declared producer helper
+    /// (`[[engines.contracts.producer_calls]]`, 9.0 T14b) dropped sites: the sites past the cap are
+    /// not registered. Counted like `files_scanned`.
+    #[serde(default)]
+    pub files_declared_capped: usize,
+    /// Names the calls of a declared producer helper stated that could not be read (a parameter, a
+    /// lookup table, a value refused as secret-shaped): no producer is registered for them, which
+    /// is not a claim that none exists.
+    #[serde(default)]
+    pub declared_call_sites_unread: usize,
     /// Enum members a queue site cannot choose between, because the declarations its import can
     /// mean give different values: the site resolves to neither and keeps its qualified member key,
     /// `heuristic`. Distinct member paths, set after every fold.
@@ -372,6 +382,32 @@ impl IndexHealth {
     #[inline]
     pub fn record_inproc(&mut self, capped: bool) {
         self.files_inproc_capped += usize::from(capped);
+    }
+
+    /// One file's declared producer call counters (`FileIndex::declared_capped`,
+    /// `FileIndex::declared_unread`).
+    #[inline]
+    pub fn record_declared(&mut self, capped: bool, unread: u32) {
+        self.files_declared_capped += usize::from(capped);
+        self.declared_call_sites_unread += unread as usize;
+    }
+
+    /// What a report that says "no producer" must add when declared producer calls could not be
+    /// read: `None` when none was cut or unreadable.
+    pub fn declared_gap_note(&self) -> Option<String> {
+        if self.declared_call_sites_unread == 0 && self.files_declared_capped == 0 {
+            return None;
+        }
+        Some(format!(
+            "{} declared producer call site(s) could not be read statically ({} file(s) cut by the per-file cap): a missing producer may be one of them",
+            self.declared_call_sites_unread, self.files_declared_capped
+        ))
+    }
+
+    /// Whether the declared producer call cap dropped sites.
+    #[inline]
+    pub fn declared_truncated(&self) -> bool {
+        self.files_declared_capped > 0
     }
 
     /// One file's string-constant cap (`FileIndex::const_capped`).
@@ -724,6 +760,23 @@ impl IndexHealth {
                 self.files_go_brokers_capped
             );
         }
+        if self.files_declared_capped > 0 {
+            let _ = writeln!(
+                out,
+                "    {} file(s) cut by the declared producer call cap (`[[engines.contracts.producer_calls]]`; \
+                 docs/parser-support.md, section 3.11): the sites past the cap are not registered",
+                self.files_declared_capped
+            );
+        }
+        if self.declared_call_sites_unread > 0 {
+            let _ = writeln!(
+                out,
+                "    ({} declared producer call(s) whose topic or queue is not a static name (a parameter, \
+                 a lookup table) or was refused as secret-shaped: no producer registered for them, which \
+                 does not say none exists)",
+                self.declared_call_sites_unread
+            );
+        }
         if self.sql_sites_unresolved > 0 {
             let _ = writeln!(
                 out,
@@ -814,6 +867,8 @@ impl IndexHealth {
         self.files_config_lossy += other.files_config_lossy;
         self.files_inproc_capped += other.files_inproc_capped;
         self.files_const_capped += other.files_const_capped;
+        self.files_declared_capped += other.files_declared_capped;
+        self.declared_call_sites_unread += other.declared_call_sites_unread;
         self.files_jvm_brokers_capped += other.files_jvm_brokers_capped;
         self.files_py_brokers_capped += other.files_py_brokers_capped;
         self.files_go_brokers_capped += other.files_go_brokers_capped;

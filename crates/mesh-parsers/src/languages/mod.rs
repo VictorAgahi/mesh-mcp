@@ -71,6 +71,9 @@ pub struct ExtractConfig {
     /// `tsconfig.json` / `jsconfig.json` `paths` and `package.json` `imports`
     /// aliases of the workspace; disabled (rewrites nothing) by default.
     pub ts_aliases: TsAliasIndex,
+    /// `[[engines.contracts.producer_calls]]`: helpers whose calls name a topic or a queue.
+    /// Part of the parse-cache fingerprint (the `Debug` form of this struct).
+    pub producer_calls: Vec<mesh_core::ProducerCallConfig>,
 }
 
 impl Default for ExtractConfig {
@@ -83,6 +86,7 @@ impl Default for ExtractConfig {
             asyncapi_spec_files: Vec::new(),
             infer_string_topics: true,
             ts_aliases: TsAliasIndex::default(),
+            producer_calls: Vec::new(),
         }
     }
 }
@@ -130,6 +134,12 @@ impl ExtractConfig {
             asyncapi_spec_files,
             infer_string_topics,
             ts_aliases: default.ts_aliases,
+            producer_calls: contracts
+                .producer_calls
+                .iter()
+                .take(mesh_core::MAX_PRODUCER_CALLS)
+                .cloned()
+                .collect(),
         }
     }
 
@@ -252,6 +262,15 @@ pub struct FileIndex {
     /// resolved against the workspace's string constants when the file is folded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_sites: Vec<MemberSite>,
+    /// Names the calls of a declared producer helper stated that could not be read (a
+    /// parameter, a lookup table, a refused value): counted in
+    /// `IndexHealth::declared_call_sites_unread`, never an absence claim.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub declared_unread: u32,
+    /// The per-file cap on declared producer calls cut sites of this file: counted in
+    /// `IndexHealth::files_declared_capped`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub declared_capped: bool,
     /// The per-file cap on JVM broker sites (`MAX_JVM_BROKER_SITES_PER_FILE`: RabbitMQ, JMS,
     /// SQS / SNS, Redis, NATS, Pub/Sub in Java) cut sites of this file: counted in
     /// `IndexHealth::files_jvm_brokers_capped`.
@@ -348,6 +367,8 @@ impl FileIndex {
         self.sql_capped |= other.sql_capped;
         self.inproc_capped |= other.inproc_capped;
         self.const_capped |= other.const_capped;
+        self.declared_unread += other.declared_unread;
+        self.declared_capped |= other.declared_capped;
         self.jvm_brokers_capped |= other.jvm_brokers_capped;
         self.py_brokers_capped |= other.py_brokers_capped;
         self.go_brokers_capped |= other.go_brokers_capped;
@@ -960,6 +981,59 @@ pub const MAX_GO_BROKER_SITES_PER_FILE: usize = 2_000;
 pub struct PolyglotIndexer;
 
 impl PolyglotIndexer {
+    /// The producers of the calls `[[engines.contracts.producer_calls]]` declares (9.0 T14b): one
+    /// call-site node per name, `heuristic` (a helper the operator vouches for, not a known
+    /// library API). A queue name given as an enum member resolves by value when the file is
+    /// folded; a topic or job type given as one keeps its member key, so a consumer naming the
+    /// same member meets it.
+    fn wire_declared_calls(
+        nodes: &mut Vec<ContractNode>,
+        declared: js_frameworks::declared::Declared,
+        file_path: &Path,
+        repo_id: RepoId,
+        out: &mut FileIndex,
+    ) {
+        out.declared_unread += declared.unread;
+        out.declared_capped |= declared.capped;
+        if declared.sites.is_empty() {
+            return;
+        }
+        let package = mesh_core::detect_service_package(file_path, None);
+        let interned: mesh_core::FilePath = Arc::from(file_path);
+        for site in declared.sites {
+            let idx = nodes.len();
+            nodes.push(ContractNode {
+                id: 0,
+                name: CompactStr::new(&site.topic),
+                kind: if site.queue {
+                    NodeKind::Queue
+                } else {
+                    NodeKind::EventStream
+                },
+                file_path: interned.clone(),
+                line_start: site.line,
+                line_end: site.line,
+                package: package.clone(),
+                repo_id,
+                signature: Some(CompactStr::new(format!(
+                    "declared producer call {}",
+                    site.callee
+                ))),
+                docstring: None,
+            });
+            if mesh_core::is_member_ref(&site.topic) {
+                out.member_sites.push(MemberSite {
+                    producer: true,
+                    pair: out.producers.len() as u32,
+                    node: site.queue.then_some(idx as u32),
+                    queue: site.queue,
+                });
+            }
+            out.producers.push((idx, CompactStr::new(&site.topic)));
+            out.heuristic_topic_nodes.push(idx);
+        }
+    }
+
     /// TypeScript event facts, which 7.0.0 created as nodes but never registered
     /// as producers or consumers (so `analyze_impact` could not link them):
     /// - a method decorated `@EventPattern` / `@MessagePattern` (a `KafkaTopic`
@@ -1483,8 +1557,18 @@ impl PolyglotIndexer {
                                 cfg.ts_aliases.rewrite(file_path, module)
                             })
                         };
+                        // Calls of the helpers the project declares as producers (9.0 T14b).
+                        let declared = if cfg.producer_calls.is_empty() {
+                            js_frameworks::declared::Declared::default()
+                        } else {
+                            js_frameworks::detect_declared_calls(
+                                tree.root_node(),
+                                content.as_bytes(),
+                                &cfg.producer_calls,
+                            )
+                        };
                         let payload = payload::scan_ts(tree, content.as_bytes());
-                        Some((nodes, imports, rpc_calls, calls, payload))
+                        Some((nodes, imports, rpc_calls, calls, declared, payload))
                     })
                 };
                 // Plain JavaScript is parsed by its own grammar. A `.js` file
@@ -1502,7 +1586,7 @@ impl PolyglotIndexer {
                         other => other,
                     };
                 }
-                let (nodes, mut imports, rpc_calls, calls, payload) = match outcome {
+                let (nodes, mut imports, rpc_calls, calls, declared, payload) = match outcome {
                     ParseOutcome::Parsed(Some(extracted)) => extracted,
                     ParseOutcome::Parsed(None) | ParseOutcome::NoGrammar => Default::default(),
                     ParseOutcome::ParseFailed => {
@@ -1550,6 +1634,7 @@ impl PolyglotIndexer {
                 let mut nodes = nodes;
                 out.inproc_capped = Self::cap_inproc_nodes(&mut nodes);
                 Self::wire_ts_events(&nodes, &mut out);
+                Self::wire_declared_calls(&mut nodes, declared, file_path, repo_id, &mut out);
                 // A file with imports and no declaration (a barrel of
                 // `export * from …`, a spec of `describe` calls) had nothing
                 // to attach them to, so `find_dependents` never listed it:
@@ -2157,6 +2242,8 @@ mod tests {
             const_capped: false,
             member_imports: Vec::new(),
             member_sites: Vec::new(),
+            declared_unread: 0,
+            declared_capped: false,
             jvm_brokers_capped: false,
             py_brokers_capped: false,
             go_brokers_capped: false,
@@ -2866,9 +2953,21 @@ topics:
             }),
             cpp: None,
             patterns: Vec::new(),
+            producer_calls: (0..=mesh_core::MAX_PRODUCER_CALLS)
+                .map(|i| mesh_core::ProducerCallConfig {
+                    name: format!("c{i}"),
+                    callee: "enqueue".to_string(),
+                    arg: 0,
+                    topic_keys: Vec::new(),
+                    queue_keys: Vec::new(),
+                })
+                .collect(),
         };
 
         let cfg = ExtractConfig::from_contracts(&contracts);
+        // Only the first 64 declared helpers are read, in order.
+        assert_eq!(cfg.producer_calls.len(), 64);
+        assert_eq!(cfg.producer_calls[63].name, "c63");
         assert_eq!(cfg.proto_dirs, vec!["proto-registry".to_string()]);
         assert_eq!(cfg.controller_annotations, vec!["@RpcHandler".to_string()]);
         assert!(!cfg.canonical_fqcn_projection);

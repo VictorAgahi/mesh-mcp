@@ -120,7 +120,8 @@ impl DoctorCommand {
             || health.inproc_truncated()
             || health.jvm_brokers_truncated()
             || health.py_brokers_truncated()
-            || health.go_brokers_truncated())
+            || health.go_brokers_truncated()
+            || health.declared_truncated())
             && health.rejected.is_empty()
             && health.rejected_overflow == 0
         {
@@ -241,6 +242,44 @@ impl DoctorCommand {
         }
     }
 
+    /// Validates `[[engines.contracts.producer_calls]]` (9.0 T14b): a callee that is a dotted
+    /// identifier path, more than `MAX_PRODUCER_CALLS` entries, an entry nothing would read.
+    fn producer_call_checks(cfg: &Config, checks: &mut Vec<DoctorCheck>) {
+        let Some(calls) = cfg.engines.contracts.as_ref().map(|c| &c.producer_calls) else {
+            return;
+        };
+        if calls.is_empty() {
+            return;
+        }
+        let mut problems: Vec<String> = Vec::new();
+        if calls.len() > mesh_core::MAX_PRODUCER_CALLS {
+            problems.push(format!(
+                "{} entries, only the first {} are read",
+                calls.len(),
+                mesh_core::MAX_PRODUCER_CALLS
+            ));
+        }
+        for c in calls {
+            if c.callee_parts().is_none() {
+                problems.push(format!(
+                    "'{}': `callee` {:?} is not a dotted identifier path (`createJob` or `Outbox.createJob`); entry is skipped",
+                    c.name, c.callee
+                ));
+            }
+        }
+        if problems.is_empty() {
+            checks.push(DoctorCheck::ok(
+                "Producer calls",
+                format!(
+                    "{} declared helper(s); every producer they yield is heuristic",
+                    calls.len()
+                ),
+            ));
+        } else {
+            checks.push(DoctorCheck::warn("Producer calls", problems.join("; ")));
+        }
+    }
+
     /// Config-derived checks (sections 1-1d): syntax, jailed roots, skill files,
     /// dead path patterns, overlapping roots.
     fn config_checks(cfg_path: Option<&Path>, checks: &mut Vec<DoctorCheck>) {
@@ -306,6 +345,7 @@ impl DoctorCommand {
         }
 
         Self::pattern_checks(&cfg, checks);
+        Self::producer_call_checks(&cfg, checks);
 
         let Ok(roots) = expand_roots(
             &cfg.workspace.roots,
@@ -1558,6 +1598,40 @@ mod pattern_confidence_tests {
              [[engines.contracts.patterns]]\nname = \"b\"\nkind = \"topic_consumer\"\nregex = 'y(.)'\n"
         ))
         .expect("config")
+    }
+
+    #[test]
+    fn producer_calls_with_a_broken_callee_or_too_many_entries_warn() {
+        let load = |entries: &str| {
+            mesh_core::Config::load_from_str(&format!(
+                "[workspace]\nname = \"w\"\nroots = [\".\"]\n[engines.contracts]\n{entries}"
+            ))
+            .expect("config")
+        };
+        let entry = |callee: &str| {
+            format!("[[engines.contracts.producer_calls]]\nname = \"n\"\ncallee = \"{callee}\"\n")
+        };
+        let mut checks = Vec::new();
+        DoctorCommand::producer_call_checks(&load(&entry("Outbox.enqueue")), &mut checks);
+        assert_eq!(checks[0].status, "ok");
+        assert!(checks[0].message.starts_with("1 declared helper(s)"));
+
+        let mut checks = Vec::new();
+        DoctorCommand::producer_call_checks(&load(&entry("not a path")), &mut checks);
+        assert_eq!(checks[0].status, "warn");
+        assert!(checks[0].message.contains("not a dotted identifier path"));
+
+        let many: String = (0..=mesh_core::MAX_PRODUCER_CALLS)
+            .map(|_| entry("enqueue"))
+            .collect();
+        let mut checks = Vec::new();
+        DoctorCommand::producer_call_checks(&load(&many), &mut checks);
+        assert_eq!(checks[0].status, "warn");
+        assert!(checks[0].message.contains("only the first 64 are read"));
+
+        let mut checks = Vec::new();
+        DoctorCommand::producer_call_checks(&load(""), &mut checks);
+        assert!(checks.is_empty());
     }
 
     #[test]
