@@ -41,6 +41,8 @@ pub struct FlowViewInput<'a, 'g> {
     /// The topic key the event was matched as, and the matched hubs (`ContractGraph::flow_centres`).
     pub key: &'a str,
     pub hubs: &'a [CompactStr],
+    /// Producer and consumer sites of each hub (same order as `hubs`).
+    pub hub_counts: &'a [(usize, usize)],
     pub graph: &'g ContractGraph,
     /// Reverse trace (producers upstream), when the view goes up.
     pub up: Option<&'a FlowTrace<'g>>,
@@ -86,6 +88,9 @@ struct VNode {
     dynamic: bool,
     /// Reached again by a cycle or a join: drawn once.
     revisit: bool,
+    /// An event node whose name carries a broker qualifier because the name is used on
+    /// several brokers (a site whose broker is unknown joins such a node only as a guess).
+    qualified: bool,
 }
 
 struct VEdge {
@@ -127,7 +132,8 @@ struct Builder<'a, 'g> {
     markers: Vec<Marker>,
     events: HashMap<String, usize>,
     sites: HashMap<NodeId, usize>,
-    edge_seen: HashSet<(usize, usize)>,
+    edge_index: HashMap<(usize, usize), usize>,
+    known_sites: HashSet<NodeId>,
     marker_seen: HashSet<(usize, bool, String)>,
     totals: Totals,
 }
@@ -148,6 +154,33 @@ fn weakest(a: EdgeConfidence, b: EdgeConfidence) -> EdgeConfidence {
         a
     } else {
         b
+    }
+}
+
+/// Adds an arrow, once per `(from, to)`; a second one keeps the WEAKER confidence (the arrow is
+/// only as strong as the weakest chain that leads over it) and the first label.
+fn add_edge(
+    edges: &mut Vec<VEdge>,
+    index: &mut HashMap<(usize, usize), usize>,
+    from: usize,
+    to: usize,
+    conf: EdgeConfidence,
+    label: String,
+) {
+    if from == to {
+        return;
+    }
+    match index.get(&(from, to)) {
+        Some(&i) => edges[i].conf = weakest(edges[i].conf, conf),
+        None => {
+            index.insert((from, to), edges.len());
+            edges.push(VEdge {
+                from,
+                to,
+                conf,
+                label,
+            });
+        }
     }
 }
 
@@ -182,7 +215,8 @@ impl<'a, 'g> Builder<'a, 'g> {
             markers: Vec::new(),
             events: HashMap::new(),
             sites: HashMap::new(),
-            edge_seen: HashSet::new(),
+            edge_index: HashMap::new(),
+            known_sites: input.graph.sites_with_known_broker(),
             marker_seen: HashSet::new(),
             totals: Totals::default(),
         };
@@ -201,6 +235,7 @@ impl<'a, 'g> Builder<'a, 'g> {
         if let Some(&i) = self.events.get(label) {
             return i;
         }
+        let qualified = split_qualified_topic_key(label).is_some();
         let (qualifier, rest) = match split_qualified_topic_key(label) {
             Some((b, bare)) => (b.slug(), bare),
             None => (
@@ -224,6 +259,7 @@ impl<'a, 'g> Builder<'a, 'g> {
             place: String::new(),
             dynamic: label.contains("${") || label.contains('*'),
             revisit: false,
+            qualified,
         });
         self.events.insert(label.to_string(), i);
         i
@@ -249,7 +285,9 @@ impl<'a, 'g> Builder<'a, 'g> {
                 return parts.into_iter().map(|p| self.event(p)).collect();
             }
         }
-        if label == self.input.key || bare_key(label) == bare_key(self.input.key) {
+        // Only the key exactly as the caller gave it (a site whose hub the engine could not
+        // name). A qualified label of ANOTHER broker is a different event, never a centre.
+        if label == self.input.key {
             return all(self);
         }
         vec![self.event(label)]
@@ -295,19 +333,26 @@ impl<'a, 'g> Builder<'a, 'g> {
             place: MarkdownFormatter::location(node, self.input.roots),
             dynamic: false,
             revisit: false,
+            qualified: false,
         });
         self.sites.insert(node.id, i);
         i
     }
 
     fn edge(&mut self, from: usize, to: usize, conf: EdgeConfidence, label: String) {
-        if from != to && self.edge_seen.insert((from, to)) {
-            self.edges.push(VEdge {
-                from,
-                to,
-                conf,
-                label,
-            });
+        add_edge(&mut self.edges, &mut self.edge_index, from, to, conf, label);
+    }
+
+    /// The confidence of attaching `site` to `evs`: a site that joins several events, or whose
+    /// broker is not statically known and that meets a broker-qualified event, is a join the
+    /// engine makes by name only: heuristic (dashed), whatever label the engine gave it.
+    fn join_conf(&self, site: &ContractNode, evs: &[usize]) -> EdgeConfidence {
+        let unknown_meets_qualified =
+            !self.known_sites.contains(&site.id) && evs.iter().any(|&e| self.nodes[e].qualified);
+        if evs.len() > 1 || unknown_meets_qualified {
+            EdgeConfidence::Heuristic
+        } else {
+            EdgeConfidence::Exact
         }
     }
 
@@ -326,6 +371,7 @@ impl<'a, 'g> Builder<'a, 'g> {
     fn outcomes(
         &mut self,
         hop: &mesh_core::FlowHop<'_>,
+        site: &ContractNode,
         from: usize,
         conf: EdgeConfidence,
         up: bool,
@@ -333,7 +379,9 @@ impl<'a, 'g> Builder<'a, 'g> {
     ) {
         let counterpart = if up { "producer" } else { "consumer" };
         for nx in &hop.next {
-            for ev in self.events_of(Some(&nx.topic)) {
+            let evs = self.events_of(Some(&nx.topic));
+            let conf = weakest(conf, self.join_conf(site, &evs));
+            for ev in evs {
                 if up {
                     self.edge(ev, from, conf, String::new());
                 } else {
@@ -431,14 +479,25 @@ impl<'a, 'g> Builder<'a, 'g> {
             } else {
                 EdgeConfidence::Exact
             };
+            // The confidence so far: the chain up to this hop, then each step; every arrow at
+            // or after a weaker step is at most that weak (the legend's weakest-arrow rule).
+            let mut cur = hop
+                .parent
+                .and_then(|p| trace.hops.get(p))
+                .map_or(EdgeConfidence::Exact, |h| h.chain_confidence);
             let first = self.site(start.node, Kind::Consumer);
-            for ev in self.events_of(start.topic.as_deref()) {
-                self.edge(ev, first, start.confidence, String::new());
+            let evs = self.events_of(start.topic.as_deref());
+            cur = weakest(
+                weakest(cur, start.confidence),
+                self.join_conf(start.node, &evs),
+            );
+            for ev in evs {
+                self.edge(ev, first, cur, String::new());
             }
             let mut prev = first;
             let mut calls = 0usize;
             let mut calls_conf = EdgeConfidence::Exact;
-            let mut produced: Option<(usize, EdgeConfidence)> = None;
+            let mut produced: Option<(usize, &ContractNode, EdgeConfidence)> = None;
             let last_call = hop.steps.iter().rposition(|s| s.kind == FlowStepKind::Call);
             let owner = hop
                 .steps
@@ -455,7 +514,8 @@ impl<'a, 'g> Builder<'a, 'g> {
                             && Some(step.node.id) == owner => {}
                     FlowStepKind::Call if self.input.detail => {
                         let n = self.site(step.node, Kind::Call);
-                        self.edge(prev, n, step.confidence, String::new());
+                        cur = weakest(cur, step.confidence);
+                        self.edge(prev, n, cur, String::new());
                         prev = n;
                     }
                     FlowStepKind::Call => {
@@ -464,23 +524,23 @@ impl<'a, 'g> Builder<'a, 'g> {
                     }
                     FlowStepKind::Produce => {
                         let p = self.site(step.node, Kind::Producer);
-                        let (conf, label) = if self.input.detail {
-                            (structural, Self::link_label(0, hop.fallback))
+                        let label = if self.input.detail {
+                            Self::link_label(0, hop.fallback)
                         } else {
-                            (
-                                weakest(calls_conf, structural),
-                                Self::link_label(calls, hop.fallback),
-                            )
+                            cur = weakest(cur, calls_conf);
+                            Self::link_label(calls, hop.fallback)
                         };
-                        self.edge(prev, p, conf, label);
+                        cur = weakest(cur, structural);
+                        self.edge(prev, p, cur, label);
                         prev = p;
-                        produced = Some((p, step.confidence));
+                        cur = weakest(cur, step.confidence);
+                        produced = Some((p, step.node, cur));
                     }
                     _ => {}
                 }
             }
             match produced {
-                Some((p, conf)) => self.outcomes(hop, p, conf, false, bounds),
+                Some((p, node, conf)) => self.outcomes(hop, node, p, conf, false, bounds),
                 None => self.hop_end_marker(hop, prev, false, bounds),
             }
         }
@@ -515,16 +575,25 @@ impl<'a, 'g> Builder<'a, 'g> {
             } else {
                 EdgeConfidence::Exact
             };
+            let mut cur = hop
+                .parent
+                .and_then(|p| trace.hops.get(p))
+                .map_or(EdgeConfidence::Exact, |h| h.chain_confidence);
             let producer = self.site(start.node, Kind::Producer);
-            for ev in self.events_of(start.topic.as_deref()) {
-                self.edge(producer, ev, start.confidence, String::new());
+            let evs = self.events_of(start.topic.as_deref());
+            cur = weakest(
+                weakest(cur, start.confidence),
+                self.join_conf(start.node, &evs),
+            );
+            for ev in evs {
+                self.edge(producer, ev, cur, String::new());
             }
             // Walk order: the producer, the callers outwards, the entry last; drawn the other
-            // way round (callers above).
+            // way round (callers above). The confidence accumulates outwards from the event.
             let mut below = producer;
             let mut calls = 0usize;
             let mut calls_conf = EdgeConfidence::Exact;
-            let mut entry: Option<(usize, FlowStepKind, EdgeConfidence)> = None;
+            let mut entry: Option<(usize, &ContractNode, FlowStepKind, EdgeConfidence)> = None;
             let mut chain: Vec<(usize, EdgeConfidence)> = Vec::new();
             let last_call = hop.steps.iter().rposition(|s| s.kind == FlowStepKind::Call);
             let owner = hop
@@ -542,7 +611,8 @@ impl<'a, 'g> Builder<'a, 'g> {
                             && Some(step.node.id) == owner => {}
                     FlowStepKind::Call if self.input.detail => {
                         let n = self.site(step.node, Kind::Call);
-                        chain.push((n, step.confidence));
+                        cur = weakest(cur, step.confidence);
+                        chain.push((n, cur));
                     }
                     FlowStepKind::Call => {
                         calls += 1;
@@ -550,33 +620,32 @@ impl<'a, 'g> Builder<'a, 'g> {
                     }
                     FlowStepKind::Consume => {
                         let n = self.site(step.node, Kind::Consumer);
-                        entry = Some((n, step.kind, step.confidence));
+                        entry = Some((n, step.node, step.kind, step.confidence));
                     }
                     FlowStepKind::Route | FlowStepKind::Handler | FlowStepKind::Cron => {
                         let n = self.site(step.node, Kind::Origin);
-                        entry = Some((n, step.kind, step.confidence));
+                        entry = Some((n, step.node, step.kind, step.confidence));
                     }
                     FlowStepKind::Produce => {}
                 }
             }
-            if let Some((e, kind, conf)) = entry {
+            if let Some((e, node, kind, conf)) = entry {
                 // Detail: entry -> caller_n -> ... -> caller_1 -> producer; a call edge carries
-                // the confidence of the call it stands for.
+                // the confidence so far (the chain from the event outwards).
                 for (n, c) in chain {
                     self.edge(n, below, c, String::new());
                     below = n;
                 }
-                let (conf_link, label) = if self.input.detail {
-                    (structural, Self::link_label(0, hop.fallback))
+                let label = if self.input.detail {
+                    Self::link_label(0, hop.fallback)
                 } else {
-                    (
-                        weakest(calls_conf, structural),
-                        Self::link_label(calls, hop.fallback),
-                    )
+                    cur = weakest(cur, calls_conf);
+                    Self::link_label(calls, hop.fallback)
                 };
-                self.edge(e, below, conf_link, label);
+                cur = weakest(cur, structural);
+                self.edge(e, below, cur, label);
                 if kind == FlowStepKind::Consume {
-                    self.outcomes(hop, e, conf, true, bounds);
+                    self.outcomes(hop, node, e, weakest(cur, conf), true, bounds);
                 }
             } else {
                 self.hop_end_marker(hop, producer, true, bounds);
@@ -674,9 +743,15 @@ fn cell(text: &str) -> String {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    let t = clamp(&t, TABLE_NAME_CHARS)
-        .replace('`', "'")
-        .replace('|', "\\|");
+    let n = t.chars().count();
+    let t = if n > TABLE_NAME_CHARS && t != REDACTED {
+        // A longer name is cut with its real length said, never silently.
+        let head: String = t.chars().take(TABLE_NAME_CHARS - 3).collect();
+        format!("{head}... (cut, {n} chars)")
+    } else {
+        t
+    };
+    let t = t.replace('`', "'").replace('|', "\\|");
     format!("`{t}`")
 }
 
@@ -750,12 +825,12 @@ fn draw(g: &Builder<'_, '_>, limit: usize) -> Drawn {
             _ => ("[", "]"),
         };
         let class = match v.kind {
-            Kind::Centre => "centre",
-            Kind::Event if v.dynamic => "unresolved",
-            Kind::Event => "event",
-            Kind::Consumer | Kind::Producer => "site",
-            Kind::Call => "call",
-            Kind::Origin => "origin",
+            Kind::Centre => "mm_centre",
+            Kind::Event if v.dynamic => "mm_unres",
+            Kind::Event => "mm_event",
+            Kind::Consumer | Kind::Producer => "mm_site",
+            Kind::Call => "mm_call",
+            Kind::Origin => "mm_origin",
         };
         let _ = writeln!(out, "  n{i}{open}\"{label}\"{close}:::{class}");
         if v.revisit {
@@ -799,7 +874,7 @@ fn draw(g: &Builder<'_, '_>, limit: usize) -> Drawn {
         let id = stub_id;
         stub_id += 1;
         let text = mermaid_escape(&clamp(text, 80));
-        let shape = if class == "unresolved" {
+        let shape = if class == "mm_unres" {
             format!("{{{{\"{text}\"}}}}")
         } else {
             format!("[[\"{text}\"]]")
@@ -815,9 +890,9 @@ fn draw(g: &Builder<'_, '_>, limit: usize) -> Drawn {
     for m in &g.markers {
         if keep[m.parent] {
             let class = if m.kind == MarkKind::Unresolved {
-                "unresolved"
+                "mm_unres"
             } else {
-                "bound"
+                "mm_bound"
             };
             let text = if m.kind == MarkKind::Unresolved {
                 format!("not statically resolved: {}", m.text)
@@ -834,7 +909,7 @@ fn draw(g: &Builder<'_, '_>, limit: usize) -> Drawn {
                 i,
                 true,
                 &format!("+{} not shown (cap)", cut_up[i]),
-                "bound",
+                "mm_bound",
             );
         }
         if cut_down[i] > 0 {
@@ -843,29 +918,31 @@ fn draw(g: &Builder<'_, '_>, limit: usize) -> Drawn {
                 i,
                 false,
                 &format!("+{} not shown (cap)", cut_down[i]),
-                "bound",
+                "mm_bound",
             );
         }
     }
 
     for i in revisits {
-        let _ = writeln!(out, "  class n{i} revisit");
+        let _ = writeln!(out, "  class n{i} mm_cycle");
     }
     for (idx, _) in &link_styles {
         let _ = writeln!(out, "  linkStyle {idx} stroke:#c92a2a,color:#c92a2a");
     }
-    out.push_str("  classDef centre fill:#fff3bf,stroke:#e67700,stroke-width:4px,color:#212529\n");
-    out.push_str("  classDef event fill:#e7f5ff,stroke:#1971c2,color:#212529\n");
-    out.push_str("  classDef site fill:#f1f3f5,stroke:#495057,color:#212529\n");
-    out.push_str("  classDef call fill:#f8f9fa,stroke:#adb5bd,color:#212529\n");
-    out.push_str("  classDef origin fill:#ebfbee,stroke:#2f9e44,color:#212529\n");
     out.push_str(
-        "  classDef unresolved fill:#ffffff,stroke:#868e96,stroke-dasharray:4 3,color:#495057\n",
+        "  classDef mm_centre fill:#fff3bf,stroke:#e67700,stroke-width:4px,color:#212529\n",
+    );
+    out.push_str("  classDef mm_event fill:#e7f5ff,stroke:#1971c2,color:#212529\n");
+    out.push_str("  classDef mm_site fill:#f1f3f5,stroke:#495057,color:#212529\n");
+    out.push_str("  classDef mm_call fill:#f8f9fa,stroke:#adb5bd,color:#212529\n");
+    out.push_str("  classDef mm_origin fill:#ebfbee,stroke:#2f9e44,color:#212529\n");
+    out.push_str(
+        "  classDef mm_unres fill:#ffffff,stroke:#868e96,stroke-dasharray:4 3,color:#495057\n",
     );
     out.push_str(
-        "  classDef bound fill:#fff9db,stroke:#f08c00,stroke-dasharray:2 2,color:#495057\n",
+        "  classDef mm_bound fill:#fff9db,stroke:#f08c00,stroke-dasharray:2 2,color:#495057\n",
     );
-    out.push_str("  classDef revisit stroke-dasharray:6 3,stroke-width:3px\n");
+    out.push_str("  classDef mm_cycle stroke-dasharray:6 3,stroke-width:3px\n");
 
     // Table of the full names.
     let mut table = String::from("| Node | Kind | Name | Location |\n|---|---|---|---|\n");
@@ -893,11 +970,18 @@ fn draw(g: &Builder<'_, '_>, limit: usize) -> Drawn {
 }
 
 /// The legend printed under every diagram.
-const LEGEND: &str = "*Legend: a rounded node is an event (broker-qualified: `kafka:orders`; `?:` = broker not statically known), the thick yellow one is the centre; a box is a code site (`name`, `path:line`); a slanted box is where a chain starts (a route, handler or schedule). Solid arrow = exact, dashed arrow = heuristic, dashed red arrow labelled `?` = ambiguous (a chain is as strong as its weakest arrow). A dashed hexagon is NOT STATICALLY RESOLVED (the flow may continue at runtime: a runtime-built topic, a registry, an unindexed root); an orange stub is a bound (depth, fan-out, cap) that cut the walk, not an end. A dashed thick border is an event reached again by a cycle or a join, drawn once.*\n";
+const LEGEND: &str = "*Legend: a rounded node is an event (broker-qualified: `kafka:orders`; `?:` = broker not statically known), the thick yellow one is the centre; a box is a code site (`name`, `path:line`); a slanted box is where a chain starts (a route, handler or schedule). Solid arrow = exact, dashed arrow = heuristic, dashed red arrow labelled `?` = ambiguous; a chain is as strong as its weakest arrow, so every arrow after a weaker one is at most that weak. A site whose broker is not statically known joins every channel of its name by name only: its arrows to a broker-qualified event are dashed. A dashed hexagon is NOT STATICALLY RESOLVED (the flow may continue at runtime: a runtime-built topic, a registry, an unindexed root); an orange stub is a bound (depth, fan-out, cap) that cut the walk, not an end. A dashed thick border (a `class ... mm_cycle` line) marks a node reached again by a cycle or a join, drawn once. The table gives each node's name in full up to 160 characters (a longer one is cut and says its length); a name or key that is not a plain name is replaced by the redaction marker, a long or non-ASCII one included.*\n";
 
 /// Renders the flow view: the header, the diagram, the legend, the table of full names and the
 /// notes. Output stays under the 48 KB cap by halving the node cap until it fits.
 pub fn render_flow_view(input: &FlowViewInput<'_, '_>) -> String {
+    let by_key = input
+        .hubs
+        .iter()
+        .any(|h| bare_key(h) == bare_key(input.key));
+    if !by_key && input.hubs.len() > 1 {
+        return render_ambiguous(input);
+    }
     let mut g = Builder::new(input);
     if let Some(up) = input.up {
         g.add_up(up);
@@ -995,18 +1079,6 @@ pub fn render_flow_view(input: &FlowViewInput<'_, '_>) -> String {
                 }
             );
         }
-        if g.centres.len() == 1 && input.hubs.len() > 1 && !g.is_centre(input.hubs[0].as_str()) {
-            let _ = writeln!(
-                notes,
-                "\n**`{clean_event}` matched {} events by substring** (the centre stands for all of them). Pass an exact key (for example `{}`) to centre on one.",
-                input.hubs.len(),
-                input
-                    .hubs
-                    .first()
-                    .map_or_else(String::new, |h| shown_key(h).replace('`', "'"))
-            );
-        }
-
         let bounds = input
             .up
             .map(|t| t.bounds)
@@ -1028,6 +1100,43 @@ pub fn render_flow_view(input: &FlowViewInput<'_, '_>) -> String {
         }
         limit = (limit / 2).max(1);
     }
+}
+
+/// Most events listed when a name matches several.
+const AMBIGUOUS_LISTED: usize = 20;
+
+/// A name that matched several DIFFERENT events by substring is not one event: nothing is drawn,
+/// the candidates are listed and the exact key is asked for.
+fn render_ambiguous(input: &FlowViewInput<'_, '_>) -> String {
+    let shown = clamp(&shown_key(input.event.trim()).replace('`', "'"), 80);
+    let n = input.hubs.len();
+    let first = input
+        .hubs
+        .first()
+        .map_or_else(String::new, |h| shown_key(h).replace('`', "'"));
+    let mut out = format!(
+        "## Event flow view for `{shown}`\n\n**ambiguous event: {n} events match `{shown}`** by substring, so nothing is drawn. Pass the exact key, for example `visualize_mesh(event: \"{first}\")`.\n\n| Key | Broker | Producers | Consumers |\n|---|---|---|---|\n"
+    );
+    for (i, hub) in input.hubs.iter().enumerate().take(AMBIGUOUS_LISTED) {
+        let (producers, consumers) = input.hub_counts.get(i).copied().unwrap_or((0, 0));
+        let broker = split_qualified_topic_key(hub)
+            .map(|(b, _)| b)
+            .or_else(|| input.graph.hub_label_broker(hub))
+            .map_or("unknown", Broker::slug);
+        let _ = writeln!(
+            out,
+            "| {} | {broker} | {producers} | {consumers} |",
+            cell(&shown_key(hub))
+        );
+    }
+    if n > AMBIGUOUS_LISTED {
+        let _ = writeln!(
+            out,
+            "\n*{} more not listed (the first {AMBIGUOUS_LISTED} by key); a longer or more specific name narrows the list.*",
+            n - AMBIGUOUS_LISTED
+        );
+    }
+    out
 }
 
 /// Largest `limit` the tool accepts.
@@ -1059,6 +1168,46 @@ mod tests {
             mermaid_escape("kafka:order.requested-v2/x_y"),
             "kafka:order.requested-v2/x_y"
         );
+    }
+
+    #[test]
+    fn a_repeated_arrow_keeps_the_weaker_confidence_and_the_first_label() {
+        let (mut edges, mut index) = (Vec::new(), HashMap::new());
+        add_edge(
+            &mut edges,
+            &mut index,
+            1,
+            2,
+            EdgeConfidence::Exact,
+            "a".into(),
+        );
+        add_edge(
+            &mut edges,
+            &mut index,
+            1,
+            2,
+            EdgeConfidence::Ambiguous,
+            "b".into(),
+        );
+        add_edge(
+            &mut edges,
+            &mut index,
+            1,
+            2,
+            EdgeConfidence::Heuristic,
+            "c".into(),
+        );
+        add_edge(
+            &mut edges,
+            &mut index,
+            3,
+            3,
+            EdgeConfidence::Exact,
+            String::new(),
+        );
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].conf, EdgeConfidence::Ambiguous);
+        assert_eq!(edges[0].label, "a");
     }
 
     #[test]

@@ -13,6 +13,8 @@ pub struct FlowCentres {
     /// Names of the matched broker / plain hubs (`kafka:orders`, `orders`), sorted. Empty when
     /// the target names no event.
     pub hubs: Vec<CompactStr>,
+    /// Producer and consumer sites of each hub of `hubs` (same order).
+    pub hub_counts: Vec<(usize, usize)>,
     /// Whether some event matched the target at all (a hub, a producer or a consumer).
     pub matched: bool,
 }
@@ -26,19 +28,46 @@ impl ContractGraph {
             && flow.upstream_producers.is_empty()
             && flow.downstream_consumers.is_empty()
             && flow.related_sagas.is_empty());
-        let mut hubs: Vec<CompactStr> = flow
+        let mut hub_nodes: Vec<&ContractNode> = flow
             .topics
             .iter()
+            .copied()
             .filter(|n| Self::is_hub_like(n))
-            .map(|n| n.name.clone())
             .collect();
-        hubs.sort();
-        hubs.dedup();
+        hub_nodes.sort_by(|a, b| a.name.cmp(&b.name));
+        hub_nodes.dedup_by(|a, b| a.name == b.name);
+        let hub_counts = hub_nodes
+            .iter()
+            .map(|h| {
+                let (mut producers, mut consumers) = (0, 0);
+                for e in &self.edges {
+                    match e.kind {
+                        EdgeKind::Produces if e.to == h.id => producers += 1,
+                        EdgeKind::Consumes if e.to == h.id || e.from == h.id => consumers += 1,
+                        _ => {}
+                    }
+                }
+                (producers, consumers)
+            })
+            .collect();
         FlowCentres {
             key: flow.key,
-            hubs,
+            hubs: hub_nodes.iter().map(|n| n.name.clone()).collect(),
+            hub_counts,
             matched,
         }
+    }
+
+    /// The producer and consumer sites some broker is statically known for. A site that is not
+    /// in this set joins every channel of its topic name (the engine's unknown-broker rule).
+    pub fn sites_with_known_broker(&self) -> HashSet<NodeId> {
+        [&self.producer_brokers, &self.consumer_brokers]
+            .into_iter()
+            .flat_map(HashMap::values)
+            .flat_map(HashMap::iter)
+            .filter(|(_, mask)| **mask != 0)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// The broker behind the hub named `label` (a `FlowNext::topic` or a step's topic): the

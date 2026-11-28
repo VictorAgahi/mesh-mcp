@@ -35,7 +35,7 @@ pub struct VisualizeMeshArgs {
     #[serde(default)]
     #[schemars(
         with = "Option<String>",
-        description = "Event flow view: centre the diagram on ONE event (an event / topic / queue / stream name, ex: 'order.requested', or its broker-qualified key 'kafka:orders'; a bare name used on several brokers draws each broker's event apart, and a substring match is reported). Returns a Mermaid `flowchart TD` (mermaid format only) with the producers upstream and the consumers downstream, each node with its path:line, solid arrows for exact links and dashed ones for heuristic / ambiguous. Chains end at a dashed 'not statically resolved' node or at a stub that names the bound that cut them, never at a bare dead end. DO NOT combine with `service`; DO NOT pass a file path, a route or a handler (use trace_flow for those)."
+        description = "Event flow view: centre the diagram on ONE event (an event / topic / queue / stream name, ex: 'order.requested', or its broker-qualified key 'kafka:orders'; a bare name used on several brokers draws each broker's event apart; a name that only matches several different events by substring draws nothing and lists them, so pass the exact key). Returns a Mermaid `flowchart TD` (mermaid format only) with the producers upstream and the consumers downstream, each node with its path:line, solid arrows for exact links and dashed ones for heuristic / ambiguous. Chains end at a dashed 'not statically resolved' node or at a stub that names the bound that cut them, never at a bare dead end. DO NOT combine with `service`; DO NOT pass a file path, a route or a handler (use trace_flow for those)."
     )]
     pub event: Option<CompactStr>,
 
@@ -332,6 +332,7 @@ fn run_event_view(
         event,
         key: &centres.key,
         hubs: &centres.hubs,
+        hub_counts: &centres.hub_counts,
         graph,
         up: up_trace.as_ref(),
         down: down_trace.as_ref(),

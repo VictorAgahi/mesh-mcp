@@ -45,10 +45,22 @@ async fn call(state: &Arc<AppState>, args: Value) -> String {
         .await
         .expect("tool call");
     assert_eq!(res["isError"], json!(false), "{res}");
-    res["content"][0]["text"]
+    let text = res["content"][0]["text"]
         .as_str()
         .expect("text")
-        .to_string()
+        .to_string();
+    // Manual check against the real Mermaid parser: `MM_DUMP=/path cargo test ...` appends
+    // every answer to that file; never set in CI.
+    if let Ok(path) = std::env::var("MM_DUMP") {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("dump file");
+        writeln!(f, "{text}").expect("dump");
+    }
+    text
 }
 
 fn temp_workspace(files: &[(&str, &str)]) -> (tempfile::TempDir, Arc<AppState>) {
@@ -161,6 +173,55 @@ fn assert_mermaid_sane(text: &str) {
             defined.push(first.to_string());
         }
     }
+    // Class names: ours all carry the `mm_` prefix, so none can be a Mermaid keyword (`call`
+    // made every diagram a parse error in Mermaid 11); each used class has a `classDef`.
+    const RESERVED: [&str; 17] = [
+        "call",
+        "click",
+        "default",
+        "end",
+        "graph",
+        "subgraph",
+        "class",
+        "style",
+        "linkStyle",
+        "classDef",
+        "flowchart",
+        "direction",
+        "href",
+        "interpolate",
+        "node",
+        "edge",
+        "state",
+    ];
+    let mut class_defs: Vec<&str> = Vec::new();
+    let mut class_uses: Vec<&str> = Vec::new();
+    for line in block.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("classDef ") {
+            class_defs.push(rest.split(' ').next().expect("class name"));
+        } else if let Some(rest) = line.strip_prefix("class ") {
+            class_uses.push(rest.split(' ').nth(1).expect("class name"));
+        } else if let Some((_, rest)) = line.split_once(":::") {
+            class_uses.push(rest.trim());
+        }
+    }
+    for name in class_defs.iter().chain(&class_uses) {
+        assert!(
+            !RESERVED.contains(name),
+            "Mermaid keyword as class name: {name}"
+        );
+        assert!(
+            name.starts_with("mm_"),
+            "class name without the mm_ prefix: {name}"
+        );
+    }
+    for name in &class_uses {
+        assert!(
+            class_defs.contains(name),
+            "class {name} used without classDef"
+        );
+    }
     for (from, to) in &edges {
         assert!(defined.contains(from), "edge from undefined {from}");
         assert!(defined.contains(to), "edge to undefined {to}");
@@ -193,6 +254,20 @@ fn has_edge(text: &str, from: &str, to: &str) -> bool {
     })
 }
 
+/// `Some("-->")` (solid) or `Some("-.->")` (dashed) for the arrow from `from` to `to`.
+fn edge_style(text: &str, from: &str, to: &str) -> Option<&'static str> {
+    mermaid_block(text).lines().find_map(|l| {
+        let l = l.trim();
+        if !l.ends_with(&format!(" {to}")) {
+            return None;
+        }
+        [("-->", "-->"), ("-.->", "-.->")]
+            .into_iter()
+            .find(|(arrow, _)| l.starts_with(&format!("{from} {arrow}")))
+            .map(|(_, a)| a)
+    })
+}
+
 fn has_line(text: &str, line: &str) -> bool {
     text.lines().any(|l| l.trim() == line)
 }
@@ -209,10 +284,10 @@ async fn layered_ts_event_flow_up_and_down() {
     assert!(text.contains("flowchart TD"), "{text}");
     assert!(!text.contains("flowchart LR"), "{text}");
     for line in [
-        r#"n0(["?:stock.reserved"]):::centre"#,
-        r#"n1["StockPublisher.publishReserved<br/>src/stock.publisher.ts:9"]:::site"#,
-        r#"n4[/"POST /orders<br/>src/order.controller.ts:9"/]:::origin"#,
-        r#"n5["ShippingConsumer.onStockReserved<br/>src/shipping.consumer.ts:10"]:::site"#,
+        r#"n0(["?:stock.reserved"]):::mm_centre"#,
+        r#"n1["StockPublisher.publishReserved<br/>src/stock.publisher.ts:9"]:::mm_site"#,
+        r#"n4[/"POST /orders<br/>src/order.controller.ts:9"/]:::mm_origin"#,
+        r#"n5["ShippingConsumer.onStockReserved<br/>src/shipping.consumer.ts:10"]:::mm_site"#,
         r#"n2 -->|"3 calls"| n1"#,
         r#"n4 -->|"3 calls"| n1"#,
         r#"n0 --> n5"#,
@@ -220,6 +295,13 @@ async fn layered_ts_event_flow_up_and_down() {
         // An ambiguous call hop: dashed, labelled `?`, red.
         r#"n8 -.->|"? 2 calls"| n9"#,
         r#"linkStyle 8 stroke:#c92a2a,color:#c92a2a"#,
+        // Past the ambiguous call hop every arrow is at most ambiguous (weakest chain), before
+        // it nothing is.
+        r#"n7 --> n8"#,
+        r#"n9 -.->|"?"| n10"#,
+        r#"n11 -.->|"?"| n12"#,
+        r#"linkStyle 9 stroke:#c92a2a,color:#c92a2a"#,
+        r#"linkStyle 11 stroke:#c92a2a,color:#c92a2a"#,
     ] {
         assert!(has_line(&text, line), "missing `{line}` in\n{text}");
     }
@@ -244,7 +326,7 @@ async fn depth_limit_is_a_stub_and_a_note_not_an_end() {
     assert!(
         has_line(
             &text,
-            r#"n4[["1 consumer#40;s#41; not expanded: depth limit #40;1#41;"]]:::bound"#
+            r#"n4[["1 consumer#40;s#41; not expanded: depth limit #40;1#41;"]]:::mm_bound"#
         ),
         "{text}"
     );
@@ -308,20 +390,20 @@ async fn cycle_is_drawn_once_and_marked_and_unresolved_topics_are_hexagons() {
         1,
         "{text}"
     );
-    assert!(has_line(&text, "class n0 revisit"), "{text}");
+    assert!(has_line(&text, "class n0 mm_cycle"), "{text}");
     assert!(has_line(&text, "n3 --> n0"), "{text}");
     // The runtime-built topic is a distinct 'not statically resolved' node, never a dead end.
     assert!(
         has_line(
             &text,
-            r#"n10(["?:$#123;invoice_dead_topic#125;"]):::unresolved"#
+            r#"n10(["?:$#123;invoice_dead_topic#125;"]):::mm_unres"#
         ),
         "{text}"
     );
     assert!(
         has_line(
             &text,
-            r#"n12{{"not statically resolved: no consumer found"}}:::unresolved"#
+            r#"n12{{"not statically resolved: no consumer found"}}:::mm_unres"#
         ),
         "{text}"
     );
@@ -330,7 +412,7 @@ async fn cycle_is_drawn_once_and_marked_and_unresolved_topics_are_hexagons() {
     assert!(
         has_line(
             &text,
-            r#"n11{{"not statically resolved: no publish found"}}:::unresolved"#
+            r#"n11{{"not statically resolved: no publish found"}}:::mm_unres"#
         ),
         "{text}"
     );
@@ -343,10 +425,10 @@ async fn hostile_paths_and_names_are_escaped_and_the_table_keeps_full_names() {
     let text = call(&state, json!({ "event": "invoice.requested" })).await;
     assert_mermaid_sane(&text);
     for line in [
-        r#"n1["InvoiceController.retry<br/>src/#40;billing#41;/#91;id#93;/invoice.controller.ts:10"]:::site"#,
-        r#"n2[/"POST /invoices/#123;id#125;/retry<br/>src/#40;billing#41;/#91;id#93;/invoice.controller.ts:9"/]:::origin"#,
-        r#"n3["LedgerConsumer.post<br/>src/ledger#59;v2/ledger.consumer.ts:10"]:::site"#,
-        r#"n6["InvoicePublisher.publishIssued<br/>src/#40;billing#41;/#91;id#93;/#233;t#233;/invoice.publisher.ts:9"]:::site"#,
+        r#"n1["InvoiceController.retry<br/>src/#40;billing#41;/#91;id#93;/invoice.controller.ts:10"]:::mm_site"#,
+        r#"n2[/"POST /invoices/#123;id#125;/retry<br/>src/#40;billing#41;/#91;id#93;/invoice.controller.ts:9"/]:::mm_origin"#,
+        r#"n3["LedgerConsumer.post<br/>src/ledger#59;v2/ledger.consumer.ts:10"]:::mm_site"#,
+        r#"n6["InvoicePublisher.publishIssued<br/>src/#40;billing#41;/#91;id#93;/#233;t#233;/invoice.publisher.ts:9"]:::mm_site"#,
     ] {
         assert!(has_line(&text, line), "missing `{line}` in\n{text}");
     }
@@ -373,7 +455,7 @@ async fn long_names_are_cut_in_the_diagram_and_whole_in_the_table() {
     assert!(
         has_line(
             &text,
-            r#"n0(["?:very.long.event.name.that.keeps.goi..."]):::centre"#
+            r#"n0(["?:very.long.event.name.that.keeps.goi..."]):::mm_centre"#
         ),
         "{text}"
     );
@@ -419,7 +501,7 @@ async fn node_cap_counts_what_it_cuts_and_marks_where() {
         "{text}"
     );
     assert!(
-        has_line(&text, r#"n16[["+9 not shown #40;cap#41;"]]:::bound"#),
+        has_line(&text, r#"n16[["+9 not shown #40;cap#41;"]]:::mm_bound"#),
         "{text}"
     );
     assert!(has_line(&text, "n0 -.-> n16"), "{text}");
@@ -489,7 +571,7 @@ async fn brokers_never_join() {
     let kafka = call(&state, json!({ "event": "kafka:orders" })).await;
     assert_mermaid_sane(&kafka);
     assert!(
-        kafka.contains(r#"n0(["kafka:orders"]):::centre"#),
+        kafka.contains(r#"n0(["kafka:orders"]):::mm_centre"#),
         "{kafka}"
     );
     assert!(kafka.contains("src/kafka.ts:12"), "{kafka}");
@@ -535,7 +617,7 @@ async fn brokers_never_join() {
         "sqs:orders",
     ] {
         assert!(
-            bare.contains(&format!("([\"{centre}\"]):::centre")),
+            bare.contains(&format!("([\"{centre}\"]):::mm_centre")),
             "{centre} missing\n{bare}"
         );
     }
@@ -692,28 +774,60 @@ fn listener(class: &str, topic: &str, emit: Option<&str>) -> String {
 }
 
 #[tokio::test]
-async fn a_name_that_matched_several_events_by_substring_says_so() {
+async fn a_name_that_matches_several_different_events_draws_nothing_and_lists_them() {
     let (_d, state) = temp_workspace(&[
-        ("a.ts", &listener("A", "ord.created", None)),
-        ("b.ts", &listener("B", "ord.shipped", None)),
+        ("a.ts", &listener("A", "order.requested", None)),
+        ("b.ts", &listener("B", "order.shipped", None)),
+        ("c.ts", &listener("C", "orders.archive", None)),
     ]);
-    let text = call(&state, json!({ "event": "ord", "direction": "downstream" })).await;
-    assert_mermaid_sane(&text);
-    assert!(
-        text.contains("**`ord` matched 2 events by substring**"),
-        "{text}"
-    );
-    assert!(has_line(&text, r#"n0(["?:ord"]):::centre"#), "{text}");
-    // An exact key is one event, no such note.
+    let text = call(&state, json!({ "event": "order" })).await;
+    assert!(!text.contains("```mermaid"), "{text}");
+    for line in [
+        "**ambiguous event: 3 events match `order`** by substring, so nothing is drawn. Pass the exact key, for example `visualize_mesh(event: \"order.requested\")`.",
+        "| `order.requested` | unknown | 0 | 1 |",
+        "| `order.shipped` | unknown | 0 | 1 |",
+        "| `orders.archive` | unknown | 0 | 1 |",
+    ] {
+        assert!(text.contains(line), "missing `{line}` in\n{text}");
+    }
+    // An exact key is one event: drawn, not merged with its neighbours.
     let exact = call(
         &state,
-        json!({ "event": "ord.created", "direction": "downstream" }),
+        json!({ "event": "order.requested", "direction": "downstream" }),
     )
     .await;
-    assert!(!exact.contains("by substring"), "{exact}");
+    assert_mermaid_sane(&exact);
     assert!(
-        has_line(&exact, r#"n0(["?:ord.created"]):::centre"#),
+        has_line(&exact, r#"n0(["?:order.requested"]):::mm_centre"#),
         "{exact}"
+    );
+    assert!(!exact.contains("order.shipped"), "{exact}");
+}
+
+#[tokio::test]
+async fn an_ambiguous_list_is_capped_and_says_how_many_more() {
+    let files: Vec<(String, String)> = (0..25)
+        .map(|i| {
+            (
+                format!("e{i:02}.ts"),
+                listener(&format!("E{i:02}"), &format!("many.evt{i:02}"), None),
+            )
+        })
+        .collect();
+    let (_d, state) = temp_from(&files);
+    let text = call(&state, json!({ "event": "many" })).await;
+    assert!(
+        text.contains("**ambiguous event: 25 events match `many`**"),
+        "{text}"
+    );
+    assert!(
+        text.contains("| `many.evt19` | unknown | 0 | 1 |"),
+        "{text}"
+    );
+    assert!(!text.contains("many.evt20"), "{text}");
+    assert!(
+        text.contains("*5 more not listed (the first 20 by key)"),
+        "{text}"
     );
 }
 
@@ -783,7 +897,7 @@ async fn a_long_place_is_cut_at_its_head_so_the_line_stays() {
     assert_mermaid_sane(&text);
     assert!(
         text.contains(
-            "<br/>...y_long_directory_name_for_a_service_module2/consumer.ts:7\"]:::site"
+            "<br/>...y_long_directory_name_for_a_service_module2/consumer.ts:7\"]:::mm_site"
         ),
         "{text}"
     );
@@ -836,10 +950,13 @@ async fn a_single_broker_workspace_still_qualifies_every_event() {
     let text = call(&state, json!({ "event": "solo.topic" })).await;
     assert_mermaid_sane(&text);
     assert!(
-        has_line(&text, r#"n0(["kafka:solo.topic"]):::centre"#),
+        has_line(&text, r#"n0(["kafka:solo.topic"]):::mm_centre"#),
         "{text}"
     );
-    assert!(text.contains(r#"(["kafka:solo.next"]):::event"#), "{text}");
+    assert!(
+        text.contains(r#"(["kafka:solo.next"]):::mm_event"#),
+        "{text}"
+    );
     assert!(!mermaid_block(&text).contains("?:"), "{text}");
 }
 
@@ -910,5 +1027,166 @@ async fn measure_two_thousand_topics() {
         let t = std::time::Instant::now();
         let text = call(&state, args).await;
         println!("{label}: {:?}, {} bytes", t.elapsed(), text.len());
+    }
+}
+
+#[tokio::test]
+async fn a_chain_that_crosses_brokers_keeps_them_apart() {
+    let state = state_for("examples/eda/flow-view-crossbroker");
+    // Kafka consumer -> bridge -> RabbitMQ publish: the RabbitMQ event is an event of its own.
+    let kafka = call(&state, json!({ "event": "kafka:orders" })).await;
+    assert_mermaid_sane(&kafka);
+    for line in [
+        r#"n0(["kafka:orders"]):::mm_centre"#,
+        r#"n4(["rabbitmq:orders"]):::mm_event"#,
+        r#"n2 -->|"1 call"| n3"#,
+        "n3 --> n4",
+        "n4 --> n5",
+    ] {
+        assert!(has_line(&kafka, line), "missing `{line}` in\n{kafka}");
+    }
+    assert_eq!(
+        edge_style(&kafka, "n3", "n0"),
+        None,
+        "rabbit producer joined the kafka centre\n{kafka}"
+    );
+    assert_eq!(
+        edge_style(&kafka, "n0", "n5"),
+        None,
+        "rabbit consumer joined the kafka centre\n{kafka}"
+    );
+    let rabbit = call(&state, json!({ "event": "rabbitmq:orders" })).await;
+    assert_mermaid_sane(&rabbit);
+    for line in [
+        r#"n0(["rabbitmq:orders"]):::mm_centre"#,
+        r#"n3(["kafka:orders"]):::mm_event"#,
+        "n3 --> n2",
+        "n1 --> n0",
+        "n0 --> n5",
+    ] {
+        assert!(has_line(&rabbit, line), "missing `{line}` in\n{rabbit}");
+    }
+    assert_eq!(
+        edge_style(&rabbit, "n0", "n2"),
+        None,
+        "kafka consumer joined the rabbit centre\n{rabbit}"
+    );
+    assert_eq!(edge_style(&rabbit, "n1", "n3"), None, "{rabbit}");
+    // Both brokers drawn at once: one centre each, the crossing publish lands on the RabbitMQ one.
+    let bare = call(&state, json!({ "event": "orders" })).await;
+    assert_mermaid_sane(&bare);
+    for line in [
+        "n2 --> n0",
+        "n3 --> n1",
+        "n0 --> n4",
+        "n1 --> n5",
+        "class n1 mm_cycle",
+    ] {
+        assert!(has_line(&bare, line), "missing `{line}` in\n{bare}");
+    }
+    assert_eq!(edge_style(&bare, "n0", "n5"), None, "{bare}");
+    assert_eq!(edge_style(&bare, "n1", "n4"), None, "{bare}");
+}
+
+#[tokio::test]
+async fn confidence_is_the_weakest_so_far_along_the_chain() {
+    let a = "import { Controller } from '@nestjs/common';\nimport { EventPattern, ClientKafka } from '@nestjs/microservices';\n@Controller()\nexport class A {\n  constructor(private readonly client: ClientKafka) {}\n  @EventPattern('a.evt')\n  onA(p: any) { console.log(p); }\n  pubB(p: any) { this.client.emit('b.evt', p); }\n}\n";
+    let b = "import { Controller } from '@nestjs/common';\nimport { EventPattern, ClientKafka } from '@nestjs/microservices';\n@Controller()\nexport class B {\n  constructor(private readonly client: ClientKafka) {}\n  @EventPattern('b.evt')\n  onB(p: any) { this.client.emit('c.evt', p); }\n}\n";
+    let (_d, state) = temp_workspace(&[("a.ts", a), ("b.ts", b)]);
+    let text = call(
+        &state,
+        json!({ "event": "a.evt", "direction": "downstream" }),
+    )
+    .await;
+    assert_mermaid_sane(&text);
+    // a.evt -> onA is exact; onA -> pubB is the same-file rule (heuristic); everything after
+    // that hop is at most heuristic, though onB itself is reached by an exact link.
+    for line in [
+        "n0 --> n1",
+        r#"n1 -.->|"same file"| n2"#,
+        "n2 -.-> n3",
+        "n3 -.-> n4",
+        "n4 -.-> n5",
+        "n5 -.-> n6",
+    ] {
+        assert!(has_line(&text, line), "missing `{line}` in\n{text}");
+    }
+    // The reverse side obeys the same rule, outwards from the centre.
+    let up = call(&state, json!({ "event": "c.evt", "direction": "upstream" })).await;
+    assert_mermaid_sane(&up);
+    assert_eq!(edge_style(&up, "n1", "n0"), Some("-->"), "{up}");
+    let b_site = id_of(&up, "`B.onB` | `b.ts:7`");
+    assert!(b_site.starts_with('n'), "{up}");
+}
+
+#[tokio::test]
+async fn an_unknown_broker_site_joins_a_qualified_event_as_a_dashed_guess() {
+    let state = state_for("examples/eda/multi-broker");
+    let kafka = call(&state, json!({ "event": "kafka:orders" })).await;
+    assert_mermaid_sane(&kafka);
+    // The NestJS `@EventPattern('orders')` consumer joins every channel of the name; the Go
+    // consumer is known to be Kafka and is solid.
+    assert!(
+        has_line(
+            &kafka,
+            r#"n8["consume orders<br/>src/legacy.ts:7"]:::mm_site"#
+        ),
+        "{kafka}"
+    );
+    assert_eq!(edge_style(&kafka, "n0", "n8"), Some("-.->"), "{kafka}");
+    assert_eq!(edge_style(&kafka, "n0", "n4"), Some("-->"), "{kafka}");
+    assert!(
+        kafka.contains("its arrows to a broker-qualified event are dashed"),
+        "{kafka}"
+    );
+    // Bare name: the unknown site hangs off EVERY broker's centre, always dashed.
+    let bare = call(
+        &state,
+        json!({ "event": "orders", "direction": "downstream" }),
+    )
+    .await;
+    assert_mermaid_sane(&bare);
+    let legacy = id_of(&bare, "`src/legacy.ts:7`");
+    for broker in ["kafka", "nats", "rabbitmq", "redis", "sns", "sqs"] {
+        let centre = id_of(&bare, &format!("| centre event | `{broker}:orders` |"));
+        assert_eq!(
+            edge_style(&bare, &centre, &legacy),
+            Some("-.->"),
+            "{broker}\n{bare}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_table_names_a_long_node_in_full_up_to_160_characters_and_says_when_it_cut() {
+    let name = format!("{}abcdefg", "abcdefghij.".repeat(16));
+    assert_eq!(name.len(), 183);
+    let (_d, state) = temp_workspace(&[("c.ts", &listener("C", &name, None))]);
+    let text = call(&state, json!({ "event": name })).await;
+    assert_mermaid_sane(&text);
+    let shown = format!("?:{name}");
+    let head: String = shown.chars().take(157).collect();
+    assert!(
+        text.contains(&format!("| centre event | `{head}... (cut, 185 chars)` |")),
+        "{text}"
+    );
+    // The diagram label is cut much shorter, on its own rule.
+    assert!(
+        text.contains(r#"(["?:abcdefghij.abcdefghij.abcdefghij.ab..."])"#),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn over_long_and_non_ascii_names_are_printed_as_the_marker_not_echoed() {
+    let state = state_for("examples/eda/layered-ts");
+    let long = "x".repeat(300);
+    for name in [long.as_str(), "na\u{ef}ve.evt"] {
+        let text = call(&state, json!({ "event": name })).await;
+        assert!(
+            text.contains("No event matched `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`"),
+            "{text}"
+        );
+        assert!(!text.contains(name), "{text}");
     }
 }

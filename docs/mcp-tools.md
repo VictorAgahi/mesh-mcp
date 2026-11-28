@@ -713,16 +713,24 @@ view does not walk the graph a second time.
 
 - **Event**: a topic / queue / stream name (`order.requested`) or its broker-qualified key
   (`kafka:orders`), matched exactly like `trace_flow` matches a topic. A bare name used on several
-  brokers draws one centre per broker, never joined (a site whose broker is not statically known
-  joins every channel of its name, as everywhere: check such a site against the source). A name that only matched by
-  substring several events is drawn as one centre, and the output says so. Every event node is
-  broker-qualified (`kafka:orders`); `?:` means the broker is not statically known (a NestJS
-  `@EventPattern`, for example).
+  brokers draws one centre per broker, and brokers never join: a Kafka consumer that calls a
+  bridge publishing the same name on RabbitMQ reaches a RabbitMQ event node of its own, never the
+  Kafka centre (`examples/eda/flow-view-crossbroker`). A site whose broker is not statically known
+  (a NestJS `@EventPattern`, a declarative pattern) joins every channel of its name, as everywhere
+  in MeshMCP, and its arrows to a broker-qualified event are drawn dashed (a guess by name, not an
+  exact link). A name that only matches several DIFFERENT events by substring (`order` against
+  `order.requested`, `order.shipped`, `orders.archive`) is not one event: nothing is drawn, the
+  answer is `ambiguous event: N events match` with a table (key, broker, producer and consumer
+  site counts, at most 20 rows and the rest counted) and asks for the exact key. Every event node
+  is broker-qualified (`kafka:orders`); `?:` means the broker is not statically known.
 - **Nodes**: a rounded node is an event (the centre is thick and yellow); a box is a code site
   (`Class.method` and its `path:line`; at module level `publish <name>` / `consume <name>`); a
   slanted box is where a chain starts (a route, handler or schedule, `POST /orders`).
-- **Arrows**: solid = exact, dashed = heuristic, dashed red labelled `?` = ambiguous (the weakest
-  call of the hop). By default the calls between a consumer and the publish it reaches fold into
+- **Arrows**: solid = exact, dashed = heuristic, dashed red labelled `?` = ambiguous. A chain is as
+  strong as its weakest link: once a hop is heuristic or ambiguous (the same-file rule, an
+  ambiguous call, an unknown-broker join) every arrow after it, down the chain from the event,
+  carries at most that confidence, exactly like `trace_flow`'s "chain" confidence. When two paths
+  reach the same arrow, the weaker one is drawn. By default the calls between a consumer and the publish it reaches fold into
   the arrow label (`3 calls`; `same file` for the legacy same-file rule); `detail: true` draws
   every call as a node (it costs nodes).
 - **Not a dead end**: where the engine finds no continuation the diagram draws a dashed hexagon,
@@ -746,10 +754,15 @@ view does not walk the graph a second time.
   semicolons, `#`, `&`, `<`, `>`, backticks and every non-ASCII character become numeric entities
   such as `#40;`), labels longer than 40 characters are cut with `...` (a place is cut at its head,
   so the `:line` stays), and the table under the diagram gives each node's full name and `path:line`
-  unescaped. Names go through the same gates as `trace_flow`
+  unescaped; a name longer than 160 characters is cut there and its real length is said
+  (`... (cut, 185 chars)`). A function that both consumes and publishes is two nodes with the
+  same name: the table's Kind column tells them apart. Names go through the same gates as `trace_flow`
   and `event_anomalies` (`member_consts::name_is_printable`; a placeholder default is masked): a
   credential-shaped event or code name is replaced by `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`,
-  also in the echo of the `event` argument.
+  also in the echo of the `event` argument. The gate is the shared one and is strict: a plain name
+  longer than the shared name limit (249 characters), or one with a non-ASCII letter such as
+  `naïve.evt`, is also replaced by the marker, a false positive that hides a name rather than
+  leaking one.
 - Test files are left out and counted (`include_tests: true` follows them). `direction`: `both`
   (default), `upstream` or `downstream`; the header shows `-` for the side not drawn.
 - Mermaid only: `format: json` / `html` with `event`, and `event` with `service`, are refused
