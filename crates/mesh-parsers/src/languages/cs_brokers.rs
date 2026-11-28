@@ -1258,15 +1258,12 @@ fn attribute_sites(attr: Node, ctx: &mut Ctx, found: &mut Vec<Site>) {
     else {
         return;
     };
-    // The first positional argument is the queue or topic; `Connection = "..."` is a setting
-    // name and is never read.
+    // The first argument is the queue or topic; `Connection = "..."` is an assignment, which
+    // names no channel (a setting name is never read).
     let first = list
         .named_children(&mut list.walk())
-        .filter(|a| a.kind() == "attribute_argument")
-        .find_map(|a| {
-            let e = a.named_child(a.named_child_count().checked_sub(1)?)?;
-            (e.kind() != "assignment_expression").then_some(e)
-        });
+        .find(|a| a.kind() == "attribute_argument")
+        .and_then(|a| a.named_child(a.named_child_count().checked_sub(1)?));
     let Some(first) = first else { return };
     let Some(key) = ctx.resolve(first, true) else {
         return;

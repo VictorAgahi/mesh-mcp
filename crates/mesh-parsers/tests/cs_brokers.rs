@@ -71,10 +71,10 @@ public class OrderCreatedConsumer : IConsumer<OrderCreated>, IConsumer<Batch<Ord
 
 #[test]
 fn masstransit_types_need_the_using_and_a_single_type_argument() {
-    // No using: not MassTransit's IConsumer.
-    assert!(read("public class A : IConsumer<OrderCreated> { }").is_empty());
+    // No MassTransit using (NServiceBus is imported, so the file is read at all): not MassTransit's.
+    assert!(read("using NServiceBus;\npublic class A : IConsumer<OrderCreated> { }").is_empty());
     // Confluent.Kafka's IConsumer<TKey, TValue>, with MassTransit imported too.
-    let kafka = "using MassTransit;\nusing Confluent.Kafka;\npublic class A : IConsumer<string, string> { }";
+    let kafka = "using MassTransit;\nusing Confluent.Kafka;\npublic class A : IConsumer<OrderKey, OrderValue> { }";
     assert!(read(kafka).is_empty());
     // A fully qualified base type needs no using.
     let qualified = "public class A : MassTransit.IConsumer<OrderCreated> { }";
@@ -310,6 +310,7 @@ public class Svc
         await _provider.GetSendEndpoint(new Uri("queue:orders?durable=false"));
         await other.GetSendEndpoint(new Uri("exchange:order-events"));
         await bus.GetSendEndpoint(new Uri("rabbitmq://host/vhost/queue"));
+        await bus.GetSendEndpoint(new Uri("loopback:plain-name"));
         await bus.GetSendEndpoint(new Uri(Settings.Address));
         await _provider.GetSendEndpoint(new Uri("queue:" + name));
     }
@@ -504,6 +505,7 @@ public class Svc
 #[test]
 fn service_bus_calls_need_the_using_and_a_typed_client() {
     let code = r##"
+using MassTransit;
 public class Svc
 {
     private readonly ServiceBusClient _client;
@@ -541,6 +543,9 @@ public class Functions
 
     [Function("E")]
     public void E([ServiceBusTrigger(Computed())] string message) { }
+
+    [Function("F")]
+    public void F([ServiceBusTrigger(Connection = "ServiceBusConnection")] string message) { }
 }
 public static class Constants { public const string Q = "const-queue"; }
 "##;
@@ -575,7 +580,7 @@ public class F
 
 #[test]
 fn a_service_bus_attribute_needs_its_namespace_and_no_local_type_of_that_name() {
-    let none = "public class F { public void A([ServiceBusTrigger(\"q\")] string m) { } }";
+    let none = "using MassTransit;\npublic class F { public void A([ServiceBusTrigger(\"q\")] string m) { } }";
     assert!(read(none).is_empty());
     let local = "using Microsoft.Azure.WebJobs;\npublic class ServiceBusTrigger : System.Attribute { public ServiceBusTrigger(string q) { } }\npublic class F { public void A([ServiceBusTrigger(\"q\")] string m) { } }";
     assert!(read(local).is_empty());
