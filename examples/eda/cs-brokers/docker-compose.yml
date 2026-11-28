@@ -1,0 +1,7 @@
+services:
+  functions:
+    image: brk/functions
+    environment:
+      OrdersQueue: orders.incoming
+      REFUND_QUEUE: refunds.requested
+      Billing__Topic: billing.events

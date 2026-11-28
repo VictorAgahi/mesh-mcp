@@ -1,0 +1,101 @@
+# Hand-annotated from the source of examples/eda/cs-brokers. Never generated from tool output.
+# C# only: MassTransit, NServiceBus, Azure Service Bus (SDK and Functions attributes) and
+# Confluent.Kafka (9.0 T8d). The channel key of each site is what the call site shows:
+#  - MassTransit / NServiceBus: the MESSAGE TYPE of a consumer class (`IConsumer<T>`, `IHandleMessages<T>`)
+#    and of a Publish / Send (`new T(...)`, `Publish<T>`, a variable of declared type T); the queue of a
+#    `ReceiveEndpoint("q")` and of `GetSendEndpoint(new Uri("queue:q"))`;
+#  - Azure Service Bus: the queue or topic of CreateSender / CreateProcessor / CreateReceiver and of
+#    `[ServiceBusTrigger("q")]` / `[ServiceBusOutput("q")]` (a `%Setting%` is the placeholder `${Setting}`).
+# A message-type key is the type name, lower-cased by the graph. `orders` is a RabbitMQ queue (a
+# MassTransit ReceiveEndpoint), an Azure Service Bus queue and a Kafka topic: three channels, so
+# `<broker>:<name>` (SCHEMA.md). Every other name is used on one broker only and keeps its plain spelling.
+# `orders.incoming` is `OrdersQueue`, `refunds.requested` is `REFUND_QUEUE` and `billing.events` is
+# `Billing__Topic` (the environment spelling of the configuration key `Billing:Topic`) of the corpus
+# docker-compose.yml; the default `billing.fallback` is never a name.
+# Where the bus is named in the same file (UsingRabbitMq, UseTransport<AzureServiceBusTransport>) a
+# message-type site is on that broker; the consumers and publishers of the other files do not show it.
+# p3 carries `broker_key` only so that check_golden.py reads the name after the `queue:` address colon (it is
+# not a qualified key).
+# Consumers.cs:15 `endpoint.Send(new BillOrder(...))` is a producer of BillOrder on a `var` that holds a
+# `GetSendEndpoint` result: real, but only a flow analysis finds it (a known false negative).
+# Decoys.cs holds no site: types named IConsumer / IPublishEndpoint / ServiceBusClient of its own
+# namespace hide the libraries, a homegrown EventBus, a Publish on an unrelated type, a log line.
+# Hostile.cs holds one site, `hostile.ok`: a connection string constant, a wildcard queue, a
+# credential-named configuration key and a plain parameter are not names.
+# tests/Brk.Tests/PublishTests.cs holds a real-looking publish: the scorer ignores test files.
+corpus: cs-brokers
+root: examples/eda/cs-brokers
+config: mesh-mcp.toml
+languages: [csharp]
+
+producers:
+  - {id: p1, topic: invoiceissued, file: src/Brk/MassTransitSetup.cs, line: 31, language: csharp, tags: [cs_broker]}
+  - {id: p2, topic: ordershipped, file: src/Brk/Consumers.cs, line: 13, language: csharp, tags: [cs_broker]}
+  - {id: p3, topic: billing-queue, file: src/Brk/Consumers.cs, line: 14, language: csharp, tags: [cs_broker, broker_key]}
+  - {id: p4, topic: billorder, file: src/Brk/Consumers.cs, line: 15, language: csharp, tags: [cs_broker]}
+  - {id: p5, topic: ordercreated, file: src/Brk/OrderService.cs, line: 18, language: csharp, tags: [cs_broker]}
+  - {id: p6, topic: paymentsettled, file: src/Brk/OrderService.cs, line: 19, language: csharp, tags: [cs_broker]}
+  - {id: p7, topic: ordercreated, file: src/Brk/OrderService.cs, line: 20, language: csharp, tags: [cs_broker]}
+  - {id: p8, topic: orderplaced, file: src/Brk/NsbHandlers.cs, line: 9, language: csharp, tags: [cs_broker]}
+  - {id: p9, topic: billorder, file: src/Brk/NsbHandlers.cs, line: 10, language: csharp, tags: [cs_broker]}
+  - {id: p10, topic: placeorder, file: src/Brk/NsbHandlers.cs, line: 20, language: csharp, tags: [cs_broker]}
+  - {id: p11, topic: billorder, file: src/Brk/NsbSetup.cs, line: 17, language: csharp, tags: [cs_broker]}
+  - {id: p12, topic: "servicebus:orders", file: src/Brk/ServiceBusSdk.cs, line: 19, language: csharp, tags: [cs_broker, broker_key]}
+  - {id: p13, topic: notifications, file: src/Brk/ServiceBusSdk.cs, line: 20, language: csharp, tags: [cs_broker]}
+  - {id: p14, topic: billing.events, file: src/Brk/ServiceBusSdk.cs, line: 24, language: csharp, tags: [cs_broker, config_topic]}
+  - {id: p15, topic: refunds.requested, file: src/Brk/ServiceBusSdk.cs, line: 25, language: csharp, tags: [cs_broker, config_topic]}
+  - {id: p16, topic: audit.log, file: src/Brk/Functions.cs, line: 8, language: csharp, tags: [cs_broker]}
+  - {id: p17, topic: "kafka:orders", file: src/Brk/KafkaOrders.cs, line: 11, language: csharp, tags: [kafka_basic, broker_key]}
+
+consumers:
+  - {id: c1, topic: "rabbitmq:orders", file: src/Brk/MassTransitSetup.cs, line: 16, language: csharp, tags: [cs_broker, broker_key]}
+  - {id: c2, topic: audit-queue, file: src/Brk/MassTransitSetup.cs, line: 17, language: csharp, tags: [cs_broker]}
+  - {id: c3, topic: invoiceissued, file: src/Brk/MassTransitSetup.cs, line: 34, language: csharp, tags: [cs_broker]}
+  - {id: c4, topic: ordercreated, file: src/Brk/Consumers.cs, line: 5, language: csharp, tags: [cs_broker]}
+  - {id: c5, topic: paymentsettled, file: src/Brk/Consumers.cs, line: 19, language: csharp, tags: [cs_broker]}
+  - {id: c6, topic: ordershipped, file: src/Brk/Consumers.cs, line: 19, language: csharp, tags: [cs_broker]}
+  - {id: c7, topic: placeorder, file: src/Brk/NsbHandlers.cs, line: 5, language: csharp, tags: [cs_broker]}
+  - {id: c8, topic: orderplaced, file: src/Brk/NsbSetup.cs, line: 15, language: csharp, tags: [cs_broker]}
+  - {id: c9, topic: invoices, file: src/Brk/ServiceBusSdk.cs, line: 21, language: csharp, tags: [cs_broker]}
+  - {id: c10, topic: billing, file: src/Brk/ServiceBusSdk.cs, line: 22, language: csharp, tags: [cs_broker]}
+  - {id: c11, topic: dead-letters, file: src/Brk/ServiceBusSdk.cs, line: 23, language: csharp, tags: [cs_broker]}
+  - {id: c12, topic: orders.incoming, file: src/Brk/Functions.cs, line: 9, language: csharp, tags: [cs_broker, config_topic]}
+  - {id: c13, topic: price-updates, file: src/Brk/Functions.cs, line: 12, language: csharp, tags: [cs_broker]}
+  - {id: c14, topic: hostile.ok, file: src/Brk/Hostile.cs, line: 18, language: csharp, tags: [cs_broker]}
+
+chains:
+  # OrderCreated -> the consumer publishes OrderShipped -> the batch consumer of OrderShipped.
+  # The consumer class and its handler are one file, and C# has no call extraction (level 2).
+  - id: ch1
+    entry: {kind: topic, value: ordercreated}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/Brk/Consumers.cs, line: 5, topic: ordercreated}
+      - {kind: produce, file: src/Brk/Consumers.cs, line: 13, topic: ordershipped}
+      - {kind: consume, file: src/Brk/Consumers.cs, line: 19, topic: ordershipped}
+    tags: [cs_broker]
+    min_hops: 0
+  # PlaceOrder (NServiceBus, no transport named) -> OrderPlaced, consumed on Azure Service Bus.
+  - id: ch2
+    entry: {kind: topic, value: placeorder}
+    direction: forward
+    steps:
+      - {kind: consume, file: src/Brk/NsbHandlers.cs, line: 5, topic: placeorder}
+      - {kind: produce, file: src/Brk/NsbHandlers.cs, line: 9, topic: orderplaced}
+      - {kind: consume, file: src/Brk/NsbSetup.cs, line: 15, topic: orderplaced}
+      - {kind: produce, file: src/Brk/NsbSetup.cs, line: 17, topic: billorder}
+    tags: [cs_broker]
+    min_hops: 0
+
+negatives:
+  - {kind: consumer, file: src/Brk/MassTransitSetup.cs, line: 18, note: "ReceiveEndpoint without a queue name: a convention-named endpoint"}
+  - {kind: consumer, file: src/Brk/Decoys.cs, line: 23, note: "IConsumer is the interface of the file's own namespace"}
+  - {kind: producer, file: src/Brk/Decoys.cs, line: 42, note: "IPublishEndpoint is a class of the file's own namespace"}
+  - {kind: producer, file: src/Brk/Decoys.cs, line: 43, note: "ServiceBusClient is a class of the file's own namespace"}
+  - {kind: producer, file: src/Brk/Decoys.cs, line: 44, note: "publish of a homegrown EventBus"}
+  - {kind: producer, file: src/Brk/Decoys.cs, line: 45, note: "publish of an unrelated type"}
+  - {kind: producer, file: src/Brk/Hostile.cs, line: 13, note: "the argument is a connection string constant"}
+  - {kind: producer, file: src/Brk/Hostile.cs, line: 14, note: "a producer never publishes to a wildcard"}
+  - {kind: producer, file: src/Brk/Hostile.cs, line: 15, note: "credential-named configuration key"}
+  - {kind: producer, file: src/Brk/Hostile.cs, line: 16, note: "queue is a parameter"}
+  - {kind: producer, file: src/Brk/Hostile.cs, line: 17, note: "connection string of the configuration"}
