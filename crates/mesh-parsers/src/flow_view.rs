@@ -343,13 +343,12 @@ impl<'a, 'g> Builder<'a, 'g> {
         add_edge(&mut self.edges, &mut self.edge_index, from, to, conf, label);
     }
 
-    /// The confidence of attaching `site` to `evs`: a site that joins several events, or whose
-    /// broker is not statically known and that meets a broker-qualified event, is a join the
-    /// engine makes by name only: heuristic (dashed), whatever label the engine gave it.
+    /// The confidence of attaching `site` to `evs`: a site whose broker is not statically known
+    /// that meets a broker-qualified event joins it by name only, a guess the engine makes
+    /// (heuristic, dashed) whatever label it gave it. A site known to be on several of the
+    /// events is on each of them.
     fn join_conf(&self, site: &ContractNode, evs: &[usize]) -> EdgeConfidence {
-        let unknown_meets_qualified =
-            !self.known_sites.contains(&site.id) && evs.iter().any(|&e| self.nodes[e].qualified);
-        if evs.len() > 1 || unknown_meets_qualified {
+        if !self.known_sites.contains(&site.id) && evs.iter().any(|&e| self.nodes[e].qualified) {
             EdgeConfidence::Heuristic
         } else {
             EdgeConfidence::Exact
