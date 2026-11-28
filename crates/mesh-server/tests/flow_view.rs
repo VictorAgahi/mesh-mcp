@@ -530,6 +530,11 @@ async fn credential_shaped_names_never_reach_the_diagram() {
         "{ok}"
     );
     assert!(ok.contains("ok.done"), "{ok}");
+    // The centre has no producer: said so, not left bare.
+    assert!(
+        ok.contains("not statically resolved: no producer found"),
+        "{ok}"
+    );
     let asked = call(&state, json!({ "event": token })).await;
     for text in [&ok, &asked] {
         let lower = text.to_ascii_lowercase();
@@ -786,4 +791,15 @@ async fn the_node_cap_shrinks_until_the_output_fits_the_budget() {
     assert_mermaid_sane(&text);
     assert!(text.contains("nodes not shown (cap "), "{}", &text[..600]);
     assert!(!text.contains("limit 200,"), "{}", &text[..300]);
+}
+
+#[tokio::test]
+async fn a_single_broker_workspace_still_qualifies_every_event() {
+    let src = "import { Kafka } from 'kafkajs';\nconst kafka = new Kafka({ clientId: 's', brokers: ['localhost:9092'] });\nconst producer = kafka.producer();\nconst consumer = kafka.consumer({ groupId: 'g' });\nexport async function put(): Promise<void> {\n  await producer.send({ topic: 'solo.topic', messages: [] });\n}\nexport async function get(): Promise<void> {\n  await consumer.subscribe({ topic: 'solo.topic' });\n  await put2();\n}\nasync function put2(): Promise<void> {\n  await producer.send({ topic: 'solo.next', messages: [] });\n}\n";
+    let (_d, state) = temp_workspace(&[("k.ts", src)]);
+    let text = call(&state, json!({ "event": "solo.topic" })).await;
+    assert_mermaid_sane(&text);
+    assert!(has_line(&text, r#"n0(["kafka:solo.topic"]):::centre"#), "{text}");
+    assert!(text.contains(r#"(["kafka:solo.next"]):::event"#), "{text}");
+    assert!(!mermaid_block(&text).contains("?:"), "{text}");
 }

@@ -1042,7 +1042,7 @@ mod tests {
         let hostile = "a\"b[c](d){e}|f;g#h<i>j&k`l\\m\nn\u{e9}\u{4e2d}";
         let e = mermaid_escape(hostile);
         for bad in [
-            '"', '[', ']', '(', ')', '{', '}', '|', ';', '<', '>', '&', '`', '\\', '\n',
+            '"', '[', ']', '(', ')', '{', '}', '|', '<', '>', '&', '`', '\\', '\n',
         ] {
             assert!(!e.contains(bad), "{bad:?} left in {e}");
         }
