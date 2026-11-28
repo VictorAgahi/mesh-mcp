@@ -224,7 +224,11 @@ A failure is a `SecurityError`, classified `-32602` and returned to the client a
 with `isError: true` (MCP 2024-11-05: a failure inside a tool is not a protocol error), so the
 agent can correct the call. The crawler uses `ignore::WalkBuilder` with `follow_links(false)`,
 always excludes `.git`, and honours `.gitignore` and `exclude_patterns`, so a symlink pointing out
-of a root is never indexed.
+of a root is never indexed. A symlink to a directory that resolves inside the same root (the
+pnpm / Nx monorepo layout) is walked once, iteratively, with one set of visited directories and
+one depth budget for the whole crawl: a link to an ancestor, to itself, to a sibling or around a
+cycle is never re-entered, at most 1024 link targets are walked per root, and every directory
+link not followed is counted in `IndexHealth::dir_symlinks_not_followed` and printed by `doctor`.
 
 `smart_search` additionally treats an omitted `scope`, `"."`, `"*"` or the exact workspace root as
 "all configured roots"; any other ancestor of the roots is still rejected. See

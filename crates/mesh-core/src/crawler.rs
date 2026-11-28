@@ -1,12 +1,28 @@
 use crate::security::ValidatedScope;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub struct FilesystemCrawler;
+
+/// Most directory-symlink targets one crawl walks (a link beyond it is counted, not followed):
+/// every followed link costs a walk of its own, so a tree of tens of thousands of links must not
+/// become tens of thousands of walks.
+pub const MAX_FOLLOWED_DIR_SYMLINKS: usize = 1024;
+
+/// A crawl's files and what it left out on purpose.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrawlReport {
+    pub files: Vec<PathBuf>,
+    /// Directory symlinks not followed: target already walked (ancestor, itself, sibling,
+    /// mutual cycle), outside the root, out of depth budget, or over
+    /// [`MAX_FOLLOWED_DIR_SYMLINKS`].
+    pub symlinks_not_followed: usize,
+}
 
 /// The default exclude pattern for dotenv files (`Config`'s `exclude_patterns`).
 pub(crate) const DEFAULT_ENV_PATTERN: &str = "**/.env*";
@@ -279,86 +295,135 @@ impl FilesystemCrawler {
         matcher: &ExcludeMatcher,
         max_depth: Option<usize>,
     ) -> Vec<PathBuf> {
+        Self::crawl_scope_report(scope, matcher, max_depth).files
+    }
+
+    /// [`Self::crawl_scope_with`] plus the count of directory symlinks that were not followed.
+    ///
+    /// Monorepo support (pnpm / Turborepo / Nx): a symlinked directory whose canonical target is
+    /// strictly inside the scope root is walked too. Iterative, one shared state for the whole
+    /// crawl (no recursion, so no stack growth whatever the links form):
+    /// - `visited` holds every canonical directory already walked (the root, every real
+    ///   directory the walks descended, every followed link target): a link to one of them
+    ///   (an ancestor, itself, a sibling, the other half of a mutual cycle) is never re-entered;
+    /// - the depth budget is the one `max_depth` of the root walk: a link found at depth `d` of a
+    ///   walk with budget `b` opens a walk with budget `b - d`, so a chain of links cannot go
+    ///   deeper than `max_depth` overall;
+    /// - at most [`MAX_FOLLOWED_DIR_SYMLINKS`] link targets are walked per crawl.
+    ///
+    /// Every directory link that is not followed (already walked, outside the root, out of depth
+    /// budget, over the cap) is counted in `symlinks_not_followed`, never dropped silently. Its
+    /// files are still indexed once through their real path when they live inside the root.
+    pub fn crawl_scope_report(
+        scope: &ValidatedScope,
+        matcher: &ExcludeMatcher,
+        max_depth: Option<usize>,
+    ) -> CrawlReport {
         let root = scope.as_path();
-        let mut builder = Self::base_walk_builder(root, max_depth);
-
-        // Prune excluded directories at the walker level so `node_modules/` is never descended.
-        let root_for_filter = root.to_path_buf();
-        let matcher_clone = matcher.clone();
-        builder.filter_entry(move |entry| {
-            let rel = match entry.path().strip_prefix(&root_for_filter) {
-                Ok(r) => r,
-                Err(_) => return true,
-            };
-            if rel.as_os_str().is_empty() {
-                return true;
-            }
-            !matcher_clone.is_excluded_with_root(rel, Some(&root_for_filter))
-        });
-
-        let mut files = Vec::new();
-        let mut visited_symlink_targets = std::collections::HashSet::new();
         let root_nfc = crate::security::to_nfc_path(root);
-        let walker = builder.build();
+        let mut files = Vec::new();
+        let mut not_followed = 0usize;
+        let mut followed = 0usize;
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        visited.insert(root.to_path_buf());
+        let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+        queue.push_back((root.to_path_buf(), max_depth.unwrap_or(10)));
 
-        for result in walker {
-            match result {
-                Ok(entry) => {
-                    let path = entry.path();
-                    let is_symlink = entry.path_is_symlink();
-                    if !is_symlink {
-                        // Exclusion already enforced by filter_entry for non-symlink entries.
-                        if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                            files.push(path.to_path_buf());
-                        }
-                    } else {
-                        // Monorepo support (pnpm / Turborepo / Nx):
-                        // If symlink target is strictly inside the validated scope root, follow it safely.
-                        // External symlinks escaping the scope are strictly discarded.
-                        if let Ok(canonical) = dunce::canonicalize(path) {
-                            let canonical_nfc = crate::security::to_nfc_path(&canonical);
-                            if canonical_nfc.starts_with(&root_nfc) {
-                                let rel_target = canonical.strip_prefix(root).unwrap_or(&canonical);
-                                if matcher.is_excluded(rel_target) {
-                                    continue;
-                                }
-                                if canonical.is_file() {
-                                    files.push(canonical);
-                                } else if canonical.is_dir()
-                                    && visited_symlink_targets.insert(canonical.clone())
-                                {
-                                    let sub_scope = match ValidatedScope::resolve(
-                                        &canonical.to_string_lossy(),
-                                        std::slice::from_ref(&root.to_path_buf()),
-                                    ) {
-                                        Ok(s) => s,
-                                        Err(_) => continue,
-                                    };
-                                    // The sub-crawl is rooted at the target, so its relative
-                                    // paths are computed from there; reuse the same pattern set.
-                                    let sub_files =
-                                        Self::crawl_scope_with(&sub_scope, matcher, Some(5));
-                                    files.extend(sub_files);
-                                }
-                            } else {
-                                tracing::debug!(
-                                    target: "mesh::crawler",
-                                    "Skipping external symlink target outside workspace: {}",
-                                    canonical.display()
-                                );
-                            }
-                        }
+        while let Some((walk_root, budget)) = queue.pop_front() {
+            let mut builder = Self::base_walk_builder(&walk_root, Some(budget));
+            // Prune excluded directories at the walker level so `node_modules/` is never
+            // descended. Relative paths are computed from the walk's own root (the link target
+            // for a followed link); the same pattern set applies.
+            let root_for_filter = walk_root.clone();
+            let matcher_clone = matcher.clone();
+            builder.filter_entry(move |entry| {
+                let rel = match entry.path().strip_prefix(&root_for_filter) {
+                    Ok(r) => r,
+                    Err(_) => return true,
+                };
+                if rel.as_os_str().is_empty() {
+                    return true;
+                }
+                !matcher_clone.is_excluded_with_root(rel, Some(&root_for_filter))
+            });
+            // Links are resolved after the walk, once `visited` knows every real directory of
+            // this walk, whatever order the walker met them in.
+            let mut pending: Vec<(PathBuf, usize)> = Vec::new();
+            for result in builder.build() {
+                let entry = match result {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        tracing::debug!(target: "mesh::crawler", "Skipping inaccessible entry: {err}");
+                        continue;
                     }
+                };
+                let path = entry.path();
+                if !entry.path_is_symlink() {
+                    // Exclusion already enforced by filter_entry for non-symlink entries.
+                    match entry.file_type() {
+                        Some(ft) if ft.is_file() => files.push(path.to_path_buf()),
+                        Some(ft) if ft.is_dir() && entry.depth() < budget => {
+                            visited.insert(path.to_path_buf());
+                        }
+                        _ => {}
+                    }
+                    continue;
                 }
-                Err(err) => {
-                    tracing::debug!(target: "mesh::crawler", "Skipping inaccessible entry: {err}");
+                let Ok(canonical) = dunce::canonicalize(path) else {
+                    continue;
+                };
+                if !crate::security::to_nfc_path(&canonical).starts_with(&root_nfc) {
+                    // External symlinks escaping the scope are strictly discarded.
+                    if canonical.is_dir() {
+                        not_followed += 1;
+                    }
+                    tracing::debug!(
+                        target: "mesh::crawler",
+                        "Skipping external symlink target outside workspace: {}",
+                        canonical.display()
+                    );
+                    continue;
                 }
+                let rel_target = canonical.strip_prefix(root).unwrap_or(&canonical);
+                if matcher.is_excluded(rel_target) {
+                    continue;
+                }
+                if canonical.is_file() {
+                    files.push(canonical);
+                } else if canonical.is_dir() {
+                    pending.push((canonical, entry.depth()));
+                }
+            }
+            for (canonical, depth) in pending {
+                let remaining = budget.saturating_sub(depth);
+                if remaining == 0 || followed >= MAX_FOLLOWED_DIR_SYMLINKS {
+                    not_followed += 1;
+                    continue;
+                }
+                if !visited.insert(canonical.clone()) {
+                    not_followed += 1;
+                    continue;
+                }
+                if ValidatedScope::resolve(
+                    &canonical.to_string_lossy(),
+                    std::slice::from_ref(&root.to_path_buf()),
+                )
+                .is_err()
+                {
+                    not_followed += 1;
+                    continue;
+                }
+                followed += 1;
+                queue.push_back((canonical, remaining));
             }
         }
 
         files.sort();
         files.dedup();
-        files
+        CrawlReport {
+            files,
+            symlinks_not_followed: not_followed,
+        }
     }
 
     /// Every directory under `root` a watcher should individually register (P2 step 3.3):
@@ -702,6 +767,153 @@ mod tests {
             !files.iter().any(|p| p.to_string_lossy().contains("/etc/")),
             "External symlink escaping workspace must be discarded"
         );
+    }
+
+    /// Crawls `root` (a fixture directory) and returns its files relative to it, sorted, plus the
+    /// not-followed count.
+    #[cfg(unix)]
+    fn crawl_rel(root: &Path, depth: usize) -> (Vec<String>, usize) {
+        let canon = dunce::canonicalize(root).expect("canon");
+        let scope = ValidatedScope::resolve(&canon.to_string_lossy(), std::slice::from_ref(&canon))
+            .expect("scope");
+        let report = FilesystemCrawler::crawl_scope_report(
+            &scope,
+            &ExcludeMatcher::compile(&[]),
+            Some(depth),
+        );
+        let rel = report
+            .files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&canon)
+                    .expect("inside root")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        (rel, report.symlinks_not_followed)
+    }
+
+    #[cfg(unix)]
+    fn write_file(path: &Path) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, "x").expect("write");
+    }
+
+    /// `src/loop -> ..` used to recurse until the 2 MB test thread stack overflowed.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_an_ancestor_is_not_re_entered_and_is_counted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_file(&tmp.path().join("src/real.rs"));
+        std::os::unix::fs::symlink("..", tmp.path().join("src/loop")).expect("symlink");
+        let (files, skipped) = crawl_rel(tmp.path(), 10);
+        assert_eq!(files, ["src/real.rs"]);
+        assert_eq!(skipped, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_its_own_directory_is_counted_not_followed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_file(&tmp.path().join("d/a.rs"));
+        std::os::unix::fs::symlink(".", tmp.path().join("d/self")).expect("symlink");
+        let (files, skipped) = crawl_rel(tmp.path(), 10);
+        assert_eq!(files, ["d/a.rs"]);
+        assert_eq!(skipped, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_link_mutual_cycle_terminates_and_lists_each_file_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_file(&tmp.path().join("a/x.rs"));
+        write_file(&tmp.path().join("b/y.rs"));
+        std::os::unix::fs::symlink("../b", tmp.path().join("a/to_b")).expect("symlink");
+        std::os::unix::fs::symlink("../a", tmp.path().join("b/to_a")).expect("symlink");
+        let (files, skipped) = crawl_rel(tmp.path(), 10);
+        assert_eq!(files, ["a/x.rs", "b/y.rs"]);
+        assert_eq!(skipped, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_a_sibling_directory_lists_its_files_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_file(&tmp.path().join("src/a/x.rs"));
+        std::os::unix::fs::symlink("a", tmp.path().join("src/b")).expect("symlink");
+        let (files, skipped) = crawl_rel(tmp.path(), 10);
+        assert_eq!(files, ["src/a/x.rs"]);
+        assert_eq!(skipped, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_a_directory_outside_the_root_is_not_followed_and_is_counted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_file(&tmp.path().join("ws/in.rs"));
+        write_file(&tmp.path().join("outside/secret.rs"));
+        std::os::unix::fs::symlink("../outside", tmp.path().join("ws/out")).expect("symlink");
+        let (files, skipped) = crawl_rel(&tmp.path().join("ws"), 10);
+        assert_eq!(files, ["in.rs"]);
+        assert_eq!(skipped, 1);
+    }
+
+    /// The monorepo feature stays: a link to a directory the walk's own depth never reaches is
+    /// followed, and its files are listed under their real path.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_a_directory_beyond_the_depth_is_followed_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_file(&tmp.path().join("a/b/c/d/e/f.rs"));
+        std::os::unix::fs::symlink("a/b/c/d/e", tmp.path().join("link")).expect("symlink");
+        let (files, skipped) = crawl_rel(tmp.path(), 3);
+        assert_eq!(files, ["a/b/c/d/e/f.rs"]);
+        assert_eq!(skipped, 0);
+    }
+
+    /// The depth budget is shared: a link at depth 2 of a budget of 2 has nothing left to walk.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_with_no_depth_budget_left_is_counted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_file(&tmp.path().join("a/b/c/d/f.rs"));
+        std::fs::create_dir_all(tmp.path().join("x")).expect("mkdir");
+        std::os::unix::fs::symlink("../a/b/c/d", tmp.path().join("x/link")).expect("symlink");
+        let (files, skipped) = crawl_rel(tmp.path(), 2);
+        assert!(files.is_empty(), "{files:?}");
+        assert_eq!(skipped, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_hundred_levels_of_real_directories_are_walked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut deep = tmp.path().to_path_buf();
+        for _ in 0..200 {
+            deep.push("d");
+        }
+        write_file(&deep.join("leaf.rs"));
+        let (files, skipped) = crawl_rel(tmp.path(), 256);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("d/leaf.rs"), "{}", files[0]);
+        assert_eq!(files[0].matches('/').count(), 200);
+        assert_eq!(skipped, 0);
+    }
+
+    /// Link targets are walked at most MAX_FOLLOWED_DIR_SYMLINKS times; the rest are counted.
+    #[cfg(unix)]
+    #[test]
+    fn links_past_the_follow_cap_are_counted_not_walked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for i in 0..1030 {
+            write_file(&tmp.path().join(format!("x/y/t{i}/f.rs")));
+            std::os::unix::fs::symlink(format!("x/y/t{i}"), tmp.path().join(format!("l{i}")))
+                .expect("symlink");
+        }
+        let (files, skipped) = crawl_rel(tmp.path(), 2);
+        assert_eq!(files.len(), 1024);
+        assert_eq!(skipped, 6);
     }
 
     #[test]

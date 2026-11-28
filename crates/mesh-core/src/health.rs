@@ -249,6 +249,12 @@ pub struct IndexHealth {
     /// `files_scanned`.
     #[serde(default)]
     pub files_cs_brokers_capped: usize,
+    /// Directory symlinks the last full crawl did not follow (cycle or already-walked target,
+    /// outside the root, out of depth budget, over the follow cap): files inside the root are
+    /// still indexed through their real path; a target outside it is not read. Set after every
+    /// full crawl, not accumulated.
+    #[serde(default)]
+    pub dir_symlinks_not_followed: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -645,6 +651,15 @@ impl IndexHealth {
             if n > 0 {
                 let _ = writeln!(out, "    {}: {n}", reason.label());
             }
+        }
+        if self.dir_symlinks_not_followed > 0 {
+            let _ = writeln!(
+                out,
+                "    {} directory symlink(s) not followed (cycle or outside root; also a target \
+                 already walked, or past the depth budget or the cap of {} followed links)",
+                self.dir_symlinks_not_followed,
+                crate::crawler::MAX_FOLLOWED_DIR_SYMLINKS
+            );
         }
         if self.files_call_facts_capped > 0 {
             let _ = writeln!(

@@ -468,8 +468,10 @@ impl WorkspaceIndexer {
         vfs: Option<&mut DifferentialVfs>,
         cache: Option<&PersistentIndexCache>,
     ) -> MeshSnapshot {
-        let files = Self::crawl_all(config, roots);
-        Self::build_snapshot_from_files(config, roots, &files, pool, vfs, cache)
+        let (files, symlinks) = Self::crawl_all_counted(config, roots);
+        let mut snapshot = Self::build_snapshot_from_files(config, roots, &files, pool, vfs, cache);
+        snapshot.health.dir_symlinks_not_followed = symlinks;
+        snapshot
     }
 
     /// [`Self::build_snapshot`] over an explicit `(RepoId, path)` list instead of
@@ -817,7 +819,7 @@ impl WorkspaceIndexer {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let config = &state.config;
         let roots = &state.allowed_roots;
-        let files = Self::crawl_all(config, roots);
+        let (files, symlinks) = Self::crawl_all_counted(config, roots);
 
         let mut vfs = state.vfs.lock().unwrap_or_else(|e| e.into_inner());
         // Deleted: tracked by the VFS but no longer on disk. Only a full crawl's
@@ -849,6 +851,13 @@ impl WorkspaceIndexer {
         );
 
         Self::apply_incremental(state, "VFS differential", files, deleted, pool, force);
+        // A link added or removed changes nothing else a reload would install, yet doctor and
+        // the notes must not keep the previous crawl's count.
+        if state.snapshot().health.dir_symlinks_not_followed != symlinks {
+            let mut snapshot = state.snapshot_clone();
+            snapshot.health.dir_symlinks_not_followed = symlinks;
+            state.install_snapshot(snapshot);
+        }
     }
 
     /// Targeted reload driven directly by the file watcher's own reported paths —
@@ -1551,6 +1560,15 @@ impl WorkspaceIndexer {
     /// everything and deduplicating after the fact, which would double the I/O on any
     /// workspace using this shape.
     pub fn crawl_all(config: &Config, roots: &[PathBuf]) -> Vec<(RepoId, PathBuf)> {
+        Self::crawl_all_counted(config, roots).0
+    }
+
+    /// [`Self::crawl_all`] plus the number of directory symlinks no root's crawl followed.
+    pub fn crawl_all_counted(
+        config: &Config,
+        roots: &[PathBuf],
+    ) -> (Vec<(RepoId, PathBuf)>, usize) {
+        let mut symlinks = 0usize;
         if roots.len() > RepoId::MAX as usize {
             tracing::error!(
                 target: "mesh::indexer",
@@ -1575,9 +1593,10 @@ impl WorkspaceIndexer {
                         root,
                     );
                     let matcher = ExcludeMatcher::compile(&exclusions);
-                    let files =
-                        FilesystemCrawler::crawl_scope_with(&scope, &matcher, Some(SCAN_DEPTH));
-                    out.extend(files.into_iter().map(|f| (repo_id, f)));
+                    let report =
+                        FilesystemCrawler::crawl_scope_report(&scope, &matcher, Some(SCAN_DEPTH));
+                    symlinks += report.symlinks_not_followed;
+                    out.extend(report.files.into_iter().map(|f| (repo_id, f)));
                 }
                 Err(e) => {
                     tracing::warn!(target: "mesh::indexer", "Skipping root {}: {e}", root.display());
@@ -1589,7 +1608,7 @@ impl WorkspaceIndexer {
         // consumer of this list (the differential VFS, `doctor`'s dead-config
         // reporting) benefits from a stable, reviewable file order.
         out.sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
-        out
+        (out, symlinks)
     }
 
     /// `exclude_patterns` plus one `<relative>/**` glob per *other* configured root
@@ -2008,6 +2027,32 @@ mod tests {
     /// 9.0 calls layer: a file over the per-file callables cap and one over the
     /// per-file call-site cap are each counted in `IndexHealth` and named by the
     /// summary `doctor` prints, never dropped silently.
+    /// `src/loop -> ..` crashed the whole server at startup (stack overflow); now the scan
+    /// completes, indexes the file once and reports the link in the health summary doctor prints.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_an_ancestor_reaches_index_health_and_survives_reload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).expect("canon");
+        std::fs::create_dir_all(root.join("src")).expect("mkdir");
+        std::fs::write(root.join("src/a.proto"), "syntax = \"proto3\"; package a;").expect("write");
+        std::os::unix::fs::symlink("..", root.join("src/loop")).expect("symlink");
+        let state = make_state(&root);
+        let snap =
+            WorkspaceIndexer::build_snapshot(&state.config, &state.allowed_roots, None, None, None);
+        assert_eq!(snap.health.files_scanned, 1);
+        assert_eq!(snap.health.dir_symlinks_not_followed, 1);
+        let summary = snap.health.render_summary(10);
+        assert!(
+            summary.contains("1 directory symlink(s) not followed (cycle or outside root"),
+            "{summary}"
+        );
+        state.install_snapshot(snap);
+        std::os::unix::fs::symlink("..", root.join("src/loop2")).expect("symlink");
+        WorkspaceIndexer::reload(&state);
+        assert_eq!(state.snapshot().health.dir_symlinks_not_followed, 2);
+    }
+
     #[test]
     fn per_file_call_fact_caps_reach_index_health_and_the_summary() {
         for (file, code) in [

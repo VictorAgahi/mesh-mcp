@@ -59,7 +59,7 @@ pub use contracts::{
     MAX_STRUCTURAL_IMPLS, MAX_STRUCTURAL_PAIRS, MAX_TYPE_HOPS, MAX_WILDCARD_PRODUCERS,
     RPC_EXACT_METHOD_PREFIX, RPC_INFERRED_METHOD_PREFIX, RPC_INHERITED_METHOD_PREFIX,
 };
-pub use crawler::{ExcludeMatcher, FilesystemCrawler, WatchPlan};
+pub use crawler::{CrawlReport, ExcludeMatcher, FilesystemCrawler, WatchPlan};
 pub use docs::{DocIndex, DocSection};
 pub use governance::{GovernanceEngine, RsahResponse};
 pub use health::{IndexHealth, RejectReason, RejectedFile};
