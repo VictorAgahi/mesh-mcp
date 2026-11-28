@@ -196,11 +196,15 @@ public class Svc
             }
             assert!(!all.contains(canary.as_str()), "{canary} leaked:\n{all}");
         }
-        // The credential-named key stays out of the answer (no `Bus__SharedAccessKey` placeholder).
-        assert!(
-            !all.to_ascii_lowercase().contains("sharedaccesskey"),
-            "{all}"
-        );
+        // A connection-string pair a snippet shows keeps its key and loses its value.
+        let lower = all.to_ascii_lowercase();
+        for (at, _) in lower.match_indices("sharedaccesskey=") {
+            assert!(
+                lower[at + "sharedaccesskey=".len()..].starts_with("[redacted"),
+                "{}",
+                &all[at..(at + 80).min(all.len())]
+            );
+        }
     }
     // The cache files (database, write-ahead log, shared memory) hold none of them either.
     let mut checked = 0;
@@ -223,4 +227,134 @@ public class Svc
         checked >= 1,
         "the cache wrote nothing: the check is vacuous"
     );
+}
+
+/// A state over `root` indexed through a persistent cache in `cache_dir`.
+fn state_with_cache(root: &Path, cache_dir: &Path) -> Arc<AppState> {
+    let cache =
+        mesh_core::PersistentIndexCache::open(cache_dir.join("index-cache.db"), 64 * 1024 * 1024)
+            .unwrap();
+    let cfg =
+        Config::load_from_str("[workspace]\nname = \"t\"\nversion = \"0\"\nroots = [\".\"]\n")
+            .unwrap();
+    let audit = Arc::new(AuditLogger::new_in_memory().unwrap());
+    let rescan = Arc::new(BackgroundRescanEngine::new().unwrap());
+    let state = Arc::new(AppState::new(cfg, vec![root.to_path_buf()], audit, rescan));
+    let snap = mesh_server::WorkspaceIndexer::build_snapshot(
+        &state.config,
+        &state.allowed_roots,
+        None,
+        None,
+        Some(&cache),
+    );
+    state.install_snapshot(snap);
+    state
+}
+
+/// No byte of a file of `dir` holds one of `canaries` (case-insensitively); at least one file.
+fn assert_cache_has_none(dir: &Path, canaries: &[String]) {
+    let mut checked = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let lower = String::from_utf8_lossy(&std::fs::read(entry.unwrap().path()).unwrap())
+            .to_ascii_lowercase();
+        checked += 1;
+        for c in canaries {
+            assert!(
+                !lower.contains(&c.to_ascii_lowercase()),
+                "{c} reached a cache file"
+            );
+        }
+    }
+    assert!(checked >= 1, "the cache wrote nothing: vacuous");
+}
+
+#[tokio::test]
+async fn the_confluent_reader_and_placeholder_keys_leak_no_secret_to_graph_tools_or_cache() {
+    let key = ["Shared", "Access", "Key"].concat();
+    let kafka_canary = ["KafkaCanary", "Zx", "9"].concat();
+    let ph_canary = ["DBPASSWORD", "Q"].concat();
+    let canaries = vec![
+        kafka_canary.clone(),
+        "hunter2-prod".to_string(),
+        ph_canary.clone(),
+        "APIKEYQUEUE".to_string(),
+        key.clone(),
+    ];
+    let tmp = tempfile::tempdir().unwrap();
+    let root = dunce::canonicalize(tmp.path()).unwrap();
+    write(
+        &root,
+        "src/Svc/K.cs",
+        &format!(
+            r#"using Azure.Messaging.ServiceBus;
+using Confluent.Kafka;
+
+public class K
+{{
+    private readonly IProducer<string, string> _p;
+    private readonly ServiceBusClient _client;
+
+    public async Task Go()
+    {{
+        await _p.ProduceAsync("Endpoint=sb://h/;{key}={kafka_canary}", new Message<string, string>());
+        await _p.ProduceAsync("hunter2-prod", new Message<string, string>());
+        await _p.ProduceAsync("kafka.real", new Message<string, string>());
+        _client.CreateSender(Environment.GetEnvironmentVariable("{ph_canary}"));
+        _client.CreateSender(Environment.GetEnvironmentVariable("APIKEYQUEUE"));
+        _client.CreateSender(Environment.GetEnvironmentVariable("REAL_QUEUE"));
+    }}
+}}
+"#
+        ),
+    );
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let state = state_with_cache(&root, &cache_dir);
+    let all = everything(&state, &["kafka.real", "${REAL_QUEUE}", "hunter2-prod"]).await;
+    assert!(
+        all.contains("kafka.real") && all.contains("REAL_QUEUE"),
+        "real names are kept:\n{all}"
+    );
+    let lower = all.to_ascii_lowercase();
+    for c in canaries.iter().filter(|c| c.as_str() != "hunter2-prod") {
+        assert!(
+            !lower.contains(&c.to_ascii_lowercase()),
+            "{c} leaked:\n{all}"
+        );
+    }
+    // `hunter2-prod` is echoed only as the query target of the tools above.
+    assert!(
+        !state
+            .snapshot()
+            .contract_graph
+            .all_nodes()
+            .any(|n| n.name.to_ascii_lowercase().contains("hunter2")),
+        "a graph node carries the password-shaped name"
+    );
+    assert_cache_has_none(&cache_dir, &canaries);
+}
+
+#[tokio::test]
+async fn smart_search_masks_a_connection_string_spread_over_a_verbatim_literal() {
+    let key = ["Shared", "Access", "Key"].concat();
+    let canary = ["MultiLine", "Canary", "Q7"].concat();
+    let pwd_canary = ["PwdCanary", "R8"].concat();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = dunce::canonicalize(tmp.path()).unwrap();
+    write(
+        &root,
+        "src/Svc/Multi.cs",
+        &format!(
+            "public class MultiLineHolder\n{{\n    private const string Conn = @\"\n        Endpoint=sb://h.example/;\n        {key}={canary};\n        Pwd = {pwd_canary};\n    \";\n\n    private const string Raw = \"\"\"\n        {key} = {canary}\n        \"\"\";\n\n    public void Run() {{ }}\n}}\n"
+        ),
+    );
+    let state = state_for(&root);
+    let out = text(&state, "smart_search", json!({"query": "MultiLineHolder"})).await;
+    assert!(
+        out.contains("MultiLineHolder") && out.contains("REDACTED_SECRET"),
+        "not vacuous: {out}"
+    );
+    for c in [&canary, &pwd_canary] {
+        assert!(!out.contains(c.as_str()), "{c} leaked:\n{out}");
+    }
 }

@@ -885,13 +885,22 @@ never a name**: `configuration["K"] ?? "d"` and `GetValue<string>("K", "d")` are
 constant that is not a plain name (a connection string such as `Endpoint=sb://...;SharedAccessKey=...`, a URL, a
 token, `Bearer_...`, a password-like value, a random-looking run) is not a name, nor is a constant named like a
 credential (`ApiKey = "x"`: the TypeScript queue-constant predicate, `member_consts::constant_is_a_name`, section
-3.8), nor a setting whose KEY is credential-named or holds `ConnectionString` (`Bus:SharedAccessKey`); the
-refused value registers nothing. A name with `*`, `#` or `>` registers no site, producer or consumer. `Connection =
+3.8), nor a setting or environment variable whose KEY is credential-named (`member_consts::placeholder_key_is_credential_named`:
+a credential word as a whole word, case-split word or **substring of a separator-less key**: `DB_PASSWORD`, `DBPASSWORD`,
+`APIKEYQUEUE`, `PASSWORDS_Q`, `SECRETQ`, `Bus:SharedAccessKey`, `ConnectionString`; the ordinary words `secretary` and
+`tokenizer` are allowed in a key). A *value* keeps the weaker rule: `password-reset-jobs`, `secretary-jobs` and
+`token-refresh-jobs` are names. A refused value registers nothing, and nothing counts it. A name with `*`, `#` or `>` registers no site, producer or consumer. `Connection =
 "..."` of a Functions attribute and the argument of `Host(...)` / `new ServiceBusClient(...)` are never read. A
 node whose signature line holds a secret-shaped literal (a `Connection = "Endpoint=..."` on an attribute line) has
 that literal replaced by `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]` in any file that names one of the libraries.
+`smart_search` snippets (every language) mask the value of a connection-string pair, `SharedAccessKey`,
+`SharedAccessSignature`, `AccountKey`, `AccessKey`, `SecretKey`, `Password`, `Pwd` or `AuthKey`, with or without spaces
+around `=`, line by line, so the lines of a verbatim `@"..."` or raw `"""` literal are masked too. A pair whose value
+is empty or a placeholder (`password=%s`, `?`, `$1`, `{0}`, `:name`, `@p1`) and a code assignment
+(`Password = settings.Password;`) are left alone. A token or a URL with credentials in a snippet is not masked (the
+older key-name rule of `smart_search` applies).
 
-The bus is known only where the same file names it: MassTransit `UsingRabbitMq` (`rabbitmq`),
+The bus is known only where the same file names it, read over the whole file (also past the site cap): MassTransit `UsingRabbitMq` (`rabbitmq`),
 `UsingAzureServiceBus` (`servicebus`), `UsingAmazonSqs` (`sqs`), `UsingInMemory` (`inproc`, the application itself);
 NServiceBus `UseTransport<RabbitMQTransport>()` / `new RabbitMQTransport(...)`, `AzureServiceBusTransport`,
 `SqsTransport`. It applies to the message-type sites of that library in that file when every `Using...` / transport of
@@ -902,8 +911,10 @@ setup has no broker** (the extractor reads one file at a time): it joins the cha
 uses the name, `heuristic`, and is never tagged `kafka`.
 
 Every site carries its broker with the producer or consumer, so `trace_flow` / `analyze_impact` never link two sites
-that know different brokers (3.7); `diff_mesh` names the broker of a removed site that is not Kafka, and
-`analyze_impact` keeps the qualifier on every row. A file whose top-level statements hold the sites (no class)
+that know different brokers (3.7); `diff_mesh` names the broker of a removed site that is not Kafka. In an
+`analyze_impact` table the topic rows carry the qualifier (`rabbitmq:orders`, `servicebus:orders`); the producer and consumer
+rows show the site's own name (`orders`) without it, as they do for the other languages (the qualifier lives on the
+topic hub, not on the row). A file whose top-level statements hold the sites (no class)
 registers them on the call nodes.
 
 Bounds: at most 2,000 sites per file (`MAX_CS_BROKER_SITES_PER_FILE`) and 16,384 declared names; a file over a bound
@@ -918,15 +929,25 @@ is keyed by its message, not by the endpoint it is routed to), `ConfigureEndpoin
 `ConfigureConsumer<T>()` (a consumer class is already read from its base list), a message sent through the variable that
 holds a `GetSendEndpoint` result (`var e = await p.GetSendEndpoint(...)`: the `GetSendEndpoint` call is the producer of
 the queue, the later `e.Send(new T())` is not read), a `global using MassTransit;` of another file (the file is not
-read as importing it), a type of another file of the same namespace that hides a library type, a queue name held by a
+read as importing it; `using global::MassTransit;` is), `using MT = MassTransit;` followed by `MT.IConsumer<T>` and
+`using Bus = MassTransit.IBus;` (an alias is read as a type of the file that hides the name, never as the library's),
+a `using` inside `#if false` (it counts), a queue name held by a
 field assigned in a constructor or by a property, a name built with `$"..."`, `+` or `nameof`, a pattern variable
 (`x is IBus b`) and an `out var` as a receiver, and the broker of a consumer class declared away from the bus setup.
 A type name is the key whatever its namespace: `A.OrderCreated` and `B.OrderCreated` are one key.
 
-**Generic Confluent.Kafka reader, unchanged.** The older reader still registers a Kafka producer or consumer for any
+**False positive, not only a gap:** a type of ANOTHER file in the same namespace as the using file hides the library's
+type in C# (`namespace Mine { interface IBus { } }` in one file, `using MassTransit; IBus _b; _b.Publish(new X())` in
+another reads `Publish`). The extractor reads one file at a time and the parse cache is per file, so this is not
+detected: such a producer or consumer is registered although it is not MassTransit's. A bus of unknown broker joins
+every channel of its name as `heuristic`.
+
+**Generic Confluent.Kafka reader.** The older reader still registers a Kafka producer or consumer for any
 `x.Produce("lit")`, `ProduceAsync("lit")` or `Subscribe("lit")` of any receiver, including a type the file declares
 (`bus.Subscribe("x")` of a homegrown bus) and a client of another library; this pass guarantees only the calls it
-recognises.
+recognises. Since T8d its literal goes through the same name rule as the names above (`constant_is_a_name`): a
+connection string, a URL, a token or a password-shaped literal (`ProduceAsync("hunter2-prod")`) registers nothing, the
+first literal argument being the topic, so a later payload literal never takes its place. A refused literal is not counted.
 
 Fixture and ground truth: `examples/eda/cs-brokers` and `tests/golden/events/cs-brokers.expected.yaml` (31 sites,
 2 chains, 11 negatives: local-type and homegrown-bus decoys, an unrelated `Publish`, a connection-string constant, a
