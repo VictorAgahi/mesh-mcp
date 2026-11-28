@@ -704,6 +704,89 @@ use the CLI: `mesh-mcp graph --format html -o graph.html`.
 `find_dependents` / `analyze_grpc`). Do NOT raise `max_services` to see everything; zoom with
 `service`.
 
+#### Event flow view (`event`)
+With `event` the tool draws one event instead of the service topology: a Mermaid `flowchart TD`
+(never `LR`) centred on that event, with the producers upstream (`hops_up`) and the consumers
+downstream (`hops_down`). It runs the chain engine of `trace_flow` (a reverse and a forward trace
+from the event), so the chains, the call resolution and the confidence are the same; the
+view does not walk the graph a second time.
+
+- **Event**: a topic / queue / stream name (`order.requested`) or its broker-qualified key
+  (`kafka:orders`), matched exactly like `trace_flow` matches a topic. A bare name used on several
+  brokers draws one centre per broker, and brokers never join: a Kafka consumer that calls a
+  bridge publishing the same name on RabbitMQ reaches a RabbitMQ event node of its own, never the
+  Kafka centre (`examples/eda/flow-view-crossbroker`). A site whose broker is not statically known
+  (a NestJS `@EventPattern`, a declarative pattern) joins every channel of its name, as everywhere
+  in MeshMCP, and its arrows to a broker-qualified event are drawn dashed (a guess by name, not an
+  exact link). A name that only matches several DIFFERENT events by substring (`order` against
+  `order.requested`, `order.shipped`, `orders.archive`) is not one event: nothing is drawn, the
+  answer is `ambiguous event: N events match` with a table (key, broker, producer and consumer
+  site counts, at most 20 rows and the rest counted) and asks for the exact key. Every event node
+  is broker-qualified (`kafka:orders`); `?:` means the broker is not statically known.
+- **Nodes**: a rounded node is an event (the centre is thick and yellow); a box is a code site
+  (`Class.method` and its `path:line`; at module level `publish <name>` / `consume <name>`); a
+  slanted box is where a chain starts (a route, handler or schedule, `POST /orders`).
+- **Arrows**: solid = exact, dashed = heuristic, dashed red labelled `?` = ambiguous. A chain is as
+  strong as its weakest link: once a hop is heuristic or ambiguous (the same-file rule, an
+  ambiguous call, an unknown-broker join) every arrow after it, down the chain from the event,
+  carries at most that confidence, exactly like `trace_flow`'s "chain" confidence. When two paths
+  reach the same arrow, the weaker one is drawn. By default the calls between a consumer and the publish it reaches fold into
+  the arrow label (`3 calls`; `same file` for the legacy same-file rule); `detail: true` draws
+  every call as a node (it costs nodes).
+- **Not a dead end**: where the engine finds no continuation the diagram draws a dashed hexagon,
+  `not statically resolved: no consumer found` / `no producer found` / `no publish found` / `no entry
+  found` (a runtime-built topic, a registry or an unindexed root may continue the flow). A topic
+  whose name is a `${PLACEHOLDER}` or a wildcard is itself drawn with that dashed style. A bound
+  that cut the walk is an orange stub that names it (`1 consumer(s) not expanded: depth limit (1)`,
+  `+9 more consumer site(s) not followed (fan_out 3)`, `call depth limit (6)`), followed by a
+  **Depth limit reached** / **Fan-out cap** / **Call depth limit reached** note, never as a chain end.
+- **Cycles and joins** are drawn once: the event or site that is reached again keeps one node, the
+  edge back to it is drawn, and the node gets a dashed thick border (`class nN revisit`).
+- **Bounds** (all in the schema; larger values are clamped and the header shows the value used):
+  `hops_up` / `hops_down` 1-5 (default 2 each; one level is one consumer or producer hop through a
+  topic), `fan_out` 1-50 (default 20, per node), `limit` 1-200 nodes (default 60). The node cap
+  keeps the nodes nearest the centre and says what it cut: `**N nodes not shown (cap L)**, use
+  hops/limit/scope` and an orange `+K not shown (cap)` stub on every node that lost neighbours. The
+  output is also kept under the 48 KB cap by halving the node cap until it fits (the note then
+  shows the cap used). The call walk inside one hop is bounded by `call_depth` 6 (not an
+  argument of this view; `trace_flow` takes it).
+- **Labels**: every label is Mermaid-escaped (quotes, brackets, parentheses, braces, pipes,
+  semicolons, `#`, `&`, `<`, `>`, backticks and every non-ASCII character become numeric entities
+  such as `#40;`), labels longer than 40 characters are cut with `...` (a place is cut at its head,
+  so the `:line` stays), and the table under the diagram gives each node's full name and `path:line`
+  unescaped; a name longer than 160 characters is cut there and its real length is said
+  (`... (cut, 185 chars)`). A function that both consumes and publishes is two nodes with the
+  same name: the table's Kind column tells them apart. Names go through the same gates as `trace_flow`
+  and `event_anomalies` (`member_consts::name_is_printable`; a placeholder default is masked): a
+  credential-shaped event or code name is replaced by `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`,
+  also in the echo of the `event` argument. The gate is the shared one and is strict: a plain name
+  longer than the shared name limit (249 characters), or one with a non-ASCII letter such as
+  `naïve.evt`, is also replaced by the marker, a false positive that hides a name rather than
+  leaking one.
+- Test files are left out and counted (`include_tests: true` follows them). `direction`: `both`
+  (default), `upstream` or `downstream`; the header shows `-` for the side not drawn.
+- Mermaid only: `format: json` / `html` with `event`, and `event` with `service`, are refused
+  (`-32602`). An event that matches nothing answers `No event matched ...` (no diagram, no
+  suggestions: use `analyze_impact` to browse topic names). It does NOT follow HTTP client calls
+  across repositories, dynamic dispatch through reflection or runtime registries.
+
+Example (`examples/eda/layered-ts`, `event: "stock.reserved"`, default bounds, abridged):
+
+```mermaid
+flowchart TD
+  n0(["?:stock.reserved"]):::centre
+  n1["StockPublisher.publishReserved<br/>src/stock.publisher.ts:9"]:::site
+  n2["OrderConsumer.handle<br/>src/order.consumer.ts:10"]:::site
+  n3(["?:order.requested"]):::event
+  n4[/"POST /orders<br/>src/order.controller.ts:9"/]:::origin
+  n5["ShippingConsumer.onStockReserved<br/>src/shipping.consumer.ts:10"]:::site
+  n1 --> n0
+  n2 -->|"3 calls"| n1
+  n3 --> n2
+  n4 -->|"3 calls"| n1
+  n0 --> n5
+```
+
 #### JSON Schema
 ```json
 {
@@ -711,7 +794,15 @@ use the CLI: `mesh-mcp graph --format html -o graph.html`.
   "properties": {
     "format": { "type": "string", "description": "'mermaid' (default), 'json' or 'html' — all render the aggregated per-service view." },
     "service": { "type": ["string", "null"], "description": "Zoom into one service: its contracts and the services they talk to, and, in the mermaid format only, its HTTP routes (bounded)." },
-    "max_services": { "type": ["integer", "null"], "description": "Groups drawn before folding into 'other' (1-200, default 40)." }
+    "max_services": { "type": ["integer", "null"], "description": "Groups drawn before folding into 'other' (1-200, default 40)." },
+    "event": { "type": ["string", "null"], "description": "Event flow view: centre the diagram on one event (name or broker-qualified key). Mermaid only; not with `service`." },
+    "hops_up": { "type": ["integer", "null"], "minimum": 1, "maximum": 5, "description": "With `event`: producer levels upstream (default 2)." },
+    "hops_down": { "type": ["integer", "null"], "minimum": 1, "maximum": 5, "description": "With `event`: consumer levels downstream (default 2)." },
+    "direction": { "type": ["string", "null"], "description": "With `event`: 'both' (default), 'upstream' or 'downstream'." },
+    "detail": { "type": ["boolean", "null"], "description": "With `event`: draw every call as a node (default false)." },
+    "limit": { "type": ["integer", "null"], "minimum": 1, "maximum": 200, "description": "With `event`: most nodes drawn (default 60)." },
+    "fan_out": { "type": ["integer", "null"], "minimum": 1, "maximum": 50, "description": "With `event`: consumers, producers or callees followed per node (default 20)." },
+    "include_tests": { "type": ["boolean", "null"], "description": "With `event`: follow test-file sites (default false)." }
   },
   "additionalProperties": false
 }

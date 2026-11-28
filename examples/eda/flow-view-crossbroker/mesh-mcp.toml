@@ -1,0 +1,13 @@
+# Fixture: one channel name ("orders") on Kafka and RabbitMQ with a chain that CROSSES brokers:
+# a Kafka consumer calls a bridge that publishes the same name on RabbitMQ (9.0 T13 flow view).
+[workspace]
+name = "flow-view-crossbroker"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/node_modules/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true

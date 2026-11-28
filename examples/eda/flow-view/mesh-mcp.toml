@@ -1,0 +1,14 @@
+# Fixture: a request -> issue -> ledger -> request event cycle in directories whose names are
+# hostile to diagram syntax (brackets, parentheses, accents, semicolons), with one runtime-built
+# topic, a route with braces and a consumer that publishes nothing (9.0 T13 flow view).
+[workspace]
+name = "flow-view"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/node_modules/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true
