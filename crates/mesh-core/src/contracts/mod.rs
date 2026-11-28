@@ -13,6 +13,7 @@ mod calls;
 mod delta;
 mod event_diff;
 mod flow;
+mod flow_view;
 mod index;
 mod payload;
 mod query;
@@ -38,6 +39,7 @@ pub use flow::{
     FlowSite, FlowStep, FlowStepKind, FlowTrace, DEFAULT_CALL_DEPTH, DEFAULT_EVENT_DEPTH,
     DEFAULT_FAN_OUT, MAX_CALL_DEPTH, MAX_EVENT_DEPTH, MAX_FAN_OUT, MAX_FLOW_HOPS,
 };
+pub use flow_view::FlowCentres;
 pub use payload::{
     json_family as payload_json_family, FieldClash, FieldGap, NotCompared, PayloadEntry,
     PayloadFacts, PayloadField, PayloadImport, PayloadReport, PayloadShape, PayloadSide,

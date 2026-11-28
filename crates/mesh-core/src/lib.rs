@@ -44,7 +44,7 @@ pub use contracts::{
     qualified_topic_key, service_from_client_field_name, split_qualified_topic_key, AnomalySite,
     Broker, CallFact, CallFacts, CallReceiver, CallStats, CallableFact, ContractGraph, CycleEdge,
     CycleEntry, DependentsMatch, EventAnomalies, EventChannel, EventHop, EventHops, EventSite,
-    FanOutProducer, FieldClash, FieldGap, FlowBounds, FlowDirection, FlowEnd, FlowEntry, FlowHop,
+    FanOutProducer, FieldClash, FieldGap, FlowBounds, FlowCentres, FlowDirection, FlowEnd, FlowEntry, FlowHop,
     FlowLimit, FlowNext, FlowOutcome, FlowSite, FlowStep, FlowStepKind, FlowTrace, GrpcTrace,
     HopEnd, HubRef, ImpactFlow, ImpactMatrix, ImpactRole, ImpactRow, ImpactScope, ImportFact,
     InjectionFact, Missing, NotCompared, PayloadEntry, PayloadFacts, PayloadField, PayloadImport,

@@ -219,7 +219,7 @@ fn weakest_of<'a>(sites: impl Iterator<Item = &'a AnomalySite<'a>>) -> EdgeConfi
 
 impl ContractGraph {
     /// `hub` with its broker: the hub's own, else the name's only known broker.
-    fn hub_ref<'g>(&self, hub: &'g ContractNode) -> HubRef<'g> {
+    pub(super) fn hub_ref<'g>(&self, hub: &'g ContractNode) -> HubRef<'g> {
         let broker = Self::hub_broker(hub).or_else(|| {
             let mask = self.known_brokers(Self::hub_key(hub));
             (mask.count_ones() == 1)
