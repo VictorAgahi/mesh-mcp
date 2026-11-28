@@ -1145,6 +1145,7 @@ impl ContractGraph {
                 scope: Self::scope_of(node, owners),
                 confidence,
                 via,
+                broker: None,
             });
         }
 
@@ -1199,6 +1200,7 @@ impl ContractGraph {
         }
         async_owners.sort_unstable();
         async_owners.dedup();
+        let site_masks = self.site_masks();
         for (nodes, role) in [
             (&flow.upstream_producers, ImpactRole::Producer),
             (&flow.topics, ImpactRole::Topic),
@@ -1228,6 +1230,15 @@ impl ContractGraph {
                     scope: Self::scope_of(node, &async_owners),
                     confidence: self.async_match_confidence(node, &target_lc),
                     via,
+                    broker: self.row_broker(
+                        node,
+                        match role {
+                            ImpactRole::Producer => Some(true),
+                            ImpactRole::Consumer => Some(false),
+                            _ => None,
+                        },
+                        &site_masks,
+                    ),
                 });
             }
         }

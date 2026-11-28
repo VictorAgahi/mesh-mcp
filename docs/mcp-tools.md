@@ -541,7 +541,10 @@ Since 9.0 a name used on two or more message brokers is two channels (broker-qua
 `kafka:orders`, `rabbitmq:orders`; a bare target (`orders`) lists them all, a qualified one
 (`kafka:orders`) lists that broker's channel only. A producer or consumer whose broker is not
 statically known (a NestJS `@EventPattern`) is on every channel of the name, marked `heuristic`.
-A name used on one broker keeps its plain key and its output is unchanged.
+A name used on one broker keeps its plain key for its topic row. A producer, consumer or site row
+carries the broker its site is known to talk to as the same qualifier (`kafka:orders` for a call-site
+named after its topic, `rabbitmq:startFulfilment` for a function); a site whose broker is not
+statically known, or that is known on several brokers, keeps its bare name.
 
 #### Depth
 Since 9.0, each hop past the first comes from the chain engine that `trace_flow` renders

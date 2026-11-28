@@ -156,6 +156,47 @@ impl ContractGraph {
             .unwrap_or(0)
     }
 
+    /// The brokers each site node is known to talk to over every channel it is registered on, as
+    /// masks: `(producers, consumers)`. One pass over the tagged sites, for a caller that labels
+    /// many rows (the impact matrix).
+    pub(super) fn site_masks(&self) -> (HashMap<NodeId, u32>, HashMap<NodeId, u32>) {
+        let fold = |map: &HashMap<CompactStr, HashMap<NodeId, u32>>| {
+            let mut out: HashMap<NodeId, u32> = HashMap::new();
+            for (id, mask) in map.values().flatten() {
+                *out.entry(*id).or_default() |= mask;
+            }
+            out
+        };
+        (fold(&self.producer_brokers), fold(&self.consumer_brokers))
+    }
+
+    /// The broker a site row of the impact matrix is labelled with: the one broker the node is
+    /// known to talk to in the row's role (`masks` from [`Self::site_masks`]; the node's own
+    /// broker when it is itself a broker site, for a row of another role). `None` for a hub (its
+    /// name carries the broker), for a node of unknown broker, and for one on several brokers.
+    pub(super) fn row_broker(
+        &self,
+        node: &ContractNode,
+        producer: Option<bool>,
+        masks: &(HashMap<NodeId, u32>, HashMap<NodeId, u32>),
+    ) -> Option<Broker> {
+        if Self::is_hub_like(node) {
+            return None;
+        }
+        let of = |m: &HashMap<NodeId, u32>| m.get(&node.id).copied().unwrap_or(0);
+        let mask = match producer {
+            Some(true) => of(&masks.0),
+            Some(false) => of(&masks.1),
+            None => of(&masks.0) | of(&masks.1),
+        };
+        if mask == 0 {
+            return self.node_brokers.get(&node.id).copied();
+        }
+        (mask.count_ones() == 1)
+            .then(|| Broker::of_mask(mask).next())
+            .flatten()
+    }
+
     /// Every broker some site of `key` is known to talk to, as a mask.
     pub(super) fn known_brokers(&self, key: &str) -> u32 {
         [&self.producer_brokers, &self.consumer_brokers]
@@ -523,6 +564,77 @@ mod tests {
             .all_edges()
             .iter()
             .any(|e| e.kind == EdgeKind::Produces && e.to == kafka_hub));
+    }
+
+    /// The broker of each impact row, by (role, node): `None` is a bare row.
+    fn row_brokers(g: &ContractGraph, target: &str) -> Vec<(String, &'static str, Option<Broker>)> {
+        g.impact_matrix(target, 1)
+            .rows
+            .iter()
+            .map(|r| (r.node.name.to_string(), r.role.label(), r.broker))
+            .collect()
+    }
+
+    /// 9.0 T17: a producer and a consumer row carry the broker of their own site, in their own
+    /// role, so two sites of one name on two brokers are two rows with two qualifiers.
+    #[test]
+    fn impact_rows_carry_the_broker_of_their_site_in_their_role() {
+        let mut g = ContractGraph::new();
+        let k = site(&mut g, "orders", "a/k.ts");
+        let r = site(&mut g, "orders", "a/r.ts");
+        let relay = site(&mut g, "relay", "a/relay.ts");
+        g.add_producer_on(k, "orders", Some(Broker::Kafka));
+        g.add_producer_on(r, "orders", Some(Broker::RabbitMq));
+        g.add_consumer_on(relay, "orders", Some(Broker::Kafka));
+        g.add_producer_on(relay, "orders", Some(Broker::RabbitMq));
+        g.reconcile_edges();
+        let m = g.impact_matrix("orders", 1);
+        let broker_of = |id: NodeId, role: &str| {
+            m.rows
+                .iter()
+                .find(|row| row.node.id == id && row.role.label() == role)
+                .map(|row| row.broker)
+        };
+        assert_eq!(broker_of(k, "producer"), Some(Some(Broker::Kafka)));
+        assert_eq!(broker_of(r, "producer"), Some(Some(Broker::RabbitMq)));
+        assert_eq!(broker_of(relay, "consumer"), Some(Some(Broker::Kafka)));
+        assert_eq!(broker_of(relay, "producer"), Some(Some(Broker::RabbitMq)));
+        // Two distinct rows: the two `orders` producers do not merge into one.
+        assert_eq!(
+            m.rows
+                .iter()
+                .filter(|row| row.node.name == "orders")
+                .count(),
+            2
+        );
+    }
+
+    /// A topic hub's name already carries its broker: the row names no second qualifier. A site
+    /// of unknown broker, and one known on two brokers, stay bare.
+    #[test]
+    fn impact_rows_of_hubs_unknown_and_multi_broker_sites_stay_bare() {
+        let mut g = ContractGraph::new();
+        let k = site(&mut g, "k", "a/k.ts");
+        let r = site(&mut g, "r", "a/r.ts");
+        let legacy = site(&mut g, "legacy", "b/legacy.ts");
+        let both = site(&mut g, "both", "b/both.ts");
+        g.add_producer_on(k, "orders", Some(Broker::Kafka));
+        g.add_consumer_on(r, "orders", Some(Broker::RabbitMq));
+        g.add_consumer(legacy, "orders");
+        g.add_producer_on(both, "orders", Some(Broker::Kafka));
+        g.add_producer_on(both, "orders", Some(Broker::RabbitMq));
+        g.reconcile_edges();
+        let rows = row_brokers(&g, "orders");
+        let find = |name: &str, role: &str| {
+            rows.iter()
+                .find(|(n, ro, _)| n == name && *ro == role)
+                .map(|(_, _, b)| *b)
+        };
+        assert_eq!(find("kafka:orders", "topic"), Some(None));
+        assert_eq!(find("rabbitmq:orders", "topic"), Some(None));
+        assert_eq!(find("legacy", "consumer"), Some(None));
+        assert_eq!(find("both", "producer"), Some(None));
+        assert_eq!(find("k", "producer"), Some(Some(Broker::Kafka)));
     }
 
     #[test]
