@@ -880,7 +880,10 @@ impl MarkdownFormatter {
                 idx + 1,
                 row.scope.label(),
                 row.role.label(),
-                Self::code_cell(&row.node.name),
+                Self::code_cell(&match row.broker {
+                    Some(b) => mesh_core::qualified_topic_key(b, &row.node.name),
+                    None => row.node.name.to_string(),
+                }),
                 Self::code_cell(label_of(row.node.repo_id)),
                 Self::code_cell(&Self::location(row.node, roots)),
                 row.confidence.label(),
@@ -1575,6 +1578,7 @@ mod tests {
                     },
                     confidence: mesh_core::EdgeConfidence::Heuristic,
                     via: None,
+                    broker: None,
                 })
                 .collect(),
         }

@@ -912,9 +912,8 @@ uses the name, `heuristic`, and is never tagged `kafka`.
 
 Every site carries its broker with the producer or consumer, so `trace_flow` / `analyze_impact` never link two sites
 that know different brokers (3.7); `diff_mesh` names the broker of a removed site that is not Kafka. In an
-`analyze_impact` table the topic rows carry the qualifier (`rabbitmq:orders`, `servicebus:orders`); the producer and consumer
-rows show the site's own name (`orders`) without it, as they do for the other languages (the qualifier lives on the
-topic hub, not on the row). A file whose top-level statements hold the sites (no class)
+`analyze_impact` table the topic rows and the producer and consumer rows carry the qualifier (`rabbitmq:orders`,
+`servicebus:orders`, as for the other languages since 9.0 T17); a site of unknown broker keeps its bare name. A file whose top-level statements hold the sites (no class)
 registers them on the call nodes.
 
 Bounds: at most 2,000 sites per file (`MAX_CS_BROKER_SITES_PER_FILE`) and 16,384 declared names; a file over a bound

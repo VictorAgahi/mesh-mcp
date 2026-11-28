@@ -418,6 +418,11 @@ pub struct ImpactRow<'g> {
     /// call-site producer row (9.0), the declaration that makes the call. `None`
     /// for a direct name match with no edge and for other async rows.
     pub via: Option<&'g ContractNode>,
+    /// The one broker the row's site is known to talk to, shown as a `broker:` qualifier on the
+    /// name (`rabbitmq:orders`) like a topic hub's. `None` for gRPC rows, for a topic hub (its
+    /// name already carries it), for a site whose broker is not statically known, and for a
+    /// site known on several brokers.
+    pub broker: Option<Broker>,
 }
 
 /// Impact matrix of a change to a gRPC method/service or an async event
