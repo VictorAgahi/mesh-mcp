@@ -59,7 +59,9 @@ fn temp_workspace(files: &[(&str, &str)]) -> (tempfile::TempDir, Arc<AppState>) 
     )
     .expect("config");
     for (name, body) in files {
-        std::fs::write(dir.path().join(name), body).expect("file");
+        let path = dir.path().join(name);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        std::fs::write(path, body).expect("file");
     }
     let root = dunce::canonicalize(dir.path()).expect("canonicalize");
     let state = state_for_abs(&root);
@@ -638,4 +640,150 @@ fn tool_schema_carries_the_negative_constraints_and_bounds() {
     ] {
         assert!(schema.contains(needle), "{needle} missing in {schema}");
     }
+}
+
+fn listener(class: &str, topic: &str, emit: Option<&str>) -> String {
+    let publish = emit.map_or(String::new(), |t| format!("this.client.emit('{t}', p);"));
+    format!(
+        "import {{ Controller }} from '@nestjs/common';\nimport {{ ClientKafka, EventPattern }} from '@nestjs/microservices';\n@Controller()\nexport class {class} {{\n  constructor(private readonly client: ClientKafka) {{}}\n  @EventPattern('{topic}')\n  async handle(p: any) {{ {publish} }}\n}}\n"
+    )
+}
+
+#[tokio::test]
+async fn a_name_that_matched_several_events_by_substring_says_so() {
+    let (_d, state) = temp_workspace(&[
+        ("a.ts", &listener("A", "ord.created", None)),
+        ("b.ts", &listener("B", "ord.shipped", None)),
+    ]);
+    let text = call(&state, json!({ "event": "ord", "direction": "downstream" })).await;
+    assert_mermaid_sane(&text);
+    assert!(
+        text.contains("**`ord` matched 2 events by substring**"),
+        "{text}"
+    );
+    assert!(has_line(&text, r#"n0(["?:ord"]):::centre"#), "{text}");
+    // An exact key is one event, no such note.
+    let exact = call(
+        &state,
+        json!({ "event": "ord.created", "direction": "downstream" }),
+    )
+    .await;
+    assert!(!exact.contains("by substring"), "{exact}");
+    assert!(
+        has_line(&exact, r#"n0(["?:ord.created"]):::centre"#),
+        "{exact}"
+    );
+}
+
+#[tokio::test]
+async fn call_depth_limit_is_a_stub_and_a_note_not_a_chain_end() {
+    // consumer -> s0 -> s1 -> ... -> s8 -> publish: nine calls, the walk is cut at six.
+    let mut files: Vec<(String, String)> = Vec::new();
+    let chain = 9;
+    files.push((
+        "consumer.ts".to_string(),
+        format!(
+            "import {{ Controller }} from '@nestjs/common';\nimport {{ EventPattern }} from '@nestjs/microservices';\nimport {{ S0 }} from './s0';\n@Controller()\nexport class Entry {{\n  constructor(private readonly s0: S0) {{}}\n  @EventPattern('deep.in')\n  async handle(p: any) {{ this.s0.run(p); }}\n}}\n"
+        ),
+    ));
+    for i in 0..chain {
+        let body = if i + 1 < chain {
+            format!("this.next.run(p);")
+        } else {
+            "this.client.emit('deep.out', p);".to_string()
+        };
+        let (field, import) = if i + 1 < chain {
+            (
+                format!("private readonly next: S{}", i + 1),
+                format!("import {{ S{} }} from './s{}';\n", i + 1, i + 1),
+            )
+        } else {
+            (
+                "private readonly client: ClientKafka".to_string(),
+                "import { ClientKafka } from '@nestjs/microservices';\n".to_string(),
+            )
+        };
+        files.push((
+            format!("s{i}.ts"),
+            format!(
+                "import {{ Injectable }} from '@nestjs/common';\n{import}@Injectable()\nexport class S{i} {{\n  constructor({field}) {{}}\n  run(p: any) {{ {body} }}\n}}\n"
+            ),
+        ));
+    }
+    let (_d, state) = temp_from(&files);
+    let text = call(
+        &state,
+        json!({ "event": "deep.in", "direction": "downstream" }),
+    )
+    .await;
+    assert_mermaid_sane(&text);
+    assert!(text.contains("call depth limit #40;6#41;"), "{text}");
+    assert!(
+        text.contains(
+            "**Call depth limit reached** (down, call_depth 6) at 1 callable(s) with further calls"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("deep.out"), "{text}");
+}
+
+#[tokio::test]
+async fn a_long_place_is_cut_at_its_head_so_the_line_stays() {
+    let dir = "an_extremely_long_directory_name_for_a_service_module";
+    let (_d, state) = temp_workspace(&[(
+        &format!("{dir}/{dir}2/consumer.ts"),
+        &listener("C", "place.event", None),
+    )]);
+    let text = call(
+        &state,
+        json!({ "event": "place.event", "direction": "downstream" }),
+    )
+    .await;
+    assert_mermaid_sane(&text);
+    assert!(
+        text.contains(
+            "<br/>...y_long_directory_name_for_a_service_module2/consumer.ts:7\"]:::site"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("`{dir}/{dir}2/consumer.ts:7`")),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn the_node_cap_shrinks_until_the_output_fits_the_budget() {
+    // 50 consumers of one event, each publishing its own topic that one more consumer hears:
+    // 201 nodes with long names, more than 44 KB of diagram and table.
+    let mut files: Vec<(String, String)> = Vec::new();
+    for i in 0..50 {
+        let long = format!("a_rather_long_consumer_class_name_for_shard_{i:02}");
+        files.push((
+            format!("modules/{long}/in.ts"),
+            listener(
+                &format!("{}In", long.replace('_', "")),
+                "wide.event",
+                Some(&format!("wide.out.{i:02}")),
+            ),
+        ));
+        files.push((
+            format!("modules/{long}/out.ts"),
+            listener(
+                &format!("{}Out", long.replace('_', "")),
+                &format!("wide.out.{i:02}"),
+                None,
+            ),
+        ));
+    }
+    let (_d, state) = temp_from(&files);
+    let text = call(
+        &state,
+        json!({ "event": "wide.event", "direction": "downstream", "limit": 200, "fan_out": 50 }),
+    )
+    .await;
+    assert!(text.len() <= 48 * 1024, "{} bytes", text.len());
+    assert_mermaid_sane(&text);
+    assert!(text.contains("nodes not shown (cap "), "{}", &text[..600]);
+    assert!(!text.contains("limit 200,"), "{}", &text[..300]);
 }

@@ -730,9 +730,8 @@ view does not walk the graph a second time.
   found` (a runtime-built topic, a registry or an unindexed root may continue the flow). A topic
   whose name is a `${PLACEHOLDER}` or a wildcard is itself drawn with that dashed style. A bound
   that cut the walk is an orange stub that names it (`1 consumer(s) not expanded: depth limit (1)`,
-  `+9 more consumer site(s) not followed (fan_out 3)`, `call depth limit (6)`, `not traced: hop
-  limit`), followed by a **Depth limit reached** / **Fan-out cap** / **Call depth limit reached** /
-  **Hop limit reached** note, never as a chain end.
+  `+9 more consumer site(s) not followed (fan_out 3)`, `call depth limit (6)`), followed by a
+  **Depth limit reached** / **Fan-out cap** / **Call depth limit reached** note, never as a chain end.
 - **Cycles and joins** are drawn once: the event or site that is reached again keeps one node, the
   edge back to it is drawn, and the node gets a dashed thick border (`class nN revisit`).
 - **Bounds** (all in the schema; larger values are clamped and the header shows the value used):
@@ -741,12 +740,13 @@ view does not walk the graph a second time.
   keeps the nodes nearest the centre and says what it cut: `**N nodes not shown (cap L)**, use
   hops/limit/scope` and an orange `+K not shown (cap)` stub on every node that lost neighbours. The
   output is also kept under the 48 KB cap by halving the node cap until it fits (the note then
-  shows the cap used). Trace hops are bounded by `trace_flow`'s own 2,000.
+  shows the cap used). The call walk inside one hop is bounded by `call_depth` 6 (not an
+  argument of this view; `trace_flow` takes it).
 - **Labels**: every label is Mermaid-escaped (quotes, brackets, parentheses, braces, pipes,
   semicolons, `#`, `&`, `<`, `>`, backticks and every non-ASCII character become numeric entities
   such as `#40;`), labels longer than 40 characters are cut with `...` (a place is cut at its head,
   so the `:line` stays), and the table under the diagram gives each node's full name and `path:line`
-  unescaped (a name is cut at 160 characters). Names go through the same gates as `trace_flow`
+  unescaped. Names go through the same gates as `trace_flow`
   and `event_anomalies` (`member_consts::name_is_printable`; a placeholder default is masked): a
   credential-shaped event or code name is replaced by `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]`,
   also in the echo of the `event` argument.
