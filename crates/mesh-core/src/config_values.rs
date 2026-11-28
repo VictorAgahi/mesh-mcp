@@ -463,53 +463,107 @@ pub fn mask_placeholder_defaults(text: &str) -> std::borrow::Cow<'_, str> {
     rewrite_placeholder_defaults(text, |d| !d.is_empty() && !plain_topic(d))
 }
 
-/// `text` with the content of every double-quoted literal that is a connection string
-/// (`Endpoint=sb://h/;SharedAccessKey=...`, `Server=h;Password=...`) replaced by the secret mask.
-/// A literal is one when it holds a `key=value` pair whose key is a credential
-/// (`SharedAccessKey`, `AccountKey`, `AccessKey`, `SecretKey`, `Password`, `Pwd`). Text with no
-/// such literal is returned as is. (9.0 T8d: a snippet of C# source must not print one.)
+/// Connection-string keys whose value is a credential.
+const CONNECTION_SECRET_KEYS: [&str; 8] = [
+    "sharedaccesskey",
+    "sharedaccesssignature",
+    "accountkey",
+    "accesskey",
+    "secretkey",
+    "password",
+    "pwd",
+    "authkey",
+];
+
+/// Byte spans `(value_start, value_end)` of the credential values of `Key=Value` pairs in
+/// `text` (`Key = Value` too; a pair ends at `;` or `"`). A value that is empty or only a
+/// placeholder (`%s`, `?`, `$1`, `{0}`, `:name`, `@p1`) is no secret.
+fn connection_secret_spans(text: &str) -> Vec<(usize, usize)> {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut spans = Vec::new();
+    for key in CONNECTION_SECRET_KEYS {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(key) {
+            let at = from + rel;
+            from = at + key.len();
+            if at > 0 && bytes[at - 1].is_ascii_alphanumeric() {
+                continue;
+            }
+            let mut i = from;
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            if bytes.get(i) != Some(&b'=') || bytes.get(i + 1) == Some(&b'=') {
+                continue;
+            }
+            i += 1;
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i] != b';' && bytes[i] != b'"' {
+                i += 1;
+            }
+            let value = text[start..i].trim_end();
+            let first = value.chars().next();
+            let placeholder = matches!(first, Some('%' | '?' | '$' | '{' | ':' | '@' | '<'));
+            if value.is_empty() || placeholder {
+                continue;
+            }
+            // Outside a quoted literal a member access or a call is code, not a secret
+            // (`Password = settings.Password;`).
+            spans.push((start, start + value.len()));
+        }
+    }
+    spans.sort_unstable();
+    spans
+}
+
+/// `text` with the value of every credential pair of a connection string
+/// (`Endpoint=sb://h/;SharedAccessKey=...`, `Server=h;Password = ...`) replaced by the secret
+/// mask. It reads a line at a time, so a connection string that a verbatim or raw literal spreads
+/// over several lines is masked line by line. A pair with an empty or placeholder value
+/// (`password=%s`, `password=?`) and a code assignment (`Password = settings.Password;`) are kept.
+/// Text with no such pair is returned as is. (9.0 T8d.)
 pub fn mask_connection_strings(text: &str) -> std::borrow::Cow<'_, str> {
-    const KEYS: [&str; 8] = [
-        "sharedaccesskey=",
-        "sharedaccesssignature=",
-        "accountkey=",
-        "accesskey=",
-        "secretkey=",
-        "password=",
-        "pwd=",
-        "authkey=",
-    ];
-    if !text.contains('"') || !text.contains('=') {
+    if !text.contains('=') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let quote_open: Vec<bool> = {
+        let mut open = false;
+        text.bytes()
+            .map(|b| {
+                if b == b'"' {
+                    open = !open;
+                }
+                open
+            })
+            .collect()
+    };
+    let kept: Vec<(usize, usize)> = connection_secret_spans(text)
+        .into_iter()
+        .filter(|&(start, end)| {
+            let value = &text[start..end];
+            // Unquoted: `x.Password`, `Get(...)`: an expression, not a literal fragment.
+            quote_open[start] || !(value.contains(['.', '(', ')']) || value.contains(' '))
+        })
+        .collect();
+    if kept.is_empty() {
         return std::borrow::Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len());
-    let mut changed = false;
-    let mut rest = text;
-    while let Some(start) = rest.find('"') {
-        out.push_str(&rest[..=start]);
-        let after = &rest[start + 1..];
-        let Some(end) = after.find('"') else {
-            out.push_str(after);
-            rest = "";
-            break;
-        };
-        let lit = &after[..end];
-        let lower = lit.to_ascii_lowercase();
-        if KEYS.iter().any(|k| lower.contains(k)) {
-            out.push_str("[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]");
-            changed = true;
-        } else {
-            out.push_str(lit);
+    let mut at = 0;
+    for (start, end) in kept {
+        if start < at {
+            continue;
         }
-        out.push('"');
-        rest = &after[end + 1..];
+        out.push_str(&text[at..start]);
+        out.push_str("[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]");
+        at = end;
     }
-    out.push_str(rest);
-    if changed {
-        std::borrow::Cow::Owned(out)
-    } else {
-        std::borrow::Cow::Borrowed(text)
-    }
+    out.push_str(&text[at..]);
+    std::borrow::Cow::Owned(out)
 }
 
 /// `text` with EVERY placeholder default removed (`${k:anything}` -> `${k}`). For a site whose
@@ -889,37 +943,66 @@ fn unquote(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
 
-    /// 9.0 T8d: a connection string literal is masked, a plain string and a name are not.
+    /// 9.0 T8d: a connection string is masked wherever it sits (a literal, a continuation line of
+    /// a verbatim literal, spaced pairs); placeholders, code and plain names are not.
     #[test]
-    fn connection_string_literals_are_masked_and_names_are_not() {
+    fn connection_strings_are_masked_and_placeholders_code_and_names_are_not() {
         let key = ["Shared", "Access", "Key"].concat();
+        let m = "[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]";
         let line = format!(
             "[ServiceBusTrigger(\"q\", Connection = \"Endpoint=sb://h/;{key}=zz9\")] // \"orders\""
         );
-        let out = mask_connection_strings(&line);
         assert_eq!(
-            out,
-            "[ServiceBusTrigger(\"q\", Connection = \"[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]\")] // \"orders\""
+            mask_connection_strings(&line),
+            format!("[ServiceBusTrigger(\"q\", Connection = \"Endpoint=sb://h/;{key}={m}\")] // \"orders\"")
         );
-        assert!(!out.contains("zz9"));
-        let pw = format!(
-            "var c = \"Server=h;{}=hunter2\";",
-            ["Pass", "word"].concat()
+        // A continuation line of a multi-line verbatim literal has no quote on it.
+        assert_eq!(
+            mask_connection_strings(&format!("    {key}=zz9;")),
+            format!("    {key}={m};")
         );
         assert_eq!(
-            mask_connection_strings(&pw),
-            "var c = \"[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]\";"
+            mask_connection_strings(&format!("    {key} = zz9;")),
+            format!("    {key} = {m};")
         );
+        let pw = ["Pass", "word"].concat();
+        assert_eq!(
+            mask_connection_strings(&format!("var c = \"Server=h;{pw} = hunter2;\";")),
+            format!("var c = \"Server=h;{pw} = {m};\";")
+        );
+        for k in [
+            "SharedAccessSignature",
+            "AccountKey",
+            "AccessKey",
+            "SecretKey",
+            "Pwd",
+        ] {
+            let masked = mask_connection_strings(&format!("\"A=b;{k}=zz9\"")).into_owned();
+            assert_eq!(masked, format!("\"A=b;{k}={m}\""), "{k}");
+        }
         for plain in [
             "var q = \"orders\";",
             "Route(\"api/[controller]\")",
             "x = \"a=b\";",
             "no quote = here",
+            "fmt.Sprintf(\"password=%s\", pw)",
+            "db.Query(\"... password=?\")",
+            "\"password=$1\"",
+            "\"password={0}\"",
+            "\"password=:name\"",
+            "\"pwd=@p1\"",
+            "\"password=\"",
+            "Password = settings.Password;",
+            "Password = Get(x);",
+            "if (a.Password == b) {}",
         ] {
-            assert!(matches!(
-                mask_connection_strings(plain),
-                std::borrow::Cow::Borrowed(_)
-            ));
+            assert!(
+                matches!(
+                    mask_connection_strings(plain),
+                    std::borrow::Cow::Borrowed(_)
+                ),
+                "{plain}"
+            );
         }
     }
     use super::*;
