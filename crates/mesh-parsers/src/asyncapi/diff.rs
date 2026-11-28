@@ -896,6 +896,62 @@ operations:
     }
 
     #[test]
+    fn a_declared_schema_that_is_not_complete_never_claims_undeclared_code_fields() {
+        let open = DOC.replace(
+            "          type: object\n          required: [id, total]",
+            "          additionalProperties: true\n          required: [id, total]",
+        );
+        let r = diff_asyncapi(&observed(), &declared(&open));
+        let p = r
+            .rows
+            .iter()
+            .find(|x| x.class == RowClass::PayloadDisagreement)
+            .expect("row");
+        // The primitive clash still holds; `extra` and `currency` are not claimed undeclared.
+        assert_eq!(
+            p.detail,
+            vec!["field `total`: declared number, code string".to_string()]
+        );
+        assert!(r
+            .payload_not_compared
+            .iter()
+            .any(|n| n.contains("partial field list on the declared side")));
+    }
+
+    #[test]
+    fn a_first_row_past_the_budget_is_still_shown_and_the_next_page_advances() {
+        let mut o = ObservedSet::default();
+        for i in 0..3 {
+            o.channels.push(chan(
+                &format!("t{i}"),
+                None,
+                vec![site(true, "a.ts:1", ObsPayload::Untyped)],
+                vec![],
+            ));
+        }
+        let mut r = diff_asyncapi(&o, &declared("asyncapi: 3.0.0\nchannels: {}\n"));
+        for row in &mut r.rows {
+            row.detail = vec!["x".repeat(40 * 1024)];
+        }
+        let view = DiffView {
+            limit: 25,
+            offset: 0,
+            scope: None,
+            coverage: None,
+            roots: 1,
+            skipped_files: vec![],
+        };
+        let p1 = format_diff(&r, &view);
+        assert!(
+            p1.contains("`t0`") && !p1.contains("`t1`"),
+            "one row, then the pointer"
+        );
+        assert!(p1.contains("2 more row(s) of this class, `offset: 1`"));
+        let p2 = format_diff(&r, &DiffView { offset: 1, ..view });
+        assert!(p2.contains("`t1`") && p2.contains("`offset: 2`"));
+    }
+
+    #[test]
     fn an_unknown_broker_and_an_unmappable_protocol_make_no_claim() {
         let mut o = observed();
         o.channels[1].broker = None;
@@ -972,29 +1028,78 @@ operations:
     #[test]
     fn credential_shaped_names_are_redacted_in_rows() {
         let secret = ["pass", "word"].concat();
+        let token = ["tok", "_", "a1b2c3"].concat();
+        // A code field, a declared required field and an observed topic, all credential-shaped.
+        let o = ObservedSet {
+            channels: vec![
+                chan(
+                    "orders.created",
+                    Some(Broker::Kafka),
+                    vec![site(true, "src/p.ts:3", ObsPayload::Typed(0))],
+                    vec![ty("Created", &[(&secret, "string", false)], false)],
+                ),
+                chan(
+                    &token,
+                    None,
+                    vec![site(true, "src/q.ts:1", ObsPayload::Untyped)],
+                    vec![],
+                ),
+            ],
+            ..ObservedSet::default()
+        };
+        let declared_secret = format!(
+            "asyncapi: 3.0.0\nchannels:\n  a:\n    address: orders.created\n    messages:\n      m:\n        payload:\n          type: object\n          required: [{secret}2]\n          properties:\n            {secret}2: {{type: string}}\n"
+        );
+        for docs in [declared(DOC), declared(&declared_secret)] {
+            let r = diff_asyncapi(&o, &docs);
+            let text = format_diff(
+                &r,
+                &DiffView {
+                    limit: 25,
+                    offset: 0,
+                    scope: None,
+                    coverage: None,
+                    roots: 1,
+                    skipped_files: vec![],
+                },
+            );
+            assert!(!text.contains(&secret), "{text}");
+            assert!(!text.contains(&token), "{text}");
+            assert!(text.contains("[REDACTED_SECRET"), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_observed_wildcard_subscription_matches_a_declared_concrete_channel() {
+        let doc = "asyncapi: 3.0.0\nchannels:\n  a:\n    address: orders.created\noperations:\n  r: {action: receive, channel: {$ref: '#/channels/a'}}\n";
         let o = ObservedSet {
             channels: vec![chan(
-                "orders.created",
-                Some(Broker::Kafka),
-                vec![site(true, "src/p.ts:3", ObsPayload::Typed(0))],
-                vec![ty("Created", &[(&secret, "string", false)], false)],
+                "orders.*",
+                Some(Broker::Nats),
+                vec![site(false, "w.ts:1", ObsPayload::Untyped)],
+                vec![],
             )],
             ..ObservedSet::default()
         };
-        let r = diff_asyncapi(&o, &declared(DOC));
-        let text = format_diff(
-            &r,
-            &DiffView {
-                limit: 25,
-                offset: 0,
-                scope: None,
-                coverage: None,
-                roots: 1,
-                skipped_files: vec![],
-            },
+        let r = diff_asyncapi(&o, &declared(doc));
+        assert_eq!(
+            r.rows,
+            Vec::new(),
+            "the wildcard hears the declared channel"
         );
-        assert!(!text.contains(&secret), "{text}");
-        assert!(text.contains("[REDACTED_SECRET"), "{text}");
+        // A wildcard that does not match leaves both unmatched.
+        let other = doc.replace("orders.created", "invoices.created");
+        let r = diff_asyncapi(&o, &declared(&other));
+        assert_eq!(
+            r.rows
+                .iter()
+                .map(|x| (x.key.as_str(), x.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("invoices.created", RowKind::DeclaredChannel),
+                ("orders.*", RowKind::UndeclaredChannel),
+            ]
+        );
     }
 
     #[test]

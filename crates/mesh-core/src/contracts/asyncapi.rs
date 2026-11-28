@@ -132,11 +132,6 @@ impl ContractGraph {
                 .iter()
                 .chain(&consumers)
                 .fold(EdgeConfidence::Exact, |acc, s| weakest(acc, s.confidence));
-            let confidence = if broker.is_some() {
-                confidence
-            } else {
-                weakest(confidence, EdgeConfidence::Heuristic)
-            };
             let wildcard = is_subject_pattern(key);
             let placeholder = key.contains("${");
             let topic = TopicEntry {

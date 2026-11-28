@@ -61,7 +61,7 @@ fn slug(s: &str) -> String {
             out.push('_');
         }
     }
-    let t = out.trim_matches('_');
+    let t = out.trim_matches(|c| c == '_' || c == '.');
     if t.is_empty() {
         "x".to_string()
     } else {
@@ -452,7 +452,7 @@ pub fn format_export(set: &ObservedSet, view: &ExportView<'_>) -> String {
     if total == 0 {
         let _ = writeln!(
             out,
-            "No channel with a statically resolved topic name is in this scope, so there is no document. That is not proof there are none: see the unresolved count below."
+            "No channel with a statically resolved topic name is in this scope, so there is no document. That is not proof there are none: a topic named at runtime or in an unindexed root is not seen."
         );
     } else if start >= total {
         let _ = writeln!(
@@ -575,10 +575,17 @@ mod tests {
                     vec![s(true, "x/y.ts:1", ObsPayload::Typed(0))],
                     vec![t.clone()],
                 ),
+                // `a/b` and `a_b` fold to one safe id: the second one is suffixed.
+                o(
+                    "a/b",
+                    None,
+                    vec![s(false, "x/y.ts:2", ObsPayload::Untyped)],
+                    vec![],
+                ),
                 o(
                     "a_b",
                     None,
-                    vec![s(false, "x/y.ts:2", ObsPayload::Untyped)],
+                    vec![s(false, "x/y.ts:4", ObsPayload::Untyped)],
                     vec![],
                 ),
                 o(
@@ -596,12 +603,10 @@ mod tests {
             .expect("channels")
             .keys()
             .collect();
-        assert_eq!(chans, vec!["a.b", "a_b", "kafka_a.b"]);
-        let second = document(&format_export(&set, &view(1, 1)));
-        assert!(second["channels"]
-            .as_object()
-            .expect("channels")
-            .contains_key("a_b"));
+        assert_eq!(chans, vec!["a.b", "a_b", "a_b_2", "kafka_a.b"]);
+        // Page 3 alone: the channel keeps the id it has in the whole document.
+        let third = document(&format_export(&set, &view(2, 1)));
+        assert_eq!(third["channels"]["a_b_2"]["address"], json!("a_b"));
         // Schema: JSON families, required for non-optional fields, no type claimed for `Date`.
         let schema = &full["components"]["schemas"]["Order"];
         assert_eq!(schema["required"], json!(["at", "id"]));

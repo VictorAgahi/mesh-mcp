@@ -727,6 +727,42 @@ async fn a_big_channel_is_cut_with_a_count_and_every_page_stays_under_the_budget
 }
 
 #[tokio::test]
+async fn the_default_page_holds_twenty_channels_and_points_at_the_next() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "mesh-mcp.toml", CONFIG);
+    write(
+        dir.path(),
+        "package.json",
+        "{\"name\":\"w\",\"dependencies\":{\"@nestjs/microservices\":\"^10\"}}",
+    );
+    let mut ts = String::from("import { Inject } from '@nestjs/common';\nimport { ClientKafka } from '@nestjs/microservices';\nexport class P {\n  constructor(@Inject('K') private readonly client: ClientKafka) {}\n");
+    for i in 0..30 {
+        ts.push_str(&format!(
+            "  t{i}() {{ this.client.emit('t.n{i:02}', 1); }}\n"
+        ));
+    }
+    ts.push_str("}\n");
+    write(dir.path(), "src/p.ts", &ts);
+    let state = state_in(dir.path());
+    let first = text(&state, json!({})).await;
+    let doc = document(&first);
+    assert_eq!(doc["x-mesh"]["channels_in_document"].as_u64(), Some(20));
+    assert_eq!(doc["x-mesh"]["next_offset"].as_u64(), Some(20));
+    assert!(
+        first.contains("10 channel(s) are not in this page"),
+        "{first}"
+    );
+    let clamp = document(&text(&state, json!({"limit": 1000})).await);
+    assert!(clamp["x-mesh"]["channels_in_document"].as_u64().expect("n") <= 30);
+    let zero = document(&text(&state, json!({"limit": 0})).await);
+    assert_eq!(
+        zero["x-mesh"]["channels_in_document"].as_u64(),
+        Some(1),
+        "limit 0 is clamped to one, never an empty page"
+    );
+}
+
+#[tokio::test]
 async fn at_most_twenty_declared_documents_are_read_and_the_rest_are_named() {
     let dir = tempfile::tempdir().expect("tempdir");
     write(dir.path(), "mesh-mcp.toml", CONFIG);
@@ -774,6 +810,43 @@ async fn a_declared_file_grown_past_the_size_budget_after_indexing_is_refused_be
         page.contains("Every indexed AsyncAPI candidate was skipped"),
         "{page}"
     );
+}
+
+#[tokio::test]
+async fn test_file_sites_and_declared_channel_nodes_are_not_observed_sites() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "mesh-mcp.toml", CONFIG);
+    write(
+        dir.path(),
+        "package.json",
+        "{\"name\":\"w\",\"dependencies\":{\"@nestjs/microservices\":\"^10\"}}",
+    );
+    let class = |name: &str, topic: &str| {
+        format!("import {{ Inject }} from '@nestjs/common';\nimport {{ ClientKafka }} from '@nestjs/microservices';\nexport class {name} {{\n  constructor(@Inject('K') private readonly client: ClientKafka) {{}}\n  go() {{ this.client.emit('{topic}', {{ id: 1 }}); }}\n}}\n")
+    };
+    write(dir.path(), "src/a.ts", &class("A", "orders.created"));
+    write(
+        dir.path(),
+        "src/a.spec.ts",
+        &class("ASpec", "spec.only.topic"),
+    );
+    // A declared channel whose id is not its address: its node is the declaration, not code.
+    write(
+        dir.path(),
+        "asyncapi.yaml",
+        "asyncapi: 3.0.0\nchannels:\n  declaredOnlyId:\n    address: declared.only.address\n",
+    );
+    let page = text(&state_in(dir.path()), json!({})).await;
+    let doc = document(&page);
+    assert_eq!(
+        keys(&doc["channels"]),
+        BTreeSet::from(["orders.created".to_string()])
+    );
+    assert!(
+        !page.contains("spec.only.topic") && !page.contains("declaredonlyid"),
+        "{page}"
+    );
+    assert!(page.contains("Test-file sites (1) and the channels a declared AsyncAPI file contributes (1) are not counted"), "{page}");
 }
 
 #[cfg(unix)]
