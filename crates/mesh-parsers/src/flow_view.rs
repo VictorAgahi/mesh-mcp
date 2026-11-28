@@ -165,7 +165,10 @@ impl<'a, 'g> Builder<'a, 'g> {
         // A key (`orders`, `kafka:orders`) centres on its hubs, one per broker; a lone hub is
         // its own centre. A target that only matched several events by substring has no single
         // event: the key stands for the group (and the output says so).
-        let by_key = input.hubs.iter().any(|h| bare_key(h) == bare_key(input.key));
+        let by_key = input
+            .hubs
+            .iter()
+            .any(|h| bare_key(h) == bare_key(input.key));
         let centres: Vec<String> = if by_key || input.hubs.len() == 1 {
             input.hubs.iter().map(ToString::to_string).collect()
         } else {
@@ -320,7 +323,14 @@ impl<'a, 'g> Builder<'a, 'g> {
     }
 
     /// `next` of a hop: what happens past the topic it publishes (down) or consumes (up).
-    fn outcomes(&mut self, hop: &mesh_core::FlowHop<'_>, from: usize, conf: EdgeConfidence, up: bool, bounds: FlowBounds) {
+    fn outcomes(
+        &mut self,
+        hop: &mesh_core::FlowHop<'_>,
+        from: usize,
+        conf: EdgeConfidence,
+        up: bool,
+        bounds: FlowBounds,
+    ) {
         let counterpart = if up { "producer" } else { "consumer" };
         for nx in &hop.next {
             for ev in self.events_of(Some(&nx.topic)) {
@@ -375,16 +385,17 @@ impl<'a, 'g> Builder<'a, 'g> {
         }
     }
 
-    fn hop_end_marker(&mut self, hop: &mesh_core::FlowHop<'_>, at: usize, up: bool, bounds: FlowBounds) {
+    fn hop_end_marker(
+        &mut self,
+        hop: &mesh_core::FlowHop<'_>,
+        at: usize,
+        up: bool,
+        bounds: FlowBounds,
+    ) {
         match hop.end {
             Some(FlowEnd::ChainEnd) => {
                 let what = if up { "entry" } else { "publish" };
-                self.marker(
-                    at,
-                    up,
-                    MarkKind::Unresolved,
-                    format!("no {what} found"),
-                );
+                self.marker(at, up, MarkKind::Unresolved, format!("no {what} found"));
             }
             Some(FlowEnd::CallDepthLimit) => self.marker(
                 at,
@@ -428,10 +439,7 @@ impl<'a, 'g> Builder<'a, 'g> {
             let mut calls = 0usize;
             let mut calls_conf = EdgeConfidence::Exact;
             let mut produced: Option<(usize, EdgeConfidence)> = None;
-            let last_call = hop
-                .steps
-                .iter()
-                .rposition(|s| s.kind == FlowStepKind::Call);
+            let last_call = hop.steps.iter().rposition(|s| s.kind == FlowStepKind::Call);
             let owner = hop
                 .steps
                 .last()
@@ -441,7 +449,10 @@ impl<'a, 'g> Builder<'a, 'g> {
                 match step.kind {
                     // The last call is the callable holding the publish: the producer node
                     // stands for it.
-                    FlowStepKind::Call if self.input.detail && Some(k) == last_call && Some(step.node.id) == owner => {}
+                    FlowStepKind::Call
+                        if self.input.detail
+                            && Some(k) == last_call
+                            && Some(step.node.id) == owner => {}
                     FlowStepKind::Call if self.input.detail => {
                         let n = self.site(step.node, Kind::Call);
                         self.edge(prev, n, step.confidence, String::new());
@@ -515,10 +526,7 @@ impl<'a, 'g> Builder<'a, 'g> {
             let mut calls_conf = EdgeConfidence::Exact;
             let mut entry: Option<(usize, FlowStepKind, EdgeConfidence)> = None;
             let mut chain: Vec<(usize, EdgeConfidence)> = Vec::new();
-            let last_call = hop
-                .steps
-                .iter()
-                .rposition(|s| s.kind == FlowStepKind::Call);
+            let last_call = hop.steps.iter().rposition(|s| s.kind == FlowStepKind::Call);
             let owner = hop
                 .steps
                 .last()
@@ -528,7 +536,10 @@ impl<'a, 'g> Builder<'a, 'g> {
                 match step.kind {
                     // The last caller is the callable holding the entry site: the entry node
                     // stands for it.
-                    FlowStepKind::Call if self.input.detail && Some(k) == last_call && Some(step.node.id) == owner => {}
+                    FlowStepKind::Call
+                        if self.input.detail
+                            && Some(k) == last_call
+                            && Some(step.node.id) == owner => {}
                     FlowStepKind::Call if self.input.detail => {
                         let n = self.site(step.node, Kind::Call);
                         chain.push((n, step.confidence));
@@ -663,7 +674,9 @@ fn cell(text: &str) -> String {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    let t = clamp(&t, TABLE_NAME_CHARS).replace('`', "'").replace('|', "\\|");
+    let t = clamp(&t, TABLE_NAME_CHARS)
+        .replace('`', "'")
+        .replace('|', "\\|");
     format!("`{t}`")
 }
 
@@ -752,27 +765,28 @@ fn draw(g: &Builder<'_, '_>, limit: usize) -> Drawn {
 
     let mut link_styles: Vec<(usize, EdgeConfidence)> = Vec::new();
     let mut links = 0usize;
-    let mut arrow = |out: &mut String, from: usize, to: usize, conf: EdgeConfidence, label: &str| {
-        let arrow = match conf {
-            EdgeConfidence::Exact => "-->",
-            _ => "-.->",
+    let mut arrow =
+        |out: &mut String, from: usize, to: usize, conf: EdgeConfidence, label: &str| {
+            let arrow = match conf {
+                EdgeConfidence::Exact => "-->",
+                _ => "-.->",
+            };
+            let label = match (conf, label.is_empty()) {
+                (EdgeConfidence::Ambiguous, true) => "?".to_string(),
+                (EdgeConfidence::Ambiguous, false) => format!("? {label}"),
+                _ => label.to_string(),
+            };
+            if label.is_empty() {
+                let _ = writeln!(out, "  n{from} {arrow} n{to}");
+            } else {
+                let label = mermaid_escape(&clamp(&label, EDGE_LABEL_CHARS));
+                let _ = writeln!(out, "  n{from} {arrow}|\"{label}\"| n{to}");
+            }
+            if conf == EdgeConfidence::Ambiguous {
+                link_styles.push((links, conf));
+            }
+            links += 1;
         };
-        let label = match (conf, label.is_empty()) {
-            (EdgeConfidence::Ambiguous, true) => "?".to_string(),
-            (EdgeConfidence::Ambiguous, false) => format!("? {label}"),
-            _ => label.to_string(),
-        };
-        if label.is_empty() {
-            let _ = writeln!(out, "  n{from} {arrow} n{to}");
-        } else {
-            let label = mermaid_escape(&clamp(&label, EDGE_LABEL_CHARS));
-            let _ = writeln!(out, "  n{from} {arrow}|\"{label}\"| n{to}");
-        }
-        if conf == EdgeConfidence::Ambiguous {
-            link_styles.push((links, conf));
-        }
-        links += 1;
-    };
     for e in &g.edges {
         if keep[e.from] && keep[e.to] {
             arrow(&mut out, e.from, e.to, e.conf, &e.label);
@@ -815,10 +829,22 @@ fn draw(g: &Builder<'_, '_>, limit: usize) -> Drawn {
     }
     for &i in &kept {
         if cut_up[i] > 0 {
-            stub(&mut out, i, true, &format!("+{} not shown (cap)", cut_up[i]), "bound");
+            stub(
+                &mut out,
+                i,
+                true,
+                &format!("+{} not shown (cap)", cut_up[i]),
+                "bound",
+            );
         }
         if cut_down[i] > 0 {
-            stub(&mut out, i, false, &format!("+{} not shown (cap)", cut_down[i]), "bound");
+            stub(
+                &mut out,
+                i,
+                false,
+                &format!("+{} not shown (cap)", cut_down[i]),
+                "bound",
+            );
         }
     }
 
@@ -833,8 +859,12 @@ fn draw(g: &Builder<'_, '_>, limit: usize) -> Drawn {
     out.push_str("  classDef site fill:#f1f3f5,stroke:#495057,color:#212529\n");
     out.push_str("  classDef call fill:#f8f9fa,stroke:#adb5bd,color:#212529\n");
     out.push_str("  classDef origin fill:#ebfbee,stroke:#2f9e44,color:#212529\n");
-    out.push_str("  classDef unresolved fill:#ffffff,stroke:#868e96,stroke-dasharray:4 3,color:#495057\n");
-    out.push_str("  classDef bound fill:#fff9db,stroke:#f08c00,stroke-dasharray:2 2,color:#495057\n");
+    out.push_str(
+        "  classDef unresolved fill:#ffffff,stroke:#868e96,stroke-dasharray:4 3,color:#495057\n",
+    );
+    out.push_str(
+        "  classDef bound fill:#fff9db,stroke:#f08c00,stroke-dasharray:2 2,color:#495057\n",
+    );
     out.push_str("  classDef revisit stroke-dasharray:6 3,stroke-width:3px\n");
 
     // Table of the full names.
@@ -1011,7 +1041,9 @@ mod tests {
     fn escape_never_leaves_syntax_characters() {
         let hostile = "a\"b[c](d){e}|f;g#h<i>j&k`l\\m\nn\u{e9}\u{4e2d}";
         let e = mermaid_escape(hostile);
-        for bad in ['"', '[', ']', '(', ')', '{', '}', '|', ';', '<', '>', '&', '`', '\\', '\n'] {
+        for bad in [
+            '"', '[', ']', '(', ')', '{', '}', '|', ';', '<', '>', '&', '`', '\\', '\n',
+        ] {
             assert!(!e.contains(bad), "{bad:?} left in {e}");
         }
         assert!(e.is_ascii());
@@ -1023,7 +1055,10 @@ mod tests {
 
     #[test]
     fn escape_keeps_plain_names_readable() {
-        assert_eq!(mermaid_escape("kafka:order.requested-v2/x_y"), "kafka:order.requested-v2/x_y");
+        assert_eq!(
+            mermaid_escape("kafka:order.requested-v2/x_y"),
+            "kafka:order.requested-v2/x_y"
+        );
     }
 
     #[test]

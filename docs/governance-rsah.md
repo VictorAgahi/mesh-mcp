@@ -43,7 +43,7 @@ subject and matches each key as a **whole path segment**: `proto` matches `proto
 `src/proto/x`, not `internal/prototype/x.go`. Both `/` and `\` separate segments.
 
 The subject is the `scope` of `smart_search`, the `target` of `find_dependents`, `analyze_grpc`
-and `analyze_impact`, and the `query` of `search_docs`. `visualize_mesh` has no subject.
+and `analyze_impact`, and the `query` of `search_docs`. `visualize_mesh` has no subject, except in its event view, where the subject is the `event`.
 
 ### When a rule applies
 `ToolRegistry::invoke` (`crates/mesh-server/src/tools/mod.rs`) consults the rules before the tool

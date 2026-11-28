@@ -4,8 +4,7 @@ use crate::tools::{McpTool, ToolError, ToolOutput};
 use mesh_core::{AppState, CompactStr, FlowBounds, FlowDirection, FlowEntry};
 use mesh_parsers::topology::{display_name, inline_code_text};
 use mesh_parsers::{
-    render_flow_view, Aggregate, FlowViewInput, GraphRenderer, TopologyOptions,
-    MAX_FLOW_VIEW_NODES,
+    render_flow_view, Aggregate, FlowViewInput, GraphRenderer, TopologyOptions, MAX_FLOW_VIEW_NODES,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -341,7 +340,7 @@ fn run_event_view(
         limit,
         tests_hidden: !include_tests,
     });
-    Ok(ToolOutput::text(crate::tools::analyze_impact::with_literal_clash_note(
-        text, graph, event,
-    )))
+    Ok(ToolOutput::text(
+        crate::tools::analyze_impact::with_literal_clash_note(text, graph, event),
+    ))
 }
