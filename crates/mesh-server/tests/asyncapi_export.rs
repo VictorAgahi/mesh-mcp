@@ -995,6 +995,35 @@ async fn a_declared_side_that_is_not_complete_never_reports_undeclared_channels(
 }
 
 #[tokio::test]
+async fn an_overflowed_rejected_list_makes_the_declared_side_incomplete() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "mesh-mcp.toml", CONFIG);
+    write(
+        dir.path(),
+        "package.json",
+        "{\"name\":\"w\",\"dependencies\":{\"@nestjs/microservices\":\"^10\"}}",
+    );
+    write(dir.path(), "src/p.ts", NEST_PUBLISHER);
+    write(
+        dir.path(),
+        "asyncapi.yaml",
+        "asyncapi: 3.0.0\nchannels:\n  other:\n    address: other.topic\n",
+    );
+    // 10,001 files the guard rejects (a null byte): the index lists at most 10,000 of them, so an
+    // AsyncAPI document may be among those it does not name.
+    for i in 0..=10_000 {
+        std::fs::write(dir.path().join(format!("blob{i}.ts")), b"\0\0").expect("write");
+    }
+    let page = text(&state_in(dir.path()), json!({"mode": "diff"})).await;
+    assert_eq!(
+        sections(&page),
+        (vec![], vec!["orders.noaddr".to_string()]),
+        "{page}"
+    );
+    assert!(page.contains("rejected path(s) are not listed"), "{page}");
+}
+
+#[tokio::test]
 async fn the_scope_is_applied_before_the_declared_document_cap() {
     let dir = tempfile::tempdir().expect("tempdir");
     write(dir.path(), "mesh-mcp.toml", CONFIG);
