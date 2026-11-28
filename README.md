@@ -185,7 +185,7 @@ classes, interfaces, functions/methods and similar symbols usable by `smart_sear
 | Rust | yes | yes | tonic service implementations (servers only) | rdkafka | axum `route`, actix-web attribute macros |
 | C++ | yes | yes (quoted `#include`) | servers deriving `::grpc::Service` | — | — |
 | Kotlin | yes | — | `@GrpcService` classes tagged; no clients | `@KafkaListener`, kafka-clients `subscribe`/`send` | Spring annotations |
-| C# | yes | — | — | Confluent.Kafka producers/consumers (string-literal topics) | ASP.NET attributes (`[HttpGet]`) |
+| C# | yes | — | — | Confluent.Kafka producers/consumers (string-literal topics); MassTransit, NServiceBus and Azure Service Bus (`IConsumer<T>` / `IHandleMessages<T>` classes, `Publish` / `Send`, `ReceiveEndpoint`, `CreateSender` / `CreateProcessor`, `[ServiceBusTrigger]`) | ASP.NET attributes (`[HttpGet]`) |
 | Ruby, PHP, Swift, Scala | yes | — | — | — | Rails routes, Symfony / Laravel, Vapor, Akka HTTP (one idiom each) |
 | Protobuf | services, methods, messages | `import` | contract source of truth | — | — |
 | OpenAPI / AsyncAPI YAML | paths, channels | — | — | AsyncAPI channels | OpenAPI paths |

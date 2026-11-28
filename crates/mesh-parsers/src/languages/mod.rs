@@ -1,5 +1,6 @@
 mod call_support;
 pub mod cpp;
+mod cs_brokers;
 pub mod csharp;
 pub mod go;
 mod go_brokers;
@@ -286,6 +287,11 @@ pub struct FileIndex {
     /// `IndexHealth::files_go_brokers_capped`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub go_brokers_capped: bool,
+    /// The per-file cap on C# broker sites (`MAX_CS_BROKER_SITES_PER_FILE`: MassTransit,
+    /// NServiceBus, Azure Service Bus in C#) cut sites of this file: counted in
+    /// `IndexHealth::files_cs_brokers_capped`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cs_brokers_capped: bool,
     /// Payload facts (9.0 T11): the payload type each producer / consumer site uses where it is
     /// statically visible, and the fields of the types this file declares (TypeScript /
     /// JavaScript and Java). Names, declared types and lines only, never a value.
@@ -372,6 +378,7 @@ impl FileIndex {
         self.jvm_brokers_capped |= other.jvm_brokers_capped;
         self.py_brokers_capped |= other.py_brokers_capped;
         self.go_brokers_capped |= other.go_brokers_capped;
+        self.cs_brokers_capped |= other.cs_brokers_capped;
         self.payload.merge(other.payload);
     }
 
@@ -977,6 +984,10 @@ pub const MAX_PY_BROKER_SITES_PER_FILE: usize = 2_000;
 /// one file registers; the rest are dropped and the file is counted in
 /// `IndexHealth::files_go_brokers_capped` (never silent).
 pub const MAX_GO_BROKER_SITES_PER_FILE: usize = 2_000;
+/// Most C# broker sites (MassTransit, NServiceBus and Azure Service Bus producers and consumers)
+/// one file registers; the rest are dropped and the file is counted in
+/// `IndexHealth::files_cs_brokers_capped` (never silent).
+pub const MAX_CS_BROKER_SITES_PER_FILE: usize = 2_000;
 
 pub struct PolyglotIndexer;
 
@@ -1730,9 +1741,12 @@ impl PolyglotIndexer {
                 }
             }
             LanguageKind::CSharp => {
-                if let Some((nodes, relations)) = parsed!(|tree| {
-                    csharp::CSharpExtractor::extract_with_relations(
-                        file_path, content, repo_id, tree,
+                if let Some(((nodes, relations), brokers)) = parsed!(|tree| {
+                    (
+                        csharp::CSharpExtractor::extract_with_relations(
+                            file_path, content, repo_id, tree,
+                        ),
+                        cs_brokers::scan(tree, content),
                     )
                 }) {
                     for (i, topic) in relations.producers {
@@ -1742,8 +1756,14 @@ impl PolyglotIndexer {
                         out.consumers.push((i, topic));
                     }
                     out.nodes = nodes;
-                    // Confluent.Kafka is the only broker detected.
-                    out.tag_brokers(Broker::Kafka);
+                    // MassTransit, NServiceBus and Azure Service Bus (9.0 T8d), each under its
+                    // own broker where the file shows it, else none.
+                    let anchor: FilePath = Arc::from(file_path);
+                    let (unsure_p, unsure_c) =
+                        cs_brokers::apply(brokers, &mut out, &anchor, repo_id);
+                    // Whatever is left is Confluent.Kafka, except a site whose broker is not
+                    // statically known (a MassTransit consumer of another file's bus setup).
+                    out.tag_brokers_except(Broker::Kafka, &unsure_p, &unsure_c);
                 }
             }
             LanguageKind::Ruby => {
@@ -2247,6 +2267,7 @@ mod tests {
             jvm_brokers_capped: false,
             py_brokers_capped: false,
             go_brokers_capped: false,
+            cs_brokers_capped: false,
             payload: mesh_core::PayloadFacts::default(),
         };
         let before = format!("{index:?}");

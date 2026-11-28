@@ -244,6 +244,11 @@ pub struct IndexHealth {
     /// dropped sites: the sites past the cap are not registered. Counted like `files_scanned`.
     #[serde(default)]
     pub files_go_brokers_capped: usize,
+    /// Files where the per-file cap on C# broker sites (MassTransit, NServiceBus, Azure Service
+    /// Bus) dropped sites: the sites past the cap are not registered. Counted like
+    /// `files_scanned`.
+    #[serde(default)]
+    pub files_cs_brokers_capped: usize,
 }
 
 /// Whether `path` is a file no MeshMCP extractor or search reads for meaning:
@@ -464,6 +469,18 @@ impl IndexHealth {
     #[inline]
     pub fn go_brokers_truncated(&self) -> bool {
         self.files_go_brokers_capped > 0
+    }
+
+    /// One file's C# broker site cap (`FileIndex::cs_brokers_capped`).
+    #[inline]
+    pub fn record_cs_brokers(&mut self, capped: bool) {
+        self.files_cs_brokers_capped += usize::from(capped);
+    }
+
+    /// Whether the C# broker site cap dropped events: some broker sites of C# files are missing.
+    #[inline]
+    pub fn cs_brokers_truncated(&self) -> bool {
+        self.files_cs_brokers_capped > 0
     }
 
     /// Whether the in-process site cap dropped events: some bus sites or schedules are missing.
@@ -760,6 +777,15 @@ impl IndexHealth {
                 self.files_go_brokers_capped
             );
         }
+        if self.files_cs_brokers_capped > 0 {
+            let _ = writeln!(
+                out,
+                "    {} file(s) cut by the C# broker site cap (MassTransit / NServiceBus / Azure Service \
+                 Bus; docs/parser-support.md, section 3.12): the sites past the cap are not \
+                 registered",
+                self.files_cs_brokers_capped
+            );
+        }
         if self.files_declared_capped > 0 {
             let _ = writeln!(
                 out,
@@ -872,6 +898,7 @@ impl IndexHealth {
         self.files_jvm_brokers_capped += other.files_jvm_brokers_capped;
         self.files_py_brokers_capped += other.files_py_brokers_capped;
         self.files_go_brokers_capped += other.files_go_brokers_capped;
+        self.files_cs_brokers_capped += other.files_cs_brokers_capped;
         self.files_skipped_non_source += other.files_skipped_non_source;
         // The calls-layer counters are the graph's, set after the reconcile.
     }

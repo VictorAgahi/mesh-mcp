@@ -87,6 +87,13 @@ impl CSharpExtractor {
         }
     }
 
+    /// Whether a topic literal may become a topic name (commandment 5): not a connection string,
+    /// a URL, a token or a password-shaped value (`member_consts::constant_is_a_name`, the rule
+    /// of the C# broker pass). A refused literal registers nothing.
+    fn topic_is_a_name(topic: &str) -> bool {
+        mesh_core::member_consts::constant_is_a_name("", topic)
+    }
+
     /// Only a genuine string literal (or a `TopicPartition("...")` wrapping
     /// one) counts as a topic. A bare `identifier` argument used to be
     /// emitted verbatim as the "topic" — e.g. `producer.Produce(topic, ...)`
@@ -105,7 +112,9 @@ impl CSharpExtractor {
                 if let Ok(text) = expr.utf8_text(source) {
                     let unquoted = text.trim_matches('"');
                     if !unquoted.is_empty() {
-                        return Some(CompactStr::new(unquoted));
+                        // The first literal is the topic: a refused one ends the search, so a
+                        // later literal (the payload) never takes its place.
+                        return Self::topic_is_a_name(unquoted).then(|| CompactStr::new(unquoted));
                     }
                 }
             }
@@ -140,7 +149,7 @@ impl CSharpExtractor {
         if unwrapped.kind() == "string_literal" {
             let text = unwrapped.utf8_text(source).ok()?;
             let unquoted = text.trim_matches('"');
-            if !unquoted.is_empty() {
+            if !unquoted.is_empty() && Self::topic_is_a_name(unquoted) {
                 return Some(CompactStr::new(unquoted));
             }
         }
