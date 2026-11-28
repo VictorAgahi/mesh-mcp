@@ -22,6 +22,8 @@ pub struct CrawlReport {
     /// mutual cycle), outside the root, out of depth budget, or over
     /// [`MAX_FOLLOWED_DIR_SYMLINKS`].
     pub symlinks_not_followed: usize,
+    /// Directory symlink targets walked (each once, at most [`MAX_FOLLOWED_DIR_SYMLINKS`]).
+    pub symlinks_followed: usize,
 }
 
 /// The default exclude pattern for dotenv files (`Config`'s `exclude_patterns`).
@@ -423,6 +425,7 @@ impl FilesystemCrawler {
         CrawlReport {
             files,
             symlinks_not_followed: not_followed,
+            symlinks_followed: followed,
         }
     }
 
@@ -772,7 +775,7 @@ mod tests {
     /// Crawls `root` (a fixture directory) and returns its files relative to it, sorted, plus the
     /// not-followed count.
     #[cfg(unix)]
-    fn crawl_rel(root: &Path, depth: usize) -> (Vec<String>, usize) {
+    fn crawl_rel(root: &Path, depth: usize) -> (Vec<String>, usize, usize) {
         let canon = dunce::canonicalize(root).expect("canon");
         let scope = ValidatedScope::resolve(&canon.to_string_lossy(), std::slice::from_ref(&canon))
             .expect("scope");
@@ -791,7 +794,7 @@ mod tests {
                     .into_owned()
             })
             .collect();
-        (rel, report.symlinks_not_followed)
+        (rel, report.symlinks_not_followed, report.symlinks_followed)
     }
 
     #[cfg(unix)]
@@ -807,9 +810,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_file(&tmp.path().join("src/real.rs"));
         std::os::unix::fs::symlink("..", tmp.path().join("src/loop")).expect("symlink");
-        let (files, skipped) = crawl_rel(tmp.path(), 10);
+        let (files, skipped, followed) = crawl_rel(tmp.path(), 10);
         assert_eq!(files, ["src/real.rs"]);
         assert_eq!(skipped, 1);
+        assert_eq!(followed, 0);
     }
 
     #[cfg(unix)]
@@ -818,9 +822,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_file(&tmp.path().join("d/a.rs"));
         std::os::unix::fs::symlink(".", tmp.path().join("d/self")).expect("symlink");
-        let (files, skipped) = crawl_rel(tmp.path(), 10);
+        let (files, skipped, followed) = crawl_rel(tmp.path(), 10);
         assert_eq!(files, ["d/a.rs"]);
         assert_eq!(skipped, 1);
+        assert_eq!(followed, 0);
     }
 
     #[cfg(unix)]
@@ -831,9 +836,10 @@ mod tests {
         write_file(&tmp.path().join("b/y.rs"));
         std::os::unix::fs::symlink("../b", tmp.path().join("a/to_b")).expect("symlink");
         std::os::unix::fs::symlink("../a", tmp.path().join("b/to_a")).expect("symlink");
-        let (files, skipped) = crawl_rel(tmp.path(), 10);
+        let (files, skipped, followed) = crawl_rel(tmp.path(), 10);
         assert_eq!(files, ["a/x.rs", "b/y.rs"]);
         assert_eq!(skipped, 2);
+        assert_eq!(followed, 0);
     }
 
     #[cfg(unix)]
@@ -842,9 +848,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_file(&tmp.path().join("src/a/x.rs"));
         std::os::unix::fs::symlink("a", tmp.path().join("src/b")).expect("symlink");
-        let (files, skipped) = crawl_rel(tmp.path(), 10);
+        let (files, skipped, followed) = crawl_rel(tmp.path(), 10);
         assert_eq!(files, ["src/a/x.rs"]);
         assert_eq!(skipped, 1);
+        assert_eq!(followed, 0);
     }
 
     #[cfg(unix)]
@@ -854,9 +861,10 @@ mod tests {
         write_file(&tmp.path().join("ws/in.rs"));
         write_file(&tmp.path().join("outside/secret.rs"));
         std::os::unix::fs::symlink("../outside", tmp.path().join("ws/out")).expect("symlink");
-        let (files, skipped) = crawl_rel(&tmp.path().join("ws"), 10);
+        let (files, skipped, followed) = crawl_rel(&tmp.path().join("ws"), 10);
         assert_eq!(files, ["in.rs"]);
         assert_eq!(skipped, 1);
+        assert_eq!(followed, 0);
     }
 
     /// The monorepo feature stays: a link to a directory the walk's own depth never reaches is
@@ -867,9 +875,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_file(&tmp.path().join("a/b/c/d/e/f.rs"));
         std::os::unix::fs::symlink("a/b/c/d/e", tmp.path().join("link")).expect("symlink");
-        let (files, skipped) = crawl_rel(tmp.path(), 3);
+        let (files, skipped, followed) = crawl_rel(tmp.path(), 3);
         assert_eq!(files, ["a/b/c/d/e/f.rs"]);
         assert_eq!(skipped, 0);
+        assert_eq!(followed, 1);
     }
 
     /// The depth budget is shared: a link at depth 2 of a budget of 2 has nothing left to walk.
@@ -880,9 +889,10 @@ mod tests {
         write_file(&tmp.path().join("a/b/c/d/f.rs"));
         std::fs::create_dir_all(tmp.path().join("x")).expect("mkdir");
         std::os::unix::fs::symlink("../a/b/c/d", tmp.path().join("x/link")).expect("symlink");
-        let (files, skipped) = crawl_rel(tmp.path(), 2);
+        let (files, skipped, followed) = crawl_rel(tmp.path(), 2);
         assert!(files.is_empty(), "{files:?}");
         assert_eq!(skipped, 1);
+        assert_eq!(followed, 0);
     }
 
     #[cfg(unix)]
@@ -894,11 +904,12 @@ mod tests {
             deep.push("d");
         }
         write_file(&deep.join("leaf.rs"));
-        let (files, skipped) = crawl_rel(tmp.path(), 256);
+        let (files, skipped, followed) = crawl_rel(tmp.path(), 256);
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("d/leaf.rs"), "{}", files[0]);
         assert_eq!(files[0].matches('/').count(), 200);
         assert_eq!(skipped, 0);
+        assert_eq!(followed, 0);
     }
 
     /// Link targets are walked at most MAX_FOLLOWED_DIR_SYMLINKS times; the rest are counted.
@@ -911,9 +922,10 @@ mod tests {
             std::os::unix::fs::symlink(format!("x/y/t{i}"), tmp.path().join(format!("l{i}")))
                 .expect("symlink");
         }
-        let (files, skipped) = crawl_rel(tmp.path(), 2);
+        let (files, skipped, followed) = crawl_rel(tmp.path(), 2);
         assert_eq!(files.len(), 1024);
         assert_eq!(skipped, 6);
+        assert_eq!(followed, 1024);
     }
 
     #[test]
