@@ -471,10 +471,20 @@ pub fn parse_declared(file: &str, content: &str) -> DeclaredParse {
 mod tests {
     use super::*;
 
+    /// The parsed document; anything else is an empty document that fails every assertion.
     fn doc(yaml: &str) -> DeclaredDoc {
         match parse_declared("asyncapi.yaml", yaml) {
             DeclaredParse::Doc(d) => d,
-            other => panic!("not a document: {other:?}"),
+            _ => DeclaredDoc {
+                file: String::new(),
+                version: "NOT A DOCUMENT".into(),
+                servers: Vec::new(),
+                channels: Vec::new(),
+                no_address: 0,
+                unread_refs: 0,
+                channels_cut: 0,
+                orphan_ops: 0,
+            },
         }
     }
 

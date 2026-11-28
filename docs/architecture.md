@@ -204,6 +204,19 @@ Placeholder and wildcard hubs are left out.
 
 ---
 
+### 3.6 AsyncAPI export and declared-versus-code diff (9.0 T12)
+
+`export_asyncapi` adds no state: it reads the snapshot like `event_anomalies` (the topic hubs per
+broker, the payload facts of 3.5) and, for `mode: diff`, re-reads the declared AsyncAPI files the
+index found, through the path jail (3). `ContractGraph::observed_events` turns the graph into
+owned rows (key, broker, sites as `path:line`, resolved payload types) before anything is
+rendered, so the document builder and the diff are pure functions of plain data in
+`mesh-parsers/src/asyncapi/`. Channels and operations are the hubs and sites of 3.4, brokers stay
+separate channels, and a site whose broker is unknown is `heuristic` and has no AsyncAPI server.
+Output is sorted, paged with a rule that a page is a valid standalone document of fewer channels
+(never a cut one), and bounded (28 KB of document per page, 40 operations per direction per channel,
+the 48 KB tool cap only a backstop). Details and the mapping table: [mcp-tools](mcp-tools.md#tool-10-export_asyncapi).
+
 ## 4. Path jail: `ValidatedScope`
 
 Every path that a tool receives (the `scope` of `smart_search`, a `.proto` path given to

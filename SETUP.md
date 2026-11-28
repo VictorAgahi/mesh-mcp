@@ -333,7 +333,7 @@ The server speaks JSON-RPC on stdio, so you can test it without an agent:
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | mesh-mcp run --standalone
 ```
 
-You should get nine tools back. To try a real query:
+You should get ten tools back. To try a real query:
 
 ```bash
 printf '%s\n' \

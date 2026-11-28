@@ -1,0 +1,84 @@
+# Hand-annotated truth for `export_asyncapi` (9.0 T12), read from the source of
+# examples/eda/asyncapi-declared (and its two declared documents). Never generated from tool
+# output. Consumed by crates/mesh-server/tests/asyncapi_export.rs (not by check_golden.py or
+# score_events.py: this file is not a `<corpus>.expected.yaml`, so the scorer totals do not move).
+#
+# `export.channels`: one AsyncAPI channel per resolved topic hub (per broker). `sends` and
+# `receives` are the `path:line` of the producer and consumer sites (the line of the call, or of
+# the method or annotation that declares the handler). `schema` is the payload type T11 resolves
+# (its declaration), absent when the payload is an inline object (no type name).
+corpus: asyncapi-declared
+root: examples/eda/asyncapi-declared
+export:
+  channels:
+    - id: bull_email
+      address: email
+      broker: bull
+      sends: ["src/email.queue.ts:10"]
+      receives: ["src/email.queue.ts:12"]
+      schema: "EmailJob src/email.queue.ts:4"
+    - id: kafka_payments.captured
+      address: payments.captured
+      broker: kafka
+      sends: ["src/main/java/com/acme/pay/PaymentPublisher.java:15"]
+      receives: ["src/main/java/com/acme/pay/LedgerListener.java:10"]
+      schema: "PaymentEvent src/main/java/com/acme/pay/PaymentEvent.java:4"
+    - id: order.audit.eu
+      address: order.audit.eu
+      broker: unknown
+      sends: ["src/order.publisher.ts:20"]
+      receives: []
+    - id: order.created
+      address: order.created
+      broker: unknown
+      sends: ["src/order.publisher.ts:11"]
+      receives: ["src/billing.consumer.ts:8"]
+      schema: "OrderCreated src/order.events.ts:2"
+    - id: order.legacy
+      address: order.legacy
+      broker: unknown
+      sends: ["src/order.publisher.ts:25"]
+      receives: []
+    - id: order.shipped
+      address: order.shipped
+      broker: unknown
+      sends: ["src/order.publisher.ts:15"]
+      receives: ["src/billing.consumer.ts:13"]
+      schema: "ShipmentEvent src/order.events.ts:9"
+  # Not channels: a `${KEY}` placeholder no file resolves (LedgerListener.java:15).
+  not_statically_resolved: ["${ledger.parking.topic}"]
+  # Channel ids and addresses of the two DECLARED documents: they are the declaration, never
+  # observed channels of the export.
+  must_not_export: ["order.refunded.v1", "orderrefunded", "ordercreated", "order.audit.{region}"]
+diff:
+  documents:
+    - {file: "asyncapi.yaml", version: "3.0.0", channels: 5, operations: 6}
+    - {file: "legacy/asyncapi.v2.yaml", version: "2.6.0", channels: 1, operations: 1}
+  # asyncapi.yaml:25 declares order.refunded.v1 (channel orderRefunded) and no code touches it.
+  declared_not_in_code:
+    - "order.refunded.v1 asyncapi.yaml:25"
+  in_code_not_declared:
+    # asyncapi.yaml: payments.captured declares only a receive operation; the code also sends.
+    - "payments.captured send"
+    # legacy/asyncapi.v2.yaml: email declares only `subscribe` (the application sends); the Worker receives.
+    - "email receive"
+    # declared nowhere.
+    - "order.legacy channel"
+  payload_disagreement:
+    # asyncapi.yaml: total is a string, the code's OrderCreated sends a number; currency is not declared.
+    - key: order.created
+      findings:
+        - "field `total`: declared string, code number"
+        - "code type `OrderCreated` has field `currency` the declaration does not list"
+    # legacy/asyncapi.v2.yaml: EmailJob has no `priority`.
+    - key: email
+      findings:
+        - "code type `EmailJob` has field `priority` the declaration does not list"
+  # asyncapi.yaml: payments.captured is on the amqp server, the code is Spring Kafka.
+  broker_disagreement: ["payments.captured"]
+  # Decoys: no row of any class for these.
+  must_not_flag:
+    - order.shipped        # declared and coded the same way, both directions
+    - order.audit.eu       # heard by the declared `order.audit.{region}` (wildcard match)
+    - email broker         # redis admits the BullMQ queue library
+  unresolved_topics: 1

@@ -22,7 +22,7 @@ consumer in another service, and a context window filled with function bodies th
 read to find a signature.
 
 MeshMCP builds that cross-service map once, keeps it in memory, updates it as files change, and
-exposes it through nine MCP tools.
+exposes it through ten MCP tools.
 
 ---
 
@@ -47,7 +47,7 @@ exposes it through nine MCP tools.
 
 ---
 
-## The nine tools
+## The ten tools
 
 | Tool | Answers |
 | :--- | :--- |
@@ -60,6 +60,7 @@ exposes it through nine MCP tools.
 | `diff_mesh` | What does my branch change in the mesh, and what will it break? Contract-level diff of the working tree against a Git base (declarations, RPCs, routes, topics, imports), the callers and dependents of what was removed or changed, and the wire-format check of every changed `.proto`. |
 | `trace_flow` | What does handling this event, route or handler trigger end to end, or what ends up publishing this event? One block per hop: entry site, each resolved call (callee declaration and call site `path:line`), the publish, then the next consumers; per-step and per-chain confidence, bounded and paged by hop. |
 | `event_anomalies` | Where does the event graph look wrong? Topics published but never consumed, consumed but never published, cycles (chains that loop back), abnormal fan-out, test-only consumers and publisher-versus-consumer payload mismatches (TypeScript / JavaScript and Java payload types) in one report; a placeholder, wildcard or dead-letter topic is listed as unresolved, never as an anomaly. |
+| `export_asyncapi` | What does the event graph look like as an AsyncAPI 3.0 document, and does it match the declared one? `mode: export`: the observed channels, `send` / `receive` operations with `path:line`, payload schemas where the type is known, one server per known broker; unresolved topics are counted, never exported. `mode: diff`: declared channels, operations, payloads and brokers against the code. |
 
 Arguments, output formats and error handling: [docs/mcp-tools.md](docs/mcp-tools.md).
 

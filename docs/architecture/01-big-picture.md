@@ -23,7 +23,7 @@ program):
 | :--- | :--- |
 | `mesh-core` | Data types, the graph, configuration, the path jail, the crawler, the file watcher, the parse cache, the audit log. No tree-sitter code. |
 | `mesh-parsers` | Everything that reads source code: tree-sitter grammars, one extractor per language, body stripping ("decapitation"), output formatting, graph rendering. |
-| `mesh-server` | The `mesh-mcp` program: the message loop, the nine tools, the indexer that builds the index, the command-line commands. |
+| `mesh-server` | The `mesh-mcp` program: the message loop, the ten tools, the indexer that builds the index, the command-line commands. |
 | `mesh-daemon` | The `meshd` program: socket server, idle shutdown, Linux network sandbox, config-following host. |
 
 The dependency direction is one-way: `mesh-daemon` uses `mesh-server`, which uses `mesh-core` and

@@ -38,7 +38,7 @@ type checker behind any of them.
 | C# | 2 | [2.7](#27-kotlin-and-c-level-2) |
 | Ruby, PHP, Swift, Scala | 1 (plus one route idiom each) | [2.8](#28-ruby-php-swift-scala-level-1) |
 | Protobuf | contract source | [3.1](#31-protobuf) |
-| OpenAPI, AsyncAPI, Spring properties | contract source | [3.2](#32-openapi-asyncapi-spring-properties) |
+| OpenAPI, AsyncAPI, Spring properties | contract source | [3.2](#32-openapi-asyncapi-spring-properties); AsyncAPI also read back for `export_asyncapi`: [3.12](#312-asyncapi-export-and-declared-versus-code-diff-90-t12) |
 | Markdown | docs | [3.3](#33-markdown) |
 | SQL (`.sql`, and the SQL strings of TypeScript / JavaScript, Go, Java, Python) | events only: outbox inserts, `NOTIFY` / `pg_notify`, `LISTEN` | [3.4](#34-sql) |
 | Declared producer helpers (`[[engines.contracts.producer_calls]]`, TypeScript / JavaScript) | producers: calls of an outbox or publish helper the config names | [3.11](#311-declared-producer-calls) |
@@ -836,6 +836,36 @@ callee = "streamBus.publish"        # no keys: argument `arg` (default 0) is the
 
 Fixture and ground truth: `examples/eda/declared-producers` and
 `tests/golden/events/declared-producers.expected.yaml`.
+
+### 3.12 AsyncAPI export and declared-versus-code diff (9.0 T12)
+
+No new extraction and no parse-cache change: the tool `export_asyncapi` ([mcp-tools](mcp-tools.md#tool-10-export_asyncapi))
+reads what the indexer already holds. The OBSERVED side is the topic hubs of the graph (per broker,
+test-file sites left out) with the payload types of 3.5 (`ContractGraph::observed_events`,
+`ContractGraph::site_payloads`, `contracts/asyncapi.rs`); the rendering is `mesh-parsers`
+`asyncapi/` (`export.rs`: AsyncAPI 3.0 document, `diff.rs`: the comparison, `declared.rs`: the reader).
+
+- **Declared documents**: the files that contributed `package == "asyncapi"` channel nodes (3.2).
+  Those nodes are the declaration, so the observed side leaves them out (`ObservedEvents::declared_sites`);
+  the declared file itself is read again at call time (path jail, no symlink, schema size budget, at
+  most 20 per call), because the indexer keeps only channel names. The reader (`declared.rs`) takes
+  AsyncAPI 2.x and 3.x: servers (protocol), channels (version 3 `address`, version 2 the channel name),
+  operations (`send` / `receive`; version 2 `publish` is `receive` and `subscribe` is `send`) and the
+  message payload properties (name, JSON family, required). Local `$ref`s are followed (8 hops); an
+  external or dangling one is counted and never guessed. A version 3 channel with a null `address` is
+  dynamic and not compared.
+- **Keys**: `normalize_topic_key`, a `{param}` token read as a one-token wildcard of the key's
+  dialect (`.` or `/`), a `kafka:orders` qualifier split off, wildcards matched with `subject_matches`
+  on either side. Brokers: a declared server protocol admits a set of brokers (`amqp`: RabbitMQ, Service
+  Bus, Event Hubs; `redis`: Redis, Bull, BeeQueue; a broker's own slug is that broker); a
+  protocol naming no broker, or a code channel of unknown broker, makes no broker claim.
+- **Unresolved topics**: a `${KEY}` placeholder topic is never a channel of the export or a row of the
+  diff; it is counted (`x-mesh.not_statically_resolved`, the diff footer).
+
+Known limits: version 3 channel nodes are still indexed under their channel id, not their `address`
+(3.2), so a declared channel id also shows as a topic name in `event_anomalies`; the export is
+read from the observed graph only, so what the extractors do not see (3.4 runtime-built names) is
+absent from it, and the document says so in its description and counts.
 
 ## 4. What every level shares
 

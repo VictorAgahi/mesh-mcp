@@ -124,9 +124,6 @@ impl Admit {
 /// The brokers a declared server protocol can be, `None` when it names no broker.
 fn protocol_brokers(protocol: &str) -> Option<Vec<Broker>> {
     let p = protocol.to_ascii_lowercase();
-    if let Some(b) = Broker::from_slug(&p) {
-        return Some(vec![b]);
-    }
     Some(match p.as_str() {
         "kafka-secure" => vec![Broker::Kafka],
         "amqp" | "amqps" | "amqp1.0" => {
@@ -138,7 +135,8 @@ fn protocol_brokers(protocol: &str) -> Option<Vec<Broker>> {
         "googlepubsub" => vec![Broker::PubSub],
         "pulsar+ssl" => vec![Broker::Pulsar],
         "stomps" => vec![Broker::Stomp],
-        _ => return None,
+        // A protocol that is a broker's own slug (`kafka`, `nats`, `sqs`) is that broker.
+        _ => return Broker::from_slug(&p).map(|b| vec![b]),
     })
 }
 
@@ -579,7 +577,12 @@ fn row_line(r: &DiffRow) -> String {
         format!("`{key}`")
     };
     let broker = r.broker.map_or("broker unknown", Broker::slug);
-    let mut s = format!("- {key} [{broker}]");
+    // A broker row is about a mismatch of brokers: no single broker label fits it.
+    let mut s = if r.kind == RowKind::Broker {
+        format!("- {key}")
+    } else {
+        format!("- {key} [{broker}]")
+    };
     if let Some(d) = &r.declared {
         let _ = write!(s, " declared at `{d}`");
     }
@@ -771,7 +774,7 @@ mod tests {
     fn declared(yaml: &str) -> Vec<(DeclaredDoc, bool)> {
         match parse_declared("asyncapi.yaml", yaml) {
             DeclaredParse::Doc(d) => vec![(d, true)],
-            other => panic!("{other:?}"),
+            _ => Vec::new(),
         }
     }
 
@@ -901,6 +904,31 @@ operations:
         let ws = DOC.replace("protocol: amqp", "protocol: ws");
         let r = diff_asyncapi(&observed(), &declared(&ws));
         assert!(rows(&r, RowClass::BrokerDisagreement).is_empty());
+    }
+
+    #[test]
+    fn a_redis_server_admits_the_queue_libraries_on_redis() {
+        let redis = "asyncapi: 2.6.0\nservers:\n  q: {url: r, protocol: redis}\nchannels:\n  jobs:\n    publish:\n      message: {payload: {type: object}}\n";
+        let mut o = ObservedSet::default();
+        o.channels.push(chan(
+            "jobs",
+            Some(Broker::Bull),
+            vec![site(false, "w.ts:1", ObsPayload::Untyped)],
+            vec![],
+        ));
+        assert!(rows(
+            &diff_asyncapi(&o, &declared(redis)),
+            RowClass::BrokerDisagreement
+        )
+        .is_empty());
+        o.channels[0].broker = Some(Broker::Kafka);
+        assert_eq!(
+            rows(
+                &diff_asyncapi(&o, &declared(redis)),
+                RowClass::BrokerDisagreement
+            ),
+            vec![("jobs".to_string(), RowKind::Broker)]
+        );
     }
 
     #[test]

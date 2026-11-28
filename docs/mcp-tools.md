@@ -1,6 +1,6 @@
 # MeshMCP MCP Tools Reference
 
-This document specifies the nine Model Context Protocol (MCP) tools exposed by MeshMCP: their arguments, output formats and error handling. The JSON schemas below are checked against the code by `test_mcp_tools_md_schema_drift_check` (`crates/mesh-server/src/tools/mod.rs`).
+This document specifies the ten Model Context Protocol (MCP) tools exposed by MeshMCP: their arguments, output formats and error handling. The JSON schemas below are checked against the code by `test_mcp_tools_md_schema_drift_check` (`crates/mesh-server/src/tools/mod.rs`).
 
 ---
 
@@ -36,6 +36,7 @@ graph LR
     T -->|diff_mesh| TDM[Branch Contract Diff & Impact]
     T -->|trace_flow| TF[End-to-End Event Chains, Hop by Hop]
     T -->|event_anomalies| TA[Event Anomaly Report]
+    T -->|export_asyncapi| TX[AsyncAPI 3 Export and Declared-vs-Code Diff]
 ```
 
 ---
@@ -1174,6 +1175,127 @@ known false positive in `tests/golden/events/anomalies.report.yaml`); a Python C
 is read only on a Celery origin (an app built by `Celery(...)` / `make_celery(...)`, a `celery` module or a `tasks` module; 9.0 T15,
 `docs/parser-support.md` 2.4), so a Locust load test shows no task, and a real task whose app comes
 from a module with another name is missed.
+
+### Tool 10: `export_asyncapi`
+
+#### Description
+AsyncAPI 3.0 view of the event graph (9.0 T12), in two modes. Surface decision: a tool of its own,
+not a class of `event_anomalies` or a section of `analyze_impact`. Its answer is a *document*
+(one valid AsyncAPI 3.0 file in a fenced block, with its own paging rule: a page is a complete
+standalone document of fewer channels, never a cut one), and its `diff` mode reads a second source
+(the workspace's declared AsyncAPI files, from disk) that no other tool reads; `event_anomalies`
+answers with rows over the graph alone, and `analyze_impact` answers for one named target.
+
+**`mode: export` (default)** renders the OBSERVED graph:
+
+| Graph | AsyncAPI 3 |
+| :--- | :--- |
+| a topic hub, per broker (two brokers sharing a name are two channels) | a **channel**: `address` is the engine's normalized topic key (lower case), the id is that key made safe, broker slug first when known (`kafka_payments.captured`); a wildcard subscription (`orders.*`) keeps its pattern as address (`x-mesh-wildcard`) |
+| a producer site | a `send` **operation** |
+| a consumer site | a `receive` **operation** |
+| each site | `x-mesh-source: path:line` and `x-mesh-confidence` (`exact` / `heuristic` / `ambiguous`) on the operation; the channel carries the weakest |
+| the payload type the T11 payload check resolves for a site (TypeScript / JavaScript, Java: the same data as `event_anomalies` class `payload_mismatch`, not re-extracted) | a **message** (`components.messages`) whose payload is a **schema** (`components.schemas`): properties by JSON family (`string`, `number`, `boolean`, arrays of them; a named object type claims no JSON type), `required` for the non-optional fields, `x-mesh-source` of the declaration, `x-mesh-fields-incomplete` for a partial field list; the operation's `messages` references it. A site whose payload is not statically typed references no message and says why in `x-mesh-payload`; the channel counts them in `x-mesh-sites-without-typed-payload` |
+| a known broker | a **server** per broker (`protocol` is the AsyncAPI name: `kafka`, `amqp` for RabbitMQ, `googlepubsub`; other brokers keep their slug). Its `host` is `unresolved.invalid` (the RFC 6761 reserved name) with `x-mesh-host-known: false`: no host is ever guessed |
+| an unknown broker (a NestJS `@EventPattern`, a Python `@task`, a declarative pattern) | no server; `x-mesh-broker: unknown`, confidence at most `heuristic`, said in `x-mesh-broker-note` |
+| a topic named by a `${KEY}` placeholder no configuration resolved, or a name that fails the name gate | **not a channel**: counted in `x-mesh.not_statically_resolved.count` and (first page) listed with its sites; "not statically resolved" is not absence |
+| test-file sites, the channels a declared AsyncAPI file contributes to the graph | not counted (the header says how many were left out) |
+
+Bounds: at most 40 operations per direction on one channel (`x-mesh-operations-not-listed` counts
+the rest); the document of a page stays under 28 KB, so a page holds *at most* `limit` channels
+(default 20, 1 to 100) and fewer when the budget says so, never fewer than one. A page that is not
+the whole graph says `PARTIAL DOCUMENT`, the channel numbers it holds, how many are not in it and
+the `offset` of the next page (`x-mesh.partial`, `channels_not_shown_after`, `next_offset`); it is a
+valid AsyncAPI 3.0 document of its own channels (every `$ref` resolves inside it). Output is sorted
+(pages follow the address order then the broker, and the map of a page is sorted by channel id; ids
+are assigned over the whole graph so a channel keeps its id on every page and under every scope) and
+byte-identical across runs. `format: json` gives the same
+document as JSON. Topic and type names that are credential-shaped (the shared name gate; type and
+field names also `member_consts::identifier_is_credential_named`) never reach the document: a
+channel whose name fails the gate is counted as unresolved without its name, a type is `type name
+redacted`, a credential-shaped field is left out and counted (`x-mesh-fields-redacted`).
+
+**`mode: diff`** compares the declared AsyncAPI 2.x / 3.x documents the index found (files that
+contributed channels to the graph: named like `asyncapi.yaml`, or holding an `asyncapi:` key;
+`[engines.contracts.asyncapi]` scopes them) with the observed channels, under the engine's own
+keys: `normalize_topic_key` (lower case, enum members reduced), a `{param}` address token read as a
+one-token wildcard, a broker qualifier (`kafka:orders`) split off, and a wildcard on either side
+matched with `subject_matches` (a code topic `order.audit.eu` is heard by a declared
+`order.audit.{region}`: no row). Version 2 words direction from the user's side: `publish` is read as
+`receive`, `subscribe` as `send`.
+
+| Class | A row is... |
+| :--- | :--- |
+| declared, not in code | a declared channel no observed topic matches, or a declared operation (`send` / `receive`) whose direction no site of the matching channel has |
+| in code, not declared | an observed channel no declared channel matches, or a direction the code has on a channel whose declaration lists operations and not that one (a channel declared with no operation is compared by existence only) |
+| payload disagreement | per matching channel and code type: a declared required property absent from the code type, a code field the declaration does not list (only when the declared schema is complete: no `oneOf` / `anyOf` / `allOf`, no `additionalProperties: true`), a primitive type difference; `path:line` of the declaration and of the code type |
+| broker disagreement | the declared servers' protocols admit none of the brokers the code uses for the channel (`amqp` admits RabbitMQ, Service Bus, Event Hubs; `redis` admits Redis, Bull and BeeQueue; a protocol that is a broker's slug is that broker). A code channel of unknown broker, and a protocol that names no broker (`ws`, `http`), make no claim |
+
+Honesty rules the output repeats: "not in code" means not statically resolved in the indexed roots
+(the footer counts the `${KEY}` placeholder topics that were not compared and the files the index
+did not read, either of which can hide the other end); payloads are compared only where both sides
+are statically known and say what was not compared (an external or dangling `$ref`, a partial field
+list on either side, several declared messages none named like the code type, no typed payload in
+code); declared files are read from disk at call time, the code from the index, so an edit not yet
+re-indexed shows on one side only; with no declared document the answer says so and lists no
+"undeclared" row (an absent declaration is not "everything is undeclared"). A declared file is read
+only through the path jail, never through a symlink, within the schema size budget (1.5 MB for
+`asyncapi.yaml` / `asyncapi.json`, 384 KB otherwise), at most 20 per call; the YAML is streamed with
+the alias-expansion budget of the indexer. `limit` / `offset` page each class independently, like
+`event_anomalies`, and `scope` keeps the rows with a code site or a declared file under it (the
+analysis always reads every root).
+
+> **Negative constraints:** DO NOT USE to find who publishes or consumes one named event (use
+> `analyze_impact`), to trace a flow (use `trace_flow`), to list anomalies (use
+> `event_anomalies`), or for gRPC / HTTP contracts (use `analyze_grpc`). It does NOT write or modify
+> any AsyncAPI file, does NOT export OpenAPI, does NOT see topics built at runtime, does NOT read
+> payload types outside TypeScript / JavaScript and Java, and does NOT follow external `$ref`s of a
+> declared document.
+
+#### JSON Schema
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "mode": { "enum": ["export", "diff"] },
+    "scope": { "type": "string" },
+    "format": { "enum": ["yaml", "json"] },
+    "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "offset": { "type": "integer", "minimum": 0 }
+  }
+}
+```
+
+#### Sample Response (`examples/eda/asyncapi-declared`, `mode: diff`, abridged)
+```markdown
+## AsyncAPI declared-versus-code diff
+*2 declared document(s) (6 channel(s)) against 6 observed channel(s) over 1 root(s); rows shown for the whole workspace.*
+
+| Declared document | AsyncAPI | Channels | Operations |
+| :--- | :--- | ---: | ---: |
+| `asyncapi.yaml` | 3.0.0 | 5 | 6 |
+| `legacy/asyncapi.v2.yaml` | 2.6.0 | 1 | 1 |
+
+### Declared, not in code
+- `order.refunded.v1` [broker unknown] declared at `asyncapi.yaml:25`
+  - channel `orderRefunded`: no producer or consumer statically resolved
+
+### Payload disagreement
+- `order.created` [broker unknown] declared at `asyncapi.yaml:13`; in code at `src/order.events.ts:2`, `src/order.publisher.ts:11`, `src/billing.consumer.ts:8`
+  - field `total`: declared string, code number
+  - code type `OrderCreated` has field `currency` the declaration does not list
+
+### Broker disagreement
+- `payments.captured` declared at `asyncapi.yaml:29`; in code at `src/main/java/com/acme/pay/PaymentPublisher.java:15`, `src/main/java/com/acme/pay/LedgerListener.java:10`
+  - declared server protocol(s) `amqp`; the code uses `kafka`
+```
+
+Known limits: the export has no channel bindings (the broker is a server and `x-mesh-broker`, not a
+`bindings` object) and no `host`; the channel address is the engine's lower-case key, which is not
+the case-sensitive topic name when the code spells it with capitals; a v3 declared channel with no
+`address` (dynamic) and an external `$ref` are counted, not compared; payloads are
+compared by field name and primitive family only (a named object property is not compared); the AsyncAPI channel nodes a declared file contributes to the graph are indexed under
+their channel id (version 3) and are left out of the observed side, not re-keyed by `address`.
 
 ---
 

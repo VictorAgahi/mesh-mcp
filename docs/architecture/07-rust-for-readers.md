@@ -57,7 +57,7 @@ scope. You can lend a value out:
 
 A **trait** is an interface: a set of functions a type can implement. `McpTool`
 (`crates/mesh-server/src/tools/mod.rs`) says a tool has a `NAME`, an `Args` type, and a `run`
-function. Each of the nine tools implements it, and `ToolRegistry` handles all of them the same way.
+function. Each of the ten tools implements it, and `ToolRegistry` handles all of them the same way.
 The `derive` attribute (`#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]`) asks the
 compiler to generate trait implementations for you; `JsonSchema` is how the tool's argument schema and
 `#[serde(deny_unknown_fields)]` (reject unknown arguments) come for free.

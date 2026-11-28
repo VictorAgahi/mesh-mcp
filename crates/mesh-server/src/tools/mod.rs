@@ -2,6 +2,7 @@ pub mod analyze_grpc;
 pub mod analyze_impact;
 pub mod diff_mesh;
 pub mod event_anomalies;
+pub mod export_asyncapi;
 pub mod find_dependents;
 pub mod search_docs;
 pub mod smart_search;
@@ -15,6 +16,7 @@ use analyze_grpc::AnalyzeGrpcTool;
 use analyze_impact::AnalyzeImpactTool;
 use diff_mesh::DiffMeshTool;
 use event_anomalies::EventAnomaliesTool;
+use export_asyncapi::ExportAsyncApiTool;
 use find_dependents::FindDependentsTool;
 use mesh_core::AppState;
 use schemars::{schema_for, JsonSchema};
@@ -115,6 +117,7 @@ impl ToolRegistry {
                 ToolRegistry::describe::<DiffMeshTool>(),
                 ToolRegistry::describe::<TraceFlowTool>(),
                 ToolRegistry::describe::<EventAnomaliesTool>(),
+                ToolRegistry::describe::<ExportAsyncApiTool>(),
             ])
         });
         TOOLS.clone()
@@ -144,6 +147,7 @@ impl ToolRegistry {
                 | DiffMeshTool::NAME
                 | TraceFlowTool::NAME
                 | EventAnomaliesTool::NAME
+                | ExportAsyncApiTool::NAME
         ) || {
             #[cfg(feature = "test-util")]
             {
@@ -210,6 +214,9 @@ impl ToolRegistry {
             TraceFlowTool::NAME => Self::invoke::<TraceFlowTool>(arguments, state, session).await?,
             EventAnomaliesTool::NAME => {
                 Self::invoke::<EventAnomaliesTool>(arguments, state, session).await?
+            }
+            ExportAsyncApiTool::NAME => {
+                Self::invoke::<ExportAsyncApiTool>(arguments, state, session).await?
             }
             #[cfg(feature = "test-util")]
             TestSlowOpTool::NAME => {
@@ -1017,7 +1024,7 @@ roots = ["."]
             );
             let mut args = match name {
                 "smart_search" | "search_docs" => json!({ "query": "x" }),
-                "visualize_mesh" | "event_anomalies" => json!({}),
+                "visualize_mesh" | "event_anomalies" | "export_asyncapi" => json!({}),
                 // Refused before any `git` runs: only `_meta` acceptance is tested.
                 "diff_mesh" => json!({ "base": "--x" }),
                 _ => json!({ "target": "x" }),
@@ -1041,7 +1048,7 @@ roots = ["."]
     fn test_list_tools_contains_all_tools() {
         let tools = ToolRegistry::list_tools();
         let arr = tools.as_array().expect("tools array");
-        assert_eq!(arr.len(), 9);
+        assert_eq!(arr.len(), 10);
         let names: Vec<_> = arr.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"smart_search"));
         assert!(names.contains(&"find_dependents"));
@@ -1052,6 +1059,7 @@ roots = ["."]
         assert!(names.contains(&"diff_mesh"));
         assert!(names.contains(&"trace_flow"));
         assert!(names.contains(&"event_anomalies"));
+        assert!(names.contains(&"export_asyncapi"));
     }
 
     /// Regression test for Issue 3: assert generated JSON schemas match real tool structs

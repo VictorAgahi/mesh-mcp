@@ -1,0 +1,25 @@
+asyncapi: 2.6.0
+info:
+  title: Legacy email jobs
+  version: 0.1.0
+servers:
+  queue:
+    url: redis.internal:6379
+    protocol: redis
+channels:
+  email:
+    subscribe:
+      operationId: sendEmailJob
+      message:
+        payload:
+          $ref: '#/components/schemas/EmailJob'
+components:
+  schemas:
+    EmailJob:
+      type: object
+      required: [to]
+      properties:
+        to:
+          type: string
+        subject:
+          type: string

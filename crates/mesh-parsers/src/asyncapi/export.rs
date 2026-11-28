@@ -677,6 +677,94 @@ mod tests {
     }
 
     #[test]
+    fn untyped_sites_wildcards_and_protocol_names_are_stated() {
+        let mut w = o(
+            "orders.*",
+            Some(Broker::RabbitMq),
+            vec![
+                s(false, "a.ts:1", ObsPayload::Untyped),
+                s(true, "a.ts:2", ObsPayload::Undeclared),
+                s(true, "a.ts:3", ObsPayload::Ambiguous),
+            ],
+            vec![],
+        );
+        w.wildcard = true;
+        let set = ObservedSet {
+            channels: vec![w],
+            ..ObservedSet::default()
+        };
+        let d = document(&format_export(&set, &view(0, 10)));
+        let ch = &d["channels"]["rabbitmq_orders"];
+        assert_eq!(ch["address"], json!("orders.*"));
+        assert_eq!(ch["x-mesh-wildcard"], json!(true));
+        assert_eq!(ch["x-mesh-sites-without-typed-payload"], json!(3));
+        assert!(ch.get("messages").is_none());
+        let ops = d["operations"].as_object().expect("ops");
+        let payloads: BTreeSet<&str> = ops
+            .values()
+            .map(|op| op["x-mesh-payload"].as_str().expect("payload note"))
+            .collect();
+        assert_eq!(
+            payloads,
+            BTreeSet::from([
+                "not statically typed",
+                "names a type no indexed file declares",
+                "ambiguous: several declarations or two payloads on one node",
+            ])
+        );
+        // RabbitMQ is the `amqp` protocol, Pub/Sub `googlepubsub`; others keep their slug.
+        assert_eq!(d["servers"]["rabbitmq"]["protocol"], json!("amqp"));
+        assert_eq!(
+            d["servers"]["rabbitmq"]["host"],
+            json!("unresolved.invalid")
+        );
+        assert_eq!(d["servers"]["rabbitmq"]["x-mesh-host-known"], json!(false));
+        assert_eq!(protocol(Broker::PubSub), "googlepubsub");
+        assert_eq!(protocol(Broker::Nats), "nats");
+    }
+
+    #[test]
+    fn unresolved_topics_are_listed_on_the_first_page_only_and_always_counted() {
+        let set = ObservedSet {
+            channels: (0..3)
+                .map(|i| {
+                    o(
+                        &format!("t{i}"),
+                        None,
+                        vec![s(true, "a.ts:1", ObsPayload::Untyped)],
+                        vec![],
+                    )
+                })
+                .collect(),
+            unresolved: vec![super::super::ObsUnresolved {
+                key: "${LATER}".into(),
+                broker: None,
+                sites: vec!["a.ts:9".into()],
+                in_scope: true,
+            }],
+            ..ObservedSet::default()
+        };
+        let first = document(&format_export(&set, &view(0, 1)));
+        let second = document(&format_export(&set, &view(1, 1)));
+        for d in [&first, &second] {
+            assert_eq!(d["x-mesh"]["not_statically_resolved"]["count"], json!(1));
+        }
+        assert_eq!(
+            first["x-mesh"]["not_statically_resolved"]["topics_listed_on_first_page"][0]["name"],
+            json!("${LATER}")
+        );
+        assert_eq!(
+            second["x-mesh"]["not_statically_resolved"]["topics_listed_on_first_page"],
+            json!([])
+        );
+        // A channel is never listed as unresolved, nor the other way round.
+        assert!(!first["channels"]
+            .as_object()
+            .expect("channels")
+            .contains_key("${LATER}"));
+    }
+
+    #[test]
     fn a_page_never_reads_as_the_whole_document_and_always_advances() {
         let set = ObservedSet {
             channels: (0..30)
