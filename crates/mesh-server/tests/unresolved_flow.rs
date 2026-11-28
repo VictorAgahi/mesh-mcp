@@ -219,7 +219,7 @@ async fn a_cycle_terminates_and_is_stable() {
         "{a}"
     );
     // The notes say a consumer is listed once.
-    assert_eq!(a.matches("| consumer | `listenCycleA`").count(), 1, "{a}");
+    assert_eq!(a.matches("| consumer | `redis:listenCycleA`").count(), 1, "{a}");
 }
 
 #[tokio::test]
