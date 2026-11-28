@@ -474,6 +474,8 @@ fn diff_rows(page: &str, title: &str) -> Vec<(String, Vec<String>)> {
     for line in page.lines() {
         if let Some(t) = line.strip_prefix("### ") {
             inside = t == title;
+        } else if line == "---" {
+            inside = false;
         } else if inside {
             if let Some(row) = line.strip_prefix("- `") {
                 let key = row.split('`').next().expect("key").to_string();
@@ -785,7 +787,7 @@ async fn at_most_twenty_declared_documents_are_read_and_the_rest_are_named() {
     );
     assert_eq!(
         page.matches("past the 20 declared documents").count(),
-        2,
+        4, // each cut file: once under "Not compared", once in the footer
         "{page}"
     );
 }
@@ -874,11 +876,163 @@ async fn a_declared_file_replaced_by_a_symlink_is_never_followed() {
     )
     .expect("symlink");
     let page = text(&state, json!({"mode": "diff"})).await;
-    assert!(page.contains("a symlink, never followed"), "{page}");
+    assert!(
+        page.contains("symlinked declared document not read"),
+        "{page}"
+    );
     assert!(
         page.contains("Every indexed AsyncAPI candidate was skipped"),
         "{page}"
     );
+}
+
+const NEST_PUBLISHER: &str = "import { Inject } from '@nestjs/common';\nimport { ClientKafka } from '@nestjs/microservices';\nexport class P {\n  constructor(@Inject('K') private readonly client: ClientKafka) {}\n  go() { this.client.emit('orders.noaddr', { id: 1 }); }\n}\n";
+
+/// The "In code, not declared" and "Not compared" sections of a diff page, as topic lists.
+fn sections(page: &str) -> (Vec<String>, Vec<String>) {
+    let keys = |title: &str| diff_rows(page, title).into_iter().map(|(k, _)| k).collect();
+    (keys("In code, not declared"), keys("Not compared"))
+}
+
+#[tokio::test]
+async fn a_declared_side_that_is_not_complete_never_reports_undeclared_channels() {
+    let package = "{\"name\":\"w\",\"dependencies\":{\"@nestjs/microservices\":\"^10\"}}";
+    // (b) a channel with no static address: the code topic may be that one.
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "mesh-mcp.toml", CONFIG);
+    write(dir.path(), "package.json", package);
+    write(dir.path(), "src/p.ts", NEST_PUBLISHER);
+    write(dir.path(), "asyncapi.yaml", "asyncapi: 3.0.0\nchannels:\n  ordersNoAddr:\n    address: null\n  other:\n    address: other.topic\n");
+    let page = text(&state_in(dir.path()), json!({"mode": "diff"})).await;
+    assert_eq!(
+        sections(&page),
+        (vec![], vec!["orders.noaddr".to_string()]),
+        "{page}"
+    );
+    assert!(
+        page.contains("**Only valid for fully-read documents**"),
+        "{page}"
+    );
+    assert!(
+        page.contains("`asyncapi.yaml`: 1 channel(s) have no static address"),
+        "{page}"
+    );
+
+    // (d) an AsyncAPI document the indexer rejected (over the 384 KB source budget).
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "mesh-mcp.toml", CONFIG);
+    write(dir.path(), "package.json", package);
+    write(dir.path(), "src/p.ts", NEST_PUBLISHER);
+    write(
+        dir.path(),
+        "asyncapi.yaml",
+        "asyncapi: 3.0.0\nchannels:\n  other:\n    address: other.topic\n",
+    );
+    write(
+        dir.path(),
+        "big.asyncapi.yaml",
+        &format!("asyncapi: 3.0.0\n# {}\n", "x".repeat(400 * 1024)),
+    );
+    let page = text(&state_in(dir.path()), json!({"mode": "diff"})).await;
+    assert_eq!(
+        sections(&page),
+        (vec![], vec!["orders.noaddr".to_string()]),
+        "{page}"
+    );
+    assert!(
+        page.contains("`big.asyncapi.yaml` (not indexed: oversized"),
+        "{page}"
+    );
+
+    // (c) a 21st declared document past the per-call cap, declaring the code topic.
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "mesh-mcp.toml", CONFIG);
+    write(dir.path(), "package.json", package);
+    write(dir.path(), "src/p.ts", NEST_PUBLISHER);
+    for i in 0..21 {
+        let topic = if i == 20 {
+            "orders.noaddr".to_string()
+        } else {
+            format!("t.n{i:02}")
+        };
+        write(
+            dir.path(),
+            &format!("specs/s{i:02}/asyncapi.yaml"),
+            &format!("asyncapi: 3.0.0\nchannels:\n  c:\n    address: {topic}\n"),
+        );
+    }
+    let page = text(&state_in(dir.path()), json!({"mode": "diff", "limit": 100})).await;
+    assert_eq!(
+        sections(&page),
+        (vec![], vec!["orders.noaddr".to_string()]),
+        "{page}"
+    );
+    assert!(
+        page.contains("past the 20 declared documents read per call"),
+        "{page}"
+    );
+
+    // The clean case still reports it as undeclared, and says the list is complete.
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "mesh-mcp.toml", CONFIG);
+    write(dir.path(), "package.json", package);
+    write(dir.path(), "src/p.ts", NEST_PUBLISHER);
+    write(
+        dir.path(),
+        "asyncapi.yaml",
+        "asyncapi: 3.0.0\nchannels:\n  other:\n    address: other.topic\n",
+    );
+    let page = text(&state_in(dir.path()), json!({"mode": "diff"})).await;
+    assert_eq!(
+        sections(&page),
+        (vec!["orders.noaddr".to_string()], vec![]),
+        "{page}"
+    );
+    assert!(
+        page.contains("*Complete for the 1 declared document(s) the index found, all fully read.*"),
+        "{page}"
+    );
+}
+
+#[tokio::test]
+async fn the_scope_is_applied_before_the_declared_document_cap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "mesh-mcp.toml", CONFIG);
+    write(dir.path(), "package.json", "{\"name\":\"w\"}");
+    for i in 0..20 {
+        write(
+            dir.path(),
+            &format!("a{i:02}/asyncapi.yaml"),
+            &format!("asyncapi: 3.0.0\nchannels:\n  c:\n    address: other.n{i:02}\n"),
+        );
+    }
+    write(
+        dir.path(),
+        "zz/asyncapi.yaml",
+        "asyncapi: 3.0.0\nchannels:\n  c:\n    address: zz.topic\n",
+    );
+    let scope = dir.path().join("zz").to_string_lossy().into_owned();
+    let page = text(
+        &state_in(dir.path()),
+        json!({"mode": "diff", "scope": scope}),
+    )
+    .await;
+    // The in-scope document is read and its row shown; the cap cuts an out-of-scope one.
+    assert!(
+        page.contains("| `zz/asyncapi.yaml` | 3.0.0 | 1 | 0 |"),
+        "{page}"
+    );
+    assert!(
+        page.contains("- `zz.topic` [broker unknown] declared at `zz/asyncapi.yaml:3`"),
+        "{page}"
+    );
+    assert_eq!(
+        page.matches("past the 20 declared documents read per call")
+            .count(),
+        2, // one cut file: once under "Not compared", once in the footer
+        "{page}"
+    );
+    assert!(!page.contains("`zz/asyncapi.yaml` (past"), "{page}");
 }
 
 #[tokio::test]

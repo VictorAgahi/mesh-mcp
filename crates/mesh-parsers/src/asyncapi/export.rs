@@ -151,16 +151,16 @@ struct Row<'a> {
 
 /// Rows for every printable channel, ids and component names assigned over all of them so a
 /// channel's id never depends on the page or the scope.
-fn rows(set: &ObservedSet) -> (Vec<Row<'_>>, usize) {
+fn rows(set: &ObservedSet) -> (Vec<Row<'_>>, Vec<&Observed>) {
     let mut ids = BTreeSet::new();
     let mut names = BTreeSet::new();
     let mut by_type: BTreeMap<(String, String), String> = BTreeMap::new();
-    let mut redacted = 0usize;
+    let mut redacted: Vec<&Observed> = Vec::new();
     let mut out = Vec::new();
     for o in &set.channels {
         let key = shown_key(&o.key);
         if key == REDACTED {
-            redacted += 1;
+            redacted.push(o);
             continue;
         }
         let base = match o.broker {
@@ -196,7 +196,7 @@ fn rows(set: &ObservedSet) -> (Vec<Row<'_>>, usize) {
     (out, redacted)
 }
 
-fn page_document(rows: &[&Row<'_>], meta: Value) -> Value {
+fn page_document(rows: &[&Row<'_>], meta: Value, ops_cap: usize) -> Value {
     let mut servers = Map::new();
     let mut channels = Map::new();
     let mut operations = Map::new();
@@ -275,7 +275,7 @@ fn page_document(rows: &[&Row<'_>], meta: Value) -> Value {
         for producer in [true, false] {
             let mut kept = 0usize;
             for s in r.o.sites.iter().filter(|s| s.producer == producer) {
-                if kept >= OPS_PER_DIRECTION {
+                if kept >= ops_cap {
                     cut += 1;
                     continue;
                 }
@@ -357,8 +357,84 @@ fn render(doc: &Value, json: bool) -> String {
     if json {
         serde_json::to_string_pretty(doc).unwrap_or_default()
     } else {
-        serde_yaml::to_string(doc).unwrap_or_default()
+        to_yaml(doc)
     }
+}
+
+/// Words a YAML 1.1 parser (PyYAML, Ruby's Psych) reads as a boolean or a null.
+const YAML_RESERVED: [&str; 11] = [
+    "y", "n", "yes", "no", "on", "off", "true", "false", "null", "none", "nil",
+];
+
+/// A string scalar for a YAML document that every YAML 1.1 and 1.2 parser reads back as the same
+/// string: plain only when it starts with a letter, holds nothing but letters, digits and
+/// `_ - . /`, and is no reserved word; anything else (numbers, `1_000`, `0x1F`, `1e3`, `.5`,
+/// `1:30`, dates, `~`, a leading `$`, `#`, `*`, `&`, `!`, `%`, `@`, spaces, colons) is a JSON
+/// string, which is a valid YAML double-quoted scalar.
+fn yaml_string(s: &str) -> String {
+    let plain = s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+        && !YAML_RESERVED.contains(&s.to_ascii_lowercase().as_str());
+    if plain {
+        s.to_string()
+    } else {
+        serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+    }
+}
+
+fn yaml_scalar(v: &Value) -> Option<String> {
+    match v {
+        Value::Null => Some("null".to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) => Some(yaml_string(s)),
+        Value::Array(a) if a.is_empty() => Some("[]".to_string()),
+        Value::Object(m) if m.is_empty() => Some("{}".to_string()),
+        _ => None,
+    }
+}
+
+/// Block-style YAML of `doc` (maps sorted as `serde_json` keeps them), written with an explicit
+/// work stack: a map is `key:` then its entries one level in, a sequence is `-` items, a map
+/// item of a sequence is `-` then its entries one level in. Every string goes through
+/// [`yaml_string`].
+fn to_yaml(doc: &Value) -> String {
+    let mut out = String::new();
+    // (indent, lead text of the line, value)
+    let mut stack: Vec<(usize, String, &Value)> = vec![(0, String::new(), doc)];
+    while let Some((indent, lead, v)) = stack.pop() {
+        let pad = " ".repeat(indent);
+        match yaml_scalar(v) {
+            Some(text) => {
+                if lead.is_empty() {
+                    out.push_str(&format!("{pad}{text}\n"));
+                } else {
+                    out.push_str(&format!("{pad}{lead} {text}\n"));
+                }
+            }
+            None => {
+                let child_indent = if lead.is_empty() { indent } else { indent + 2 };
+                if !lead.is_empty() {
+                    out.push_str(&format!("{pad}{lead}\n"));
+                }
+                match v {
+                    Value::Object(m) => {
+                        for (k, child) in m.iter().rev() {
+                            stack.push((child_indent, format!("{}:", yaml_string(k)), child));
+                        }
+                    }
+                    Value::Array(a) => {
+                        for child in a.iter().rev() {
+                            stack.push((child_indent, "-".to_string(), child));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
 }
 
 fn fence_for(text: &str) -> String {
@@ -378,13 +454,14 @@ fn fence_for(text: &str) -> String {
 /// One page of the export: Markdown with the AsyncAPI document in a fenced block.
 pub fn format_export(set: &ObservedSet, view: &ExportView<'_>) -> String {
     let (all, redacted_channels) = rows(set);
+    let redacted_in_scope = redacted_channels.iter().filter(|o| o.in_scope).count();
     let in_scope: Vec<&Row<'_>> = all.iter().filter(|r| r.o.in_scope).collect();
     let total = in_scope.len();
     let scope = view.scope.map_or("the whole workspace".to_string(), |s| {
         format!("`{}`", s.replace(['`', '\n', '\r'], "'"))
     });
     let unresolved: Vec<_> = set.unresolved.iter().filter(|u| u.in_scope).collect();
-    let unresolved_count = unresolved.len() + redacted_channels;
+    let unresolved_count = unresolved.len() + redacted_in_scope;
     let mut out = String::from("## AsyncAPI 3.0 export of the observed event graph\n");
     let producers: usize = in_scope
         .iter()
@@ -402,6 +479,7 @@ pub fn format_export(set: &ObservedSet, view: &ExportView<'_>) -> String {
 
     let start = view.offset.min(total);
     let mut n = view.limit.min(total - start);
+    let mut ops_cap = OPS_PER_DIRECTION;
     let (text, shown) = loop {
         let page = &in_scope[start..start + n];
         let not_shown = total - start - n;
@@ -439,11 +517,19 @@ pub fn format_export(set: &ObservedSet, view: &ExportView<'_>) -> String {
                 "topics_listed_on_first_page": listed,
             }),
         );
-        let doc = page_document(page, Value::Object(meta));
+        let doc = page_document(page, Value::Object(meta), ops_cap);
         let text = render(&doc, view.json);
-        if text.len() > BUDGET && n > 1 {
-            n -= 1;
-            continue;
+        if text.len() > BUDGET {
+            if n > 1 {
+                n -= 1;
+                continue;
+            }
+            // One channel alone is over the budget: its operations are cut (and counted in
+            // `x-mesh-operations-not-listed`) until it fits, never fewer than one per direction.
+            if ops_cap > 1 {
+                ops_cap /= 2;
+                continue;
+            }
         }
         break (text, n);
     };
@@ -767,6 +853,198 @@ mod tests {
             .as_object()
             .expect("channels")
             .contains_key("${LATER}"));
+    }
+
+    #[test]
+    fn every_scalar_a_yaml_1_1_or_1_2_parser_could_misread_is_quoted() {
+        let risky = [
+            "no",
+            "on",
+            "yes",
+            "off",
+            "y",
+            "n",
+            "Yes",
+            "NO",
+            "On",
+            "OFF",
+            "true",
+            "False",
+            "null",
+            "NULL",
+            "Null",
+            "none",
+            "~",
+            "1_000",
+            "0x1F",
+            "0o17",
+            "0b11",
+            "017",
+            "1e3",
+            ".5",
+            ".inf",
+            "1:30",
+            "12",
+            "-3",
+            "+4",
+            "2024-01-01",
+            "2024-01-01 10:00:00",
+            "",
+            "a b",
+            "a: b",
+            "#x",
+            "$ref",
+            "*a",
+            "&a",
+            "!t",
+            "%d",
+            "@a",
+            "- x",
+            "? x",
+            "{a}",
+            "[a]",
+            "a#b ",
+            "é",
+        ];
+        for name in risky {
+            assert_eq!(
+                yaml_string(name),
+                serde_json::to_string(name).expect("json"),
+                "{name:?}"
+            );
+        }
+        for plain in [
+            "order.created",
+            "kafka_orders",
+            "a/b",
+            "x-mesh-source",
+            "A1",
+            "nope",
+            "onward",
+        ] {
+            assert_eq!(yaml_string(plain), plain, "{plain}");
+        }
+        // A document keyed and valued by those names reads back unchanged, as strings, through
+        // serde_yaml and (when one is installed) through Ruby's Psych, a YAML 1.1 parser.
+        let mut m = Map::new();
+        for name in risky.iter().filter(|n| !n.is_empty()) {
+            m.insert((*name).to_string(), json!([*name, {"k": *name}]));
+        }
+        let doc = Value::Object(m);
+        let text = to_yaml(&doc);
+        let back: Value = serde_yaml::from_str(&text).expect("valid YAML");
+        assert_eq!(back, doc, "{text}");
+        let ruby = std::process::Command::new("ruby")
+            .args([
+                "-ryaml",
+                "-rjson",
+                "-e",
+                "puts JSON.generate(YAML.safe_load(STDIN.read))",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Ok(mut child) = ruby {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(text.as_bytes())
+                .expect("write");
+            let out = child.wait_with_output().expect("ruby");
+            if out.status.success() {
+                let parsed: Value = serde_json::from_slice(&out.stdout).expect("json from ruby");
+                assert_eq!(parsed, doc, "Psych read the document differently");
+            }
+        }
+    }
+
+    #[test]
+    fn the_scoped_unresolved_count_leaves_out_the_other_scope() {
+        let token = ["tok", "_", "a1b2c3"].concat();
+        let mut elsewhere = o(
+            &token,
+            None,
+            vec![s(true, "x/a.ts:1", ObsPayload::Untyped)],
+            vec![],
+        );
+        elsewhere.in_scope = false;
+        let here = o(
+            &token,
+            None,
+            vec![s(true, "y/a.ts:1", ObsPayload::Untyped)],
+            vec![],
+        );
+        let set = ObservedSet {
+            channels: vec![
+                elsewhere,
+                here,
+                o(
+                    "ok",
+                    None,
+                    vec![s(true, "y/b.ts:1", ObsPayload::Untyped)],
+                    vec![],
+                ),
+            ],
+            unresolved: vec![
+                super::super::ObsUnresolved {
+                    key: "${A}".into(),
+                    broker: None,
+                    sites: vec!["x/c.ts:1".into()],
+                    in_scope: false,
+                },
+                super::super::ObsUnresolved {
+                    key: "${B}".into(),
+                    broker: None,
+                    sites: vec!["y/c.ts:1".into()],
+                    in_scope: true,
+                },
+            ],
+            ..ObservedSet::default()
+        };
+        let d = document(&format_export(&set, &view(0, 10)));
+        // One placeholder and one credential-shaped topic are in scope; the other two are not.
+        assert_eq!(d["x-mesh"]["not_statically_resolved"]["count"], json!(2));
+    }
+
+    #[test]
+    fn one_huge_channel_is_cut_to_the_budget_and_says_how_many_operations_are_missing() {
+        let sites = (0..40)
+            .map(|j| {
+                s(
+                    true,
+                    &format!("src/a/very/long/directory/name/for/the/budget/very/long/directory/name/for/the/budget/very/long/directory/name/for/the/budget/file{j}.ts:{j}"),
+                    ObsPayload::Untyped,
+                )
+            })
+            .chain((0..40).map(|j| {
+                s(
+                    false,
+                    &format!("src/b/very/long/directory/name/for/the/budget/very/long/directory/name/for/the/budget/very/long/directory/name/for/the/budget/file{j}.ts:{j}"),
+                    ObsPayload::Untyped,
+                )
+            }))
+            .collect();
+        let set = ObservedSet {
+            channels: vec![o("hot", None, sites, vec![])],
+            ..ObservedSet::default()
+        };
+        let page = format_export(&set, &view(0, 10));
+        let start = page.find("```json\n").expect("fence") + 8;
+        let end = page[start..].find("\n```").expect("end") + start;
+        // The documented bound, literally: the document of a page is at most 28 KB.
+        assert!(end - start <= 28 * 1024, "{}", end - start);
+        let d = document(&page);
+        let ops = d["operations"].as_object().expect("ops").len() as u64;
+        let missing = d["channels"]["hot"]["x-mesh-operations-not-listed"]
+            .as_u64()
+            .expect("count");
+        assert!(
+            ops >= 2 && missing > 0 && ops + missing == 80,
+            "{ops} {missing}"
+        );
     }
 
     #[test]

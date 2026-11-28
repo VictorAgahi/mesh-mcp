@@ -137,49 +137,97 @@ impl McpTool for ExportAsyncApiTool {
             }
             AsyncApiMode::Diff => {
                 let mut docs: Vec<(DeclaredDoc, bool)> = Vec::new();
+                // `skipped`: every file named in the footer. `unread`: the subset that may have
+                // declared a channel (cut, unreadable, unsupported, not indexed): while there
+                // is one, an observed channel no read document declares is "not compared".
                 let mut skipped: Vec<String> = Vec::new();
+                let mut unread: Vec<String> = Vec::new();
                 let mut accessed: Vec<String> = Vec::new();
-                let files = snapshot.contract_graph.declared_asyncapi_files();
+                let under = |path: &Path| match &scope {
+                    SearchScope::Global => true,
+                    SearchScope::Scoped(dir) => starts_with_folded(path, dir.as_path()),
+                };
+                let label_of = |path: &Path, repo_id: Option<usize>| {
+                    let root = match repo_id {
+                        Some(i) => state.allowed_roots.get(i),
+                        None => state.allowed_roots.iter().find(|r| path.starts_with(r)),
+                    };
+                    root.and_then(|root| path.strip_prefix(root).ok())
+                        .map_or_else(|| path.display().to_string(), slash_path)
+                };
+                let mut files = snapshot.contract_graph.declared_asyncapi_files();
+                let indexed = files.len();
+                // The cap counts the documents under the scope first: a scope never loses its own
+                // document to out-of-scope ones. What the cap still cuts is `unread`.
+                files.sort_by_key(|(path, _)| !under(path));
                 for (i, (path, repo_id)) in files.iter().enumerate() {
-                    let label = state
-                        .allowed_roots
-                        .get(*repo_id as usize)
-                        .and_then(|root| path.strip_prefix(root).ok())
-                        .map_or_else(|| path.display().to_string(), slash_path);
+                    let label = label_of(path, Some(*repo_id as usize));
                     if i >= MAX_DECLARED_FILES {
-                        skipped.push(format!(
+                        let why = format!(
                             "`{label}` (past the {MAX_DECLARED_FILES} declared documents read per call)"
-                        ));
+                        );
+                        unread.push(why.clone());
+                        skipped.push(why);
                         continue;
                     }
                     accessed.push(label.clone());
                     let content = match read_declared(path, state) {
                         Ok(c) => c,
                         Err(why) => {
-                            skipped.push(format!("`{label}` ({why})"));
+                            let why = format!("`{label}` ({why})");
+                            unread.push(why.clone());
+                            skipped.push(why);
                             continue;
                         }
                     };
                     match parse_declared(&label, &content) {
-                        DeclaredParse::Doc(d) => {
-                            let under = match &scope {
-                                SearchScope::Global => true,
-                                SearchScope::Scoped(dir) => starts_with_folded(path, dir.as_path()),
-                            };
-                            docs.push((d, under));
-                        }
+                        DeclaredParse::Doc(d) => docs.push((d, under(path))),
                         DeclaredParse::NotAsyncApi => skipped.push(format!(
                             "`{label}` (no top-level `asyncapi` version: not an AsyncAPI document)"
                         )),
-                        DeclaredParse::Unsupported(v) => skipped.push(format!(
-                            "`{label}` (AsyncAPI version `{}` is not 2.x or 3.x)",
-                            v.replace(['`', '\n', '\r'], "'")
-                        )),
-                        DeclaredParse::Unreadable(e) => skipped.push(format!(
-                            "`{label}` (not readable as YAML: {})",
-                            e.replace(['`', '\n', '\r'], "'")
-                        )),
+                        DeclaredParse::Unsupported(v) => {
+                            let why = format!(
+                                "`{label}` (AsyncAPI version `{}` is not 2.x or 3.x)",
+                                v.replace(['`', '\n', '\r'], "'")
+                            );
+                            unread.push(why.clone());
+                            skipped.push(why);
+                        }
+                        DeclaredParse::Unreadable(e) => {
+                            let why = format!(
+                                "`{label}` (not readable as YAML: {})",
+                                e.replace(['`', '\n', '\r'], "'")
+                            );
+                            unread.push(why.clone());
+                            skipped.push(why);
+                        }
                     }
+                }
+                // A file the indexer rejected (oversized, unreadable, ...) never reached the
+                // graph, so it is not in `files`: an AsyncAPI-looking one may declare channels.
+                for r in &snapshot.health.rejected {
+                    let name = r
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                        .unwrap_or_default();
+                    let spec = name.contains("asyncapi")
+                        && [".yaml", ".yml", ".json"].iter().any(|e| name.ends_with(e));
+                    if spec {
+                        let why = format!(
+                            "`{}` (not indexed: {})",
+                            label_of(&r.path, None),
+                            r.describe()
+                        );
+                        unread.push(why.clone());
+                        skipped.push(why);
+                    }
+                }
+                if snapshot.health.rejected_overflow > 0 {
+                    unread.push(format!(
+                        "{} rejected path(s) are not listed (the index lists a bounded number), one may be an AsyncAPI document",
+                        snapshot.health.rejected_overflow
+                    ));
                 }
                 let view = DiffView {
                     limit: args.limit.unwrap_or(DEFAULT_DIFF_LIMIT).clamp(1, MAX_LIMIT) as usize,
@@ -190,9 +238,9 @@ impl McpTool for ExportAsyncApiTool {
                     skipped_files: skipped,
                 };
                 let text = if docs.is_empty() {
-                    no_declared_document(&view, files.len())
+                    no_declared_document(&view, indexed)
                 } else {
-                    format_diff(&diff_asyncapi(&observed, &docs), &view)
+                    format_diff(&diff_asyncapi(&observed, &docs, &unread), &view)
                 };
                 let mut out = ToolOutput::text(text);
                 out.files_accessed = accessed;
@@ -214,7 +262,7 @@ fn slash_path(rel: &Path) -> String {
 /// "everything is undeclared".
 fn no_declared_document(view: &DiffView<'_>, indexed: usize) -> String {
     let mut out = String::from("## AsyncAPI declared-versus-code diff\n");
-    if indexed == 0 {
+    if indexed == 0 && view.skipped_files.is_empty() {
         out.push_str("No AsyncAPI document is indexed in this workspace (a YAML or JSON file named like `asyncapi.yaml` or holding an `asyncapi:` key, with at least one channel; `[engines.contracts.asyncapi]` scopes which files count), so there is nothing to compare. This is not a finding about the code: use `mode: export` to produce a document from it.\n");
     } else {
         out.push_str(
@@ -232,7 +280,7 @@ fn no_declared_document(view: &DiffView<'_>, indexed: usize) -> String {
 fn read_declared(abs: &Path, state: &AppState) -> Result<String, String> {
     let meta = std::fs::symlink_metadata(abs).map_err(|e| format!("unreadable: {e}"))?;
     if meta.file_type().is_symlink() {
-        return Err("a symlink, never followed".into());
+        return Err("symlinked declared document not read: a symlink is never followed".into());
     }
     if !meta.is_file() {
         return Err("not a regular file".into());

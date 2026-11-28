@@ -1201,7 +1201,8 @@ answers with rows over the graph alone, and `analyze_impact` answers for one nam
 | test-file sites, the channels a declared AsyncAPI file contributes to the graph | not counted (the header says how many were left out) |
 
 Bounds: at most 40 operations per direction on one channel (`x-mesh-operations-not-listed` counts
-the rest); the document of a page stays under 28 KB, so a page holds *at most* `limit` channels
+the rest; when one channel alone would pass the page budget its operations are halved, down to one
+per direction, until it fits); the document of a page stays under 28 KB (a unit test pins 28 * 1024 bytes), so a page holds *at most* `limit` channels
 (default 20, 1 to 100) and fewer when the budget says so, never fewer than one. A page that is not
 the whole graph says `PARTIAL DOCUMENT`, the channel numbers it holds, how many are not in it and
 the `offset` of the next page (`x-mesh.partial`, `channels_not_shown_after`, `next_offset`); it is a
@@ -1209,8 +1210,12 @@ valid AsyncAPI 3.0 document of its own channels (every `$ref` resolves inside it
 (pages follow the address order then the broker, and the map of a page is sorted by channel id; ids
 are assigned over the whole graph so a channel keeps its id on every page and under every scope) and
 byte-identical across runs. `format: json` gives the same
-document as JSON. Topic and type names that are credential-shaped (the shared name gate; type and
-field names also `member_consts::identifier_is_credential_named`) never reach the document: a
+document as JSON; the YAML is written by the tool so that every string that a YAML 1.1 or 1.2
+parser could read as a boolean, null, number (`1_000`, `0x1F`, `1e3`, `.5`), sexagesimal or date
+(`no`, `on`, `y`, `~`, `1:30`, `2024-01-01`) is double-quoted, and only plain letters, digits and
+`_ - . /` starting with a letter are left bare (a test reads a document of such names back through
+serde_yaml and, where installed, Ruby's Psych). Topic and type names that are credential-shaped (the shared name gate; type and
+field names also `member_consts::identifier_is_credential_named`) that the gates refuse do not reach the document (see the residual under Known limits): a
 channel whose name fails the gate is counted as unresolved without its name, a type is `type name
 redacted`, a credential-shaped field is left out and counted (`x-mesh-fields-redacted`).
 
@@ -1227,7 +1232,8 @@ matched with `subject_matches` (a code topic `order.audit.eu` is heard by a decl
 | :--- | :--- |
 | declared, not in code | a declared channel no observed topic matches, or a declared operation (`send` / `receive`) whose direction no site of the matching channel has |
 | in code, not declared | an observed channel no declared channel matches, or a direction the code has on a channel whose declaration lists operations and not that one (a channel declared with no operation is compared by existence only) |
-| payload disagreement | per matching channel and code type: a declared required property absent from the code type, a code field the declaration does not list (only when the declared schema is complete: no `oneOf` / `anyOf` / `allOf`, no `additionalProperties: true`), a primitive type difference; `path:line` of the declaration and of the code type |
+| payload disagreement | per matching channel and code type, the declared message being the one named like the code type (message name or schema name, case and separators ignored, a trailing `Event` / `Payload` / `Message` ignored; one unrelated declared message is NOT taken for it): a declared required property absent from the code type, a code field the declaration does not list (only when the declared schema is complete: no `oneOf` / `anyOf` / `allOf`, no `additionalProperties: true`), a primitive type difference; `path:line` of the declaration and of the code type |
+| not compared | what the diff could not compare, with the reason, never read as undeclared or as agreeing: an observed channel no declaration it read matches while a declared source was incomplete (a document cut at the 2,000-channel read cap, a version 3 channel with no static `address`, a file past the 20 per call, unreadable, unsupported, symlinked, or rejected by the indexer (`not indexed: oversized`)); a payload whose channel declares no message named like the code type (or an inline payload with no type name) |
 | broker disagreement | the declared servers' protocols admit none of the brokers the code uses for the channel (`amqp` admits RabbitMQ, Service Bus, Event Hubs; `redis` admits Redis, Bull and BeeQueue; a protocol that is a broker's slug is that broker). A code channel of unknown broker, and a protocol that names no broker (`ws`, `http`), make no claim |
 
 Honesty rules the output repeats: "not in code" means not statically resolved in the indexed roots
@@ -1237,12 +1243,12 @@ are statically known and say what was not compared (an external or dangling `$re
 list on either side, several declared messages none named like the code type, no typed payload in
 code); declared files are read from disk at call time, the code from the index, so an edit not yet
 re-indexed shows on one side only; with no declared document the answer says so and lists no
-"undeclared" row (an absent declaration is not "everything is undeclared"). A declared file is read
-only through the path jail, never through a symlink, within the schema size budget (1.5 MB for
-`asyncapi.yaml` / `asyncapi.json`, 384 KB otherwise), at most 20 per call; the YAML is streamed with
+"undeclared" row (an absent declaration is not "everything is undeclared"). The "in code, not declared" header says it is complete only when every declared source was fully read and otherwise "only valid for fully-read documents"; "declared, not in code" says it is only valid for what the index resolved when placeholder topics or unindexed files exist. A declared file is read
+only through the path jail, never through a symlink (a symlinked document is named `symlinked declared document not read`; a symlink the crawler never indexed is not seen at all), within the schema size budget (1.5 MB for
+`asyncapi.yaml` / `asyncapi.json`, 384 KB otherwise), at most 20 per call, the documents under `scope` first (the cap counts them before the others, so a scope never loses its own document to out-of-scope ones); the YAML is streamed with
 the alias-expansion budget of the indexer. `limit` / `offset` page each class independently, like
 `event_anomalies`, and `scope` keeps the rows with a code site or a declared file under it (the
-analysis always reads every root).
+analysis always reads every root). A file that held no channel node in the index (unparsable, an alias bomb) is not discovered at all, so a document of only such channels is not listed.
 
 > **Negative constraints:** DO NOT USE to find who publishes or consumes one named event (use
 > `analyze_impact`), to trace a flow (use `trace_flow`), to list anomalies (use
@@ -1290,7 +1296,7 @@ analysis always reads every root).
   - declared server protocol(s) `amqp`; the code uses `kafka`
 ```
 
-Known limits: the export has no channel bindings (the broker is a server and `x-mesh-broker`, not a
+Known limits: credential-shaped names the shared name gate accepts (compound words such as `token-<id>` or `pw_<id>`) can still reach an export address or a diff row: tightening the gate is a known, accepted follow-up, and the secrets claims above cover exactly what the tests prove (a `tok_` token, a `password` / `api_key` field or type name, a `${KEY:default}` placeholder default). A literal topic such as `a{x}b` is exported as the address `a{x}b`, which AsyncAPI reads as a parameter; a placeholder default `${K:orders-x}` becomes the address (the shared engine rule, not re-keyed here). The export has no channel bindings (the broker is a server and `x-mesh-broker`, not a
 `bindings` object) and no `host`; the channel address is the engine's lower-case key, which is not
 the case-sensitive topic name when the code spells it with capitals; a v3 declared channel with no
 `address` (dynamic) and an external `$ref` are counted, not compared; payloads are

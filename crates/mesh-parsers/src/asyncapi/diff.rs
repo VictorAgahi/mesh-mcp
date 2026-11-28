@@ -37,6 +37,10 @@ pub enum RowClass {
     InCodeNotDeclared,
     PayloadDisagreement,
     BrokerDisagreement,
+    /// What could not be compared, with the reason: an observed channel no complete declaration
+    /// matches while a declared document was cut, skipped or unreadable, and a payload whose
+    /// declared message is not named like the code type.
+    NotCompared,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -47,6 +51,8 @@ pub enum RowKind {
     UndeclaredDirection(Action),
     Payload,
     Broker,
+    /// A declared channel's messages, none named like a code type.
+    PayloadNotNamed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +94,10 @@ pub struct DiffReport {
     pub unresolved_topics: usize,
     /// Channel payloads that were not compared, with the topic.
     pub payload_not_compared: Vec<String>,
+    /// Why the declared side is not complete (a document cut, skipped, unreadable, or with
+    /// channels that have no static address): while this is non-empty, an observed channel no
+    /// declaration matches is `not compared`, never `undeclared`.
+    pub incomplete: Vec<String>,
 }
 
 /// How one page of the report is shown.
@@ -225,12 +235,35 @@ fn compare_fields(
 
 /// The diff of `docs` (each with whether its file is under the caller's scope) against
 /// `observed`. No document, no rows: an absent declaration is not "everything undeclared".
-pub fn diff_asyncapi(observed: &ObservedSet, docs: &[(DeclaredDoc, bool)]) -> DiffReport {
+pub fn diff_asyncapi(
+    observed: &ObservedSet,
+    docs: &[(DeclaredDoc, bool)],
+    unread: &[String],
+) -> DiffReport {
     let mut rep = DiffReport {
         observed_channels: observed.channels.len(),
         unresolved_topics: observed.unresolved.len(),
         ..DiffReport::default()
     };
+    // Whatever bound or failure left a declared document incomplete is a reason an observed
+    // channel may be declared where this diff did not look.
+    rep.incomplete = unread.to_vec();
+    for (doc, _) in docs {
+        let file = doc.file.replace(['`', '\n', '\r'], "'");
+        if doc.no_address > 0 {
+            rep.incomplete.push(format!(
+                "`{file}`: {} channel(s) have no static address",
+                doc.no_address
+            ));
+        }
+        if doc.channels_cut > 0 {
+            rep.incomplete.push(format!(
+                "`{file}`: {} channel(s) past the read cap",
+                doc.channels_cut
+            ));
+        }
+    }
+    let incomplete = !rep.incomplete.is_empty();
     // Per observed channel: the declared channels that match its key.
     let mut declared_by: Vec<Vec<(usize, usize)>> = vec![Vec::new(); observed.channels.len()];
 
@@ -396,20 +429,30 @@ pub fn diff_asyncapi(observed: &ObservedSet, docs: &[(DeclaredDoc, bool)]) -> Di
 
     for (i, o) in observed.channels.iter().enumerate() {
         let sites: Vec<String> = o.sites.iter().take(3).map(|s| s.loc.clone()).collect();
+        let (class, why) = if incomplete {
+            (
+                RowClass::NotCompared,
+                Some("not reported as undeclared: a declared document was not fully read (see the footer)".to_string()),
+            )
+        } else {
+            (RowClass::InCodeNotDeclared, None)
+        };
         if declared_by[i].is_empty() {
             rep.rows.push(DiffRow {
-                class: RowClass::InCodeNotDeclared,
+                class,
                 kind: RowKind::UndeclaredChannel,
                 key: o.key.clone(),
                 broker: o.broker,
                 declared: None,
                 code: sites,
-                detail: vec![format!(
+                detail: std::iter::once(format!(
                     "{} producer(s), {} consumer(s), {}",
                     o.sites.iter().filter(|s| s.producer).count(),
                     o.sites.iter().filter(|s| !s.producer).count(),
                     o.confidence
-                )],
+                ))
+                .chain(why)
+                .collect(),
                 in_scope: o.in_scope,
             });
             continue;
@@ -433,17 +476,19 @@ pub fn diff_asyncapi(observed: &ObservedSet, docs: &[(DeclaredDoc, bool)]) -> Di
             }
             let (di, ci) = declared_by[i][0];
             rep.rows.push(DiffRow {
-                class: RowClass::InCodeNotDeclared,
+                class,
                 kind: RowKind::UndeclaredDirection(action),
                 key: o.key.clone(),
                 broker: o.broker,
                 declared: Some(loc(&docs[di].0.file, docs[di].0.channels[ci].line)),
                 code: here.into_iter().take(3).collect(),
-                detail: vec![format!(
+                detail: std::iter::once(format!(
                     "the code {}s on this channel, the declaration lists no {} operation",
                     action.word(),
                     action.word()
-                )],
+                ))
+                .chain(why.clone())
+                .collect(),
                 in_scope: o.in_scope,
             });
         }
@@ -465,6 +510,23 @@ pub fn diff_asyncapi(observed: &ObservedSet, docs: &[(DeclaredDoc, bool)]) -> Di
 }
 
 /// Compares the declared payload of `ch` with each type the code uses on the channels `m`.
+/// A type or message name folded for comparison: ASCII letters and digits, lower case, one
+/// trailing `event` / `payload` / `message` dropped.
+fn norm_type(name: &str) -> String {
+    let mut n: String = name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    for suffix in ["event", "payload", "message"] {
+        if n.len() > suffix.len() && n.ends_with(suffix) {
+            n.truncate(n.len() - suffix.len());
+            break;
+        }
+    }
+    n
+}
+
 fn compare_payloads(
     observed: &ObservedSet,
     m: &[usize],
@@ -488,17 +550,45 @@ fn compare_payloads(
         for (ti, t) in o.types.iter().enumerate() {
             typed_any = true;
             let name = t.name.as_deref();
-            let msg = with_schema
-                .iter()
-                .find(|msg| name.is_some_and(|n| msg.name.eq_ignore_ascii_case(n)))
-                .copied()
-                .or_else(|| (with_schema.len() == 1).then(|| with_schema[0]));
+            // A declared message is compared only when it is named like the code type (the
+            // message name or its schema name, case and separators ignored, a trailing `Event`,
+            // `Payload` or `Message` ignored): one unrelated declared message is not "the"
+            // declaration of this type.
+            let msg = name.and_then(|n| {
+                let want = norm_type(n);
+                with_schema
+                    .iter()
+                    .find(|msg| {
+                        norm_type(&msg.name) == want
+                            || msg
+                                .schema
+                                .as_ref()
+                                .and_then(|s| s.name.as_deref())
+                                .is_some_and(|sn| norm_type(sn) == want)
+                    })
+                    .copied()
+            });
             let Some(schema) = msg.and_then(|m| m.schema.as_ref()) else {
-                rep.payload_not_compared.push(format!(
-                    "`{}`: {} messages declared, none named like the code type",
-                    shown_key(&o.key),
-                    with_schema.len()
-                ));
+                let declared: Vec<String> = with_schema
+                    .iter()
+                    .take(5)
+                    .map(|m| format!("`{}`", shown_name(&m.name)))
+                    .collect();
+                rep.rows.push(DiffRow {
+                    class: RowClass::NotCompared,
+                    kind: RowKind::PayloadNotNamed,
+                    key: ch.key.clone(),
+                    broker: o.broker,
+                    declared: Some(at.to_string()),
+                    code: vec![t.loc.clone()],
+                    detail: vec![format!(
+                        "payload not compared: no declared message of channel `{}` ({}) is named like the code type {}",
+                        shown_name(&ch.id),
+                        declared.join(", "),
+                        name.map_or("(inline payload, no type name)".to_string(), |n| format!("`{}`", shown_name(n)))
+                    )],
+                    in_scope: doc_in_scope || o.in_scope,
+                });
                 continue;
             };
             compared_any = true;
@@ -561,6 +651,10 @@ fn class_title(c: RowClass) -> (&'static str, &'static str) {
         RowClass::PayloadDisagreement => (
             "Payload disagreement",
             "The declared payload properties against the fields of the code's type, where both are statically known.",
+        ),
+        RowClass::NotCompared => (
+            "Not compared",
+            "What this diff could not compare, with the reason: an observed channel no declaration it read matches while a declared document was cut, skipped or unreadable (it may be declared there), and a payload whose declared message is not named like the code type. Never read these as undeclared or as agreeing.",
         ),
         RowClass::BrokerDisagreement => (
             "Broker disagreement",
@@ -640,6 +734,7 @@ pub fn format_diff(report: &DiffReport, view: &DiffView<'_>) -> String {
         RowClass::InCodeNotDeclared,
         RowClass::PayloadDisagreement,
         RowClass::BrokerDisagreement,
+        RowClass::NotCompared,
     ];
     for c in classes {
         let n = in_scope.iter().filter(|r| r.class == c).count();
@@ -650,6 +745,42 @@ pub fn format_diff(report: &DiffReport, view: &DiffView<'_>) -> String {
         let rows: Vec<&DiffRow> = in_scope.iter().copied().filter(|r| r.class == c).collect();
         let (title, blurb) = class_title(c);
         let _ = writeln!(out, "### {title}\n*{blurb}*\n");
+        match c {
+            RowClass::InCodeNotDeclared if !report.incomplete.is_empty() => {
+                let _ = writeln!(
+                    out,
+                    "**Only valid for fully-read documents**: {} declared source(s) were not fully read, so a channel no read declaration matches is listed under \"Not compared\", not here.\n",
+                    report.incomplete.len()
+                );
+            }
+            RowClass::InCodeNotDeclared => {
+                let _ = writeln!(
+                    out,
+                    "*Complete for the {} declared document(s) the index found, all fully read.*\n",
+                    report.docs.len()
+                );
+            }
+            RowClass::DeclaredNotInCode
+                if report.unresolved_topics > 0 || view.coverage.is_some() =>
+            {
+                let _ = writeln!(
+                    out,
+                    "**Only valid for what the index resolved**: {} placeholder topic(s) were not compared{}; a declared channel may be implemented there.\n",
+                    report.unresolved_topics,
+                    if view.coverage.is_some() { " and the coverage note below says what was not indexed" } else { "" }
+                );
+            }
+            RowClass::NotCompared if !report.incomplete.is_empty() => {
+                for why in report.incomplete.iter().take(10) {
+                    let _ = writeln!(out, "- Declared side incomplete: {why}.");
+                }
+                if report.incomplete.len() > 10 {
+                    let _ = writeln!(out, "- and {} more.", report.incomplete.len() - 10);
+                }
+                out.push('\n');
+            }
+            _ => {}
+        }
         if rows.is_empty() {
             out.push_str("None.\n\n");
             continue;
@@ -778,6 +909,10 @@ mod tests {
         }
     }
 
+    fn diff(o: &ObservedSet, docs: &[(DeclaredDoc, bool)]) -> DiffReport {
+        diff_asyncapi(o, docs, &[])
+    }
+
     fn rows(r: &DiffReport, class: RowClass) -> Vec<(String, RowKind)> {
         r.rows
             .iter()
@@ -795,7 +930,7 @@ channels:
     address: orders.created
     servers: [{$ref: '#/servers/main'}]
     messages:
-      m:
+      Created:
         payload:
           type: object
           required: [id, total]
@@ -848,7 +983,7 @@ operations:
 
     #[test]
     fn every_class_on_a_hand_built_pair() {
-        let r = diff_asyncapi(&observed(), &declared(DOC));
+        let r = diff(&observed(), &declared(DOC));
         assert_eq!(
             rows(&r, RowClass::DeclaredNotInCode),
             vec![
@@ -887,7 +1022,7 @@ operations:
     fn a_partial_code_type_never_claims_missing_fields() {
         let mut o = observed();
         o.channels[1].types = vec![ty("Created", &[("total", "number", false)], true)];
-        let r = diff_asyncapi(&o, &declared(DOC));
+        let r = diff(&o, &declared(DOC));
         assert!(rows(&r, RowClass::PayloadDisagreement).is_empty());
         assert!(r
             .payload_not_compared
@@ -901,7 +1036,7 @@ operations:
             "          type: object\n          required: [id, total]",
             "          additionalProperties: true\n          required: [id, total]",
         );
-        let r = diff_asyncapi(&observed(), &declared(&open));
+        let r = diff(&observed(), &declared(&open));
         let p = r
             .rows
             .iter()
@@ -918,6 +1053,214 @@ operations:
             .any(|n| n.contains("partial field list on the declared side")));
     }
 
+    fn undeclared_candidates() -> ObservedSet {
+        ObservedSet {
+            channels: vec![
+                chan(
+                    "c2050",
+                    None,
+                    vec![site(true, "src/a.ts:1", ObsPayload::Untyped)],
+                    vec![],
+                ),
+                chan(
+                    "orders.noaddr",
+                    None,
+                    vec![site(true, "src/b.ts:2", ObsPayload::Untyped)],
+                    vec![],
+                ),
+                chan(
+                    "late.topic",
+                    None,
+                    vec![site(true, "src/c.ts:3", ObsPayload::Untyped)],
+                    vec![],
+                ),
+            ],
+            ..ObservedSet::default()
+        }
+    }
+
+    fn row_keys(r: &DiffReport, class: RowClass) -> Vec<String> {
+        r.rows
+            .iter()
+            .filter(|x| x.class == class)
+            .map(|x| x.key.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_complete_declared_side_reports_undeclared_channels() {
+        let r = diff(
+            &undeclared_candidates(),
+            &declared("asyncapi: 3.0.0\nchannels: {}\n"),
+        );
+        assert!(r.incomplete.is_empty());
+        assert_eq!(
+            row_keys(&r, RowClass::InCodeNotDeclared),
+            vec!["c2050", "late.topic", "orders.noaddr"]
+        );
+        assert!(row_keys(&r, RowClass::NotCompared).is_empty());
+        let text = format_diff(
+            &r,
+            &DiffView {
+                limit: 25,
+                offset: 0,
+                scope: None,
+                coverage: None,
+                roots: 1,
+                skipped_files: vec![],
+            },
+        );
+        assert!(
+            text.contains(
+                "*Complete for the 1 declared document(s) the index found, all fully read.*"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_document_cut_at_the_channel_cap_never_makes_code_channels_undeclared() {
+        let mut yaml = String::from("asyncapi: 3.0.0\nchannels:\n");
+        for i in 0..2100 {
+            yaml.push_str(&format!("  k{i}:\n    address: c{i}\n"));
+        }
+        let r = diff(&undeclared_candidates(), &declared(&yaml));
+        assert_eq!(
+            r.incomplete,
+            vec!["`asyncapi.yaml`: 100 channel(s) past the read cap".to_string()]
+        );
+        // c2050 is declared past the cap: it is not "undeclared", and neither are the others.
+        assert!(row_keys(&r, RowClass::InCodeNotDeclared).is_empty());
+        assert_eq!(
+            row_keys(&r, RowClass::NotCompared),
+            vec!["c2050", "late.topic", "orders.noaddr"]
+        );
+        let text = format_diff(
+            &r,
+            &DiffView {
+                limit: 25,
+                offset: 0,
+                scope: None,
+                coverage: None,
+                roots: 1,
+                skipped_files: vec![],
+            },
+        );
+        assert!(
+            text.contains("**Only valid for fully-read documents**"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "- Declared side incomplete: `asyncapi.yaml`: 100 channel(s) past the read cap."
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_channel_without_an_address_never_makes_code_channels_undeclared() {
+        let r = diff(
+            &undeclared_candidates(),
+            &declared("asyncapi: 3.0.0\nchannels:\n  ordersNoAddr:\n    description: dynamic\n"),
+        );
+        assert_eq!(
+            r.incomplete,
+            vec!["`asyncapi.yaml`: 1 channel(s) have no static address".to_string()]
+        );
+        assert!(row_keys(&r, RowClass::InCodeNotDeclared).is_empty());
+        assert_eq!(row_keys(&r, RowClass::NotCompared).len(), 3);
+    }
+
+    #[test]
+    fn a_skipped_or_unreadable_document_never_makes_code_channels_undeclared() {
+        let late = vec!["`late.yaml` (past the 20 declared documents read per call)".to_string()];
+        let r = diff_asyncapi(
+            &undeclared_candidates(),
+            &declared("asyncapi: 3.0.0\nchannels: {}\n"),
+            &late,
+        );
+        assert_eq!(r.incomplete, late);
+        assert!(row_keys(&r, RowClass::InCodeNotDeclared).is_empty());
+        assert_eq!(row_keys(&r, RowClass::NotCompared).len(), 3);
+        // A direction the code has beyond what a read declaration lists is held back the same way.
+        let send_only = "asyncapi: 3.0.0\nchannels:\n  a:\n    address: late.topic\noperations:\n  s: {action: receive, channel: {$ref: '#/channels/a'}}\n";
+        let r = diff_asyncapi(&undeclared_candidates(), &declared(send_only), &late);
+        assert!(r.rows.iter().any(|x| x.class == RowClass::NotCompared
+            && x.kind == RowKind::UndeclaredDirection(Action::Send)));
+        assert!(row_keys(&r, RowClass::InCodeNotDeclared).is_empty());
+    }
+
+    #[test]
+    fn a_declared_message_not_named_like_the_code_type_is_not_a_field_disagreement() {
+        let doc = "asyncapi: 3.0.0\nchannels:\n  a:\n    address: orders.created\n    messages:\n      OrderCreated:\n        payload:\n          type: object\n          required: [orderId]\n          properties:\n            orderId: {type: string}\n";
+        let o = |ty: ObsType| ObservedSet {
+            channels: vec![chan(
+                "orders.created",
+                None,
+                vec![site(true, "src/p.ts:3", ObsPayload::Typed(0))],
+                vec![ty],
+            )],
+            ..ObservedSet::default()
+        };
+        // An unrelated type on the same topic: informational row, no finding.
+        let r = diff(
+            &o(ty(
+                "Unrelated",
+                &[("sku", "string", false), ("qty", "number", false)],
+                false,
+            )),
+            &declared(doc),
+        );
+        assert!(row_keys(&r, RowClass::PayloadDisagreement).is_empty());
+        let row = r
+            .rows
+            .iter()
+            .find(|x| x.class == RowClass::NotCompared)
+            .expect("not compared row");
+        assert_eq!(row.kind, RowKind::PayloadNotNamed);
+        assert_eq!(
+            row.detail,
+            vec!["payload not compared: no declared message of channel `a` (`OrderCreated`) is named like the code type `Unrelated`".to_string()]
+        );
+        // An inline payload has no name to match.
+        let mut inline = ty("X", &[("orderId", "string", false)], false);
+        inline.name = None;
+        let r = diff(&o(inline), &declared(doc));
+        assert!(
+            r.rows[0].detail[0].contains("(inline payload, no type name)"),
+            "{:?}",
+            r.rows
+        );
+        // Case, separators and a trailing Event / Payload / Message are ignored for the match.
+        for name in [
+            "order_created",
+            "OrderCreatedEvent",
+            "ORDERCREATED",
+            "OrderCreatedPayload",
+        ] {
+            let r = diff(
+                &o(ty(name, &[("orderId", "number", false)], false)),
+                &declared(doc),
+            );
+            assert_eq!(
+                row_keys(&r, RowClass::PayloadDisagreement),
+                vec!["orders.created"],
+                "{name}"
+            );
+            assert_eq!(
+                r.rows[0].detail,
+                vec!["field `orderId`: declared string, code number".to_string()]
+            );
+        }
+        assert_eq!(norm_type("Order-Created.Message"), "ordercreated");
+        assert_eq!(
+            norm_type("Event"),
+            "event",
+            "a bare suffix word is a name, not a suffix"
+        );
+    }
+
     #[test]
     fn a_first_row_past_the_budget_is_still_shown_and_the_next_page_advances() {
         let mut o = ObservedSet::default();
@@ -929,7 +1272,7 @@ operations:
                 vec![],
             ));
         }
-        let mut r = diff_asyncapi(&o, &declared("asyncapi: 3.0.0\nchannels: {}\n"));
+        let mut r = diff(&o, &declared("asyncapi: 3.0.0\nchannels: {}\n"));
         for row in &mut r.rows {
             row.detail = vec!["x".repeat(40 * 1024)];
         }
@@ -955,10 +1298,10 @@ operations:
     fn an_unknown_broker_and_an_unmappable_protocol_make_no_claim() {
         let mut o = observed();
         o.channels[1].broker = None;
-        let r = diff_asyncapi(&o, &declared(DOC));
+        let r = diff(&o, &declared(DOC));
         assert!(rows(&r, RowClass::BrokerDisagreement).is_empty());
         let ws = DOC.replace("protocol: amqp", "protocol: ws");
-        let r = diff_asyncapi(&observed(), &declared(&ws));
+        let r = diff(&observed(), &declared(&ws));
         assert!(rows(&r, RowClass::BrokerDisagreement).is_empty());
     }
 
@@ -972,17 +1315,10 @@ operations:
             vec![site(false, "w.ts:1", ObsPayload::Untyped)],
             vec![],
         ));
-        assert!(rows(
-            &diff_asyncapi(&o, &declared(redis)),
-            RowClass::BrokerDisagreement
-        )
-        .is_empty());
+        assert!(rows(&diff(&o, &declared(redis)), RowClass::BrokerDisagreement).is_empty());
         o.channels[0].broker = Some(Broker::Kafka);
         assert_eq!(
-            rows(
-                &diff_asyncapi(&o, &declared(redis)),
-                RowClass::BrokerDisagreement
-            ),
+            rows(&diff(&o, &declared(redis)), RowClass::BrokerDisagreement),
             vec![("jobs".to_string(), RowKind::Broker)]
         );
     }
@@ -996,7 +1332,7 @@ operations:
             vec![site(false, "src/r.ts:2", ObsPayload::Untyped)],
             vec![],
         ));
-        let r = diff_asyncapi(&o, &declared(DOC));
+        let r = diff(&o, &declared(DOC));
         // The RabbitMQ hub is the one the amqp server admits: no broker row, and the receive
         // operation is satisfied by the RabbitMQ consumer, not by the Kafka producer.
         assert!(rows(&r, RowClass::BrokerDisagreement).is_empty());
@@ -1013,12 +1349,12 @@ operations:
     #[test]
     fn an_undeclared_direction_needs_a_declaration_that_lists_operations() {
         let only_channel = "asyncapi: 3.0.0\nchannels:\n  a:\n    address: orders.created\n";
-        let r = diff_asyncapi(&observed(), &declared(only_channel));
+        let r = diff(&observed(), &declared(only_channel));
         assert!(rows(&r, RowClass::InCodeNotDeclared)
             .iter()
             .all(|(_, k)| *k == RowKind::UndeclaredChannel));
         let send_only = "asyncapi: 3.0.0\nchannels:\n  a:\n    address: orders.legacy\noperations:\n  s: {action: send, channel: {$ref: '#/channels/a'}}\n";
-        let r = diff_asyncapi(&observed(), &declared(send_only));
+        let r = diff(&observed(), &declared(send_only));
         assert!(rows(&r, RowClass::InCodeNotDeclared).contains(&(
             "orders.legacy".into(),
             RowKind::UndeclaredDirection(Action::Receive)
@@ -1051,7 +1387,7 @@ operations:
             "asyncapi: 3.0.0\nchannels:\n  a:\n    address: orders.created\n    messages:\n      m:\n        payload:\n          type: object\n          required: [{secret}2]\n          properties:\n            {secret}2: {{type: string}}\n"
         );
         for docs in [declared(DOC), declared(&declared_secret)] {
-            let r = diff_asyncapi(&o, &docs);
+            let r = diff(&o, &docs);
             let text = format_diff(
                 &r,
                 &DiffView {
@@ -1081,7 +1417,7 @@ operations:
             )],
             ..ObservedSet::default()
         };
-        let r = diff_asyncapi(&o, &declared(doc));
+        let r = diff(&o, &declared(doc));
         assert_eq!(
             r.rows,
             Vec::new(),
@@ -1089,7 +1425,7 @@ operations:
         );
         // A wildcard that does not match leaves both unmatched.
         let other = doc.replace("orders.created", "invoices.created");
-        let r = diff_asyncapi(&o, &declared(&other));
+        let r = diff(&o, &declared(&other));
         assert_eq!(
             r.rows
                 .iter()
@@ -1113,7 +1449,7 @@ operations:
                 vec![],
             ));
         }
-        let r = diff_asyncapi(&o, &declared("asyncapi: 3.0.0\nchannels: {}\n"));
+        let r = diff(&o, &declared("asyncapi: 3.0.0\nchannels: {}\n"));
         let view = |offset| DiffView {
             limit: 2,
             offset,
