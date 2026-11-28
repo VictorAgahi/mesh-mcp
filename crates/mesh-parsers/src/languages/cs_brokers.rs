@@ -991,16 +991,13 @@ pub(crate) fn scan(tree: &Tree, content: &str) -> Scan {
             "invocation_expression" => {
                 call_sites(node, &mut ctx, &mut found, &mut mt_ev, &mut nsb_ev);
             }
-            "object_creation_expression" => {
-                if ctx.imports.has(Lib::NServiceBus) {
-                    if let Some(t) = node
-                        .child_by_field_name("type")
-                        .and_then(|t| named_type(t, source))
-                    {
-                        if !ctx.types.contains(&t) {
-                            nsb_ev.extend(nsb_transport(&t));
-                        }
-                    }
+            "object_creation_expression" if ctx.imports.has(Lib::NServiceBus) => {
+                let class = node
+                    .child_by_field_name("type")
+                    .and_then(|t| named_type(t, source))
+                    .filter(|t| !ctx.types.contains(t));
+                if let Some(t) = class {
+                    nsb_ev.extend(nsb_transport(&t));
                 }
             }
             _ => {}
