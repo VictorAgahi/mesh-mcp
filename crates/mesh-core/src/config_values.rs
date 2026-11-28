@@ -487,9 +487,6 @@ fn connection_secret_spans(text: &str) -> Vec<(usize, usize)> {
         while let Some(rel) = lower[from..].find(key) {
             let at = from + rel;
             from = at + key.len();
-            if at > 0 && bytes[at - 1].is_ascii_alphanumeric() {
-                continue;
-            }
             let mut i = from;
             while i < bytes.len() && bytes[i] == b' ' {
                 i += 1;
@@ -970,6 +967,11 @@ mod tests {
             mask_connection_strings(&format!("var c = \"Server=h;{pw} = hunter2;\";")),
             format!("var c = \"Server=h;{pw} = {m};\";")
         );
+        // A key that merely ends in a credential key is one too.
+        assert_eq!(
+            mask_connection_strings("\"A=b;DbPassword=zz9\""),
+            format!("\"A=b;DbPassword={m}\"")
+        );
         for k in [
             "SharedAccessSignature",
             "AccountKey",
@@ -994,6 +996,7 @@ mod tests {
             "\"password=\"",
             "Password = settings.Password;",
             "Password = Get(x);",
+            "msg = \"a Password == b\";",
             "if (a.Password == b) {}",
         ] {
             assert!(
