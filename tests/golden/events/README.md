@@ -65,6 +65,7 @@ golden must be rejected).
 | Corpus | Languages | Producers | Consumers | Hops | Chains | Chains >= 3 call steps | Optional items | Tags (items) |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
 | bullmq-enum-queues | ts | 4 | 4 | 0 | 0 | 0 | 0 | enum_topic 8 |
+| cs-brokers | csharp | 17 | 14 | 0 | 2 | 0 | 0 | broker_key 4, config_topic 3, cs_broker 32, kafka_basic 1 |
 | declared-producers | ts | 12 | 2 | 0 | 0 | 0 | 0 | declared_call 12, enum_topic 12 |
 | layered-go | go | 3 | 2 | 6 | 4 | 1 | 0 | kafka_basic 5, layered_calls 10 |
 | layered-py | python | 3 | 2 | 4 | 2 | 2 | 0 | kafka_basic 3, layered_calls 6, py_broker 3 |

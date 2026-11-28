@@ -79,6 +79,7 @@ pub struct MemberTable {
 /// credential.
 const CREDENTIAL_WORDS: &[&str] = &[
     "password",
+    "passwords",
     "passwd",
     "pwd",
     "pass",
@@ -120,6 +121,43 @@ pub fn member_is_credential_named(member: &str) -> bool {
         .unwrap_or(member)
         .to_ascii_lowercase();
     last.split('_').any(|w| CREDENTIAL_WORDS.contains(&w))
+}
+
+/// Words a placeholder or configuration KEY may not hold even inside a longer, separator-less
+/// word (`DBPASSWORD`, `APIKEYQUEUE`, `SECRETQ`). Substrings, so they apply to keys only: a topic
+/// VALUE such as `password-reset-jobs` or `secretary-jobs` stays a name.
+const CREDENTIAL_KEY_PARTS: &[&str] = &[
+    "password",
+    "passwd",
+    "passphrase",
+    "secret",
+    "token",
+    "apikey",
+    "credential",
+    "accesskey",
+    "privatekey",
+    "connectionstring",
+    "connstr",
+    "sharedaccess",
+];
+
+/// Ordinary words that hold a [`CREDENTIAL_KEY_PARTS`] entry without naming a credential.
+const CREDENTIAL_KEY_WORDS_OK: &[&str] = &["secretary", "secretaries", "secretariat", "tokenizer"];
+
+/// Whether a placeholder or configuration key (`DB_PASSWORD`, `Bus:SharedAccessKey`,
+/// `DBPASSWORDQ`) names a credential: [`member_is_credential_named`], the case-split rule of
+/// [`identifier_is_credential_named`], and a credential word as a substring of any
+/// separator-delimited part (9.0 T8d). Keys only; see [`constant_is_a_name`] for values.
+pub fn placeholder_key_is_credential_named(key: &str) -> bool {
+    if member_is_credential_named(&key.replace(['-', '.', ':'], "_"))
+        || identifier_is_credential_named(key)
+    {
+        return true;
+    }
+    key.split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|part| !CREDENTIAL_KEY_WORDS_OK.contains(&part.as_str()))
+        .any(|part| CREDENTIAL_KEY_PARTS.iter().any(|w| part.contains(w)))
 }
 
 /// Whether a string value may become a topic name (commandment 5): a plain name that is not a
@@ -557,6 +595,38 @@ impl MemberTable {
 
 #[cfg(test)]
 mod tests {
+
+    /// 9.0 T8d: a credential word inside a separator-less key is refused; a plain key and an
+    /// ordinary word that holds one are not.
+    #[test]
+    fn placeholder_keys_with_a_credential_word_inside_are_refused() {
+        for key in [
+            "DBPASSWORD",
+            "APIKEYQUEUE",
+            "DBPASSWORDQ",
+            "PASSWORDS_Q",
+            "SECRETQ",
+            "dbpassword",
+            "Bus:SharedAccessKey",
+            "DbPasswordQueue",
+            "A__Token",
+            "Db_ConnectionString",
+            "PASSWORDS",
+        ] {
+            assert!(placeholder_key_is_credential_named(key), "{key}");
+        }
+        for key in [
+            "ORDERS_QUEUE",
+            "OrdersQueue",
+            "SECRETARY_QUEUE",
+            "KEYSTONE_Q",
+            "Billing__Topic",
+            "routingKey",
+        ] {
+            assert!(!placeholder_key_is_credential_named(key), "{key}");
+        }
+        assert!(member_is_credential_named("DB_PASSWORDS"));
+    }
     use super::*;
 
     type SiteSpec<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, &'a str, &'a str)]);

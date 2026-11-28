@@ -1,0 +1,12 @@
+# Fixture: .NET services on MassTransit, NServiceBus, Azure Service Bus and Confluent.Kafka (9.0 T8d).
+[workspace]
+name = "cs-brokers"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/bin/**", "**/obj/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true

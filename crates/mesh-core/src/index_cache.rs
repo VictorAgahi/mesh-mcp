@@ -145,7 +145,10 @@ pub type CacheEntry = ([u8; 32], Vec<u8>);
 /// `[[engines.contracts.producer_calls]]` names register `EventStream` / `Queue` call-site nodes
 /// and `FileIndex::member_sites`, `FileIndex::declared_unread` / `declared_capped`; the
 /// declaration is part of the config fingerprint.
-const SCHEMA_VERSION: u8 = 27;
+/// v28: C# brokers (9.0 T8d, after T14b's 27): MassTransit, NServiceBus and Azure Service Bus
+/// producers and consumers in C# (`EventStream` call-site nodes, `[ServiceBusTrigger]` owners),
+/// sites whose bus the file does not show stay without a broker, `FileIndex::cs_brokers_capped`.
+const SCHEMA_VERSION: u8 = 28;
 
 /// How long a cache statement waits for another connection's lock (other processes of the
 /// same workspace share the database) before failing with `SQLITE_BUSY`.

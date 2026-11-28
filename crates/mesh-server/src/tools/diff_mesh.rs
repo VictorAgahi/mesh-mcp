@@ -2536,6 +2536,25 @@ export class UserEvents {
         );
     }
 
+    /// 9.0 T8d: the same heading for a C# site (`orders` removed from Azure Service Bus).
+    #[test]
+    fn a_removed_csharp_site_of_another_broker_names_its_broker() {
+        const OUT: &str = "using Azure.Messaging.ServiceBus;\n\npublic class Out\n{\n    private readonly ServiceBusClient _client;\n\n    public void Announce()\n    {\n        _client.CreateSender(\"orders\");\n    }\n}\n";
+        let repo = base_repo();
+        repo.write("cs/Out.cs", OUT);
+        repo.commit("service bus producer");
+        repo.write("cs/Out.cs", &OUT.replace("\"orders\"", "\"orders.v2\""));
+        let state = indexed_state(&repo.root);
+        let out = run_with(&args(None, None), &state, &repo.runner(), Limits::DEFAULT)
+            .expect("diff_mesh ok");
+        assert!(
+            out.text
+                .contains("produces topic `orders` removed (on servicebus)"),
+            "{}",
+            out.text
+        );
+    }
+
     #[test]
     fn scope_restricts_the_diff_and_an_outside_scope_is_refused() {
         let repo = changed_repo();

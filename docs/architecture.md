@@ -153,8 +153,9 @@ collapsed into one key, so a producer of one appeared linked to a consumer of an
   changed topic (`kafka` -> `rabbitmq`) and looks up the other side of a removed site on that
   site's own broker. `visualize_mesh` draws one topic node per hub.
 - Where the broker comes from: the TypeScript / JavaScript rule tables name the library of every rule
-  (`kafkajs producer.send`, `aws-sdk sns.publish`); the Kafka-only Java, Kotlin, Go, C# and Rust
-  extractors tag their sites `kafka`. Python (Kafka and Celery share one extractor), declarative
+  (`kafkajs producer.send`, `aws-sdk sns.publish`); the Kafka calls of the Java, Kotlin, Go, C# and Rust
+  extractors are tagged `kafka`; the C# MassTransit and NServiceBus sites carry the bus their own file names
+  (`UsingRabbitMq`, `UseTransport<...>`), else none ([parser support 3.12](parser-support.md#312-c-brokers)). Python (Kafka and Celery share one extractor), declarative
   patterns and AsyncAPI channels have no broker: unknown.
 - Golden files write a name used on two or more brokers of a corpus as `<broker>:<name>`
   (`tests/golden/events/SCHEMA.md`).

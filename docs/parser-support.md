@@ -38,12 +38,13 @@ type checker behind any of them.
 | C# | 2 | [2.7](#27-kotlin-and-c-level-2) |
 | Ruby, PHP, Swift, Scala | 1 (plus one route idiom each) | [2.8](#28-ruby-php-swift-scala-level-1) |
 | Protobuf | contract source | [3.1](#31-protobuf) |
-| OpenAPI, AsyncAPI, Spring properties | contract source | [3.2](#32-openapi-asyncapi-spring-properties); AsyncAPI also read back for `export_asyncapi`: [3.12](#312-asyncapi-export-and-declared-versus-code-diff-90-t12) |
+| OpenAPI, AsyncAPI, Spring properties | contract source | [3.2](#32-openapi-asyncapi-spring-properties); AsyncAPI also read back for `export_asyncapi`: [3.13](#313-asyncapi-export-and-declared-versus-code-diff-90-t12) |
 | Markdown | docs | [3.3](#33-markdown) |
 | SQL (`.sql`, and the SQL strings of TypeScript / JavaScript, Go, Java, Python) | events only: outbox inserts, `NOTIFY` / `pg_notify`, `LISTEN` | [3.4](#34-sql) |
 | Declared producer helpers (`[[engines.contracts.producer_calls]]`, TypeScript / JavaScript) | producers: calls of an outbox or publish helper the config names | [3.11](#311-declared-producer-calls) |
 | In-process buses and schedules (NestJS EventEmitter2 / CQRS / `@nestjs/schedule`, Spring application events / `@Scheduled`) | events and chain entries | [3.5](#35-in-process-buses-and-schedules) |
 | Go brokers (RabbitMQ, NATS, Redis, SQS / SNS, Pub/Sub) | events and chain entries | [3.9](#39-go-brokers) |
+| C# brokers (MassTransit, NServiceBus, Azure Service Bus) | events and chain entries | [3.12](#312-c-brokers) |
 
 ---
 
@@ -228,13 +229,13 @@ no import resolution through build systems (CMake, Bazel).
 | :--- | :--- | :--- |
 | Declarations | classes, objects, interfaces, functions | classes, interfaces, methods |
 | Imports | not extracted | not extracted |
-| Events | Spring `@KafkaListener`; `kafka-clients` `.subscribe` / `.send` / `.produce`; string defaults resolved | Confluent.Kafka producers and consumers, **string literal topics only** (a variable argument records nothing rather than the variable's name) |
+| Events | Spring `@KafkaListener`; `kafka-clients` `.subscribe` / `.send` / `.produce`; string defaults resolved | Confluent.Kafka producers and consumers, **string literal topics only** (a variable argument records nothing rather than the variable's name); MassTransit, NServiceBus and Azure Service Bus ([3.12](#312-c-brokers)) |
 | HTTP | Spring annotations | ASP.NET attributes (`[ApiController]`, `[HttpGet("/x")]`) |
 | gRPC | `@GrpcService` classes are tagged; no clients | none |
 
 **You will not get** (Kotlin): imports, gRPC clients. **(C#)**: a `using` graph, gRPC, minimal APIs
-(`MapGet`), MassTransit, Azure Service Bus, RabbitMQ, DI-registered handlers, and the `.csproj` /
-NuGet / solution graph.
+(`MapGet`), the raw RabbitMQ client (`RabbitMQ.Client`), DI-registered handlers, and the `.csproj` /
+NuGet / solution graph. MassTransit, NServiceBus and Azure Service Bus are read, narrowly: [3.12](#312-c-brokers).
 
 Consequence: `find_dependents` cannot answer "who imports this" for Kotlin or C# files, and
 gRPC tracing (`analyze_grpc`) will not list a C# service or client. The `.proto` is still the
@@ -837,7 +838,124 @@ callee = "streamBus.publish"        # no keys: argument `arg` (default 0) is the
 Fixture and ground truth: `examples/eda/declared-producers` and
 `tests/golden/events/declared-producers.expected.yaml`.
 
-### 3.12 AsyncAPI export and declared-versus-code diff (9.0 T12)
+### 3.12 C# brokers
+
+C# reads the buses below besides Confluent.Kafka (9.0 T8d, tag `cs_broker`). A site is recorded under its
+broker where the file shows it, so a queue named like a Kafka topic is another channel
+(`rabbitmq:orders`, `servicebus:orders`; [architecture 3.4](architecture.md#34-broker-qualified-topic-keys)).
+No new broker key: `rabbitmq`, `servicebus`, `sqs`, `inproc` and `kafka` are the slugs used.
+
+| Library | Consumers | Producers | Key of a site |
+| :--- | :--- | :--- | :--- |
+| MassTransit | a class whose base list has `IConsumer<T>` or `IJobConsumer<T>` (`Batch<T>` reads as `T`); `ReceiveEndpoint("q", ...)` inside a `Using...` configuration | `Publish` / `Send` on `IPublishEndpoint`, `ISendEndpoint`, `IBus`, `IBusControl`, `ConsumeContext`; `GetSendEndpoint(new Uri("queue:q"))` (also `exchange:`, `topic:`) on `ISendEndpointProvider`, `IBus`, `IBusControl`, `ConsumeContext` | the message type `T`; the queue of a `ReceiveEndpoint` and of a short address |
+| NServiceBus | a class whose base list has `IHandleMessages<T>` or `IAmStartedByMessages<T>` | `Publish`, `Send`, `SendLocal`, `Reply` on `IMessageSession`, `IEndpointInstance`, `IMessageHandlerContext`, `IPipelineContext` | the message type `T` (`Send("endpoint", new T())` is `T`, not the endpoint) |
+| Azure Service Bus (SDK) | `ServiceBusClient.CreateProcessor` / `CreateSessionProcessor` / `CreateReceiver` | `ServiceBusClient.CreateSender` | the queue or topic (the subscription of a topic is not a key) |
+| Azure Functions | `[ServiceBusTrigger("q")]` on a function or one of its parameters | `[ServiceBusOutput("q")]` (isolated worker), `[ServiceBus("q")]` (WebJobs) | the queue or topic; `%Setting%` is the placeholder `${Setting}` |
+
+A consumer class and a `[ServiceBusTrigger]` register on the class or function declaration (the first line
+of the node, attributes included); every other site is an `EventStream` node on the call line, as in the Java,
+Go and Python passes. A site is a call on a client **only** when all of these hold:
+
+- the file brings the library in: a parsed `using` directive of one of its namespaces (`MassTransit`,
+  `NServiceBus`, `Azure.Messaging.ServiceBus`, `Microsoft.Azure.WebJobs`, `Microsoft.Azure.Functions.Worker`,
+  `Microsoft.Extensions.Configuration` for configuration reads; sub-namespaces count, a look-alike such as
+  `MassTransitShim` does not) or the type is written fully qualified (`MassTransit.IConsumer<T>`);
+- no type of the file and no `using X = ...` alias is named like the client (a local `interface IConsumer<T>`,
+  `class ServiceBusClient`, `class IPublishEndpoint` hides the library's, and so does a local `ServiceBusTrigger`
+  attribute class);
+- the receiver is a field, property, primary-constructor parameter, method / lambda / catch / `for` /
+  `foreach` / `using` variable, `this.x`, or a `new T(...)` whose **declared type** is the client (a
+  `var x = new T()` counts, a `var x = await ...` does not). A lambda parameter without a type, a parameter of
+  another type or a local of the same name hides an outer client. `IConsumer<TKey, TValue>` (Confluent.Kafka) has
+  two type arguments and is never MassTransit's. `IHandleMessages<T>` of Rebus is not NServiceBus's (the `using`
+  differs), and MassTransit's names never read as NServiceBus's.
+
+What a name may be (nothing else is read, no name is guessed from an identifier). A **message type** is the type a
+generic argument names (`Publish<OrderCreated>(...)`), the type of a `new OrderCreated(...)` argument, or the type
+of a variable declared with that type; a type parameter (`Publish<TEvent>`), `object`, a predefined type and a
+generic type are never one. A **queue or topic** is a plain string literal (no escape, no interpolation, no raw
+string), a `const string` or `static readonly string` of the file (also `Queues.Orders` of a class the file
+declares, and a constant defined by another one), an `Environment.GetEnvironmentVariable("K")` read, an
+`IConfiguration` read (`configuration["A:B"]`, `GetValue<string>("A:B")`, on a parameter, field or property typed
+`IConfiguration`, `IConfigurationRoot` or `IConfigurationSection`), or a Functions `%Setting%`. A read is the
+placeholder `${K}`, and `A:B` is spelled as the environment variable that overrides it, `${A__B}`: it resolves
+against a compose `environment:` block, a Kubernetes `env:` list or a `.env.example`-style template (3.6), and
+stays a visible, counted `${A__B}` topic when nothing defines it (`appsettings.json` is not read). **A default is
+never a name**: `configuration["K"] ?? "d"` and `GetValue<string>("K", "d")` are read as `${K}`. A literal or
+constant that is not a plain name (a connection string such as `Endpoint=sb://...;SharedAccessKey=...`, a URL, a
+token, `Bearer_...`, a password-like value, a random-looking run) is not a name, nor is a constant named like a
+credential (`ApiKey = "x"`: the TypeScript queue-constant predicate, `member_consts::constant_is_a_name`, section
+3.8), nor a setting or environment variable whose KEY is credential-named (`member_consts::placeholder_key_is_credential_named`:
+a credential word as a whole word, case-split word or **substring of a separator-less key**: `DB_PASSWORD`, `DBPASSWORD`,
+`APIKEYQUEUE`, `PASSWORDS_Q`, `SECRETQ`, `Bus:SharedAccessKey`, `ConnectionString`; the ordinary words `secretary` and
+`tokenizer` are allowed in a key). A *value* keeps the weaker rule: `password-reset-jobs`, `secretary-jobs` and
+`token-refresh-jobs` are names. A refused value registers nothing, and nothing counts it. A name with `*`, `#` or `>` registers no site, producer or consumer. `Connection =
+"..."` of a Functions attribute and the argument of `Host(...)` / `new ServiceBusClient(...)` are never read. A
+node whose signature line holds a secret-shaped literal (a `Connection = "Endpoint=..."` on an attribute line) has
+that literal replaced by `[REDACTED_SECRET: USE_ENV_OR_LOCAL_FALLBACK]` in any file that names one of the libraries.
+`smart_search` snippets (every language) mask the value of a connection-string pair, `SharedAccessKey`,
+`SharedAccessSignature`, `AccountKey`, `AccessKey`, `SecretKey`, `Password`, `Pwd` or `AuthKey`, with or without spaces
+around `=`, line by line, so the lines of a verbatim `@"..."` or raw `"""` literal are masked too. A pair whose value
+is empty or a placeholder (`password=%s`, `?`, `$1`, `{0}`, `:name`, `@p1`) and a code assignment
+(`Password = settings.Password;`) are left alone. A token or a URL with credentials in a snippet is not masked (the
+older key-name rule of `smart_search` applies).
+
+The bus is known only where the same file names it, read over the whole file (also past the site cap): MassTransit `UsingRabbitMq` (`rabbitmq`),
+`UsingAzureServiceBus` (`servicebus`), `UsingAmazonSqs` (`sqs`), `UsingInMemory` (`inproc`, the application itself);
+NServiceBus `UseTransport<RabbitMQTransport>()` / `new RabbitMQTransport(...)`, `AzureServiceBusTransport`,
+`SqsTransport`. It applies to the message-type sites of that library in that file when every `Using...` / transport of
+the file agrees; two different buses, or a transport with no broker key (`UsingActiveMq`, `LearningTransport`), leave
+the broker unknown. A `ReceiveEndpoint` takes the bus of the nearest enclosing `Using...` call, and the Azure Service
+Bus SDK and Functions attributes are `servicebus` by construction. **A consumer class of another file than the bus
+setup has no broker** (the extractor reads one file at a time): it joins the channel of its name on every broker that
+uses the name, `heuristic`, and is never tagged `kafka`.
+
+Every site carries its broker with the producer or consumer, so `trace_flow` / `analyze_impact` never link two sites
+that know different brokers (3.7); `diff_mesh` names the broker of a removed site that is not Kafka. In an
+`analyze_impact` table the topic rows carry the qualifier (`rabbitmq:orders`, `servicebus:orders`); the producer and consumer
+rows show the site's own name (`orders`) without it, as they do for the other languages (the qualifier lives on the
+topic hub, not on the row). A file whose top-level statements hold the sites (no class)
+registers them on the call nodes.
+
+Bounds: at most 2,000 sites per file (`MAX_CS_BROKER_SITES_PER_FILE`) and 16,384 declared names; a file over a bound
+is counted in `IndexHealth::files_cs_brokers_capped` and listed by `mesh-mcp doctor` (a warning). Every walk is
+iterative, a constant chain follows at most 4 links, and the per-scope tables are built once, so a hostile file costs a
+bounded pass whatever it nests.
+
+**You will not get:** `RabbitMQ.Client` (`BasicPublish` / `BasicConsume`), Rebus, Wolverine, Brighter, Dapr,
+`Microsoft.Azure.ServiceBus` (`QueueClient`, `TopicClient`, `SubscriptionClient`), Event Hubs, `GetResponse<T>` /
+`IRequestClient<T>` and `RespondAsync`, Kafka riders, `RouteToEndpoint` / `EndpointConvention.Map` routing (a `Send`
+is keyed by its message, not by the endpoint it is routed to), `ConfigureEndpoints` and `AddConsumer<T>()` /
+`ConfigureConsumer<T>()` (a consumer class is already read from its base list), a message sent through the variable that
+holds a `GetSendEndpoint` result (`var e = await p.GetSendEndpoint(...)`: the `GetSendEndpoint` call is the producer of
+the queue, the later `e.Send(new T())` is not read), a `global using MassTransit;` of another file (the file is not
+read as importing it; `using global::MassTransit;` is), `using MT = MassTransit;` followed by `MT.IConsumer<T>` and
+`using Bus = MassTransit.IBus;` (an alias is read as a type of the file that hides the name, never as the library's),
+a `using` inside `#if false` (it counts), a queue name held by a
+field assigned in a constructor or by a property, a name built with `$"..."`, `+` or `nameof`, a pattern variable
+(`x is IBus b`) and an `out var` as a receiver, and the broker of a consumer class declared away from the bus setup.
+A type name is the key whatever its namespace: `A.OrderCreated` and `B.OrderCreated` are one key.
+
+**False positive, not only a gap:** a type of ANOTHER file in the same namespace as the using file hides the library's
+type in C# (`namespace Mine { interface IBus { } }` in one file, `using MassTransit; IBus _b; _b.Publish(new X())` in
+another reads `Publish`). The extractor reads one file at a time and the parse cache is per file, so this is not
+detected: such a producer or consumer is registered although it is not MassTransit's. A bus of unknown broker joins
+every channel of its name as `heuristic`.
+
+**Generic Confluent.Kafka reader.** The older reader still registers a Kafka producer or consumer for any
+`x.Produce("lit")`, `ProduceAsync("lit")` or `Subscribe("lit")` of any receiver, including a type the file declares
+(`bus.Subscribe("x")` of a homegrown bus) and a client of another library; this pass guarantees only the calls it
+recognises. Since T8d its literal goes through the same name rule as the names above (`constant_is_a_name`): a
+connection string, a URL, a token or a password-shaped literal (`ProduceAsync("hunter2-prod")`) registers nothing, the
+first literal argument being the topic, so a later payload literal never takes its place. A refused literal is not counted.
+
+Fixture and ground truth: `examples/eda/cs-brokers` and `tests/golden/events/cs-brokers.expected.yaml` (31 sites,
+2 chains, 11 negatives: local-type and homegrown-bus decoys, an unrelated `Publish`, a connection-string constant, a
+wildcard queue, credential-named configuration keys, a parameter and a test file). Producer `p4`
+(`endpoint.Send(new BillOrder(...))` on a `var` holding a `GetSendEndpoint` result) is a real producer the pass
+does not read.
+
+### 3.13 AsyncAPI export and declared-versus-code diff (9.0 T12)
 
 No new extraction and no parse-cache change: the tool `export_asyncapi` ([mcp-tools](mcp-tools.md#tool-10-export_asyncapi))
 reads what the indexer already holds. The OBSERVED side is the topic hubs of the graph (per broker,

@@ -70,6 +70,7 @@ impl EventInput {
                 || i.jvm_brokers_capped
                 || i.go_brokers_capped
                 || i.py_brokers_capped
+                || i.cs_brokers_capped
                 || i.sql_capped
         };
         self.relevant |= base.as_ref().is_some_and(has_sites) || current.is_some_and(has_sites);
