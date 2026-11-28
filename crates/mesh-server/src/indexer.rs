@@ -703,6 +703,7 @@ impl WorkspaceIndexer {
             health.record_jvm_brokers(frag.code.jvm_brokers_capped);
             health.record_py_brokers(frag.code.py_brokers_capped);
             health.record_go_brokers(frag.code.go_brokers_capped);
+            health.record_cs_brokers(frag.code.cs_brokers_capped);
             if frag.code.calls.capped {
                 tracing::warn!(
                     target: "mesh::indexer",

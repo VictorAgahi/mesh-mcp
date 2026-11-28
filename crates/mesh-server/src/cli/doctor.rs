@@ -121,6 +121,7 @@ impl DoctorCommand {
             || health.jvm_brokers_truncated()
             || health.py_brokers_truncated()
             || health.go_brokers_truncated()
+            || health.cs_brokers_truncated()
             || health.declared_truncated())
             && health.rejected.is_empty()
             && health.rejected_overflow == 0
@@ -128,7 +129,7 @@ impl DoctorCommand {
             DoctorCheck::warn(
                 "Index health",
                 format!(
-                    "{summary}\n    Some SQL events, in-process bus sites, schedules or broker sites (Java, Go, Python) of these files are not registered."
+                    "{summary}\n    Some SQL events, in-process bus sites, schedules or broker sites (Java, Go, Python, C#) of these files are not registered."
                 ),
             )
         } else if health.config_degraded()
