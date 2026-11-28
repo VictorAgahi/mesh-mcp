@@ -27,7 +27,7 @@ the reply is a normal success response whose result has `isError: true` and the 
 agent sees the message and can correct its next call. Only protocol faults (unparseable JSON, unknown
 method) are JSON-RPC errors.
 
-## The nine tools
+## The ten tools
 
 | Tool | Reads | Answers |
 | :--- | :--- | :--- |
@@ -40,6 +40,7 @@ method) are JSON-RPC errors.
 | `diff_mesh` | Git base and working tree, extracted like the index; the live graph for impact | what a branch changes at the contract level and who depends on it |
 | `trace_flow` | produce/consume edges and the calls layer (`Callable` nodes, `Calls` edges) | the end-to-end chain of an event, route or handler, hop by hop with each call's `path:line`, forward or reverse |
 | `event_anomalies` | produce/consume edges, the calls layer and the test-file rule | where the event graph looks wrong: topics published but never consumed or the reverse, cycles, abnormal fan-out, test-only consumers, publisher-versus-consumer payload mismatches (the payload facts of TypeScript and Java files); unresolved topics listed apart |
+| `export_asyncapi` | the topic hubs, their sites, the payload facts, and the declared AsyncAPI files read from disk | the observed event graph as an AsyncAPI 3.0 document; the declared documents compared with the code (missing channels or operations, payload and broker disagreements) |
 
 Each tool is a Rust type that implements the `McpTool` trait: a name, a description, an argument
 type, and a `run` function that takes the arguments and the shared state and returns text.

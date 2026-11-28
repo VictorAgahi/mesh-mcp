@@ -56,6 +56,31 @@ pub struct EventAnomaliesArgs {
 const DEFAULT_LIMIT: u32 = 25;
 const MAX_LIMIT: u32 = 100;
 
+/// What the index did not read or resolve, as notes for a report that says "no producer" or
+/// "not in code": a missing end may be there. Shared with `export_asyncapi`.
+pub(crate) fn coverage_notes(h: &mesh_core::IndexHealth) -> Vec<String> {
+    let unread = h.files_rejected_oversized
+        + h.files_rejected_guard
+        + h.files_read_error
+        + h.files_parse_failed;
+    let mut coverage = Vec::new();
+    if unread > 0 {
+        coverage.push(format!(
+            "{unread} file(s) were not indexed (oversized, rejected by a guard, unreadable or unparsable; see `mesh-mcp doctor`), so a missing producer or consumer may be in one"
+        ));
+    }
+    if h.config_topics_unresolved > 0 {
+        coverage.push(format!(
+            "{} config-driven topic name(s) no configuration file resolves",
+            h.config_topics_unresolved
+        ));
+    }
+    if let Some(note) = h.declared_gap_note() {
+        coverage.push(note);
+    }
+    coverage
+}
+
 pub struct EventAnomaliesTool;
 
 impl McpTool for EventAnomaliesTool {
@@ -109,26 +134,7 @@ impl McpTool for EventAnomaliesTool {
                 }
             }
         };
-        let h = &snapshot.health;
-        let unread = h.files_rejected_oversized
-            + h.files_rejected_guard
-            + h.files_read_error
-            + h.files_parse_failed;
-        let mut coverage = Vec::new();
-        if unread > 0 {
-            coverage.push(format!(
-                "{unread} file(s) were not indexed (oversized, rejected by a guard, unreadable or unparsable; see `mesh-mcp doctor`), so a missing producer or consumer may be in one"
-            ));
-        }
-        if h.config_topics_unresolved > 0 {
-            coverage.push(format!(
-                "{} config-driven topic name(s) no configuration file resolves",
-                h.config_topics_unresolved
-            ));
-        }
-        if let Some(note) = h.declared_gap_note() {
-            coverage.push(note);
-        }
+        let coverage = coverage_notes(&snapshot.health);
         let view = AnomalyView {
             show,
             limit: args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as usize,

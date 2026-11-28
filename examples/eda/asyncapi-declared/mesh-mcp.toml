@@ -1,0 +1,15 @@
+# Fixture: AsyncAPI export and declared-versus-code diff (9.0 T12). A NestJS service (broker not
+# statically known), a BullMQ queue and a Spring Kafka listener, with two DECLARED AsyncAPI
+# documents (asyncapi.yaml, version 3, and legacy/asyncapi.v2.yaml, version 2) that deliberately
+# disagree with the code. Truth: tests/golden/events/asyncapi.report.yaml.
+[workspace]
+name = "asyncapi-declared"
+version = "1.0.0"
+roots = ["."]
+exclude_patterns = ["**/node_modules/**", "**/target/**"]
+
+[engines.docs]
+enabled = true
+
+[engines.contracts]
+enabled = true

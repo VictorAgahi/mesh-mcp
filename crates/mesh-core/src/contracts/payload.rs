@@ -688,6 +688,85 @@ impl ContractGraph {
             _ => Resolved::Ambiguous,
         }
     }
+
+    /// The payload of every site in `sites` (the producers or the consumers of topic `key`),
+    /// resolved exactly as the payload check resolves them (T11), one row per site, in order.
+    /// `declared` is [`Self::declared_payload_types`], built once for many topics.
+    pub fn site_payloads<'g>(
+        &'g self,
+        sites: &[&'g ContractNode],
+        producer: bool,
+        key: &str,
+        declared: &DeclaredPayloadTypes<'g>,
+    ) -> Vec<SitePayload<'g>> {
+        sites
+            .iter()
+            .map(
+                |node| match self.resolve_payload(node, producer, key, &declared.0) {
+                    Resolved::Side {
+                        type_name,
+                        file,
+                        repo_id,
+                        line,
+                        fields,
+                        incomplete,
+                    } => SitePayload::Typed {
+                        type_name,
+                        file,
+                        repo_id,
+                        line,
+                        fields,
+                        incomplete,
+                    },
+                    Resolved::Untyped => SitePayload::Untyped,
+                    Resolved::Undeclared => SitePayload::Undeclared,
+                    Resolved::Ambiguous => SitePayload::Ambiguous,
+                },
+            )
+            .collect()
+    }
+
+    /// The declared payload types of the whole graph, by name.
+    pub fn declared_payload_types(&self) -> DeclaredPayloadTypes<'_> {
+        let mut declared: HashMap<&str, Vec<(&FilePath, &FilePayloads, &PayloadType)>> =
+            HashMap::new();
+        for (path, f) in &self.payload_facts {
+            for t in &f.facts.types {
+                declared
+                    .entry(t.name.as_str())
+                    .or_default()
+                    .push((path, f, t));
+            }
+        }
+        DeclaredPayloadTypes(declared)
+    }
+}
+
+/// The declared payload types of a graph, by name (see [`ContractGraph::declared_payload_types`]).
+pub struct DeclaredPayloadTypes<'g>(
+    HashMap<&'g str, Vec<(&'g FilePath, &'g FilePayloads, &'g PayloadType)>>,
+);
+
+/// What one site's payload resolves to (the public face of the payload check's resolution).
+#[derive(Debug, Clone, Serialize)]
+pub enum SitePayload<'g> {
+    /// A declared type or an inline object: its fields and where it is written.
+    Typed {
+        /// `None` for an inline object type or literal.
+        type_name: Option<&'g str>,
+        file: &'g FilePath,
+        repo_id: RepoId,
+        line: u32,
+        fields: &'g [PayloadField],
+        /// The field list is partial (a cap, a spread, an `extends`).
+        incomplete: bool,
+    },
+    /// Not statically typed (a raw string, `any`, no fact).
+    Untyped,
+    /// The type name is declared by no indexed file.
+    Undeclared,
+    /// Several indexed files declare the name, or a node holds two different payload sites.
+    Ambiguous,
 }
 
 #[cfg(test)]

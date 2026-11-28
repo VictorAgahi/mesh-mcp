@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 mod anomalies;
+mod asyncapi;
 mod broker;
 mod calls;
 mod delta;
@@ -25,6 +26,7 @@ pub use anomalies::{
     TopicEntry, UnresolvedEntry, UnresolvedReason, ANOMALY_FAN_OUT_CONSUMERS,
     ANOMALY_FAN_OUT_TOPICS, ANOMALY_MAX_CYCLE_SITES,
 };
+pub use asyncapi::{ObservedChannel, ObservedEvents, ASYNCAPI_PACKAGE};
 pub use broker::{qualified_topic_key, split_qualified_topic_key, Broker};
 pub use calls::{
     CallFact, CallFacts, CallReceiver, CallStats, CallableFact, ImportFact, InjectionFact,
@@ -39,11 +41,11 @@ pub use flow::{
     DEFAULT_FAN_OUT, MAX_CALL_DEPTH, MAX_EVENT_DEPTH, MAX_FAN_OUT, MAX_FLOW_HOPS,
 };
 pub use payload::{
-    json_family as payload_json_family, FieldClash, FieldGap, NotCompared, PayloadEntry,
-    PayloadFacts, PayloadField, PayloadImport, PayloadReport, PayloadShape, PayloadSide,
-    PayloadSite, PayloadSkipReason, PayloadSkipped, PayloadType, MAX_PAYLOAD_FIELDS_PER_TYPE,
-    MAX_PAYLOAD_SHAPES_PER_TOPIC, MAX_PAYLOAD_SITES_PER_FILE, MAX_PAYLOAD_TYPES_PER_FILE,
-    MAX_PAYLOAD_TYPE_NAMES_PER_FILE,
+    json_family as payload_json_family, DeclaredPayloadTypes, FieldClash, FieldGap, NotCompared,
+    PayloadEntry, PayloadFacts, PayloadField, PayloadImport, PayloadReport, PayloadShape,
+    PayloadSide, PayloadSite, PayloadSkipReason, PayloadSkipped, PayloadType, SitePayload,
+    MAX_PAYLOAD_FIELDS_PER_TYPE, MAX_PAYLOAD_SHAPES_PER_TOPIC, MAX_PAYLOAD_SITES_PER_FILE,
+    MAX_PAYLOAD_TYPES_PER_FILE, MAX_PAYLOAD_TYPE_NAMES_PER_FILE,
 };
 
 #[cfg(test)]
