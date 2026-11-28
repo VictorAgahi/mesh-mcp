@@ -724,13 +724,12 @@ async fn call_depth_limit_is_a_stub_and_a_note_not_a_chain_end() {
     let chain = 9;
     files.push((
         "consumer.ts".to_string(),
-        format!(
-            "import {{ Controller }} from '@nestjs/common';\nimport {{ EventPattern }} from '@nestjs/microservices';\nimport {{ S0 }} from './s0';\n@Controller()\nexport class Entry {{\n  constructor(private readonly s0: S0) {{}}\n  @EventPattern('deep.in')\n  async handle(p: any) {{ this.s0.run(p); }}\n}}\n"
-        ),
+        "import { Controller } from '@nestjs/common';\nimport { EventPattern } from '@nestjs/microservices';\nimport { S0 } from './s0';\n@Controller()\nexport class Entry {\n  constructor(private readonly s0: S0) {}\n  @EventPattern('deep.in')\n  async handle(p: any) { this.s0.run(p); }\n}\n"
+            .to_string(),
     ));
     for i in 0..chain {
         let body = if i + 1 < chain {
-            format!("this.next.run(p);")
+            "this.next.run(p);".to_string()
         } else {
             "this.client.emit('deep.out', p);".to_string()
         };
@@ -868,4 +867,48 @@ async fn credential_shaped_route_paths_are_redacted_and_braces_are_not() {
         "{text}"
     );
     assert!(text.contains("| entry | `POST /x/{id}/retry` |"), "{text}");
+}
+
+/// Measurement, not an assertion: a synthetic 2,000-topic workspace (a chain of consumers that
+/// each publish the next topic, plus a hub with 300 consumers). Run with
+/// `cargo test --release -p mesh-server --test flow_view -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore]
+async fn measure_two_thousand_topics() {
+    let mut files: Vec<(String, String)> = Vec::new();
+    for i in 0..2000 {
+        files.push((
+            format!("modules/m{i:04}/c.ts"),
+            listener(
+                &format!("Chain{i:04}"),
+                &format!("topic.{i:04}"),
+                Some(&format!("topic.{:04}", i + 1)),
+            ),
+        ));
+    }
+    for i in 0..300 {
+        files.push((
+            format!("hub/h{i:03}.ts"),
+            listener(&format!("Hub{i:03}"), "hub.event", None),
+        ));
+    }
+    let t = std::time::Instant::now();
+    let (_d, state) = temp_from(&files);
+    println!("index (2,300 files, 2,300 topics): {:?}", t.elapsed());
+    for (label, args) in [
+        ("chain centre, defaults", json!({ "event": "topic.1000" })),
+        (
+            "chain centre, hops 5/5, detail",
+            json!({ "event": "topic.1000", "hops_up": 5, "hops_down": 5, "detail": true }),
+        ),
+        (
+            "hub, limit 200, fan_out 50",
+            json!({ "event": "hub.event", "limit": 200, "fan_out": 50 }),
+        ),
+        ("hub, defaults", json!({ "event": "hub.event" })),
+    ] {
+        let t = std::time::Instant::now();
+        let text = call(&state, args).await;
+        println!("{label}: {:?}, {} bytes", t.elapsed(), text.len());
+    }
 }

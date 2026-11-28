@@ -714,7 +714,7 @@ view does not walk the graph a second time.
 - **Event**: a topic / queue / stream name (`order.requested`) or its broker-qualified key
   (`kafka:orders`), matched exactly like `trace_flow` matches a topic. A bare name used on several
   brokers draws one centre per broker, never joined (a site whose broker is not statically known
-  joins every channel of its name, as everywhere, and is dashed). A name that only matched by
+  joins every channel of its name, as everywhere: check such a site against the source). A name that only matched by
   substring several events is drawn as one centre, and the output says so. Every event node is
   broker-qualified (`kafka:orders`); `?:` means the broker is not statically known (a NestJS
   `@EventPattern`, for example).
